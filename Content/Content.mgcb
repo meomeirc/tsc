@@ -1,0 +1,27 @@
+
+#----------------------------- Global Properties ----------------------------#
+
+/outputDir:bin/$(Platform)/$(Configuration)/Content
+/intermediateDir:obj/$(Platform)/$(Configuration)/Content
+/platform:DesktopGL
+
+#-------------------------------- References --------------------------------#
+
+#---------------------------------- Content ---------------------------------#
+
+/build:DefaultFont.spritefont
+
+#begin LaneLine.fx
+/importer:EffectImporter
+/processor:EffectProcessor
+/build:LaneLine.fx
+
+#begin SkinSparkles.fx
+/importer:EffectImporter
+/processor:EffectProcessor
+/build:SkinSparkles.fx
+
+#begin SkinQuad3D.fx
+/importer:EffectImporter
+/processor:EffectProcessor
+/build:SkinQuad3D.fx

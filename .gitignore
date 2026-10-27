@@ -1,0 +1,20 @@
+# .NET and IDE output
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+bin/
+obj/
+
+# Local game state
+gameConfig.json
+keybinds.json
+tsc_crash.log
+Logs/
+save/
+
+# Optional local FFmpeg archive
+tools/
+
+songs/

@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Configurations>Debug;Release;Publish</Configurations>
+    <MonoGamePlatform>DesktopGL</MonoGamePlatform>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Publish'">
+    <!-- Publish is a separate feature-reduced build; Debug and Release remain full-featured. -->
+    <DefineConstants>$(DefineConstants);TSC_PUBLISH</DefineConstants>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(Configuration)' == 'Publish'">
+    <Compile Remove="Skins\SkinDebugConsole.cs" />
+    <Compile Remove="Ares/FpkWriter.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="SharpCompress" Version="0.50.4" />
+    <PackageReference Include="Moonsharp" Version="2.0.0" />
+    <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.5.1" />
+    <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.5.1" />
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
+    <PackageReference Include="Concentus.Oggfile" Version="1.0.7" />
+  </ItemGroup>
+  <ItemGroup>
+    <MonoGameContentReference Include="Content\Content.mgcb" />
+    <EmbeddedResource Include="info.md" LogicalName="TSC.info.md" />
+    <EmbeddedResource Include="version.txt" LogicalName="TSC.version.txt" />
+    <None Update="info.md" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <None Update="version.txt" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <!-- Optional local FFmpeg Essentials archive; runtime extracts only ffmpeg.exe from it. -->
+    <None Update="tools\ffmpeg.7z" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Song bundles are runtime data, not C# source. -->
+    <Compile Remove="songs\**\*.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="Samples\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Developer builds keep the editable root-level Lua scripts beside the executable. -->
+    <None Update="*.lua" Condition="'$(Configuration)' != 'Publish'" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="*.lua" Condition="'$(Configuration)' == 'Publish'" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <!-- Publish the Default skin tree as-is. -->
+    <None Update="skins\Default\**\*" Condition="'$(Configuration)' == 'Publish'"
+          CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <Content Include="skins\Default\**\*" Condition="'$(Configuration)' == 'Publish'">
+      <Link>skins\Default\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <TargetPath>skins\Default\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <None Include="textures\**\*.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
