@@ -629,7 +629,7 @@ public sealed partial class Playfield
 
         var volume = ev.NoteType == NoteType.LinkTail
             ? config.LinkVolume
-            : (ev.Duration > 6 || ev.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead ? config.LinkVolume : config.TapVolume);
+            : config.TapVolume;
         _hitSounds.PlayNote(volume);
     }
 }
