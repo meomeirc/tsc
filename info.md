@@ -1,5 +1,13 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.14
+
+## editor
+
+- fixed ambiguous link attr reuse when a new linkTail occurs at the previous link’s duration end tick
+- fixed a crash when using connector tool over empty grids
+- fixed repeated webp album load failures in song select when ffmpeg is missing
+
 # 0.0.13
 
 i think im gonna use this menu for changelog so uhh
