@@ -4448,8 +4448,20 @@ public sealed class SongSelectMenu : IDisposable
 
         try
         {
-            using var stream = File.OpenRead(path);
-            var texture = Texture2D.FromStream(_graphics, stream);
+            Texture2D texture;
+            try
+            {
+                using var stream = File.OpenRead(path);
+                texture = Texture2D.FromStream(_graphics, stream);
+            }
+            catch (Exception decodeException)
+            {
+                // MonoGame's image loader does not support WebP. Song Select must
+                // use the same FFmpeg fallback as the editor instead of failing
+                // even when FFmpeg has already been detected and installed.
+                texture = LoadArtworkWithFfmpeg(path, decodeException);
+            }
+
             if (texture.Width <= 0 || texture.Height <= 0)
             {
                 texture.Dispose();
@@ -4466,12 +4478,82 @@ public sealed class SongSelectMenu : IDisposable
         }
         catch (Exception ex)
         {
-            // Remember failed paths so unsupported formats (notably WebP when
-            // FFmpeg is missing) are attempted and logged only once, rather than
-            // being re-queued every frame until the log or memory grows without bound.
+            // Remember failed paths so unsupported formats are attempted and
+            // logged only once, rather than being re-queued every frame until
+            // the log or memory grows without bound.
             _artworkFailed.Add(path);
             Program.LogRuntime($"SONG_SELECT_ARTWORK_LOAD_FAILED {path} :: {ex.Message}");
             return null;
+        }
+    }
+
+    private Texture2D LoadArtworkWithFfmpeg(string path, Exception nativeDecodeException)
+    {
+        var ffmpeg = FindFfmpegExecutable();
+        if (ffmpeg is null)
+        {
+            throw new InvalidDataException(
+                $"Native image decoding failed ({nativeDecodeException.Message}); FFmpeg is unavailable.",
+                nativeDecodeException);
+        }
+
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "TSC-SongSelectArtwork-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(temporaryDirectory);
+            var outputPath = Path.Combine(temporaryDirectory, "artwork.png");
+            var start = new ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            foreach (var argument in new[]
+            {
+                "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                "-map", "0:v:0", "-frames:v", "1", "-f", "image2", outputPath
+            })
+            {
+                start.ArgumentList.Add(argument);
+            }
+
+            using var process = Process.Start(start)
+                ?? throw new InvalidOperationException("Could not start FFmpeg.");
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0 || !File.Exists(outputPath) || new FileInfo(outputPath).Length <= 0)
+            {
+                var detail = string.IsNullOrWhiteSpace(stderr)
+                    ? "FFmpeg did not create a PNG image."
+                    : stderr.Trim();
+                if (detail.Length > 1000)
+                    detail = detail[..1000];
+                throw new InvalidDataException(
+                    $"FFmpeg conversion failed (exit code {process.ExitCode}): {detail}");
+            }
+
+            using var convertedStream = File.OpenRead(outputPath);
+            return Texture2D.FromStream(_graphics, convertedStream);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidDataException(
+                $"Native image loading failed ({nativeDecodeException.Message}); FFmpeg fallback failed: {ex.Message}",
+                ex);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(temporaryDirectory))
+                    Directory.Delete(temporaryDirectory, recursive: true);
+            }
+            catch
+            {
+                // Temporary artwork is best-effort cleanup; do not hide the load result.
+            }
         }
     }
 
