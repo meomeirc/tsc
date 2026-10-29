@@ -1,5 +1,13 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.2
+
+- added LAN testing
+- fixed LINK VOLUME setting to only apply to linkTails
+- added INITIAL CHART BPM to the info menu to control tick 0 tempo event
+- prevent placeholder difficulty charts from being included in exports
+- add text wrapping to info menu text fields
+
 # 0.0.14
 
 ## editor
