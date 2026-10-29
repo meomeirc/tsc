@@ -1101,6 +1101,53 @@ public sealed partial class Playfield
         }
     }
 
+    private bool ShouldIncludeEditorDifficultyInBundleExport(string? difficultyCode, EditorDifficultyState state)
+    {
+        var code = GetEditorDifficultyCode(difficultyCode, state.SourceName);
+        if (!IsEditorDifficultyEnabled(code))
+            return false;
+
+        // A missing difficulty tab is represented by a generated blank chart in
+        // memory. Keep supplied charts even if they are intentionally empty, but
+        // omit unsupplied placeholders until the user authors actual chart data.
+        // Re-check loose chart paths in case a save or external file change made
+        // the cached HasSourceChart flag stale; an FPK path alone is not a chart.
+        var hasSourceChart = state.HasSourceChart;
+        if (!hasSourceChart && state.FpkChartName is null && !string.IsNullOrWhiteSpace(state.SourcePath))
+        {
+            var logicalPath = StripEditorDisabledSuffix(state.SourcePath);
+            var extension = Path.GetExtension(logicalPath);
+            if ((extension.Equals(".tsc", StringComparison.OrdinalIgnoreCase) ||
+                 extension.Equals(".ares", StringComparison.OrdinalIgnoreCase)) &&
+                (File.Exists(state.SourcePath) || File.Exists(logicalPath)))
+                hasSourceChart = true;
+        }
+        return hasSourceChart || HasEditorDifficultyAuthoredContent(state.Chart);
+    }
+
+    private static bool HasEditorDifficultyAuthoredContent(AresChart chart)
+    {
+        foreach (var ev in chart.Events)
+        {
+            if (ev.LoopReconstructed)
+                continue;
+
+            // Main notes and editor panel events are user-authored chart content.
+            if (ev.RawType == 1 && ev.Kind == "Note" && ev.NoteType != NoteType.End &&
+                ((ev.Track >= 0 && ev.Track <= 15) || (ev.Track >= 17 && ev.Track <= 20)))
+                return true;
+
+            // Additional tempo changes and authored tempo-ramp/stutter metadata
+            // distinguish a deliberately edited chart from a blank placeholder.
+            if (ev.RawType == 3 && ev.Tick > 0 && float.IsFinite(ev.Value) && ev.Value > 0f)
+                return true;
+            if (ev.Track == 30 && ev.RawType == 1 && (ev.Attr is 1 or 2 or 3) && ev.Duration > 0)
+                return true;
+        }
+
+        return false;
+    }
+
     private void DeleteEditorDifficultyFromSession()
     {
         var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
@@ -4220,18 +4267,38 @@ public sealed partial class Playfield
             SyncSharedEditorMetadataToDifficultyStates();
             StoreActiveEditorDifficulty();
             var difficulty = GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+            // A chart loaded directly (without entering multi-difficulty mode) has
+            // no cached difficulty states. Treat the open chart as the sole state
+            // in that case so ordinary single-chart TSC ZIP exports still work.
+            var candidateStates = _editorDifficultyStates.Count > 0
+                ? _editorDifficultyStates.ToList()
+                : new List<KeyValuePair<string, EditorDifficultyState>>
+                {
+                    new(difficulty, CaptureEditorDifficultyState(difficulty))
+                };
+            var includedStates = candidateStates
+                .OrderBy(pair => Array.IndexOf(EditorDifficultyCodes, pair.Key))
+                .Where(pair => ShouldIncludeEditorDifficultyInBundleExport(pair.Key, pair.Value))
+                .ToList();
+            if (includedStates.Count == 0)
+                throw new InvalidOperationException("There are no supplied or authored difficulty charts to export.");
+
+            var includedCodes = includedStates.Select(pair => pair.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var activeIsIncluded = includedCodes.Contains(difficulty);
             var chartPath = Path.Combine(staging, GetTscDifficultyStem(difficulty) + ".tsc");
+            // Save through the normal path first so shared audio and artwork are
+            // staged exactly as they are for a regular TSC export. If the active
+            // tab is only an unsupplied blank placeholder, its chart file and its
+            // temporary metadata are removed below before the bundle is finalized.
             SaveEditorChartAsTsc(chartPath, adoptOutputAsSource: false, writeSongJsonSidecar: true);
             var bundleMusicPath = _loadedMusicBytes is { Length: > 0 }
                 ? "music.opus"
                 : (string.IsNullOrWhiteSpace(_chart.MusicPath) ? "music.opus" : _chart.MusicPath.Replace('\\', '/'));
 
-            // A TSC ZIP is a song bundle, so include every currently loaded difficulty
-            // state that is enabled, not just the difficulty selected in the editor.
-            foreach (var pair in _editorDifficultyStates.OrderBy(pair => Array.IndexOf(EditorDifficultyCodes, pair.Key)))
+            foreach (var pair in includedStates)
             {
                 var code = GetEditorDifficultyCode(pair.Key);
-                if (string.Equals(code, difficulty, StringComparison.OrdinalIgnoreCase) || !IsEditorDifficultyEnabled(code))
+                if (string.Equals(code, difficulty, StringComparison.OrdinalIgnoreCase))
                     continue;
                 var stateChart = pair.Value.Chart;
                 var stateMedia = CaptureEditorChartMediaState(stateChart);
@@ -4242,15 +4309,66 @@ public sealed partial class Playfield
                     var statePath = Path.Combine(staging, GetTscDifficultyStem(code) + ".tsc");
                     TscLoader.Save(statePath, stateChart, bundleMusicPath,
                         includeJudgementWindows: IsEditorCustomJudgementWindowsEnabled(code),
-                        writeSongJsonSidecar: true);
+                        writeSongJsonSidecar: false);
                 }
                 finally
                 {
                     RestoreEditorChartMediaState(stateChart, stateMedia);
                 }
             }
-            IncludeExistingExtraDifficultyInTscZip(staging, difficulty);
-            UpdateEditorExtraDifficultySongJson(chartPath, createIfMissing: true);
+
+            if (!activeIsIncluded && File.Exists(chartPath))
+                File.Delete(chartPath);
+
+            // Preserve an existing Extra chart only when it is a real supplied
+            // chart. The helper's fallback can find a sibling that wasn't loaded
+            // into the active session, so register that file before rebuilding metadata.
+            IncludeExistingExtraDifficultyInTscZip(staging, activeIsIncluded ? difficulty : "ez");
+            AresChart? extraChartOutsideSession = null;
+            var stagedExtraPath = Path.Combine(staging, "sc.tsc");
+            if (!includedCodes.Contains("xt") && File.Exists(stagedExtraPath))
+            {
+                extraChartOutsideSession = TscLoader.Load(stagedExtraPath);
+                includedCodes.Add("xt");
+            }
+
+            // Rebuild song.json from only the chart files that will actually ship.
+            // This prevents sidecar updates from leaving difficulty levels for a
+            // removed placeholder chart behind.
+            var songJsonPath = Path.Combine(staging, "song.json");
+            if (File.Exists(songJsonPath)) File.Delete(songJsonPath);
+            foreach (var pair in includedStates)
+            {
+                var code = GetEditorDifficultyCode(pair.Key);
+                var statePath = Path.Combine(staging, GetTscDifficultyStem(code) + ".tsc");
+                if (!File.Exists(statePath))
+                    continue;
+                TscLoader.SaveSongJsonSidecar(statePath, pair.Value.Chart, bundleMusicPath,
+                    supportsSeries: true, schema: 3,
+                    includeJudgementWindows: IsEditorCustomJudgementWindowsEnabled(code));
+            }
+            if (extraChartOutsideSession is not null)
+            {
+                TscLoader.SaveSongJsonSidecar(stagedExtraPath, extraChartOutsideSession, bundleMusicPath,
+                    supportsSeries: true, schema: 3,
+                    includeJudgementWindows: IsEditorCustomJudgementWindowsEnabled("xt"));
+            }
+            if (File.Exists(songJsonPath))
+            {
+                var json = JsonNode.Parse(File.ReadAllText(songJsonPath)) as JsonObject
+                    ?? throw new InvalidDataException("Could not create TSC ZIP song.json metadata.");
+                if (!_editorExtraDifficultyEnabled)
+                    ApplyExtraDifficultyDisabledMetadata(json);
+                else
+                    ApplyExtraDifficultyEnabledMetadata(json,
+                        includedStates.FirstOrDefault(pair => string.Equals(pair.Key, "xt", StringComparison.OrdinalIgnoreCase)).Value?.Chart,
+                        activeIsIncluded && string.Equals(difficulty, "xt", StringComparison.OrdinalIgnoreCase) ? _chart : null);
+                ApplyDisabledDifficultyMetadata(json);
+                RemoveMissingDifficultyLevels(json);
+                File.WriteAllText(songJsonPath, json.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine,
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            }
+
             if (File.Exists(temporaryZip))
                 File.Delete(temporaryZip);
             using (var archive = ZipFile.Open(temporaryZip, ZipArchiveMode.Create))
@@ -4258,7 +4376,7 @@ public sealed partial class Playfield
                 foreach (var file in Directory.EnumerateFiles(staging, "*", SearchOption.AllDirectories))
                 {
                     var chartCode = GetEditorDifficultyCodeFromChartFileName(file);
-                    if (chartCode is not null && !IsEditorDifficultyEnabled(chartCode))
+                    if (chartCode is not null && !includedCodes.Contains(chartCode))
                         continue;
                     var relative = Path.GetRelativePath(staging, file).Replace('\\', '/');
                     archive.CreateEntryFromFile(file, relative, CompressionLevel.Optimal);
@@ -4275,18 +4393,19 @@ public sealed partial class Playfield
 
     private void IncludeExistingExtraDifficultyInTscZip(string stagingDirectory, string activeDifficultyCode)
     {
-        // The active Extra chart has already been exported by SaveEditorChartAsTsc.
-        // For another selected difficulty, carry the existing Extra chart into the
-        // ZIP in TSC format, preserving it under the requested disabled suffix.
+        // If the active Extra chart is already present, no sidecar export is needed.
+        // For another selected difficulty, carry a genuinely existing Extra chart
+        // into the ZIP in TSC format.
         if (string.Equals(GetEditorDifficultyCode(activeDifficultyCode), "xt", StringComparison.OrdinalIgnoreCase) ||
-            !_editorExtraDifficultyEnabled)
+            !IsEditorDifficultyEnabled("xt"))
             return;
 
         var outputPath = Path.Combine(stagingDirectory, "sc.tsc");
         if (File.Exists(outputPath))
             return;
         AresChart? extraChart = null;
-        if (_editorDifficultyStates.TryGetValue("xt", out var extraState))
+        if (_editorDifficultyStates.TryGetValue("xt", out var extraState) &&
+            ShouldIncludeEditorDifficultyInBundleExport("xt", extraState))
         {
             extraChart = extraState.Chart;
         }
@@ -4652,9 +4771,13 @@ public sealed partial class Playfield
         var states = _editorDifficultyStates
             .OrderBy(state => Array.IndexOf(EditorDifficultyCodes, state.Key))
             .ToList();
-        if (states.Count == 0)
-            throw new InvalidOperationException("There are no difficulty charts to export.");
+        var exportableStates = states
+            .Where(state => ShouldIncludeEditorDifficultyInBundleExport(state.Key, state.Value))
+            .ToList();
+        if (exportableStates.Count == 0)
+            throw new InvalidOperationException("There are no supplied or authored difficulty charts to export.");
 
+        var exportableCodes = exportableStates.Select(state => state.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var sourcePath = _editorDifficultyDiscoverySourcePath ?? _loadedSourcePath;
         var sourceIsFpk = !string.IsNullOrWhiteSpace(sourcePath) &&
                           string.Equals(Path.GetExtension(sourcePath), ".fpk", StringComparison.OrdinalIgnoreCase) &&
@@ -4690,7 +4813,7 @@ public sealed partial class Playfield
                 if (state.Value is not null && string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase))
                 {
                     exportedCodes.Add(state.Key);
-                    if (IsEditorDifficultyEnabled(state.Key))
+                    if (exportableCodes.Contains(state.Key))
                     {
                         var targetName = GetFpkExportChartEntryName(state.Key);
                         AddEntry(targetName, AresWriter.BuildBytes(state.Value.Chart, state.Value.AresHeaderTemplate));
@@ -4714,7 +4837,7 @@ public sealed partial class Playfield
             if (exportedCodes.Contains(state.Key))
                 continue;
             exportedCodes.Add(state.Key);
-            if (IsEditorDifficultyEnabled(state.Key))
+            if (exportableCodes.Contains(state.Key))
             {
                 var targetName = GetFpkExportChartEntryName(state.Key);
                 AddEntry(targetName, AresWriter.BuildBytes(state.Value.Chart, state.Value.AresHeaderTemplate));
@@ -4754,13 +4877,12 @@ public sealed partial class Playfield
             AddEntry("album_big", _editorSharedAlbumBigBytes.ToArray());
         }
         ReplaceEditorSharedPreviewEntry(entries);
-        var originalMediaStates = states
+        var originalMediaStates = exportableStates
             .Select(state => (Chart: state.Value.Chart, Media: CaptureEditorChartMediaState(state.Value.Chart)))
             .ToList();
         try
         {
-            ApplyFixedMediaPaths(_chart, ChartBundleTemplate.Bold);
-            foreach (var state in states)
+            foreach (var state in exportableStates)
             {
                 ApplyFixedMediaPaths(state.Value.Chart, ChartBundleTemplate.Bold);
                 _bundleJudgementWindows[state.Key] = GetJudgementWindows(state.Value.Chart);
@@ -4768,9 +4890,8 @@ public sealed partial class Playfield
             AddOrReplaceBundleMetadataEntry(entries, BuildBundleMetadataIni());
             entries.RemoveAll(entry => string.Equals(Path.GetFileName(entry.Name), "song.json", StringComparison.OrdinalIgnoreCase));
             entries.Add(new FpkWriteEntry("song.json", BuildSongJsonBytesForStates(
-                states.Where(state => IsEditorDifficultyEnabled(state.Key) &&
-                                      (_editorExtraDifficultyEnabled || !string.Equals(state.Key, "xt", StringComparison.OrdinalIgnoreCase)))
-                    .Select(state => state.Value), _chart, schema: 3, supportsSeries: true,
+                exportableStates.Where(state => _editorExtraDifficultyEnabled || !string.Equals(state.Key, "xt", StringComparison.OrdinalIgnoreCase))
+                    .Select(state => state.Value), exportableStates.First().Value.Chart, schema: 3, supportsSeries: true,
                 musicPathOverride: musicBytes is { Length: > 0 } ? "music.opus" : _chart.MusicPath)));
             FpkWriter.Save(fullTarget, entries, sourcePackage);
         }
@@ -4790,7 +4911,14 @@ public sealed partial class Playfield
             {
                 if (_editorCommittedDeletedDifficultyCodes.Contains(state.Key))
                     continue;
+                if (!exportableCodes.Contains(state.Key))
+                {
+                    state.Value.HasSourceChart = false;
+                    state.Value.FpkChartName = null;
+                    continue;
+                }
                 state.Value.SourcePath = fullTarget;
+                state.Value.HasSourceChart = true;
                 state.Value.FpkChartName = GetFpkExportChartEntryName(state.Key);
                 state.Value.SourceName = state.Value.FpkChartName;
                 state.Value.MusicBytes = musicBytes?.ToArray();
@@ -4800,8 +4928,9 @@ public sealed partial class Playfield
             }
             _loadedSourcePath = fullTarget;
             _editorDifficultyDiscoverySourcePath = fullTarget;
-            _loadedFpkChartName = GetFpkExportChartEntryName(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName));
-            _sourceName = Path.GetFileName(_loadedFpkChartName);
+            var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+            _loadedFpkChartName = exportableCodes.Contains(activeCode) ? GetFpkExportChartEntryName(activeCode) : null;
+            _sourceName = _loadedFpkChartName is null ? GetFpkExportChartEntryName(activeCode) : Path.GetFileName(_loadedFpkChartName);
             _lastLoadedSourceName = _sourceName;
             _editorSharedMusicBytes = musicBytes?.ToArray();
             _editorSharedSongImportedAudio = false;
@@ -4862,12 +4991,11 @@ public sealed partial class Playfield
         {
             var states = difficultyStates
                 .Where(state => _editorExtraDifficultyEnabled || GetEditorDifficultyCode(state.Chart.Difficulty, state.SourceName) != "xt")
+                .Where(state => ShouldIncludeEditorDifficultyInBundleExport(
+                    GetEditorDifficultyCode(state.Chart.Difficulty, state.SourceName), state))
                 .ToList();
-            if (states.Count == 0) states.Add(new EditorDifficultyState
-            {
-                Chart = fallbackChart,
-                SourceName = "pattern_" + GetEditorDifficultyCode(fallbackChart.Difficulty, _sourceName) + ".ares"
-            });
+            if (states.Count == 0)
+                throw new InvalidOperationException("There are no supplied or authored difficulty charts to export.");
             // Create path placeholders first so sc_passcode detection sees the
             // complete set of difficulty charts, independent of save iteration order.
             foreach (var state in states)
@@ -4965,21 +5093,33 @@ public sealed partial class Playfield
                     [GetEditorDifficultyCode(_chart.Difficulty, _sourceName)] = new EditorDifficultyState { Chart = _chart, SourceName = _sourceName ?? "ex.ares", AresHeaderTemplate = _loadedAresHeaderTemplate }
                 };
             var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+            states.TryGetValue(activeCode, out var previousActiveState);
             states[activeCode] = new EditorDifficultyState
             {
                 Chart = _chart,
+                SourcePath = previousActiveState?.SourcePath ?? _loadedSourcePath,
                 SourceName = _sourceName ?? GetAresFileNameForTemplate(activeCode, ChartBundleTemplate.Tsts),
+                FpkChartName = previousActiveState?.FpkChartName ?? _loadedFpkChartName,
+                HasSourceChart = previousActiveState?.HasSourceChart ??
+                    (!string.IsNullOrWhiteSpace(_loadedSourcePath) && File.Exists(_loadedSourcePath)),
+                ImportedSongAudio = previousActiveState?.ImportedSongAudio ?? _editorImportedSongAudio,
                 AresHeaderTemplate = _loadedAresHeaderTemplate,
                 MusicBytes = _editorSharedMusicBytes ?? _loadedMusicBytes
             };
+            var exportableStates = states
+                .Where(pair => ShouldIncludeEditorDifficultyInBundleExport(pair.Key, pair.Value))
+                .ToList();
+            if (exportableStates.Count == 0)
+                throw new InvalidOperationException("There are no supplied or authored difficulty charts to export.");
+            var exportableCodes = exportableStates.Select(pair => pair.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
             var musicBytes = _editorSharedMusicBytes ?? _loadedMusicBytes;
             if (musicBytes is not { Length: > 0 })
-                musicBytes = states.Values.Select(state => state.MusicBytes).FirstOrDefault(bytes => bytes is { Length: > 0 });
+                musicBytes = exportableStates.Select(pair => pair.Value.MusicBytes).FirstOrDefault(bytes => bytes is { Length: > 0 });
             var hasBundledMusic = musicBytes is { Length: > 0 };
             var sourceDirectory = GetTstsAssetSourceDirectory();
-            var previewHint = states.Values.Select(state => state.Chart.PreviewPath).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
-            var albumHint = states.Values.Select(state => state.Chart.AlbumPath).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+            var previewHint = exportableStates.Select(pair => pair.Value.Chart.PreviewPath).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+            var albumHint = exportableStates.Select(pair => pair.Value.Chart.AlbumPath).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
             var previewSource = FindTstsSourceAsset(previewHint, sourceDirectory, "preview.opus", "preview.ogg", "preview.mp3", "preview.wav");
             var coverSource = FindTstsSourceAsset(albumHint, sourceDirectory, "cover.webp", "album.png", "album.jpg", "album.jpeg");
             var previewOutput = Path.Combine(staging, "preview.opus");
@@ -4995,10 +5135,8 @@ public sealed partial class Playfield
             if (_editorSharedAlbumBytes is { Length: > 0 })
                 WriteImportedTstsCover(_editorSharedAlbumBytes, coverOutput);
 
-            foreach (var pair in states)
+            foreach (var pair in exportableStates)
             {
-                if (!IsEditorDifficultyEnabled(pair.Key))
-                    continue;
                 var chart = pair.Value.Chart;
                 chart.Series = null;
                 chart.MusicPath = "song.opus";
@@ -5012,7 +5150,7 @@ public sealed partial class Playfield
             // Generate the single root-level song.json by updating it once for
             // each difficulty. Passing chart paths at the root makes the helper
             // keep song.json out of charts/.
-            foreach (var pair in states)
+            foreach (var pair in exportableStates)
             {
                 if (!_editorExtraDifficultyEnabled && string.Equals(pair.Key, "xt", StringComparison.OrdinalIgnoreCase))
                     continue;
@@ -5059,9 +5197,16 @@ public sealed partial class Playfield
                 _tstsWorkingDirectory = staging;
                 _loadedTstsBundlePath = fullTarget;
                 _editorBundleTemplate = ChartBundleTemplate.Tsts;
-                _loadedSourcePath = Path.Combine(chartsDirectory, GetTstsExportChartFileName(activeCode));
-                _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
-                _sourceName = Path.GetFileName(_loadedSourcePath);
+                var activeChartWasExported = exportableCodes.Contains(activeCode);
+                var activeChartOutputPath = Path.Combine(chartsDirectory, GetTstsExportChartFileName(activeCode));
+                var discoveryState = activeChartWasExported
+                    ? states[activeCode]
+                    : exportableStates[0].Value;
+                var discoveryChartPath = Path.Combine(chartsDirectory, GetTstsExportChartFileName(
+                    activeChartWasExported ? activeCode : GetEditorDifficultyCode(discoveryState.Chart.Difficulty, discoveryState.SourceName)));
+                _loadedSourcePath = activeChartWasExported ? activeChartOutputPath : null;
+                _editorDifficultyDiscoverySourcePath = discoveryChartPath;
+                _sourceName = Path.GetFileName(activeChartWasExported ? activeChartOutputPath : GetTstsExportChartFileName(activeCode));
                 _lastLoadedSourceName = _sourceName;
                 _editorActiveDifficultyCode = activeCode;
                 _loadedMusicBytes = hasBundledMusic ? musicBytes!.ToArray() : null;
@@ -5073,7 +5218,7 @@ public sealed partial class Playfield
                 FinalizeEditorDifficultyDeletions();
                 _editorDifficultyStates.Clear();
                 _bundleJudgementWindows.Clear();
-                foreach (var pair in states)
+                foreach (var pair in exportableStates)
                 {
                     if (_editorCommittedDeletedDifficultyCodes.Contains(pair.Key))
                         continue;
@@ -5081,6 +5226,7 @@ public sealed partial class Playfield
                     pair.Value.SourcePath = Path.Combine(chartsDirectory, chartFile);
                     pair.Value.SourceName = chartFile;
                     pair.Value.FpkChartName = null;
+                    pair.Value.HasSourceChart = true;
                     pair.Value.MusicBytes = hasBundledMusic ? musicBytes!.ToArray() : null;
                     pair.Value.ImportedSongAudio = false;
                     _editorDifficultyStates[pair.Key] = pair.Value;
