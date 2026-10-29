@@ -152,6 +152,10 @@ public sealed class SongSelectMenu : IDisposable
     private readonly Dictionary<string, LinkedListNode<string>> _artLruNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<string> _artworkLoadQueue = new();
     private readonly HashSet<string> _artworkQueued = new(StringComparer.OrdinalIgnoreCase);
+    // Failed artwork must not be retried every frame. Unsupported formats such as
+    // WebP can otherwise generate an unbounded stream of load errors when FFmpeg
+    // is unavailable. Keep failures cached for this Song Select instance.
+    private readonly HashSet<string> _artworkFailed = new(StringComparer.OrdinalIgnoreCase);
     private const int MaxCachedArtwork = 32;
     private const int ArtworkLoadsPerUpdate = 1;
 
@@ -4114,7 +4118,7 @@ public sealed class SongSelectMenu : IDisposable
             return;
 
         path = Path.GetFullPath(path);
-        if (_artCache.ContainsKey(path) || !_artworkQueued.Add(path))
+        if (_artCache.ContainsKey(path) || _artworkFailed.Contains(path) || !_artworkQueued.Add(path))
             return;
 
         _artworkLoadQueue.Enqueue(path);
@@ -4439,6 +4443,9 @@ public sealed class SongSelectMenu : IDisposable
             return existing;
         }
 
+        if (_artworkFailed.Contains(path))
+            return null;
+
         try
         {
             using var stream = File.OpenRead(path);
@@ -4446,6 +4453,7 @@ public sealed class SongSelectMenu : IDisposable
             if (texture.Width <= 0 || texture.Height <= 0)
             {
                 texture.Dispose();
+                _artworkFailed.Add(path);
                 Program.LogRuntime($"SONG_SELECT_ARTWORK_INVALID {path}");
                 return null;
             }
@@ -4458,6 +4466,10 @@ public sealed class SongSelectMenu : IDisposable
         }
         catch (Exception ex)
         {
+            // Remember failed paths so unsupported formats (notably WebP when
+            // FFmpeg is missing) are attempted and logged only once, rather than
+            // being re-queued every frame until the log or memory grows without bound.
+            _artworkFailed.Add(path);
             Program.LogRuntime($"SONG_SELECT_ARTWORK_LOAD_FAILED {path} :: {ex.Message}");
             return null;
         }
@@ -4693,6 +4705,7 @@ public sealed class SongSelectMenu : IDisposable
         _artHandleCache.Clear();
         _artworkLoadQueue.Clear();
         _artworkQueued.Clear();
+        _artworkFailed.Clear();
         _initialLoadTask = null;
         _initialLoadInProgress = false;
         _songListReady = false;
