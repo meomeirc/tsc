@@ -8458,7 +8458,7 @@ public sealed partial class Playfield
     }
 
     private static bool IsLinkPairOccupied(AresChart chart, int pair, int startTick, int targetTick,
-        HashSet<ChartEvent>? ignoredEvents = null)
+        HashSet<ChartEvent>? ignoredEvents = null, bool hasLinkTailAtStart = false)
     {
         if (targetTick < startTick)
             return false;
@@ -8473,7 +8473,8 @@ public sealed partial class Playfield
             .OfType<string>()
             .Distinct(StringComparer.Ordinal);
         return families.Any(candidateFamily =>
-            IsLinkPairOccupiedInFamily(chart, candidateFamily, pair, startTick, targetTick, ignoredEvents));
+            IsLinkPairOccupiedInFamily(chart, candidateFamily, pair, startTick, targetTick,
+                ignoredEvents, hasLinkTailAtStart));
     }
 
     // Compatibility overload for editor-history code from versions that passed
@@ -8482,7 +8483,8 @@ public sealed partial class Playfield
         => IsLinkPairOccupied(chart, pair, startTick, targetTick);
 
     private static bool IsLinkPairOccupiedInFamily(AresChart chart, string family, int pair,
-        int startTick, int targetTick, HashSet<ChartEvent>? ignoredEvents = null)
+        int startTick, int targetTick, HashSet<ChartEvent>? ignoredEvents = null,
+        bool hasLinkTailAtStart = false)
     {
         var nodes = chart.Events
             .Where(ev => ev.Kind == "Note" &&
@@ -8506,8 +8508,9 @@ public sealed partial class Playfield
         // Be conservative if malformed data contains overlapping chains that
         // reuse one pair: a later head must not erase the earlier chain's longer
         // occupied interval while the allocator is deciding whether to reuse it.
-        // The interval is half-open, though: expiry exactly at startTick is a
-        // valid handoff and must not reserve the pair for one extra tick.
+        // The interval is normally half-open, so a LinkHead may hand off the ID
+        // exactly at startTick. A candidate LinkTail at that same tick is the
+        // exception because it would be ambiguous with the previous chain's end.
         long occupiedUntil = long.MinValue;
 
         for (var i = 0; i < nodes.Count; i++)
@@ -8519,7 +8522,9 @@ public sealed partial class Playfield
             // Treat the requested range as start-inclusive and end-exclusive. A
             // point at targetTick is on the boundary, not inside the requested
             // span, so two chains may hand off the same ID there. Same-tick
-            // connector operations still need to check their single tick.
+            // connector operations still need to check their single tick. If the
+            // candidate has a LinkTail at startTick, a previous chain ending
+            // exactly there also occupies the pair.
             if (ev.Tick >= startTick)
             {
                 var pointIsInsideRange = targetTick > startTick
@@ -8528,7 +8533,9 @@ public sealed partial class Playfield
                 var anExistingChainExtendsIntoRange = targetTick > startTick
                     ? occupiedUntil > startTick
                     : occupiedUntil >= startTick;
-                return pointIsInsideRange || anExistingChainExtendsIntoRange;
+                var sameTickTailConflictsWithBoundary = hasLinkTailAtStart && occupiedUntil == startTick;
+                return pointIsInsideRange || anExistingChainExtendsIntoRange ||
+                       sameTickTailConflictsWithBoundary;
             }
 
             if (ev.NoteType == NoteType.LinkHead)
@@ -8589,9 +8596,10 @@ public sealed partial class Playfield
             }
         }
 
-        return targetTick > startTick
+        var requestedRangeOccupied = targetTick > startTick
             ? occupiedUntil > startTick
             : occupiedUntil >= startTick;
+        return requestedRangeOccupied || (hasLinkTailAtStart && occupiedUntil == startTick);
     }
 
     private void AddEditorConnector(int targetTick, int targetTrack, ChartEvent? existingTarget = null)
@@ -8813,6 +8821,9 @@ public sealed partial class Playfield
             : new HashSet<ChartEvent> { source };
         var ignoredChainEventsForPair = new HashSet<ChartEvent>(sourceChainNodesForPair);
         var pairAllocationStartTick = sourceChainNodesForPair.Min(node => node.Tick);
+        var candidateHasLinkTailAtStart = targetTick == pairAllocationStartTick ||
+            sourceChainNodesForPair.Any(node => node.NoteType == NoteType.LinkTail &&
+                                                node.Tick == pairAllocationStartTick);
         if (existingTarget is not null)
         {
             var targetRootForPair = GetEditorLinkRoot(existingTarget) ??
@@ -8852,7 +8863,8 @@ public sealed partial class Playfield
             var usedPairs = new HashSet<int>();
             foreach (var candidatePair in new[] { 1, 3, 5, 7 })
             {
-                if (IsLinkPairOccupied(_chart, candidatePair, pairAllocationStartTick, targetTick, ignoredChainEventsForPair))
+                if (IsLinkPairOccupied(_chart, candidatePair, pairAllocationStartTick, targetTick,
+                        ignoredChainEventsForPair, candidateHasLinkTailAtStart))
                     usedPairs.Add(candidatePair);
             }
             pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !usedPairs.Contains(candidate));
@@ -8885,7 +8897,8 @@ public sealed partial class Playfield
             var usedPairs = new HashSet<int>();
             foreach (var candidatePair in new[] { 1, 3, 5, 7 })
             {
-                if (IsLinkPairOccupied(_chart, candidatePair, pairAllocationStartTick, targetTick, ignoredChainEventsForPair))
+                if (IsLinkPairOccupied(_chart, candidatePair, pairAllocationStartTick, targetTick,
+                        ignoredChainEventsForPair, candidateHasLinkTailAtStart))
                     usedPairs.Add(candidatePair);
             }
             pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !usedPairs.Contains(candidate));
@@ -8920,7 +8933,8 @@ public sealed partial class Playfield
                 // ended or been damaged. Give it the first genuinely free pair
                 // for this interval instead of blindly reusing that stale ID.
                 pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                    !IsLinkPairOccupied(_chart, candidate, pairAllocationStartTick, targetTick, ignoredChainEventsForPair));
+                    !IsLinkPairOccupied(_chart, candidate, pairAllocationStartTick, targetTick,
+                        ignoredChainEventsForPair, candidateHasLinkTailAtStart));
                 if (pair == 0)
                 {
                     _statusMessage = "No free link line pair across that time range. Choose another interval or remove an existing chain.";
@@ -8947,10 +8961,12 @@ public sealed partial class Playfield
                 // Pair IDs are global. An existing chain may have had its ID reused
                 // later in the chart, so extending it must avoid colliding with that
                 // unrelated chain. Reassign every point in the source chain together.
-                if (IsLinkPairOccupied(_chart, pair, pairAllocationStartTick, targetTick, ignoredChainEventsForPair))
+                if (IsLinkPairOccupied(_chart, pair, pairAllocationStartTick, targetTick,
+                        ignoredChainEventsForPair, candidateHasLinkTailAtStart))
                 {
                     var replacementPair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                        !IsLinkPairOccupied(_chart, candidate, pairAllocationStartTick, targetTick, ignoredChainEventsForPair));
+                        !IsLinkPairOccupied(_chart, candidate, pairAllocationStartTick, targetTick,
+                            ignoredChainEventsForPair, candidateHasLinkTailAtStart));
                     if (replacementPair == 0)
                     {
                         _statusMessage = "No free link line pair across that time range. Choose another interval or remove an existing chain.";

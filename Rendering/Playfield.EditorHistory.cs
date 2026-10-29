@@ -765,7 +765,7 @@ public sealed partial class Playfield
         }
 
         var groupPairs = new Dictionary<int, int>();
-        var groupRanges = new Dictionary<int, (int StartTick, int EndTick)>();
+        var groupRanges = new Dictionary<int, (int StartTick, int EndTick, bool HasLinkTailAtStart)>();
         void AllocateLinkPairs()
         {
             groupPairs.Clear();
@@ -789,15 +789,21 @@ public sealed partial class Playfield
                     continue;
                 var startTick = (int)startTickLong;
                 var endTick = (int)endTickLong;
+                var hasLinkTailAtStart = group.Any(index =>
+                    clipboardEntries[index].NoteType == NoteType.LinkTail &&
+                    (long)baseTick + clipboardEntries[index].TickOffset == startTickLong);
                 var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                    !IsLinkPairOccupied(_chart, candidate, startTick, endTick) &&
+                    !IsLinkPairOccupied(_chart, candidate, startTick, endTick,
+                        hasLinkTailAtStart: hasLinkTailAtStart) &&
                     !groupPairs.Any(existing => existing.Value == candidate &&
                         groupRanges.TryGetValue(existing.Key, out var range) &&
-                        range.StartTick < endTick && range.EndTick > startTick));
+                        (range.StartTick < endTick && range.EndTick > startTick ||
+                         (hasLinkTailAtStart && range.EndTick == startTick) ||
+                         (endTick == range.StartTick && range.HasLinkTailAtStart))));
                 if (pair != 0)
                 {
                     groupPairs[group.Key] = pair;
-                    groupRanges[group.Key] = (startTick, endTick);
+                    groupRanges[group.Key] = (startTick, endTick, hasLinkTailAtStart);
                 }
             }
         }

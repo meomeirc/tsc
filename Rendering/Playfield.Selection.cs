@@ -1143,6 +1143,31 @@ public sealed partial class Playfield
 
     private sealed record EditorLinkPathIssue(int Tick, int Track, string Message, ChartEvent? Event);
 
+    // Link IDs can be handed off at an exact duration boundary when the new
+    // chain starts with a LinkHead and its next LinkTail is later. A LinkTail
+    // at that same boundary is different: it can be mistaken for the ending
+    // point of the previous chain, so the two chains must not share an ID.
+    private static ChartEvent? GetEditorLinkBoundaryTailConflict(
+        EditorLinkChainInfo endingChain, EditorLinkChainInfo startingChain)
+    {
+        if (endingChain.EndTick != startingChain.StartTick)
+            return null;
+
+        return startingChain.Nodes
+            .Where(node => node.NoteType == NoteType.LinkTail && node.Tick == startingChain.StartTick)
+            .OrderBy(node => node.Track)
+            .ThenBy(node => node.EventIndex)
+            .FirstOrDefault();
+    }
+
+    private static bool EditorLinkChainsConflictInTime(EditorLinkChainInfo a, EditorLinkChainInfo b)
+    {
+        var rangesOverlap = a.StartTick < b.EndTick && b.StartTick < a.EndTick;
+        return rangesOverlap ||
+               GetEditorLinkBoundaryTailConflict(a, b) is not null ||
+               GetEditorLinkBoundaryTailConflict(b, a) is not null;
+    }
+
     private bool HasSelectedEditorNotes()
     {
         if (_chart is null)
@@ -4954,11 +4979,25 @@ public sealed partial class Playfield
             for (var j = i + 1; j < chains.Count; j++)
             {
                 var b = chains[j];
-                // Pair ownership is a half-open tick range. A chain ending at T
-                // releases its ID at T, so another chain may begin there.
-                if (a.Pair != b.Pair || a.StartTick >= b.EndTick || b.StartTick >= a.EndTick)
+                if (a.Pair != b.Pair)
                     continue;
-                Add(b.Root, $"global pair {a.Pair}/{a.Pair + 1} overlaps between ticks {a.StartTick} and {b.StartTick}");
+
+                // Normal pair ownership is half-open: a chain ending at T can
+                // hand its ID to a new LinkHead at T. But if that new chain also
+                // has a LinkTail at T, the old and new tails become ambiguous.
+                if (a.StartTick < b.EndTick && b.StartTick < a.EndTick)
+                {
+                    Add(b.Root, $"global pair {a.Pair}/{a.Pair + 1} overlaps between ticks {a.StartTick} and {b.StartTick}");
+                    continue;
+                }
+
+                var boundaryTail = GetEditorLinkBoundaryTailConflict(a, b) ??
+                                   GetEditorLinkBoundaryTailConflict(b, a);
+                if (boundaryTail is not null)
+                {
+                    Add(boundaryTail,
+                        $"global pair {a.Pair}/{a.Pair + 1} cannot be reused at tick {boundaryTail.Tick}: a LinkTail at the hand-off tick is ambiguous; use a different ID");
+                }
             }
         }
 
@@ -5197,8 +5236,7 @@ public sealed partial class Playfield
             foreach (var chain in chains)
             {
                 var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !assignments.Any(existing =>
-                    existing.Pair == candidate && existing.Chain.StartTick < chain.EndTick &&
-                    chain.StartTick < existing.Chain.EndTick));
+                    existing.Pair == candidate && EditorLinkChainsConflictInTime(existing.Chain, chain)));
                 if (pair == 0)
                 {
                     idFixFailure = $"more than four chains overlap near tick {chain.StartTick}";
@@ -5276,10 +5314,10 @@ public sealed partial class Playfield
            !ev.IsFlick && !ev.IsSuperFlick && ev.NoteType != NoteType.Vibrato;
 
     private bool IsEditorLinkPairAvailable(int pair, int startTick, int endTick,
-        HashSet<ChartEvent> movingEvents)
+        HashSet<ChartEvent> movingEvents, bool hasLinkTailAtStart = false)
     {
         return _chart is not null &&
-               !IsLinkPairOccupied(_chart, pair, startTick, endTick, movingEvents);
+               !IsLinkPairOccupied(_chart, pair, startTick, endTick, movingEvents, hasLinkTailAtStart);
     }
 
     private ChartTrack GetOrCreateEditorTrack(int trackIndex)
@@ -5460,10 +5498,14 @@ public sealed partial class Playfield
 
             var startTick = points[0].Tick;
             var endTickForPath = Math.Max(terminalEnd, points[^1].Tick);
+            var hasLinkTailAtStart = points.Count > 1 && points[1].Tick == startTick;
             var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                IsEditorLinkPairAvailable(candidate, startTick, endTickForPath, selectedSet) &&
+                IsEditorLinkPairAvailable(candidate, startTick, endTickForPath, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
-                    plan.StartTick < endTickForPath && plan.EndTick > startTick));
+                    (plan.StartTick < endTickForPath && plan.EndTick > startTick ||
+                     (hasLinkTailAtStart && plan.EndTick == startTick) ||
+                     (endTickForPath == plan.StartTick && plan.Points.Count > 1 &&
+                      plan.Points[1].Tick == plan.StartTick))));
             if (pair == 0)
             {
                 _statusMessage = "No free link pair is available across all banks for this time range.";
@@ -5688,9 +5730,14 @@ public sealed partial class Playfield
                 TryGetEditorSameTickTapHoldPair(notes, out var sameTickTap, out var sameTickHold))
             {
                 var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                    IsEditorLinkPairAvailable(candidate, sameTickTap.Tick, sameTickHold.EndTick, selectedSet) &&
+                    IsEditorLinkPairAvailable(candidate, sameTickTap.Tick, sameTickHold.EndTick, selectedSet,
+                        hasLinkTailAtStart: true) &&
                     !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
-                        plan.StartTick < sameTickHold.EndTick && plan.EndTick > sameTickTap.Tick));
+                        (plan.StartTick < sameTickHold.EndTick && plan.EndTick > sameTickTap.Tick ||
+                         plan.EndTick == sameTickTap.Tick ||
+                         (sameTickHold.EndTick == plan.StartTick &&
+                          (plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
+                           (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick))))));
                 if (pair == 0)
                 {
                     _statusMessage = "No free link pair is available across all banks for this time range.";
@@ -5810,10 +5857,16 @@ public sealed partial class Playfield
             }
 
             var startTick = points[0].Tick;
+            var hasLinkTailAtStart = generated.Any(ev => ev.Tick == startTick) ||
+                                     (points.Count > 1 && points[1].Tick == startTick);
             var pairId = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                IsEditorLinkPairAvailable(candidate, startTick, terminalEnd, selectedSet) &&
+                IsEditorLinkPairAvailable(candidate, startTick, terminalEnd, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
-                    plan.StartTick < terminalEnd && plan.EndTick > startTick));
+                    (plan.StartTick < terminalEnd && plan.EndTick > startTick ||
+                     (hasLinkTailAtStart && plan.EndTick == startTick) ||
+                     (terminalEnd == plan.StartTick &&
+                      (plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
+                       (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick))))));
             if (pairId == 0)
             {
                 _statusMessage = "No free link pair is available across all banks for this time range.";

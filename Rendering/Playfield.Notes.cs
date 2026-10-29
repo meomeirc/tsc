@@ -38,7 +38,9 @@ public sealed partial class Playfield
             if (previewSource.NoteType == NoteType.Single && previewSource.Attr == 0)
                 _editorConnectorPreviewSourceTap = previewSource;
 
-            if (previewTargetHead.NoteType == NoteType.SingleLong)
+            // A valid preview over a blank grid cell has no existing target head.
+            // Only inspect long-note target properties when an actual note is hovered.
+            if (previewTargetHead is { NoteType: NoteType.SingleLong })
             {
                 var sameTrackTarget = previewTargetHead.Track == previewSource.Track;
                 var horizontalFirstTarget = !sameTrackTarget &&
@@ -774,10 +776,10 @@ public sealed partial class Playfield
         return true;
     }
 
-    private bool TryGetEditorConnectorPreviewTarget(out ChartEvent source, out ChartEvent targetHead)
+    private bool TryGetEditorConnectorPreviewTarget(out ChartEvent source, out ChartEvent? targetHead)
     {
         source = null!;
-        targetHead = null!;
+        targetHead = null;
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
@@ -833,7 +835,7 @@ public sealed partial class Playfield
         {
             // A blank-cell preview still replaces a plain tap with the translucent
             // LinkHead appearance. The source tap would otherwise be drawn twice.
-            targetHead = null!;
+            targetHead = null;
             if (targetTick < source.Tick)
                 return false;
             if (targetTrack == source.Track && targetTick - source.Tick <= 6)
