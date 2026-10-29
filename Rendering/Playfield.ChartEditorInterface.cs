@@ -477,11 +477,18 @@ public sealed partial class Playfield
             }
             if (editing)
             {
-                var metrics = GetEditorTextFieldMetrics(value, _editorMetaInputCaretIndex, _editorMetaSelectionAnchor);
+                var caretIndex = Math.Clamp(_editorMetaInputCaretIndex, 0, value.Length);
+                var anchorIndex = Math.Clamp(_editorMetaSelectionAnchor, 0, value.Length);
+                var metrics = GetEditorTextFieldMetrics(value, caretIndex, anchorIndex);
                 item["caret_offset"] = metrics.CaretOffset;
                 item["selection_offset"] = metrics.SelectionOffset;
                 item["selection_width"] = metrics.SelectionWidth;
                 item["text_width"] = metrics.TextWidth;
+                // Lua works with UTF-8 byte offsets. Providing byte indices lets a
+                // wrapped active field place its caret and selection on the correct
+                // line rather than treating the whole value as one horizontal line.
+                item["caret_byte_index"] = System.Text.Encoding.UTF8.GetByteCount(value[..caretIndex]);
+                item["anchor_byte_index"] = System.Text.Encoding.UTF8.GetByteCount(value[..anchorIndex]);
             }
             return (object?)item;
         }).ToList();
@@ -700,9 +707,9 @@ public sealed partial class Playfield
             ["meta_categories"] = metaCategories,
             ["meta_difficulties"] = difficulties,
             ["meta_rows"] = metaRows,
-            ["meta_visible_rows"] = GetEditorMetaVisibleRowCount(width, height),
+            ["meta_visible_rows"] = GetEditorMetaVisibleRowCount(rows, width, height),
             ["meta_scroll"] = _editorMetaScrollOffset,
-            ["meta_scroll_max"] = Math.Max(0, rows.Count - GetEditorMetaVisibleRowCount(width, height)),
+            ["meta_scroll_max"] = GetEditorMetaMaxScrollOffset(rows, width, height),
             ["meta_export_expanded"] = _editorMetaExportExpanded,
             ["meta_export_options"] = exportOptions,
             ["meta_difficulty_enabled"] = HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName))
@@ -913,14 +920,14 @@ public sealed partial class Playfield
                     Math.Max(0, _editorProblems.Count - LAYOUT_PROBLEM_ROW_COUNT));
                 return true;
             case "editor.meta.scroll":
-                var metaCount = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0).Count;
+                var metaRowsForScroll = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
                 _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset + Number(), 0,
-                    Math.Max(0, metaCount - GetEditorMetaVisibleRowCount(width, height)));
+                    GetEditorMetaMaxScrollOffset(metaRowsForScroll, width, height));
                 return true;
             case "editor.meta.scroll_to":
-                var scrollMetaCount = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0).Count;
+                var scrollMetaRows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
                 _editorMetaScrollOffset = Math.Clamp(Number(), 0,
-                    Math.Max(0, scrollMetaCount - GetEditorMetaVisibleRowCount(width, height)));
+                    GetEditorMetaMaxScrollOffset(scrollMetaRows, width, height));
                 return true;
             case "editor.meta.close":
                 CancelEditorMetaField();

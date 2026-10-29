@@ -2142,8 +2142,12 @@ public sealed partial class Playfield
         var unit = _projection.ScalePixels(1f);
         var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.MetadataPanelMargin * unit);
         var desiredWidth = (int)MathF.Round((float)_chartEditorInterfaceLayout.MetadataPanelWidth * unit);
+        // Match chartEditorInterface.lua's 660-unit panel cap. The same bounds are
+        // used to calculate wrapped row heights and scroll limits for the Lua menu.
+        var maxPanelWidth = (int)MathF.Round(660f * unit);
         var width = Math.Min(virtualWidth - margin * 2,
-            Math.Max((int)MathF.Round(420f * unit), Math.Min(desiredWidth, (int)MathF.Round(virtualWidth * 0.60f))));
+            Math.Max((int)MathF.Round(420f * unit),
+                Math.Min(desiredWidth, Math.Min(maxPanelWidth, (int)MathF.Round(virtualWidth * 0.60f)))));
         width = Math.Max(1, width);
         return new Rectangle(virtualWidth - margin - width, margin, width,
             Math.Max(1, virtualHeight - margin * 2));
@@ -2241,6 +2245,11 @@ public sealed partial class Playfield
         };
     }
 
+    private readonly record struct EditorMetaRowLayout(int LabelHeight, int LabelGap, int FieldHeight, int RowGap)
+    {
+        public int Pitch => LabelHeight + LabelGap + FieldHeight + RowGap;
+    }
+
     private int GetEditorMetaLabelHeight(float unit)
         => Math.Max(1, (int)MathF.Round(20f * unit));
 
@@ -2250,56 +2259,143 @@ public sealed partial class Playfield
     private int GetEditorMetaFieldHeight(float unit)
         => Math.Max(1, (int)MathF.Round(46f * unit));
 
-    private int GetEditorMetaRowPitch(float unit)
-    {
-        // Match chartEditorInterface.lua exactly: 20 label + 5 gap + 46 field + 8 row gap.
-        // If this estimate is smaller than the Lua layout, scrolling stops early and
-        // the final INFO rows cannot be reached.
-        var labelHeight = GetEditorMetaLabelHeight(unit);
-        var labelGap = GetEditorMetaLabelGap(unit);
-        var valueHeight = GetEditorMetaFieldHeight(unit);
-        var rowGap = Math.Max(1, (int)MathF.Round(8f * unit));
-        return Math.Max(1, labelHeight + labelGap + valueHeight + rowGap);
-    }
+    private int GetEditorMetaRowGap(float unit)
+        => Math.Max(1, (int)MathF.Round(8f * unit));
 
-    private int GetEditorMetaVisibleRowCount(int virtualWidth, int virtualHeight)
+    private List<EditorMetaRowLayout> GetEditorMetaRowLayouts(
+        IReadOnlyList<(string Label, string Value)> rows, int virtualWidth, int virtualHeight)
     {
-        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        // The Lua renderer lays out rows with floating-point scaled dimensions;
-        // use the same unrounded pitch for the scroll limit it receives in state.
-        return Math.Max(1, (int)MathF.Floor(content.Height / Math.Max(1f, 79f * unit)));
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var scrollbarSpace = (int)MathF.Round(8f * unit);
+        // Match the Lua field width: content padding, the scrollbar rail, the
+        // skin's extra trailing gap, and both field text insets are reserved.
+        var fieldWidth = Math.Max(1f, content.Width - (scrollbarSpace + 42f * unit));
+        var font = GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont, 24f);
+        // Keep this in lockstep with chartEditorInterface.lua's small text size.
+        var lineHeight = Math.Max(16f * unit, 24f * 1.2f * unit);
+        var layouts = new List<EditorMetaRowLayout>(rows.Count);
+        foreach (var row in rows)
+        {
+            var displayValue = row.Value;
+            var fieldKey = GetEditorMetaFieldKey(row.Label);
+            if (fieldKey is not null && string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase))
+                displayValue = _editorMetaInputText;
+
+            // These are controls rather than free-form text fields. Keep them at the
+            // standard height; editable/readonly text values expand to fit wrapped lines.
+            var wrapValue = row.Label is not ("ELEMENT" or "CUSTOM JUDGEMENT WINDOWS" or
+                "DELETE DIFFICULTY" or "MUSIC" or "ALBUM" or "ALBUM BIG");
+            var fieldHeight = GetEditorMetaFieldHeight(unit);
+            if (wrapValue)
+            {
+                var safeValue = FontSafeText(font, displayValue);
+                var isEditing = fieldKey is not null &&
+                    string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase);
+                var lineCount = isEditing
+                    ? WrapEditorTextWithRanges(safeValue, fieldWidth,
+                        candidate => UnicodeTextRenderer.MeasureString(font, candidate).X).Count
+                    : WrapEditorHudText(font, safeValue, fieldWidth).Count;
+                fieldHeight = Math.Max(fieldHeight,
+                    (int)MathF.Ceiling(lineCount * lineHeight + 12f * unit));
+            }
+
+            layouts.Add(new EditorMetaRowLayout(
+                GetEditorMetaLabelHeight(unit), GetEditorMetaLabelGap(unit),
+                fieldHeight, GetEditorMetaRowGap(unit)));
+        }
+        return layouts;
     }
 
-    private void ClampEditorMetaScrollOffset(int rowCount, int virtualWidth, int virtualHeight)
+    private static int GetEditorMetaPrefixHeight(IReadOnlyList<EditorMetaRowLayout> layouts, int endExclusive)
     {
-        var visible = GetEditorMetaVisibleRowCount(virtualWidth, virtualHeight);
-        _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset, 0, Math.Max(0, rowCount - visible));
+        var height = 0;
+        for (var i = 0; i < Math.Clamp(endExclusive, 0, layouts.Count); i++)
+            height += layouts[i].Pitch;
+        return height;
     }
+
+    private int GetEditorMetaMaxScrollOffset(IReadOnlyList<(string Label, string Value)> rows,
+        int virtualWidth, int virtualHeight)
+    {
+        if (rows.Count == 0)
+            return 0;
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+        var suffixHeight = 0;
+        for (var i = layouts.Count - 1; i >= 0; i--)
+        {
+            var pitch = layouts[i].Pitch;
+            if (suffixHeight + pitch > content.Height)
+                return suffixHeight == 0 ? i : i + 1;
+            suffixHeight += pitch;
+        }
+        return 0;
+    }
+
+    private int GetEditorMetaVisibleRowCount(IReadOnlyList<(string Label, string Value)> rows,
+        int virtualWidth, int virtualHeight)
+    {
+        if (rows.Count == 0)
+            return 0;
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+        var start = Math.Clamp(_editorMetaScrollOffset, 0, GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+        var used = 0;
+        var count = 0;
+        for (var i = start; i < layouts.Count; i++)
+        {
+            if (count > 0 && used + layouts[i].Pitch > content.Height)
+                break;
+            used += layouts[i].Pitch;
+            count++;
+            if (used >= content.Height)
+                break;
+        }
+        return Math.Max(1, count);
+    }
+
+    private void ClampEditorMetaScrollOffset(IReadOnlyList<(string Label, string Value)> rows,
+        int virtualWidth, int virtualHeight)
+        => _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset, 0,
+            GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
 
     private Rectangle GetEditorMetaFieldLabelBounds(int index, int virtualWidth, int virtualHeight)
     {
+        var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+        return GetEditorMetaFieldLabelBounds(index, virtualWidth, virtualHeight, rows, layouts);
+    }
+
+    private Rectangle GetEditorMetaFieldLabelBounds(int index, int virtualWidth, int virtualHeight,
+        IReadOnlyList<(string Label, string Value)> rows, IReadOnlyList<EditorMetaRowLayout> layouts)
+    {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var pitch = GetEditorMetaRowPitch(unit);
-        var labelHeight = GetEditorMetaLabelHeight(unit);
-        var rowTop = content.Y + (index - _editorMetaScrollOffset) * pitch;
+        var start = Math.Clamp(_editorMetaScrollOffset, 0, Math.Max(0, rows.Count - 1));
+        var rowTop = content.Y + GetEditorMetaPrefixHeight(layouts, index) - GetEditorMetaPrefixHeight(layouts, start);
         var scrollbarSpace = (int)MathF.Round(8f * unit);
         return new Rectangle(content.X, rowTop,
-            Math.Max(1, content.Width - scrollbarSpace), labelHeight);
+            Math.Max(1, content.Width - scrollbarSpace), layouts[index].LabelHeight);
     }
 
     private Rectangle GetEditorMetaFieldBounds(int index, int virtualWidth, int virtualHeight)
     {
+        var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+        return GetEditorMetaFieldBounds(index, virtualWidth, virtualHeight, rows, layouts);
+    }
+
+    private Rectangle GetEditorMetaFieldBounds(int index, int virtualWidth, int virtualHeight,
+        IReadOnlyList<(string Label, string Value)> rows, IReadOnlyList<EditorMetaRowLayout> layouts)
+    {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var labelHeight = GetEditorMetaLabelHeight(unit);
-        var labelGap = GetEditorMetaLabelGap(unit);
-        var valueHeight = GetEditorMetaFieldHeight(unit);
-        var rowTop = content.Y + (index - _editorMetaScrollOffset) * GetEditorMetaRowPitch(unit);
+        var start = Math.Clamp(_editorMetaScrollOffset, 0, Math.Max(0, rows.Count - 1));
+        var rowTop = content.Y + GetEditorMetaPrefixHeight(layouts, index) - GetEditorMetaPrefixHeight(layouts, start);
         var scrollbarSpace = (int)MathF.Round(8f * unit);
-        return new Rectangle(content.X, rowTop + labelHeight + labelGap,
-            Math.Max(1, content.Width - scrollbarSpace), valueHeight);
+        return new Rectangle(content.X, rowTop + layouts[index].LabelHeight + layouts[index].LabelGap,
+            Math.Max(1, content.Width - scrollbarSpace), layouts[index].FieldHeight);
     }
 
     private enum EditorMetaExportAction
@@ -2474,45 +2570,70 @@ public sealed partial class Playfield
 
     private void PlaceEditorMetaCaretFromClick(Rectangle bounds, Microsoft.Xna.Framework.Point pixel, float unit)
     {
-        var fieldId = _editorMetaEditingField is null ? (_editorTextActiveFieldId ?? "meta") : "meta:" + _editorMetaEditingField;
+        var skinRuntimeAvailable = _chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null;
         var textLeft = bounds.X + 10f * unit;
-        var textWidth = Math.Max(1f, bounds.Width - 20f * unit);
-        if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+        var textWidth = Math.Max(1f, bounds.Width - (skinRuntimeAvailable ? 20f : 42f) * unit);
+        const string fontPath = "Roboto-Regular.ttf";
+        var textSize = 24f * unit;
+        SpriteFont? fallbackFont = null;
+        float fallbackScale = 1f;
+
+        float Measure(string candidate)
         {
-            const string fontPath = "Roboto-Medium.ttf";
-            var textSize = 24f * unit;
-            var clickOffset = Math.Max(0f, pixel.X - textLeft);
-            var previousWidth = 0f;
-            var caret = 0;
-            for (var index = 1; index <= _editorMetaInputText.Length; index++)
-            {
-                var nextWidth = _chartEditorInterfaceRuntime.MeasureTextWidthForUi(
-                    _editorMetaInputText[..index], fontPath, textSize);
-                if (nextWidth > textWidth)
-                    break;
-                if (clickOffset < (previousWidth + nextWidth) * 0.5f)
-                {
-                    caret = index - 1;
-                    break;
-                }
-                previousWidth = nextWidth;
-                caret = index;
-            }
-            if (clickOffset > previousWidth && caret == _editorMetaInputText.Length)
-                caret = _editorMetaInputText.Length;
-            _editorMetaInputCaretIndex = caret;
-            return;
+            if (skinRuntimeAvailable)
+                return _chartEditorInterfaceRuntime.MeasureTextWidthForUi(candidate, fontPath, textSize);
+            fallbackFont ??= GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont, 24f);
+            return UnicodeTextRenderer.MeasureString(fallbackFont, FontSafeText(fallbackFont, candidate)).X * fallbackScale;
         }
 
-        var fontName = _chartEditorInterfaceLayout.LabelFont;
-        var font = GetChartEditorFont(fontName);
-        var size = UnicodeTextRenderer.MeasureString(font, FontSafeText(font, _editorMetaInputText));
-        var scale = Math.Min(1f, Math.Max(0.55f, (bounds.Height - 8f * unit) / Math.Max(1f, size.Y)));
-        font = GetChartEditorFont(fontName, 24f * scale);
-        scale = Math.Min(1f, (bounds.Height - 8f * unit) /
-            Math.Max(1f, UnicodeTextRenderer.MeasureString(font, "Ag").Y));
-        _editorMetaInputCaretIndex = GetEditorTextCaretIndexFromMouse(fieldId, _editorMetaInputText,
-            pixel.X, textLeft, textWidth, scale, font);
+        if (!skinRuntimeAvailable)
+        {
+            var fontName = _chartEditorInterfaceLayout.LabelFont;
+            fallbackFont = GetChartEditorFont(fontName);
+            var initialSize = UnicodeTextRenderer.MeasureString(fallbackFont, FontSafeText(fallbackFont, _editorMetaInputText));
+            fallbackScale = Math.Min(1f, Math.Max(0.55f,
+                (bounds.Height - 8f * unit) / Math.Max(1f, initialSize.Y)));
+            fallbackFont = GetChartEditorFont(fontName, 24f * fallbackScale);
+            fallbackScale = Math.Min(1f, (bounds.Height - 8f * unit) /
+                Math.Max(1f, UnicodeTextRenderer.MeasureString(fallbackFont, "Ag").Y));
+        }
+
+        // The active field is visually wrapped now, so place the caret using both
+        // pointer axes and the same wrapped line ranges used by the renderer.
+        var lines = WrapEditorTextWithRanges(_editorMetaInputText, textWidth, Measure);
+        var lineHeight = Math.Max(16f * unit, textSize * 1.2f);
+        var blockHeight = lines.Count * lineHeight;
+        var firstLineY = bounds.Y + (bounds.Height - blockHeight) * 0.5f;
+        var localLine = Math.Clamp((int)MathF.Floor((pixel.Y - firstLineY) / Math.Max(1f, lineHeight)),
+            0, lines.Count - 1);
+        var line = lines[localLine];
+        var clickX = Math.Max(0f, pixel.X - textLeft);
+        var localCaret = 0;
+        var previousWidth = 0f;
+        foreach (var textElement in GetEditorTextElementRanges(line.Text))
+        {
+            var nextWidth = Measure(line.Text[..textElement.End]);
+            if (clickX < (previousWidth + nextWidth) * 0.5f)
+            {
+                localCaret = textElement.Start;
+                _editorMetaInputCaretIndex = Math.Clamp(line.Start + localCaret, 0, _editorMetaInputText.Length);
+                return;
+            }
+            previousWidth = nextWidth;
+            localCaret = textElement.End;
+        }
+        _editorMetaInputCaretIndex = Math.Clamp(line.Start + localCaret, 0, _editorMetaInputText.Length);
+    }
+
+    private static IEnumerable<(int Start, int End)> GetEditorTextElementRanges(string value)
+    {
+        var enumerator = StringInfo.GetTextElementEnumerator(value);
+        while (enumerator.MoveNext())
+        {
+            var start = enumerator.ElementIndex;
+            var element = enumerator.GetTextElement();
+            yield return (start, start + element.Length);
+        }
     }
 
     private Rectangle GetEditorMetaInterfaceFieldBounds(int rowIndex, int virtualWidth, int virtualHeight)
@@ -2745,7 +2866,7 @@ public sealed partial class Playfield
             if (!GetEditorMetaFieldBounds(elementRowIndex, virtualWidth, virtualHeight).Contains(pixel))
                 _editorElementDropdownOpen = false;
         }
-        ClampEditorMetaScrollOffset(metaRows.Count, virtualWidth, virtualHeight);
+        ClampEditorMetaScrollOffset(metaRows, virtualWidth, virtualHeight);
         if (GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight).Contains(pixel))
         {
             var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
@@ -2756,14 +2877,15 @@ public sealed partial class Playfield
         }
         var metaContent = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var firstVisibleRow = _editorMetaScrollOffset;
-        var visibleRowEnd = Math.Min(metaRows.Count,
-            firstVisibleRow + GetEditorMetaVisibleRowCount(virtualWidth, virtualHeight));
+        var metaRowLayouts = GetEditorMetaRowLayouts(metaRows, virtualWidth, virtualHeight);
         if (metaContent.Contains(pixel))
         {
-            for (var i = firstVisibleRow; i < visibleRowEnd; i++)
+            for (var i = firstVisibleRow; i < metaRows.Count; i++)
             {
-                var bounds = GetEditorMetaFieldBounds(i, virtualWidth, virtualHeight);
-                if (!bounds.Contains(pixel))
+                var bounds = GetEditorMetaFieldBounds(i, virtualWidth, virtualHeight, metaRows, metaRowLayouts);
+                if (bounds.Y >= metaContent.Bottom)
+                    break;
+                if (bounds.Bottom <= metaContent.Y || !bounds.Contains(pixel))
                     continue;
                 var fieldLabel = metaRows[i].Label;
                 if (fieldLabel == "DELETE DIFFICULTY")

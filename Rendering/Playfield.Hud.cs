@@ -1315,6 +1315,107 @@ public sealed partial class Playfield
         return lines;
     }
 
+    private readonly record struct EditorWrappedTextLine(string Text, int Start, int EndExclusive, int NextStart);
+
+    // Like WrapEditorHudText, but retain source ranges so an active text field can
+    // draw its caret and selection on the wrapped line that contains each index.
+    // Start/EndExclusive/NextStart are UTF-16 indices into the original string.
+    private static List<EditorWrappedTextLine> WrapEditorTextWithRanges(
+        string? rawText, float maxWidth, Func<string, float> measure)
+    {
+        var text = rawText ?? string.Empty;
+        maxWidth = Math.Max(1f, maxWidth);
+        var lines = new List<EditorWrappedTextLine>();
+
+        void AddLine(int start, int endExclusive, int nextStart)
+            => lines.Add(new EditorWrappedTextLine(text[start..endExclusive], start, endExclusive, nextStart));
+
+        void WrapParagraph(int paragraphStart, int paragraphEnd, int afterParagraph)
+        {
+            if (paragraphStart >= paragraphEnd)
+            {
+                AddLine(paragraphStart, paragraphStart, afterParagraph);
+                return;
+            }
+
+            var lineStart = paragraphStart;
+            while (lineStart < paragraphEnd)
+            {
+                var cursor = lineStart;
+                var fitEnd = lineStart;
+                var whitespaceStart = -1;
+                var whitespaceEnd = -1;
+                var overflow = false;
+                while (cursor < paragraphEnd)
+                {
+                    var element = StringInfo.GetNextTextElement(text, cursor);
+                    var elementEnd = Math.Min(paragraphEnd, cursor + element.Length);
+                    var candidate = text[lineStart..elementEnd];
+                    if (measure(candidate) <= maxWidth || fitEnd == lineStart)
+                    {
+                        fitEnd = elementEnd;
+                        if (char.IsWhiteSpace(text[cursor]))
+                        {
+                            whitespaceStart = cursor;
+                            whitespaceEnd = elementEnd;
+                        }
+                        cursor = elementEnd;
+                    }
+                    else
+                    {
+                        overflow = true;
+                        break;
+                    }
+                }
+
+                if (!overflow)
+                {
+                    AddLine(lineStart, paragraphEnd, afterParagraph);
+                    break;
+                }
+
+                int lineEnd;
+                int nextStart;
+                if (whitespaceStart > lineStart)
+                {
+                    lineEnd = whitespaceStart;
+                    nextStart = whitespaceEnd;
+                    while (nextStart < paragraphEnd && char.IsWhiteSpace(text[nextStart]))
+                        nextStart++;
+                }
+                else
+                {
+                    lineEnd = fitEnd;
+                    nextStart = fitEnd;
+                }
+
+                if (lineEnd <= lineStart)
+                {
+                    lineEnd = Math.Max(fitEnd, lineStart + 1);
+                    nextStart = lineEnd;
+                }
+                AddLine(lineStart, lineEnd, nextStart);
+                lineStart = nextStart;
+            }
+        }
+
+        var paragraphStart = 0;
+        while (true)
+        {
+            var newline = text.IndexOf('\n', paragraphStart);
+            var paragraphEnd = newline >= 0 ? newline : text.Length;
+            var afterParagraph = newline >= 0 ? newline + 1 : paragraphEnd;
+            WrapParagraph(paragraphStart, paragraphEnd, afterParagraph);
+            if (newline < 0)
+                break;
+            paragraphStart = newline + 1;
+        }
+
+        if (lines.Count == 0)
+            AddLine(0, 0, 0);
+        return lines;
+    }
+
     private (SpriteFont Font, string Text, Vector2 Measured, float Scale) FitChartEditorText(
         string rawText, string requestedFont, float requestedPixelHeight, float maxWidth, float maxHeight)
     {
@@ -2121,15 +2222,17 @@ public sealed partial class Playfield
         }
         else
         {
-            ClampEditorMetaScrollOffset(rows.Count, virtualWidth, virtualHeight);
-            var visibleRows = GetEditorMetaVisibleRowCount(virtualWidth, virtualHeight);
+            ClampEditorMetaScrollOffset(rows, virtualWidth, virtualHeight);
+            var rowLayouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
             var firstRow = _editorMetaScrollOffset;
-            var rowEnd = Math.Min(rows.Count, firstRow + visibleRows);
-            for (var i = firstRow; i < rowEnd; i++)
+            for (var i = firstRow; i < rows.Count; i++)
             {
                 var (label, rawValue) = rows[i];
-                var labelBounds = GetEditorMetaFieldLabelBounds(i, virtualWidth, virtualHeight);
-                var bounds = GetEditorMetaFieldBounds(i, virtualWidth, virtualHeight);
+                var labelBounds = GetEditorMetaFieldLabelBounds(i, virtualWidth, virtualHeight, rows, rowLayouts);
+                var bounds = GetEditorMetaFieldBounds(i, virtualWidth, virtualHeight, rows, rowLayouts);
+                if (labelBounds.Y >= content.Bottom || bounds.Y >= content.Bottom ||
+                    (i > firstRow && bounds.Bottom + rowLayouts[i].RowGap > content.Bottom))
+                    break;
                 var fieldKey = GetEditorMetaFieldKey(label);
                 var editing = fieldKey is not null && string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase);
                 var value = editing ? _editorMetaInputText : rawValue;
@@ -2157,8 +2260,9 @@ public sealed partial class Playfield
                         labelBounds.Y + (labelBounds.Height - labelSize.Y) * 0.5f),
                     interfaceUi.MutedTextColor, 0f, Vector2.Zero, fittedLabel.Scale, SpriteEffects.None, 0f);
 
-                var maxTextWidth = Math.Max(1, bounds.Width - (int)MathF.Round(20f * unit));
-                var display = editing ? _editorMetaInputText : FitHudText(labelFont, FontSafeText(labelFont, value), maxTextWidth);
+                // Keep the original font size and let the field's dynamic height carry
+                // wrapped values. Only the active editor uses horizontal caret scrolling.
+                var display = editing ? _editorMetaInputText : FontSafeText(labelFont, value);
                 if (previewMedia)
                 {
                     DrawEditorMetaButton(GetEditorPreviewRowEditButtonBounds(i, virtualWidth, virtualHeight),
@@ -2177,27 +2281,31 @@ public sealed partial class Playfield
                             ? interfaceUi.DangerColor : new Color(100, 100, 102));
                 else
                     DrawEditorMetaTextField(bounds, display, editing, editable, accent,
-                        editing ? _editorMetaInputText : null, _editorMetaSelectionAnchor, _editorMetaInputCaretIndex);
+                        editing ? _editorMetaInputText : null, _editorMetaSelectionAnchor, _editorMetaInputCaretIndex,
+                        reserveMetaScrollbarSpace: true);
             }
 
-            if (rows.Count > visibleRows && content.Height > 0)
+            var totalContentHeight = GetEditorMetaPrefixHeight(rowLayouts, rowLayouts.Count);
+            var maxOffset = GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight);
+            if (totalContentHeight > content.Height && maxOffset > 0 && content.Height > 0)
             {
                 var unitSize = Math.Max(2, (int)MathF.Round(3f * unit));
                 var rail = new Rectangle(content.Right - unitSize, content.Y, unitSize, content.Height);
                 _spriteBatch.Draw(_pixel, rail, new Color(54, 54, 56, 220));
                 var thumbHeight = Math.Max((int)MathF.Round(24f * unit),
-                    (int)MathF.Round(content.Height * (visibleRows / (float)rows.Count)));
+                    (int)MathF.Round(content.Height * (content.Height / (float)totalContentHeight)));
                 thumbHeight = Math.Min(content.Height, thumbHeight);
-                var maxOffset = Math.Max(1, rows.Count - visibleRows);
+                var maxScrollY = Math.Max(1, GetEditorMetaPrefixHeight(rowLayouts, maxOffset));
+                var currentScrollY = GetEditorMetaPrefixHeight(rowLayouts, firstRow);
                 var travel = Math.Max(0, content.Height - thumbHeight);
-                var thumbY = content.Y + (int)MathF.Round(travel * (_editorMetaScrollOffset / (float)maxOffset));
+                var thumbY = content.Y + (int)MathF.Round(travel * Math.Clamp(currentScrollY / (float)maxScrollY, 0f, 1f));
                 _spriteBatch.Draw(_pixel, new Rectangle(rail.X, thumbY, rail.Width, thumbHeight), Active);
             }
 
             if (_editorElementDropdownOpen && string.Equals(_editorMetaCategory, "SONG", StringComparison.OrdinalIgnoreCase))
             {
                 var elementIndex = rows.FindIndex(row => row.Label == "ELEMENT");
-                if (elementIndex >= firstRow && elementIndex < rowEnd)
+                if (elementIndex >= firstRow && GetEditorMetaFieldLabelBounds(elementIndex, virtualWidth, virtualHeight, rows, rowLayouts).Y < content.Bottom)
                 {
                     var elementOptions = new[] { "DANCER", "VOCAL", "SESSION" };
                     for (var option = 0; option < elementOptions.Length; option++)
@@ -2295,7 +2403,8 @@ public sealed partial class Playfield
     }
 
     private void DrawEditorMetaTextField(Rectangle bounds, string rawValue, bool editing, bool editable, Color accent,
-        string? selectionText = null, int selectionAnchor = 0, int caretIndex = 0)
+        string? selectionText = null, int selectionAnchor = 0, int caretIndex = 0,
+        bool reserveMetaScrollbarSpace = false)
     {
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return;
@@ -2313,36 +2422,103 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(bounds.Right - edge, bounds.Y, edge, bounds.Height), border);
 
         var textLeft = bounds.X + (int)MathF.Round(10f * unit);
-        var textWidth = Math.Max(1f, bounds.Width - 20f * unit);
-        var caretPrefix = string.Empty;
-        var visibleStart = 0;
+        // Reserve the same right-side space as the Lua row layout so the wrap
+        // measurement and the actual draw width always produce the same line count.
+        // Standalone MEDIA fields keep their full width because they have no list rail.
+        var textWidth = Math.Max(1f, bounds.Width - (reserveMetaScrollbarSpace ? 42f : 20f) * unit);
         var textScale = Math.Min(1f, Math.Max(0.55f,
             (bounds.Height - 8f * unit) / Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y)));
         labelFont = GetChartEditorFont(interfaceUi.LabelFont, 24f * textScale);
         textScale = Math.Min(1f, (bounds.Height - 8f * unit) /
             Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y));
         var value = FontSafeText(labelFont, rawValue);
-        var visibleEnd = value.Length;
-        var display = editing
-            ? FitEditorTextAroundCaret(labelFont, value, caretIndex, textWidth,
-                _editorTextActiveFieldId ?? "meta", textScale, out caretPrefix, out visibleStart, out visibleEnd)
-            : FitHudText(labelFont, value, textWidth);
-        var measured = UnicodeTextRenderer.MeasureString(labelFont, display);
         var textColor = editing ? interfaceUi.ButtonTextColor : editable
             ? interfaceUi.ButtonTextColor
             : interfaceUi.MutedTextColor;
-        var textPosition = new Vector2(textLeft, bounds.Y + (bounds.Height - measured.Y * textScale) * 0.5f);
-        if (editing && selectionText is not null)
+        if (editing)
         {
-            var mappedAnchor = Math.Clamp(selectionAnchor, visibleStart, visibleEnd) - visibleStart;
-            var mappedCaret = Math.Clamp(caretIndex, visibleStart, visibleEnd) - visibleStart;
-            DrawEditorTextSelectionHighlight(bounds, display, mappedAnchor, mappedCaret,
-                textPosition.X, textPosition.Y, textScale, textWidth, unit, 1f * unit, labelFont);
+            var wrapWidth = textWidth / Math.Max(0.01f, textScale);
+            var wrappedLines = WrapEditorTextWithRanges(value, wrapWidth,
+                candidate => UnicodeTextRenderer.MeasureString(labelFont, candidate).X);
+            var editingLineHeight = Math.Max(16f * unit, 24f * 1.2f * unit);
+            var editingBlockHeight = wrappedLines.Count * editingLineHeight;
+            var editingLineY = bounds.Y + (bounds.Height - editingBlockHeight) * 0.5f;
+            var selectionStart = Math.Min(Math.Clamp(selectionAnchor, 0, value.Length),
+                Math.Clamp(caretIndex, 0, value.Length));
+            var selectionEnd = Math.Max(Math.Clamp(selectionAnchor, 0, value.Length),
+                Math.Clamp(caretIndex, 0, value.Length));
+            var caret = Math.Clamp(caretIndex, 0, value.Length);
+            var caretLineIndex = -1;
+            var caretLocalIndex = 0;
+            var fontHeight = UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y * textScale;
+            var selectionHeight = Math.Max(1f, Math.Min(editingLineHeight, fontHeight));
+
+            for (var lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
+            {
+                var line = wrappedLines[lineIndex];
+                var currentY = editingLineY + lineIndex * editingLineHeight;
+                var visibleSelectionStart = Math.Max(selectionStart, line.Start);
+                var visibleSelectionEnd = Math.Min(selectionEnd, line.EndExclusive);
+                if (visibleSelectionEnd > visibleSelectionStart)
+                {
+                    var prefix = line.Text[..Math.Clamp(visibleSelectionStart - line.Start, 0, line.Text.Length)];
+                    var selected = line.Text.Substring(
+                        Math.Clamp(visibleSelectionStart - line.Start, 0, line.Text.Length),
+                        Math.Clamp(visibleSelectionEnd - visibleSelectionStart, 0,
+                            line.Text.Length - Math.Clamp(visibleSelectionStart - line.Start, 0, line.Text.Length)));
+                    var x1 = textLeft + UnicodeTextRenderer.MeasureString(labelFont, prefix).X * textScale;
+                    var width = UnicodeTextRenderer.MeasureString(labelFont, selected).X * textScale;
+                    var left = Math.Max(bounds.Left + 2f * unit, x1);
+                    var right = Math.Min(bounds.Right - 2f * unit, Math.Min(x1 + width, textLeft + textWidth));
+                    if (right > left)
+                    {
+                        var selectionY = currentY + (editingLineHeight - selectionHeight) * 0.5f;
+                        _spriteBatch.Draw(_pixel, new Rectangle((int)MathF.Floor(left), (int)MathF.Floor(selectionY),
+                            Math.Max(1, (int)MathF.Ceiling(right - left)), Math.Max(1, (int)MathF.Ceiling(selectionHeight))),
+                            new Color(88, 128, 194, 155));
+                    }
+                }
+
+                UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, line.Text,
+                    new Vector2(textLeft, currentY), textColor, 0f, Vector2.Zero, textScale, SpriteEffects.None, 0f);
+
+                // A caret inside a whitespace run skipped at a visual wrap belongs
+                // at the end of that preceding line; the position after the run is
+                // owned by the next line.
+                if (caret >= line.Start && caret < line.NextStart)
+                {
+                    caretLineIndex = lineIndex;
+                    caretLocalIndex = Math.Clamp(caret, line.Start, line.EndExclusive) - line.Start;
+                }
+            }
+
+            if (caretLineIndex < 0)
+            {
+                caretLineIndex = wrappedLines.Count - 1;
+                caretLocalIndex = Math.Clamp(caret - wrappedLines[caretLineIndex].Start, 0,
+                    wrappedLines[caretLineIndex].Text.Length);
+            }
+            var caretLine = wrappedLines[caretLineIndex];
+            var caretPrefix = caretLine.Text[..Math.Clamp(caretLocalIndex, 0, caretLine.Text.Length)];
+            var caretPosition = new Vector2(textLeft, editingLineY + caretLineIndex * editingLineHeight +
+                (editingLineHeight - fontHeight) * 0.5f);
+            DrawEditorTextCaret(caretPrefix, caretPosition, textScale, unit, labelFont);
+            return;
         }
-        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, display,
-            textPosition,
-            textColor, 0f, Vector2.Zero, textScale, SpriteEffects.None, 0f);
-        if (editing) DrawEditorTextCaret(caretPrefix, textPosition, textScale, unit, labelFont);
+
+        // Unfocused fields use real multiline wrapping instead of fitting the full
+        // value into one line. The row layout grows to fit these lines, preserving
+        // the normal 24px text size and keeping adjacent rows in the right position.
+        var lines = WrapEditorHudText(labelFont, value, textWidth / Math.Max(0.01f, textScale));
+        var lineHeight = Math.Max(16f * unit, 24f * 1.2f * unit);
+        var blockHeight = lines.Count * lineHeight;
+        var lineY = bounds.Y + (bounds.Height - blockHeight) * 0.5f;
+        foreach (var line in lines)
+        {
+            UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, line,
+                new Vector2(textLeft, lineY), textColor, 0f, Vector2.Zero, textScale, SpriteEffects.None, 0f);
+            lineY += lineHeight;
+        }
     }
 
     private void DrawEditorMetaExportPopup(int virtualWidth, int virtualHeight)

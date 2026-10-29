@@ -189,6 +189,107 @@ local function wrapMeasuredText(text, maxWidth, size, font)
     return lines
 end
 
+-- Editable metadata values use wrapped lines too. Keep the original UTF-8 byte
+-- ranges beside each line so the caret and selection can follow text onto later
+-- lines without changing the underlying string or its keyboard editing indices.
+local function wrapEditableText(text, maxWidth, size, font)
+    text = tostring(text or "")
+    size = math.max(1, tonumber(size) or 1)
+    maxWidth = math.max(1, tonumber(maxWidth) or 1)
+    font = font or F.regular
+    local measureOptions = { font = font, size = size }
+    local function measured(value)
+        return draw.measure_text(value, measureOptions)
+    end
+    local function glyphEnd(source, index)
+        local first = string.byte(source, index)
+        local length = first < 128 and 1 or first < 224 and 2 or first < 240 and 3 or 4
+        return math.min(#source + 1, index + length)
+    end
+    local function isSpaceGlyph(glyph)
+        return glyph == " " or glyph == "\t" or glyph == "\r" or glyph == "\v" or glyph == "\f"
+    end
+
+    local lines = {}
+    local function addLine(startByte, endByte, nextByte)
+        table.insert(lines, {
+            text = string.sub(text, startByte, endByte - 1),
+            start_byte = startByte,
+            end_byte = endByte,
+            next_byte = nextByte,
+        })
+    end
+    local function wrapParagraph(startByte, endByte)
+        if startByte >= endByte then
+            addLine(startByte, startByte, startByte)
+            return
+        end
+        local lineStart = startByte
+        while lineStart < endByte do
+            local cursor = lineStart
+            local fitEnd = lineStart
+            local whitespaceStart, whitespaceEnd = nil, nil
+            local overflow = false
+            while cursor < endByte do
+                local nextByte = math.min(endByte, glyphEnd(text, cursor))
+                local glyph = string.sub(text, cursor, nextByte - 1)
+                local candidate = string.sub(text, lineStart, nextByte - 1)
+                if measured(candidate) <= maxWidth or fitEnd == lineStart then
+                    fitEnd = nextByte
+                    if isSpaceGlyph(glyph) then
+                        whitespaceStart, whitespaceEnd = cursor, nextByte
+                    end
+                    cursor = nextByte
+                else
+                    overflow = true
+                    break
+                end
+            end
+
+            if not overflow then
+                addLine(lineStart, endByte, endByte)
+                break
+            end
+
+            local lineEnd, nextStart
+            if whitespaceStart ~= nil and whitespaceStart > lineStart then
+                lineEnd = whitespaceStart
+                nextStart = whitespaceEnd
+                while nextStart < endByte do
+                    local nextByte = math.min(endByte, glyphEnd(text, nextStart))
+                    local glyph = string.sub(text, nextStart, nextByte - 1)
+                    if not isSpaceGlyph(glyph) then break end
+                    nextStart = nextByte
+                end
+            else
+                lineEnd = fitEnd
+                nextStart = fitEnd
+            end
+            if lineEnd <= lineStart then
+                lineEnd = math.max(fitEnd, glyphEnd(text, lineStart))
+                nextStart = lineEnd
+            end
+            addLine(lineStart, lineEnd, nextStart)
+            lineStart = nextStart
+        end
+    end
+
+    local paragraphStart = 1
+    while true do
+        local newline = string.find(text, "\n", paragraphStart, true)
+        local paragraphEnd = newline or (#text + 1)
+        wrapParagraph(paragraphStart, paragraphEnd)
+        if newline == nil then break end
+        paragraphStart = newline + 1
+        if paragraphStart > #text then
+            wrapParagraph(paragraphStart, paragraphStart)
+            break
+        end
+    end
+    if #lines == 0 then addLine(1, 1, 1) end
+    return lines
+end
+
 local function panel(id, x, y, width, height, title, layer)
     ui.button({ id = id .. "_shield", x = x, y = y, width = width, height = height,
         action = "editor.block" })
@@ -807,30 +908,106 @@ end
 -- but draw the edited text, selection, and caret separately so the caret does
 -- not shift the value while the user types.
 drawTextField = function(id, value, action, actionValue, x, y, width, height, layer, focused, editable,
-    caretOffset, selectionOffset, selectionWidth, measuredTextWidth, centered)
+    caretOffset, selectionOffset, selectionWidth, measuredTextWidth, centered, wrapValue, caretByteIndex, anchorByteIndex)
     local display = tostring(value or "")
     local textLeft = x + 10 * ACTIVE_SCALE
     local textLimit = math.max(1, width - 20 * ACTIVE_SCALE)
+    local textSize = fontSize("small")
+    local lineHeight = math.max(16 * ACTIVE_SCALE, textSize * 1.2)
     if not editable then
         draw.rect({ id = id .. "_readonly", x = x, y = y, width = width, height = height,
             color = C.button, layer = layer })
-        draw.text(display, {
-            x = textLeft, y = y + height * 0.5, size = fontSize("small"), color = C.muted,
-            font = F.regular, anchor = "left", layer = layer + 2,
-        })
+        if wrapValue then
+            local lines = wrapMeasuredText(display, textLimit, textSize, F.regular)
+            local blockHeight = #lines * lineHeight
+            local lineY = y + (height - blockHeight) * 0.5
+            for _, line in ipairs(lines) do
+                draw.text(line, { x = textLeft, y = lineY, size = textSize, color = C.muted,
+                    font = F.regular, anchor = "top-left", layer = layer + 2 })
+                lineY = lineY + lineHeight
+            end
+        else
+            draw.text(display, {
+                x = textLeft, y = y + height * 0.5, size = textSize, color = C.muted,
+                font = F.regular, anchor = "left", layer = layer + 2,
+            })
+        end
         return
     end
     UI.draw_button({
         id = id, x = x, y = y, width = width, height = height,
         label = "",
-        text_size = fontSize("small"), text_color = C.text,
+        text_size = textSize, text_color = C.text,
         font = F.medium, background_color = focused and C.selected or C.button,
         accent = focused, selected = focused,
         action = action, value = actionValue, layer = layer,
     })
+
+    if wrapValue and focused then
+        local lines = wrapEditableText(display, textLimit, textSize, F.regular)
+        local blockHeight = #lines * lineHeight
+        local lineY = y + (height - blockHeight) * 0.5
+        local caretByte = clamp(num(caretByteIndex, #display), 0, #display)
+        local anchorByte = clamp(num(anchorByteIndex, caretByte), 0, #display)
+        local selectionStart = math.min(caretByte, anchorByte)
+        local selectionEnd = math.max(caretByte, anchorByte)
+        local caretLine, caretLocalByte = nil, 0
+        local textHeight = math.min(textSize, math.max(1, height - 8 * ACTIVE_SCALE))
+
+        for lineIndex, line in ipairs(lines) do
+            local lineStart = line.start_byte - 1
+            local lineEnd = line.end_byte - 1
+            local nextStart = line.next_byte - 1
+            local currentY = lineY + (lineIndex - 1) * lineHeight
+            local visibleSelectionStart = math.max(selectionStart, lineStart)
+            local visibleSelectionEnd = math.min(selectionEnd, lineEnd)
+            if visibleSelectionEnd > visibleSelectionStart then
+                local prefix = string.sub(display, line.start_byte, visibleSelectionStart)
+                local selected = string.sub(display, visibleSelectionStart + 1, visibleSelectionEnd)
+                local prefixWidth = draw.measure_text(prefix, { font = F.regular, size = textSize })
+                local selectedWidth = draw.measure_text(selected, { font = F.regular, size = textSize })
+                draw.rect({ x = textLeft + prefixWidth, y = currentY + (lineHeight - textHeight) * 0.5,
+                    width = math.max(1, selectedWidth), height = textHeight,
+                    color = C.accent_dim, layer = layer + 1 })
+            end
+
+            draw.text(line.text, { x = textLeft, y = currentY, size = textSize, color = C.text,
+                font = F.regular, anchor = "top-left", layer = layer + 2 })
+            if caretByte >= lineStart and caretByte < nextStart then
+                caretLine = lineIndex
+                caretLocalByte = math.max(0, math.min(caretByte, lineEnd) - lineStart)
+            end
+        end
+
+        if caretLine == nil then
+            caretLine = #lines
+            local last = lines[caretLine]
+            caretLocalByte = math.max(0, math.min(caretByte, last.end_byte - 1) - (last.start_byte - 1))
+        end
+        local caretText = lines[caretLine].text
+        local caretPrefix = string.sub(caretText, 1, caretLocalByte)
+        local caretX = textLeft + draw.measure_text(caretPrefix, { font = F.regular, size = textSize })
+        local caretY = lineY + (caretLine - 1) * lineHeight + (lineHeight - textHeight) * 0.5
+        draw.rect({ x = caretX, y = caretY, width = 1.5 * ACTIVE_SCALE, height = textHeight,
+            color = C.text, layer = layer + 3 })
+        return
+    end
+
+    if not focused and wrapValue then
+        local lines = wrapMeasuredText(display, textLimit, textSize, F.regular)
+        local blockHeight = #lines * lineHeight
+        local lineY = y + (height - blockHeight) * 0.5
+        for _, line in ipairs(lines) do
+            draw.text(line, { x = textLeft, y = lineY, size = textSize, color = C.text,
+                font = F.regular, anchor = "top-left", layer = layer + 2 })
+            lineY = lineY + lineHeight
+        end
+        return
+    end
+
     measuredTextWidth = num(measuredTextWidth, 0)
     if measuredTextWidth <= 0 then
-        measuredTextWidth = draw.measure_text(display, { font = F.regular, size = fontSize("small") })
+        measuredTextWidth = draw.measure_text(display, { font = F.regular, size = textSize })
     end
     measuredTextWidth = math.min(textLimit, math.max(0, measuredTextWidth))
     if centered then textLeft = x + (width - measuredTextWidth) * 0.5 end
@@ -838,7 +1015,7 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     selectionWidth = num(selectionWidth, 0)
     selectionOffset = clamp(selectionOffset, 0, textLimit)
     selectionWidth = clamp(selectionWidth, 0, textLimit - selectionOffset)
-    local textHeight = math.min(fontSize("small"), math.max(1, height - 8 * ACTIVE_SCALE))
+    local textHeight = math.min(textSize, math.max(1, height - 8 * ACTIVE_SCALE))
     local textY = y + height * 0.5
     if focused and selectionWidth > 0 then
         draw.rect({ x = textLeft + selectionOffset, y = textY - textHeight * 0.5,
@@ -847,7 +1024,7 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     end
     draw.text(display, {
         x = textLeft, y = textY,
-        size = fontSize("small"), color = C.text,
+        size = textSize, color = C.text,
         font = F.regular, anchor = "left", layer = layer + 2,
     })
     if focused then
@@ -859,11 +1036,67 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     end
 end
 
-local function textField(item, x, y, width, height, layer)
+local function textField(item, x, y, width, height, layer, wrapValue)
     drawTextField("editor_meta_row_" .. tostring(item.index), item.value,
         item.editable and "editor.meta.row" or "editor.block", item.index,
         x, y, width, height, layer, item.editing == true, item.editable == true,
-        item.caret_offset, item.selection_offset, item.selection_width, item.text_width)
+        item.caret_offset, item.selection_offset, item.selection_width, item.text_width, false, wrapValue == true,
+        item.caret_byte_index, item.anchor_byte_index)
+end
+
+local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
+    local trailing = item.label == "PREVIEW" and (132 * scale) or
+        (item.label == "ALBUM" or
+            (item.label == "ALBUM BIG" and item.value ~= "Unsupported by TSTS")) and (68 * scale) or (8 * scale)
+    local fieldW = math.max(96 * scale, panelW - padding * 2 - trailing - 22 * scale)
+    local fieldH = 46 * scale
+    if item.kind ~= "toggle" and item.kind ~= "picker" and item.kind ~= "danger" then
+        local textSize = fontSize("small")
+        local lineHeight = math.max(16 * scale, textSize * 1.2)
+        local lines = item.editing == true
+            and wrapEditableText(item.value or "", math.max(1, fieldW - 20 * scale), textSize, F.regular)
+            or wrapMeasuredText(item.value or "", math.max(1, fieldW - 20 * scale), textSize, F.regular)
+        fieldH = math.ceil(math.max(fieldH, #lines * lineHeight + 12 * scale))
+    end
+    return {
+        fieldW = fieldW,
+        fieldH = fieldH,
+        labelH = rowLabelH,
+        labelGap = rowLabelGap,
+        rowGap = rowGap,
+        pitch = rowLabelH + rowLabelGap + fieldH + rowGap,
+    }
+end
+
+local function buildMetaRowLayouts(rows, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
+    local layouts = {}
+    local totalHeight = 0
+    for index, item in ipairs(rows) do
+        local layout = getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
+        layouts[index] = layout
+        totalHeight = totalHeight + layout.pitch
+    end
+    return layouts, totalHeight
+end
+
+local function metaPrefixHeight(layouts, endExclusive)
+    local height = 0
+    for index = 1, math.min(endExclusive or 0, #layouts) do
+        height = height + layouts[index].pitch
+    end
+    return height
+end
+
+local function metaMaxScrollStart(layouts, contentHeight)
+    local suffixHeight = 0
+    for index = #layouts, 1, -1 do
+        local pitch = layouts[index].pitch
+        if suffixHeight + pitch > contentHeight then
+            return math.max(0, suffixHeight == 0 and index - 1 or index)
+        end
+        suffixHeight = suffixHeight + pitch
+    end
+    return 0
 end
 
 local function drawMeta(state, w, h, layer)
@@ -909,22 +1142,32 @@ local function drawMeta(state, w, h, layer)
     local contentTop = y + 156 * scale
     local rowLabelH = 20 * scale
     local rowLabelGap = 5 * scale
-    local fieldH = 46 * scale
+    local baseFieldH = 46 * scale
     local rowGap = 8 * scale
-    local rowPitch = rowLabelH + rowLabelGap + fieldH + rowGap
-    local visibleBySpace = math.max(1, math.floor(math.max(1, contentBottom - contentTop) / rowPitch))
-    local visible = math.min(#rows, num(state.meta_visible_rows, visibleBySpace), visibleBySpace)
-    local rowStart = clamp(num(state.meta_scroll, 0), 0, math.max(0, #rows - visible))
+    local rowPitch = rowLabelH + rowLabelGap + baseFieldH + rowGap
+    local dynamicLayouts, totalRowsHeight = buildMetaRowLayouts(rows, panelW, padding, scale,
+        rowLabelH, rowLabelGap, rowGap)
+    local contentHeight = math.max(0, contentBottom - contentTop)
+    -- C# computes the same row heights for wheel input and passes the maximum
+    -- scroll start through state, keeping wheel and scrollbar limits in sync.
+    local maxScrollStart = clamp(num(state.meta_scroll_max,
+        metaMaxScrollStart(dynamicLayouts, contentHeight)), 0, math.max(0, #rows - 1))
+    local rowStart = clamp(num(state.meta_scroll, 0), 0, maxScrollStart)
 
-    local function drawMetaRow(item, rowY)
+    local function drawMetaRow(item, rowY, rowLayout)
         if not item then return end
+        local wrapValue = rowLayout ~= nil
+        if not rowLayout then
+            local trailing = item.label == "PREVIEW" and (132 * scale) or
+                (item.label == "ALBUM" or
+                    (item.label == "ALBUM BIG" and item.value ~= "Unsupported by TSTS")) and (68 * scale) or (8 * scale)
+            rowLayout = { fieldW = math.max(96 * scale, panelW - padding * 2 - trailing - 22 * scale), fieldH = baseFieldH }
+        end
         label(item.label, x + padding, rowY, fontSize("small"), C.muted, nil, (layer or 100) + 4)
         local fieldY = rowY + rowLabelH + rowLabelGap
         local fieldX = x + padding
-        local trailing = item.label == "PREVIEW" and (132 * scale) or
-            (item.label == "ALBUM" or
-                (item.label == "ALBUM BIG" and item.value ~= "Unsupported by TSTS")) and (68 * scale) or (8 * scale)
-        local fieldW = math.max(96 * scale, panelW - padding * 2 - trailing - 22 * scale)
+        local fieldW = rowLayout.fieldW
+        local fieldH = rowLayout.fieldH
         if item.kind == "danger" then
             if state.meta_delete_enabled == true then
                 UI.draw_button({ id = "editor_meta_delete_difficulty", x = fieldX, y = fieldY,
@@ -955,7 +1198,7 @@ local function drawMeta(state, w, h, layer)
                 font = (not isElementPicker and item.selected) and F.medium or F.regular,
                 text_size = fontSize("small"), layer = (layer or 100) + 5 })
         else
-            textField(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5)
+            textField(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, wrapValue)
         end
         if item.label == "PREVIEW" then
             UI.draw_button({ id = "editor_meta_preview_edit", x = x + panelW - 130 * scale, y = fieldY,
@@ -1108,25 +1351,32 @@ local function drawMeta(state, w, h, layer)
             drawAlbumCard(album, x + padding, innerWidth, "editor_meta_album", "editor.meta.media_album")
         end
     else
-        for slot = 1, visible do
-            local item = rows[rowStart + slot]
-            if item then drawMetaRow(item, contentTop + (slot - 1) * rowPitch) end
+        local rowY = contentTop
+        for index = rowStart + 1, #rows do
+            if rowY >= contentBottom then break end
+            local item = rows[index]
+            local rowLayout = dynamicLayouts[index]
+            if index > rowStart + 1 and rowY + rowLayout.pitch > contentBottom then break end
+            drawMetaRow(item, rowY, rowLayout)
+            rowY = rowY + rowLayout.pitch
         end
 
-        if #rows > visible then
+        if maxScrollStart > 0 and contentHeight > 0 then
             local barX = x + panelW - padding - 10 * scale
             local barY = contentTop
-            local barH = math.max(1, contentBottom - contentTop)
-            local scrollMax = math.max(1, #rows - visible)
-            local thumbH = math.max(30 * scale, barH * visible / (visible + scrollMax))
+            local barH = math.max(1, contentHeight)
+            local thumbH = math.max(30 * scale, barH * contentHeight / math.max(1, totalRowsHeight))
+            thumbH = math.min(barH, thumbH)
             local thumbTravel = math.max(0, barH - thumbH)
-            local thumbY = barY + thumbTravel * num(state.meta_scroll, 0) / scrollMax
+            local currentScrollHeight = metaPrefixHeight(dynamicLayouts, rowStart)
+            local maxScrollHeight = math.max(1, metaPrefixHeight(dynamicLayouts, maxScrollStart))
+            local thumbY = barY + thumbTravel * clamp(currentScrollHeight / maxScrollHeight, 0, 1)
             draw.rect({ x = barX + 4 * scale, y = barY, width = 5 * scale, height = barH,
                 color = C.button, layer = (layer or 100) + 6 })
             draw.rect({ x = barX + 4 * scale, y = thumbY, width = 5 * scale, height = thumbH,
                 color = C.accent, layer = (layer or 100) + 7 })
             ui.slider({ id = "editor_meta_scrollbar", x = barX, y = barY,
-                width = 14 * scale, height = barH, min = 0, max = scrollMax, step = 1,
+                width = 14 * scale, height = barH, min = 0, max = maxScrollStart, step = 1,
                 axis = "vertical", action = "editor.meta.scroll_to" })
         end
     end
@@ -1159,15 +1409,17 @@ local function drawMeta(state, w, h, layer)
     -- the last registered overlapping control priority.
     if state.meta_element_open == true then
         local rows = state.meta_rows or {}
-        local rowStart = clamp(num(state.meta_scroll, 0), 0, math.max(0, #rows - visible))
-        for slot = 1, visible do
-            local item = rows[rowStart + slot]
+        local rowStart = clamp(num(state.meta_scroll, 0), 0, maxScrollStart)
+        for index = rowStart + 1, #rows do
+            local item = rows[index]
+            local rowY = contentTop + metaPrefixHeight(dynamicLayouts, index - 1) - metaPrefixHeight(dynamicLayouts, rowStart)
+            if rowY >= contentBottom then break end
             if item and item.label == "ELEMENT" then
-                local rowY = contentTop + (slot - 1) * rowPitch
+                local rowLayout = dynamicLayouts[index]
                 local fieldY = rowY + rowLabelH + rowLabelGap
                 local fieldX = x + padding
-                local trailing = 8 * scale
-                local fieldW = math.max(96 * scale, panelW - padding * 2 - trailing - 22 * scale)
+                local fieldW = rowLayout.fieldW
+                local fieldH = rowLayout.fieldH
                 local options = state.meta_element_options or {}
                 local elementGap = 4 * scale
                 for optionIndex, option in ipairs(options) do

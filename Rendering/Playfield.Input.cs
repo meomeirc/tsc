@@ -283,17 +283,18 @@ public sealed partial class Playfield
                 (int)MathF.Round(GlobalInput.Mouse.Y * virtualHeight / (float)Math.Max(1, viewport.Height)));
             if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
             {
-                var uiOverMeta = _editorMetaPanelOpen && GetEditorMetaPanelBounds(virtualWidth, virtualHeight).Contains(pointer) &&
+                var uiOverMetaContent = _editorMetaPanelOpen &&
+                    GetEditorMetaContentBounds(virtualWidth, virtualHeight).Contains(pointer) &&
                     _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_meta_");
                 var uiOverProblems = _editorProblemsExpanded &&
                     (_chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problems_") ||
                      _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problem_"));
                 var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
-                if (uiOverMeta)
+                if (uiOverMetaContent)
                 {
                     var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
                     _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset + (wheelDelta < 0 ? steps : -steps),
-                        0, Math.Max(0, rows.Count - GetEditorMetaVisibleRowCount(virtualWidth, virtualHeight)));
+                        0, GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
                     return;
                 }
                 if (uiOverProblems)
@@ -333,10 +334,10 @@ public sealed partial class Playfield
                 if (content.Contains(pointer))
                 {
                     var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
-                    ClampEditorMetaScrollOffset(rows.Count, virtualWidth, virtualHeight);
+                    ClampEditorMetaScrollOffset(rows, virtualWidth, virtualHeight);
                     var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
                     _editorMetaScrollOffset += wheelDelta < 0 ? steps : -steps;
-                    ClampEditorMetaScrollOffset(rows.Count, virtualWidth, virtualHeight);
+                    ClampEditorMetaScrollOffset(rows, virtualWidth, virtualHeight);
                 }
                 return;
             }
