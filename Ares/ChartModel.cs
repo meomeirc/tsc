@@ -170,6 +170,10 @@ public sealed class AresChart
     // TSC stores this as opaque round-trip metadata when a chart originated as ARES.
     public byte[]? AresHeaderTemplate { get; set; }
     public int TicksPerMeasure { get; set; } = 192;
+    // Song-wide metadata BPM (song.json `bpm`), used as the base BPM for
+    // metadata-driven behavior such as MMOD. This is independent of the actual
+    // chart starting tempo stored in InitialTempo and the tick-0 tempo event.
+    public double MetadataBpm { get; set; } = 120;
     public double InitialTempo { get; set; } = 120;
     public int PlayTick { get; set; }
     public double PlayTime { get; set; }

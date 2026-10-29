@@ -419,11 +419,15 @@ public sealed class AresLoader
     private static AresChart ParseLogical(byte[] logical)
     {
         var r = new LogicalReader(logical);
+        var rawMagic = r.U32();
+        var ticksPerMeasure = r.U16();
+        var initialTempo = r.F32();
         var chart = new AresChart
         {
-            RawMagic = r.U32(),
-            TicksPerMeasure = r.U16(),
-            InitialTempo = r.F32(),
+            RawMagic = rawMagic,
+            TicksPerMeasure = ticksPerMeasure,
+            InitialTempo = initialTempo,
+            MetadataBpm = double.IsFinite(initialTempo) && initialTempo > 0 ? initialTempo : 120.0,
             PlayTick = checked((int)r.U32()),
             PlayTime = r.F32()
         };

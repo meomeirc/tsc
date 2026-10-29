@@ -186,7 +186,7 @@ public static class TscLoader
             root["mapper"] = chart.Mapper;
             root["description"] = chart.Description ?? string.Empty;
             root["version"] = chart.Version ?? "1.0.0";
-            root["bpm"] = chart.InitialTempo;
+            root["bpm"] = chart.MetadataBpm;
             root["difficulty_levels"] = level;
             if (chart.AlbumBigPath is not null)
                 root["album_big"] = chart.AlbumBigPath;
@@ -208,7 +208,7 @@ public static class TscLoader
             {
                 root.Remove("series");
             }
-            root["bpm"] = chart.InitialTempo;
+            root["bpm"] = chart.MetadataBpm;
             if (chart.AlbumBigPath is not null) root["album_big"] = chart.AlbumBigPath;
             if (chart.Level.HasValue)
             {
@@ -634,6 +634,17 @@ public static class TscLoader
 
         chart.TempoEvents.AddRange(tempoEvents);
 
+        // TSC stores the playable starting tempo in the tick-0 tempo event.
+        // Keep it separate from song.json's metadata `bpm`, which is the base
+        // BPM used by song-level behavior such as MMOD.
+        var tickZeroTempo = chart.Tracks.SelectMany(track => track.Events)
+            .Where(ev => ev.RawType == 3 && ev.Tick == 0 && float.IsFinite(ev.Value) && ev.Value > 0f)
+            .OrderBy(ev => ev.Track)
+            .ThenBy(ev => ev.EventIndex)
+            .FirstOrDefault();
+        if (tickZeroTempo is not null)
+            chart.InitialTempo = tickZeroTempo.Value;
+
         // TSC is now always loaded through the ARES semantic finalization path.
         // The file no longer needs an import=ares marker: callback reconstruction
         // is part of normal TSC loading.
@@ -692,7 +703,7 @@ public static class TscLoader
             // album_big remains a legacy optional field for TSC/BOLD metadata.
             chart.AlbumBigPath = isTsts ? null : GetString("album_big") ?? (isBold ? "album_big" : "album_big.png");
             if (root.TryGetProperty("bpm", out var bpmValue) && bpmValue.ValueKind == JsonValueKind.Number && bpmValue.TryGetDouble(out var bpm) && double.IsFinite(bpm) && bpm > 0)
-                chart.InitialTempo = bpm;
+                chart.MetadataBpm = bpm;
 
             var stem = Path.GetFileNameWithoutExtension(chartPath).Trim().ToLowerInvariant();
             if (stem.StartsWith("pattern_", StringComparison.OrdinalIgnoreCase))
@@ -770,8 +781,10 @@ public static class TscLoader
     {
         // Ticks per measure is a game setting, never a chart property.
         const int ticksPerMeasure = 192;
-        // Read legacy bpm metadata for old charts only; schema-3 song.json
-        // overrides it when present. New TSC saves never write bpm.
+        // Read legacy `bpm` from old TSC files as a fallback for both values.
+        // On load, a tick-0 tempo event overrides InitialTempo, while schema-3
+        // song.json independently overrides MetadataBpm. New TSC saves do not
+        // write the legacy [meta] bpm value.
         var initialTempo = GetDouble(metadata, "bpm", 120.0);
 
         AresBinaryMetadata? aresMetadata = null;
@@ -810,6 +823,7 @@ public static class TscLoader
             AresTrackCount = aresMetadata?.TrackCount ?? 64,
             AresHeaderTemplate = aresMetadata?.HeaderTemplate?.ToArray(),
             TicksPerMeasure = ticksPerMeasure,
+            MetadataBpm = initialTempo,
             InitialTempo = initialTempo,
             PlayTick = GetInt(metadata, "play_tick", 0),
             PlayTime = GetDouble(metadata, "play_time", 0),

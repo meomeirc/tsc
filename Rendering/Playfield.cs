@@ -2436,6 +2436,7 @@ public sealed partial class Playfield
         to.Element = from.Element;
         to.Version = from.Version;
         to.ScPasscode = from.ScPasscode;
+        to.MetadataBpm = from.MetadataBpm;
         to.MusicPath = from.MusicPath;
         to.PreviewPath = from.PreviewPath;
         to.AlbumPath = from.AlbumPath;
@@ -2520,6 +2521,7 @@ public sealed partial class Playfield
             AlbumPath = basis.AlbumPath,
             AlbumBigPath = basis.AlbumBigPath,
             TicksPerMeasure = basis.TicksPerMeasure,
+            MetadataBpm = basis.MetadataBpm,
             InitialTempo = basis.InitialTempo,
             RawMagic = basis.RawMagic,
             AresTrackCount = basis.AresTrackCount,
@@ -3641,6 +3643,8 @@ public sealed partial class Playfield
             ApplyBundleJsonMetadataToChart(_chart, FpkPackage.Load(prepared.SourcePath), prepared.ChartBytes,
                 GetEditorDifficultyCode(prepared.ChartName, prepared.ChartName));
             ApplyFixedMediaPaths(_chart, ChartBundleTemplate.Bold);
+            if (_chartEditorMode)
+                _projection.SongBaseBpm = _chart.MetadataBpm;
             RefreshResultSongInfo();
         }
         InitializeEditorDifficultySession();
@@ -3970,6 +3974,8 @@ public sealed partial class Playfield
         _editorRectSelecting = false;
         _editorSelectedHoldEnd = false;
         _chart = chart;
+        if (_chartEditorMode)
+            _projection.SongBaseBpm = _chart.MetadataBpm;
         if (_chartEditorMode && !_switchingEditorDifficulty)
             MarkEditorSaved();
         _scoreSavedForCurrentRun = false;
@@ -5579,6 +5585,66 @@ public sealed partial class Playfield
         return File.Exists(standardMusicPath) ? File.ReadAllBytes(standardMusicPath) : null;
     }
 
+    private double GetEditorInitialChartBpm()
+    {
+        if (_chart is null)
+            return 120.0;
+
+        // The tick-0 tempo event is authoritative for the initial BPM shown in INFO.
+        // InitialTempo is kept in sync for serialization and for systems that use it
+        // as a fallback when no usable tempo event exists.
+        var tickZeroTempo = _chart.Tracks.SelectMany(track => track.Events)
+            .Where(ev => ev.RawType == 3 && ev.Tick == 0 && float.IsFinite(ev.Value) && ev.Value > 0f)
+            .OrderBy(ev => ev.Track)
+            .ThenBy(ev => ev.EventIndex)
+            .FirstOrDefault();
+        return tickZeroTempo is not null
+            ? tickZeroTempo.Value
+            : double.IsFinite(_chart.InitialTempo) && _chart.InitialTempo > 0
+                ? _chart.InitialTempo
+                : 120.0;
+    }
+
+    private void SetEditorInitialChartBpm(double bpm)
+    {
+        if (_chart is null || !double.IsFinite(bpm) || bpm < 1.0 || bpm > float.MaxValue)
+            return;
+
+        var bpmValue = (float)bpm;
+        var oldTempo = _tempo;
+        var undoSnapshot = CaptureEditorChartSnapshot();
+        var timelinePoints = _editorAutoAdjustBpm && oldTempo is not null
+            ? CaptureEditorTimelinePoints(oldTempo, 0)
+            : new List<EditorTimelinePoint>();
+
+        var tickZeroTempos = _chart.Tracks.SelectMany(track => track.Events)
+            .Where(ev => ev.RawType == 3 && ev.Tick == 0)
+            .ToList();
+        if (tickZeroTempos.Count == 0)
+        {
+            EnsureEditorTickZeroTempoEvent(_chart, bpmValue);
+            tickZeroTempos = _chart.Tracks.SelectMany(track => track.Events)
+                .Where(ev => ev.RawType == 3 && ev.Tick == 0)
+                .ToList();
+        }
+
+        foreach (var tempoEvent in tickZeroTempos)
+        {
+            tempoEvent.Value = bpmValue;
+            if (!_chart.Events.Contains(tempoEvent))
+                _chart.Events.Add(tempoEvent);
+        }
+
+        _chart.InitialTempo = bpmValue;
+        RebuildChartTempoEventsFromTracks();
+        if (_editorAutoAdjustBpm && timelinePoints.Count > 0)
+            AutoAdjustEditorTimelineAfterTempoChange(0, timelinePoints);
+
+        CommitEditorUndoSnapshot(undoSnapshot);
+        RefreshAfterEditorMutation();
+        _editorBpmInputText = bpmValue.ToString("0.##", CultureInfo.InvariantCulture);
+    }
+
     private string GetEditorMetaFieldValue(string field, string fallback)
     {
         if (_chart is null) return string.Empty;
@@ -5593,6 +5659,8 @@ public sealed partial class Playfield
             "sc_passcode" => _chart.ScPasscode ?? string.Empty,
             "series" => _chart.Series ?? string.Empty,
             "level" => _chart.Level?.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
+            "metadata_bpm" => _chart.MetadataBpm.ToString("0.###", CultureInfo.InvariantCulture),
+            "initial_chart_bpm" => GetEditorInitialChartBpm().ToString("0.###", CultureInfo.InvariantCulture),
             "judgment_perfect_plus_ms" => _chart.PerfectPlusWindowMs.ToString("0.###", CultureInfo.InvariantCulture),
             "judgment_perfect_ms" => _chart.PerfectWindowMs.ToString("0.###", CultureInfo.InvariantCulture),
             "judgment_good_ms" => _chart.GoodWindowMs.ToString("0.###", CultureInfo.InvariantCulture),
@@ -5600,7 +5668,6 @@ public sealed partial class Playfield
             "preview" => _chart.PreviewPath ?? string.Empty,
             "album" => _chart.AlbumPath ?? string.Empty,
             "album_big" => _chart.AlbumBigPath ?? string.Empty,
-            "bpm" => _chart.InitialTempo.ToString("0.###", CultureInfo.InvariantCulture),
             "ticks_per_measure" => _chart.TicksPerMeasure.ToString(CultureInfo.InvariantCulture),
             "start_gear" => _chart.InitialGearAttr switch { 0 or 2 => "1K", 4 => "2K", _ => "3K" },
             "play_tick" => _chart.PlayTick.ToString(CultureInfo.InvariantCulture),
@@ -5675,9 +5742,18 @@ public sealed partial class Playfield
             case "preview": _chart.PreviewPath = NormalizeEditorMetaValue(value); break;
             case "album": _chart.AlbumPath = NormalizeEditorMetaValue(value); break;
             case "album_big": _chart.AlbumBigPath = NormalizeEditorMetaValue(value); break;
-            case "bpm":
-                if (TryDouble(out var bpm) && bpm >= 1 && bpm <= float.MaxValue) _chart.InitialTempo = bpm;
-                else { _statusMessage = "BPM must be at least 1 and fit the chart's numeric format."; return; }
+            case "metadata_bpm":
+                if (TryDouble(out var metadataBpm) && metadataBpm >= 1 && metadataBpm <= float.MaxValue)
+                {
+                    _chart.MetadataBpm = metadataBpm;
+                    _projection.SongBaseBpm = metadataBpm;
+                }
+                else { _statusMessage = "BPM metadata must be at least 1 and fit the chart's numeric format."; return; }
+                break;
+            case "initial_chart_bpm":
+                if (TryDouble(out var initialChartBpm) && initialChartBpm >= 1 && initialChartBpm <= float.MaxValue)
+                    SetEditorInitialChartBpm(initialChartBpm);
+                else { _statusMessage = "Initial chart BPM must be at least 1 and fit the chart's numeric format."; return; }
                 break;
             case "ticks_per_measure":
                 if (TryInt(out var ticks) && ticks >= 1 && ticks <= 3840) _chart.TicksPerMeasure = ticks;
@@ -5719,7 +5795,7 @@ public sealed partial class Playfield
                 else { _statusMessage = "Audio origin tick cannot be negative."; return; }
                 break;
         }
-        if (field is "ticks_per_measure" or "bpm")
+        if (field is "ticks_per_measure" or "initial_chart_bpm")
         {
             _tempo = new TempoMap(_chart);
             _projection.SetTempo(_tempo);
@@ -8131,6 +8207,15 @@ public sealed partial class Playfield
             ? CaptureEditorTimelinePoints(oldTempo, targetTick, ev)
             : new List<EditorTimelinePoint>();
         ev.Value = (float)bpm;
+        if (targetTick == 0)
+        {
+            // Tick 0 defines the chart's initial BPM. Keep every tick-0 tempo event
+            // consistent if a chart already contains duplicate events at that tick.
+            foreach (var tickZeroTempo in _chart.Tracks.SelectMany(track => track.Events)
+                         .Where(tempoEvent => tempoEvent.RawType == 3 && tempoEvent.Tick == 0))
+                tickZeroTempo.Value = ev.Value;
+            _chart.InitialTempo = ev.Value;
+        }
         RebuildChartTempoEventsFromTracks();
         if (_editorAutoAdjustBpm)
             AutoAdjustEditorTimelineAfterTempoChange(targetTick, timelinePoints);
@@ -8218,6 +8303,13 @@ public sealed partial class Playfield
         track.Events.Add(tempoEvent);
         if (!_chart.Events.Contains(tempoEvent))
             _chart.Events.Add(tempoEvent);
+        if (tick == 0)
+        {
+            foreach (var tickZeroTempo in _chart.Tracks.SelectMany(track => track.Events)
+                         .Where(existingTempo => existingTempo.RawType == 3 && existingTempo.Tick == 0))
+                tickZeroTempo.Value = tempoEvent.Value;
+            _chart.InitialTempo = tempoEvent.Value;
+        }
         RebuildChartTempoEventsFromTracks();
         if (_editorAutoAdjustBpm)
             AutoAdjustEditorTimelineAfterTempoChange(tick, timelinePoints);

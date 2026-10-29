@@ -28,6 +28,7 @@ public sealed partial class Playfield
     {
         public required List<EditorTrackSnapshot> Tracks { get; init; }
         public required List<EditorEventSnapshot> Events { get; init; }
+        public required double MetadataBpm { get; init; }
         public required double InitialTempo { get; init; }
         public required int PlayTick { get; init; }
         public required double PlayTime { get; init; }
@@ -141,6 +142,7 @@ public sealed partial class Playfield
         {
             Tracks = tracks,
             Events = events,
+            MetadataBpm = _chart.MetadataBpm,
             InitialTempo = _chart.InitialTempo,
             PlayTick = _chart.PlayTick,
             PlayTime = _chart.PlayTime,
@@ -172,7 +174,7 @@ public sealed partial class Playfield
 
     private bool EditorChartMatchesSnapshot(EditorChartSnapshot snapshot)
     {
-        if (_chart is null || _chart.InitialTempo != snapshot.InitialTempo ||
+        if (_chart is null || _chart.MetadataBpm != snapshot.MetadataBpm || _chart.InitialTempo != snapshot.InitialTempo ||
             _chart.PlayTick != snapshot.PlayTick || _chart.PlayTime != snapshot.PlayTime || _chart.AudioOriginTick != snapshot.AudioOriginTick ||
             _chart.RawMagic != snapshot.RawMagic || _chart.AresTrackCount != snapshot.AresTrackCount ||
             _chart.Tracks.Count != snapshot.Tracks.Count)
@@ -286,6 +288,7 @@ public sealed partial class Playfield
             state.Event.LoopPhase = state.LoopPhase;
         }
 
+        _chart.MetadataBpm = snapshot.MetadataBpm;
         _chart.InitialTempo = snapshot.InitialTempo;
         _chart.PlayTick = snapshot.PlayTick;
         _chart.PlayTime = snapshot.PlayTime;
