@@ -4,7 +4,7 @@ using System.Text.RegularExpressions;
 
 namespace TSC;
 
-/// <summary>Checks the latest stable GitHub release without blocking the game loop.</summary>
+/// <summary>Checks stable GitHub releases without blocking the game loop.</summary>
 internal static class UpdateCheckService
 {
     private const string Repository = "meomeirc/tsc";
@@ -62,6 +62,10 @@ internal static class UpdateCheckService
     {
         try
         {
+            var current = ParseVersion(GameVersion.Current);
+            if (current is null)
+                return;
+
             using var response = await Client.GetAsync(LatestReleaseUrl).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 return;
@@ -72,9 +76,8 @@ internal static class UpdateCheckService
             var tag = root.TryGetProperty("tag_name", out var tagValue) ? tagValue.GetString() : null;
             var htmlUrl = root.TryGetProperty("html_url", out var urlValue) ? urlValue.GetString() : null;
             var isPrerelease = root.TryGetProperty("prerelease", out var prereleaseValue) && prereleaseValue.ValueKind == JsonValueKind.True;
-            var current = ParseVersion(GameVersion.Current);
             var latest = ParseVersion(tag);
-            if (isPrerelease || current is null || latest is null)
+            if (isPrerelease || latest is null)
                 return;
 
             lock (Sync)
@@ -86,8 +89,8 @@ internal static class UpdateCheckService
         }
         catch
         {
-            // An update check is optional. Offline or rate-limited users should still
-            // be able to play without a warning popup or a persistent error label.
+            // An update check is optional. Offline, empty release lists, and rate-limited
+            // users should still be able to play without a warning popup.
         }
         finally
         {

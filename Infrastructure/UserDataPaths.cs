@@ -6,8 +6,8 @@ using System.Linq;
 namespace TSC;
 
 /// <summary>
-/// In published installs, user data stays beside the root launcher. Developer builds keep
-/// their historic per-user application-data location for scores and temporary state.
+/// Per-user saves and runtime state live in AppData for both developer and published builds.
+/// Editable config files and the crash log remain beside the game launcher for easy access.
 /// </summary>
 public static class UserDataPaths
 {
@@ -16,9 +16,6 @@ public static class UserDataPaths
     {
         get
         {
-#if TSC_PUBLISH
-            return GameRootDirectory;
-#else
             var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             if (!string.IsNullOrWhiteSpace(local))
                 return Path.Combine(local, "TSC");
@@ -31,7 +28,6 @@ public static class UserDataPaths
             return !string.IsNullOrWhiteSpace(profile)
                 ? Path.Combine(profile, ".local", "share", "TSC")
                 : Path.Combine(AppContext.BaseDirectory, "TSC-UserData");
-#endif
         }
     }
 
@@ -83,7 +79,7 @@ public static class UserDataPaths
         return path;
     }
 
-    /// <summary>Creates user data folders and migrates legacy files, keeping backups.</summary>
+    /// <summary>Creates the per-user data folders. Published builds do not migrate data from the install folder.</summary>
     public static void Initialize(string? legacyRoot = null)
     {
         lock (Sync)
@@ -91,31 +87,20 @@ public static class UserDataPaths
             Directory.CreateDirectory(RootDirectory);
             Directory.CreateDirectory(Path.GetDirectoryName(ScoresPath)!);
 
-#if TSC_PUBLISH
-            // Older installs kept settings, scores, logs, and song-list state in LocalAppData.
-            // Copy those files beside the launcher without deleting the original copies.
-            MigrateLegacyAppDataToInstallRoot();
-#else
-            // TSC-268 through TSC-270 stored editable files and logs in app data. Bring
-            // newer app-data copies back to the project/game folder in developer runs.
+#if !TSC_PUBLISH
+            // Preserve developer-build compatibility for editable files that older debug builds
+            // temporarily stored in AppData. The live config and logs remain in the game root.
             MigrateUserFileToGameRootIfNewer("gameConfig.json");
             MigrateUserFileToGameRootIfNewer("keybinds.json");
             MigrateUserFileToGameRootIfNewer(Path.Combine("Logs", "tsc_crash.log"), Path.GetFileName(CrashLogPath));
             MigrateUserFileToGameRootIfNewer(Path.Combine("Logs", "song_select_debug.log"), Path.Combine("Logs", "song_select_debug.log"));
             MigrateUserFileToGameRootIfNewer(Path.Combine("Logs", "superFlick_debug.log"), Path.Combine("Logs", "superFlick_debug.log"));
-#endif
 
             var roots = new List<string>();
             if (!string.IsNullOrWhiteSpace(legacyRoot)) roots.Add(legacyRoot);
-#if TSC_PUBLISH
-            // A published install may be launched with an unrelated working directory.
-            roots.Add(AppContext.BaseDirectory);
-            roots.Add(Environment.CurrentDirectory);
-#else
             // Developer runs normally launch with the project root as their working directory.
             roots.Add(Environment.CurrentDirectory);
             roots.Add(AppContext.BaseDirectory);
-#endif
             roots = roots
                 .Where(Directory.Exists)
                 .Select(Path.GetFullPath)
@@ -123,63 +108,12 @@ public static class UserDataPaths
                 .ToList();
 
             foreach (var root in roots)
-            {
                 MigrateIfMissing(Path.Combine(root, "save", "scores.json"), ScoresPath);
-            }
-
-        }
-    }
-
-#if TSC_PUBLISH
-    private static string LegacyAppDataDirectory
-    {
-        get
-        {
-            var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (!string.IsNullOrWhiteSpace(local)) return Path.Combine(local, "TSC");
-            var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            return !string.IsNullOrWhiteSpace(roaming) ? Path.Combine(roaming, "TSC") : string.Empty;
-        }
-    }
-
-    private static void MigrateLegacyAppDataToInstallRoot()
-    {
-        var legacyRoot = LegacyAppDataDirectory;
-        if (string.IsNullOrWhiteSpace(legacyRoot) || !Directory.Exists(legacyRoot)) return;
-
-        foreach (var relative in new[]
-        {
-            "gameConfig.json", "keybinds.json", "save/scores.json",
-            "Logs/tsc_crash.log", "Logs/song_select_debug.log",
-            "Logs/superFlick_debug.log", "Logs/ffmpeg-download.log"
-        })
-            MigrateLegacyFileIfNewer(Path.Combine(legacyRoot, relative), Path.Combine(GameRootDirectory, relative));
-
-        var legacyState = Path.Combine(legacyRoot, "State");
-        if (!Directory.Exists(legacyState)) return;
-        foreach (var source in Directory.EnumerateFiles(legacyState, "*", SearchOption.AllDirectories))
-        {
-            var relative = Path.GetRelativePath(legacyState, source);
-            MigrateLegacyFileIfNewer(source, Path.Combine(GameRootDirectory, "State", relative));
-        }
-    }
-
-    private static void MigrateLegacyFileIfNewer(string source, string destination)
-    {
-        try
-        {
-            if (!File.Exists(source)) return;
-            if (File.Exists(destination) && File.GetLastWriteTimeUtc(destination) >= File.GetLastWriteTimeUtc(source)) return;
-            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            File.Copy(source, destination, overwrite: File.Exists(destination));
-        }
-        catch (Exception ex)
-        {
-            Program.LogRuntime($"LEGACY_USER_DATA_MIGRATION_FAILED source={source} destination={destination} error={ex.Message}");
-        }
-    }
 #endif
+        }
+    }
 
+#if !TSC_PUBLISH
     private static void MigrateUserFileToGameRootIfNewer(string fileName)
         => MigrateUserFileToGameRootIfNewer(fileName, fileName);
 
@@ -225,4 +159,5 @@ public static class UserDataPaths
             Program.LogRuntime($"USER_DATA_MIGRATION_FAILED source={legacyPath} destination={destinationPath} error={ex.Message}");
         }
     }
+#endif
 }

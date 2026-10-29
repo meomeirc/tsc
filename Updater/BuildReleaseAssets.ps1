@@ -10,6 +10,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 # Automatic script-path variables can be empty while PowerShell evaluates param()
@@ -123,7 +124,32 @@ function Remove-ExcludedFiles([string]$Root, [bool]$Minimal) {
 
 function Write-AssetZip([string]$Root, [string]$ZipPath) {
     if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
-    [IO.Compression.ZipFile]::CreateFromDirectory($Root, $ZipPath, [IO.Compression.CompressionLevel]::Optimal, $false)
+
+    # Write entries individually with ZIP-standard '/' separators. Windows PowerShell
+    # can inherit legacy .NET Framework ZIP behavior that stores '\' separators;
+    # the older updater expected 'files/' and would then miss otherwise-valid payloads.
+    $archiveStream = [IO.File]::Open($ZipPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $archive = $null
+    try {
+        $archive = [IO.Compression.ZipArchive]::new($archiveStream, [IO.Compression.ZipArchiveMode]::Create, $false)
+        foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
+            $relative = (Get-RelativePath $Root $file.FullName).Replace('\', '/')
+            $entry = $archive.CreateEntry($relative, [IO.Compression.CompressionLevel]::Optimal)
+            $inputStream = [IO.File]::OpenRead($file.FullName)
+            $outputStream = $entry.Open()
+            try {
+                $inputStream.CopyTo($outputStream)
+            }
+            finally {
+                $outputStream.Dispose()
+                $inputStream.Dispose()
+            }
+        }
+    }
+    finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        else { $archiveStream.Dispose() }
+    }
 }
 
 function Assert-NoEmbeddedManifest([string]$ZipPath, [string]$ManifestEntryName) {
@@ -142,6 +168,63 @@ function Expand-Zip([string]$ZipPath, [string]$Destination) {
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
     [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $Destination)
+}
+
+function Get-StreamSha256([IO.Stream]$Stream) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($Stream))).Replace('-', '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Assert-PatchZipMatchesManifest([string]$ZipPath, $Manifest) {
+    # Catch mismatched patch ZIP/manifest pairs before they are uploaded. The updater
+    # relies on each manifest file having a matching files/<relative-path> entry.
+    $archive = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $payloads = @{}
+        foreach ($entry in $archive.Entries) {
+            $entryPath = $entry.FullName.Replace('\', '/')
+            if (-not $entryPath.StartsWith('files/', [StringComparison]::OrdinalIgnoreCase) -or [string]::IsNullOrEmpty($entry.Name)) { continue }
+            $relative = $entryPath.Substring(6)
+            if ($payloads.ContainsKey($relative)) {
+                throw "Patch ZIP validation failed: duplicate payload path 'files/$relative'."
+            }
+            $payloads[$relative] = $entry
+        }
+
+        $expected = @{}
+        foreach ($file in @($Manifest.files)) {
+            $relative = ([string]$file.path).Replace('\', '/')
+            $expected[$relative] = $true
+            if (-not $payloads.ContainsKey($relative)) {
+                throw "Patch ZIP validation failed: the patch manifest lists '$relative', but '$ZipPath' has no 'files/$relative' payload. Rebuild the patch ZIP and combined manifest together, then upload both from the same build."
+            }
+
+            $entry = $payloads[$relative]
+            if ([long]$entry.Length -ne [long]$file.size) {
+                throw "Patch ZIP validation failed: payload '$relative' has size $($entry.Length), but the manifest expects $($file.size)."
+            }
+            $stream = $entry.Open()
+            try { $hash = Get-StreamSha256 $stream }
+            finally { $stream.Dispose() }
+            if ($hash -ine [string]$file.sha256) {
+                throw "Patch ZIP validation failed: payload '$relative' does not match its SHA-256 in the patch manifest."
+            }
+        }
+
+        foreach ($relative in $payloads.Keys) {
+            if (-not $expected.ContainsKey($relative)) {
+                throw "Patch ZIP validation failed: payload 'files/$relative' is not listed in the patch manifest."
+            }
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
 }
 
 try {
@@ -168,6 +251,11 @@ try {
     $releaseManifestPath = Join-Path $output "TSC-win-x64-$Version-manifest.json"
     $legacyMinimalManifestPath = Join-Path $output "TSC-win-x64-$Version-minimal-manifest.json"
     $legacyPatchManifestPath = Join-Path $output "TSC-win-x64-$Version-patch-manifest.json"
+    # Remove this version's old metadata before rebuilding. If later validation fails,
+    # a stale combined manifest must not remain beside a newly written patch ZIP.
+    foreach ($staleManifest in @($releaseManifestPath, $legacyMinimalManifestPath, $legacyPatchManifestPath)) {
+        if (Test-Path -LiteralPath $staleManifest) { Remove-Item -LiteralPath $staleManifest -Force }
+    }
 
     $fullZip = Join-Path $output "TSC-win-x64-$Version.zip"
     $minimalZip = Join-Path $output "TSC-win-x64-$Version-minimal.zip"
@@ -260,11 +348,19 @@ try {
             toVersion = $Version
             files = @($changed | Sort-Object path)
             deletedFiles = @($deleted | Sort-Object path)
+            # Hash the archive itself so the updater can detect when someone uploads
+            # a ZIP and combined manifest from different packaging runs.
+            assetSize = [long]0
+            assetSha256 = ''
         }
         $patchZip = Join-Path $output "TSC-win-x64-$Version-patch.zip"
         Write-AssetZip $patchRoot $patchZip
         Assert-NoEmbeddedManifest $patchZip 'patch-manifest.json'
-        Write-Host "Created $patchZip"
+        $patchZipInfo = Get-Item -LiteralPath $patchZip
+        $patchManifest.assetSize = [long]$patchZipInfo.Length
+        $patchManifest.assetSha256 = (Get-FileHash -LiteralPath $patchZip -Algorithm SHA256).Hash
+        Assert-PatchZipMatchesManifest $patchZip $patchManifest
+        Write-Host "Created and verified $patchZip"
     }
     else {
         # Avoid accidentally leaving an old patch for this version in the output

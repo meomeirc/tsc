@@ -38,7 +38,7 @@ internal sealed class UpdateForm : Form
     private readonly UpdateOptions _options;
     private readonly Label _status;
     private readonly ProgressBar _progress;
-    private readonly Label _detail;
+    private readonly TextBox _detail;
     private bool _finished;
 
     public UpdateForm(UpdateOptions options)
@@ -47,25 +47,31 @@ internal sealed class UpdateForm : Form
         Text = "TSC Updater";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new System.Drawing.Size(440, 126);
+        ClientSize = new System.Drawing.Size(720, 260);
         MaximizeBox = false;
         MinimizeBox = false;
         ShowInTaskbar = true;
 
         _status = new Label
         {
-            Left = 18, Top = 15, Width = 404, Height = 24,
+            Left = 18, Top = 15, Width = 684, Height = 24,
             Text = "Preparing update…", AutoEllipsis = true
         };
         _progress = new ProgressBar
         {
-            Left = 18, Top = 45, Width = 404, Height = 20,
+            Left = 18, Top = 45, Width = 684, Height = 20,
             Minimum = 0, Maximum = 100, Value = 0, Style = ProgressBarStyle.Continuous
         };
-        _detail = new Label
+        _detail = new TextBox
         {
-            Left = 18, Top = 76, Width = 404, Height = 30,
-            Text = "Please keep this window open.", AutoEllipsis = true
+            Left = 18, Top = 76, Width = 684, Height = 138,
+            Text = "Please keep this window open.",
+            Multiline = true,
+            ReadOnly = true,
+            WordWrap = true,
+            ScrollBars = ScrollBars.Vertical,
+            BorderStyle = BorderStyle.FixedSingle,
+            TabStop = true
         };
         Controls.AddRange([_status, _progress, _detail]);
         Shown += async (_, _) => await RunUpdateAsync();
@@ -88,15 +94,30 @@ internal sealed class UpdateForm : Form
         }
         catch (Exception ex)
         {
-            ReportProgress("Update failed", _progress.Value, ex.Message);
-            _detail.Width = 306;
-            _detail.Text = ex.Message;
+            ReportProgress("Update failed", _progress.Value, ex.ToString());
+            _detail.Text = ex.ToString();
+            _detail.SelectionStart = 0;
+            _detail.SelectionLength = 0;
             _finished = true;
-            var close = new Button { Text = "Close", Width = 82, Height = 26, Left = 340, Top = 82, DialogResult = DialogResult.OK };
+
+            var copy = new Button { Text = "Copy details", Width = 110, Height = 28, Left = 470, Top = 222 };
+            copy.Click += (_, _) =>
+            {
+                try
+                {
+                    Clipboard.SetText(_detail.Text);
+                    copy.Text = "Copied";
+                }
+                catch
+                {
+                    copy.Text = "Copy failed";
+                }
+            };
+            var close = new Button { Text = "Close", Width = 82, Height = 28, Left = 620, Top = 222, DialogResult = DialogResult.OK };
             close.Click += (_, _) => Close();
-            Controls.Add(close);
+            Controls.AddRange([copy, close]);
             AcceptButton = close;
-            ClientSize = new System.Drawing.Size(440, 128);
+            CancelButton = close;
             Environment.ExitCode = 1;
         }
     }
@@ -146,14 +167,15 @@ internal sealed class UpdateEngine
             Report("Waiting for TSC to close…", 1);
             await WaitForGameAsync(_options.WaitPid).ConfigureAwait(true);
 
-            Report("Checking GitHub releases…", 4);
+            Report("Checking GitHub releases…", 4, _options.Repository);
             var releases = await FetchReleasesAsync().ConfigureAwait(true);
             var current = UpdateCheckServiceCompat.ParseVersion(_options.CurrentVersion)
                 ?? throw new InvalidDataException($"The installed version '{_options.CurrentVersion}' is not a valid numeric version.");
+            var sourceDescription = $"stable GitHub releases from {_options.Repository}";
             var latest = releases.Where(r => !r.IsDraft && !r.IsPrerelease && r.Version is not null)
                 .OrderByDescending(r => r.Version)
                 .FirstOrDefault(r => r.Version! > current)
-                ?? throw new InvalidOperationException("No newer stable GitHub release was found. The release may have been removed or its tag may not be a numeric version.");
+                ?? throw new InvalidOperationException($"No newer stable update was found in {sourceDescription}. Check that the release files exist and use a numeric version.");
 
             var versionText = latest.Version!.ToString();
             var fullAsset = FindAsset(latest, $"TSC-win-x64-{versionText}.zip");
@@ -183,7 +205,7 @@ internal sealed class UpdateEngine
 
             // When no complete package is published, don't cap the patch chain by a
             // nonexistent fallback package. The chain is still fully verified below.
-            var patchChain = FindPatchChain(releases, current, latest.Version!, fallbackCost);
+            var patchChain = await FindPatchChainAsync(releases, current, latest, fallbackCost).ConfigureAwait(true);
             PatchResult? preparedPatch = null;
             string? patchChainFailure = null;
             if (patchChain.Count > 0)
@@ -208,9 +230,9 @@ internal sealed class UpdateEngine
                         completedBytes += Math.Max(0L, patch.Asset.Size);
                         patchArchives.Add(archivePath);
 
-                        string? patchManifestPath = null;
+                        var patchManifestPath = patch.ManifestPath;
                         var patchManifestAsset = patch.ManifestAsset;
-                        if (patchManifestAsset is not null)
+                        if (patchManifestAsset is not null && string.IsNullOrWhiteSpace(patchManifestPath))
                         {
                             patchManifestPath = Path.Combine(_work, $"patch-{i + 1}-manifest.json");
                             var manifestBaseCompleted = completedBytes;
@@ -219,6 +241,12 @@ internal sealed class UpdateEngine
                                 var overall = totalPatchBytes <= 0 ? 1 : (manifestBaseCompleted + received) / totalPatchBytes;
                                 Report($"Downloading patch metadata {i + 1} of {patchChain.Count}…", 6 + (int)(overall * 50), patchManifestAsset.Name);
                             }).ConfigureAwait(true);
+                            completedBytes += Math.Max(0L, patchManifestAsset.Size);
+                        }
+                        else if (patchManifestAsset is not null)
+                        {
+                            // Direct target patches may be pre-inspected so unrelated
+                            // releases between the installed and target versions are skipped.
                             completedBytes += Math.Max(0L, patchManifestAsset.Size);
                         }
                         patchManifestPaths.Add(patchManifestPath);
@@ -264,13 +292,15 @@ internal sealed class UpdateEngine
                 }
 
                 var reason = string.IsNullOrWhiteSpace(patchChainFailure)
-                    ? "No complete patch chain was found from the installed version."
+                    ? "No complete patch chain was found from the installed version. The installed version may not match the patch's fromVersion, or one of the required patch ZIPs/manifests may be missing."
                     : $"Patch validation failed: {patchChainFailure}";
+                var newline = Environment.NewLine;
                 throw new InvalidDataException(
-                    $"Release {latest.TagName} has a patch but no full/minimal fallback, and a safe patch chain " +
-                    $"from installed version {current} to {latest.Version} could not be verified. {reason} " +
-                    "Make sure every intervening stable release has its patch ZIP and combined manifest, " +
-                    "and that the patch targets this exact installed version. Otherwise, add a full or minimal game ZIP.");
+                    $"Release {latest.TagName} contains a patch ZIP but no full or minimal fallback package.{newline}{newline}" +
+                    $"Installed version: {current}{newline}Target version: {latest.Version}{newline}{newline}" +
+                    $"Reason: {reason}{newline}{newline}" +
+                    "Check that the combined manifest's patch.fromVersion matches the installed version, patch.toVersion matches the target version, " +
+                    "and every required patch ZIP plus its combined manifest exists on the GitHub releases. Add a full or minimal ZIP if you want a fallback.");
             }
 
             var flavor = fallbackKind.Equals("minimal", StringComparison.OrdinalIgnoreCase) ? "Minimal" : "Full";
@@ -309,7 +339,7 @@ internal sealed class UpdateEngine
             }
 
             Report("Installing game files…", 80);
-            var oldState = await ReadStateAsync(Path.Combine(_root, StateFileName)).ConfigureAwait(true);
+            var oldState = await ReadStateAsync(GetUpdaterStatePath(StateFileName)).ConfigureAwait(true);
             var deletePaths = FindObsoleteManagedPaths(oldState, package.Manifest, package.Manifest.Kind == "minimal");
             deletePaths.UnionWith(skinDeletedPaths);
             if (package.Manifest.Kind == "full")
@@ -342,7 +372,7 @@ internal sealed class UpdateEngine
                 await SaveSkinStateFromPackageAsync(package.Manifest.Files, versionText).ConfigureAwait(true);
             }
 
-            await File.WriteAllTextAsync(Path.Combine(_root, StateFileName), JsonSerializer.Serialize(newState, JsonOptions)).ConfigureAwait(true);
+            await WriteUpdaterStateAsync(StateFileName, JsonSerializer.Serialize(newState, JsonOptions)).ConfigureAwait(true);
             await ScheduleRestartAsync(latest).ConfigureAwait(true);
         }
         catch
@@ -408,12 +438,57 @@ internal sealed class UpdateEngine
         return result.Where(r => r.Version is not null).OrderBy(r => r.Version).ToList();
     }
 
+    private async Task<List<PatchRelease>> FindPatchChainAsync(List<ReleaseInfo> releases, Version current, ReleaseInfo latest, long fallbackSize)
+    {
+        var target = latest.Version;
+        if (target is not null && target > current)
+        {
+            var directPatch = FindAsset(latest, $"TSC-win-x64-{target}-patch.zip");
+            var directManifest = FindAsset(latest, GetPatchManifestAssetName(target.ToString()))
+                ?? FindAsset(latest, GetReleaseManifestAssetName(target.ToString()));
+            if (directPatch is not null && directManifest is not null && directPatch.Size >= 0 && directManifest.Size >= 0)
+            {
+                var directSize = (decimal)directPatch.Size + directManifest.Size;
+                if (directSize <= fallbackSize)
+                {
+                    var manifestPath = Path.Combine(_work, "direct-target-patch-manifest.json");
+                    try
+                    {
+                        await DownloadAssetAsync(directManifest, manifestPath, null).ConfigureAwait(true);
+                        var metadata = await ReadPatchManifestAssetAsync(manifestPath, directManifest.Name).ConfigureAwait(true);
+                        if (metadata is not null &&
+                            string.Equals(metadata.FromVersion, current.ToString(), StringComparison.Ordinal) &&
+                            string.Equals(metadata.ToVersion, target.ToString(), StringComparison.Ordinal) &&
+                            metadata.TargetManifest is not null &&
+                            string.Equals(metadata.TargetManifest.Version, target.ToString(), StringComparison.Ordinal))
+                        {
+                            // Prefer the exact patch built from this installed version.
+                            // This allows version jumps even when other releases are also
+                            // present locally or on GitHub and their patches are unrelated.
+                            return [new PatchRelease(current, target, latest, directPatch, directManifest, manifestPath)];
+                        }
+                    }
+                    catch
+                    {
+                        // Fall through to the regular chain. The actual patch attempt
+                        // below will capture and display the complete validation error.
+                    }
+                }
+            }
+        }
+
+        return FindPatchChain(releases, current, target ?? current, fallbackSize);
+    }
+
     private static List<PatchRelease> FindPatchChain(List<ReleaseInfo> releases, Version current, Version target, long fallbackSize)
     {
-        var currentIndex = releases.FindIndex(r => r.Version is not null && r.Version.CompareTo(current) == 0 && !r.IsDraft && !r.IsPrerelease);
-        if (currentIndex < 0) return [];
-        var chainReleases = releases.Skip(currentIndex + 1)
-            .Where(r => r.Version is not null && r.Version.CompareTo(target) <= 0 && !r.IsDraft && !r.IsPrerelease)
+        // A patch-only GitHub release may contain just the target patch and its
+        // combined manifest. The installed version does not need to have its own
+        // release assets present: each patch manifest verifies its exact fromVersion.
+        var chainReleases = releases
+            .Where(r => r.Version is not null && r.Version.CompareTo(current) > 0 &&
+                        r.Version.CompareTo(target) <= 0 && !r.IsDraft && !r.IsPrerelease)
+            .OrderBy(r => r.Version)
             .ToList();
         if (chainReleases.Count == 0 || chainReleases[^1].Version is null || chainReleases[^1].Version!.CompareTo(target) != 0) return [];
 
@@ -437,28 +512,37 @@ internal sealed class UpdateEngine
 
     private async Task<string> DownloadAssetAsync(ReleaseAsset asset, string outputPath, Action<long, long>? progress)
     {
-        if (!Uri.TryCreate(asset.DownloadUrl, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
-            throw new InvalidDataException("GitHub supplied an invalid asset URL.");
+        if (!Uri.TryCreate(asset.DownloadUrl, UriKind.Absolute, out var uri))
+            throw new InvalidDataException($"The update source supplied an invalid asset location for {asset.Name}.");
+
+        if (uri.Scheme != Uri.UriSchemeHttps)
+            throw new InvalidDataException($"Update asset '{asset.Name}' must be downloaded over HTTPS.");
 
         using var response = await Client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(true);
         response.EnsureSuccessStatusCode();
+        var inputStream = await response.Content.ReadAsStreamAsync().ConfigureAwait(true);
         var total = response.Content.Headers.ContentLength ?? asset.Size;
-        await using var input = await response.Content.ReadAsStreamAsync().ConfigureAwait(true);
+        return await CopyAssetStreamAsync(inputStream, asset, outputPath, total, progress).ConfigureAwait(true);
+    }
+
+    private static async Task<string> CopyAssetStreamAsync(Stream input, ReleaseAsset asset, string outputPath, long total, Action<long, long>? progress)
+    {
+        await using var inputStream = input;
         await using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[128 * 1024];
         long received = 0;
         int read;
-        while ((read = await input.ReadAsync(buffer.AsMemory()).ConfigureAwait(true)) > 0)
+        while ((read = await inputStream.ReadAsync(buffer.AsMemory()).ConfigureAwait(false)) > 0)
         {
-            await output.WriteAsync(buffer.AsMemory(0, read)).ConfigureAwait(true);
+            await output.WriteAsync(buffer.AsMemory(0, read)).ConfigureAwait(false);
             hash.AppendData(buffer, 0, read);
             received += read;
             progress?.Invoke(received, total);
         }
-        await output.FlushAsync().ConfigureAwait(true);
+        await output.FlushAsync().ConfigureAwait(false);
         if (asset.Size >= 0 && received != asset.Size)
-            throw new InvalidDataException($"Downloaded {asset.Name} has the wrong size (expected {asset.Size}, got {received}).");
+            throw new InvalidDataException($"Asset {asset.Name} has the wrong size (expected {asset.Size}, got {received}).");
 
         var digest = asset.Digest;
         if (!string.IsNullOrWhiteSpace(digest) && digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
@@ -570,15 +654,57 @@ internal sealed class UpdateEngine
             if (manifest.TargetManifest is null || manifest.TargetManifest.Version != manifest.ToVersion)
                 throw new InvalidDataException("Patch lacks a valid target package manifest.");
 
-            var payloads = archive.Entries.Where(e => e.FullName.StartsWith("files/", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(e.Name))
-                .ToDictionary(e => NormalizeArchivePath(e.FullName[6..]), e => e, StringComparer.OrdinalIgnoreCase);
+            // New combined release manifests include the size and SHA-256 of the exact
+            // patch ZIP they describe. This detects accidentally mixed release assets
+            // before trying to apply individual files. Older manifests remain supported.
+            var patchArchiveInfo = new FileInfo(archives[i]);
+            if (manifest.AssetSize > 0 && patchArchiveInfo.Length != manifest.AssetSize)
+                throw new InvalidDataException($"Patch ZIP {patchRelease.Asset.Name} does not match its combined manifest: expected {manifest.AssetSize} bytes, got {patchArchiveInfo.Length}. Rebuild the patch ZIP and manifest together, then replace both release assets.");
+            if (!string.IsNullOrWhiteSpace(manifest.AssetSha256))
+            {
+                await using var patchHashStream = new FileStream(archives[i], FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, useAsync: true);
+                var actualPatchHash = Convert.ToHexString(await SHA256.HashDataAsync(patchHashStream).ConfigureAwait(true));
+                if (!actualPatchHash.Equals(manifest.AssetSha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException($"Patch ZIP {patchRelease.Asset.Name} does not match the SHA-256 in its combined manifest. Rebuild the patch ZIP and manifest together, then replace both release assets.");
+            }
+
+            // ZIP paths are conventionally separated with '/', but archives created by
+            // some Windows tooling may expose '\' separators. The release builder's
+            // validator normalizes both forms, so the updater must do the same or it can
+            // falsely report that valid payloads such as files/data/TSC.dll are missing.
+            var payloads = new Dictionary<string, ZipArchiveEntry>(StringComparer.OrdinalIgnoreCase);
+            foreach (var entry in archive.Entries)
+            {
+                if (string.IsNullOrEmpty(entry.Name)) continue;
+                var entryPath = entry.FullName.Replace('\\', '/');
+                if (!entryPath.StartsWith("files/", StringComparison.OrdinalIgnoreCase)) continue;
+
+                var payloadPath = NormalizeArchivePath(entryPath["files/".Length..]);
+                if (!payloads.TryAdd(payloadPath, entry))
+                    throw new InvalidDataException($"Patch ZIP {patchRelease.Asset.Name} contains duplicate payload path 'files/{payloadPath}'.");
+            }
 
             foreach (var file in manifest.Files)
             {
                 var path = NormalizeArchivePath(file.Path);
                 if (IsProtectedPath(path) || path.Equals("version.txt", StringComparison.OrdinalIgnoreCase) || path.Equals("info.md", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"Patch attempts to change protected path: {path}");
-                if (!payloads.TryGetValue(path, out var payload)) throw new InvalidDataException($"Patch payload is missing: {path}");
+                if (!payloads.TryGetValue(path, out var payload))
+                {
+                    var matchingArchiveEntries = archive.Entries
+                        .Where(e => !string.IsNullOrEmpty(e.Name))
+                        .Select(e => e.FullName.Replace('\\', '/'))
+                        .Where(name => name.Contains(Path.GetFileName(path), StringComparison.OrdinalIgnoreCase))
+                        .Take(8)
+                        .ToArray();
+                    var entryDetails = matchingArchiveEntries.Length == 0
+                        ? "none"
+                        : string.Join(", ", matchingArchiveEntries);
+                    throw new InvalidDataException(
+                        $"Patch ZIP/manifest mismatch: {patchRelease.Asset.Name} is missing the required payload 'files/{path}' listed by its combined manifest. " +
+                        $"The ZIP contains {payloads.Count} recognized files/ payload(s); archive entries matching '{Path.GetFileName(path)}': {entryDetails}. " +
+                        "Rebuild the patch ZIP and combined manifest together, then replace both release assets.");
+                }
                 if (payload.Length > int.MaxValue) throw new InvalidDataException($"Patch file is too large: {path}");
                 await using var payloadStream = payload.Open();
                 using var memory = new MemoryStream((int)Math.Min(payload.Length, 16 * 1024 * 1024));
@@ -665,9 +791,9 @@ internal sealed class UpdateEngine
             Kind = "patch",
             Files = result.Manifest.Files.Where(f => !IsProtectedPath(f.Path)).ToList()
         };
-        await File.WriteAllTextAsync(Path.Combine(_root, StateFileName), JsonSerializer.Serialize(newState, JsonOptions)).ConfigureAwait(true);
+        await WriteUpdaterStateAsync(StateFileName, JsonSerializer.Serialize(newState, JsonOptions)).ConfigureAwait(true);
         var skinFiles = result.Manifest.Files.Where(f => IsDefaultSkinPath(f.Path)).ToList();
-        await File.WriteAllTextAsync(Path.Combine(_root, SkinStateFileName), JsonSerializer.Serialize(new SkinState
+        await WriteUpdaterStateAsync(SkinStateFileName, JsonSerializer.Serialize(new SkinState
         {
             Version = result.Manifest.Version,
             Commit = null,
@@ -825,7 +951,7 @@ internal sealed class UpdateEngine
     private async Task SaveSkinStateAsync(IEnumerable<string> currentPaths, string? commit, string version)
     {
         var state = new SkinState { Version = version, Commit = commit, Files = currentPaths.Where(IsDefaultSkinPath).OrderBy(p => p, StringComparer.OrdinalIgnoreCase).ToList() };
-        await File.WriteAllTextAsync(Path.Combine(_root, SkinStateFileName), JsonSerializer.Serialize(state, JsonOptions)).ConfigureAwait(true);
+        await WriteUpdaterStateAsync(SkinStateFileName, JsonSerializer.Serialize(state, JsonOptions)).ConfigureAwait(true);
     }
 
     private async Task SaveSkinStateFromPackageAsync(IEnumerable<ManagedFile> files, string version)
@@ -833,9 +959,19 @@ internal sealed class UpdateEngine
         await SaveSkinStateAsync(files.Where(f => IsDefaultSkinPath(f.Path)).Select(f => f.Path), null, version).ConfigureAwait(true);
     }
 
+    private static string GetUpdaterStatePath(string fileName) =>
+        Path.Combine(TSC.UserDataPaths.RootDirectory, "State", "Updater", fileName);
+
+    private async Task WriteUpdaterStateAsync(string fileName, string contents)
+    {
+        var path = GetUpdaterStatePath(fileName);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, contents).ConfigureAwait(true);
+    }
+
     private async Task<SkinState?> ReadSkinStateAsync()
     {
-        var path = Path.Combine(_root, SkinStateFileName);
+        var path = GetUpdaterStatePath(SkinStateFileName);
         if (!File.Exists(path)) return null;
         try { return JsonSerializer.Deserialize<SkinState>(await File.ReadAllTextAsync(path).ConfigureAwait(true), JsonOptions); }
         catch { return null; }
@@ -1037,7 +1173,7 @@ internal sealed class UpdateEngine
 
     private sealed record ReleaseInfo(string TagName, Version? Version, bool IsDraft, bool IsPrerelease, List<ReleaseAsset> Assets);
     private sealed record ReleaseAsset(string Name, string DownloadUrl, long Size, string? Digest);
-    private sealed record PatchRelease(Version FromVersion, Version Version, ReleaseInfo Release, ReleaseAsset Asset, ReleaseAsset? ManifestAsset);
+    private sealed record PatchRelease(Version FromVersion, Version Version, ReleaseInfo Release, ReleaseAsset Asset, ReleaseAsset? ManifestAsset, string? ManifestPath = null);
     private sealed record PreparedPackage(PackageManifest Manifest, Dictionary<string, byte[]> Files);
     private sealed record PatchResult(PackageManifest Manifest, HashSet<string> Deletions, Dictionary<string, byte[]> FinalWrites);
     private sealed record SkinDownloadResult(Dictionary<string, byte[]> Files, string Commit, HashSet<string> DeletedPaths);
@@ -1045,7 +1181,7 @@ internal sealed class UpdateEngine
     private sealed class PackageManifest { public int SchemaVersion { get; set; } = 1; public string Version { get; set; } = ""; public string Kind { get; set; } = "full"; public List<ManagedFile> Files { get; set; } = []; }
     private sealed class ReleaseManifest { public int SchemaVersion { get; set; } = 2; public string Version { get; set; } = ""; public PackageManifest? Full { get; set; } public PackageManifest? Minimal { get; set; } public PatchManifest? Patch { get; set; } }
     private sealed class ManagedFile { public string Path { get; set; } = ""; public long Size { get; set; } public string Sha256 { get; set; } = ""; }
-    private sealed class PatchManifest { public int SchemaVersion { get; set; } = 1; public string FromVersion { get; set; } = ""; public string ToVersion { get; set; } = ""; public List<PatchFile> Files { get; set; } = []; public List<PatchDeletion> DeletedFiles { get; set; } = []; public PackageManifest? TargetManifest { get; set; } }
+    private sealed class PatchManifest { public int SchemaVersion { get; set; } = 1; public string FromVersion { get; set; } = ""; public string ToVersion { get; set; } = ""; public List<PatchFile> Files { get; set; } = []; public List<PatchDeletion> DeletedFiles { get; set; } = []; public PackageManifest? TargetManifest { get; set; } public long AssetSize { get; set; } public string AssetSha256 { get; set; } = ""; }
     private sealed class PatchFile { public string Path { get; set; } = ""; public string? FromSha256 { get; set; } public long Size { get; set; } public string Sha256 { get; set; } = ""; }
     private sealed class PatchDeletion { public string Path { get; set; } = ""; public string? FromSha256 { get; set; } }
     private sealed class ManagedState { public string Version { get; set; } = ""; public string Kind { get; set; } = "full"; public List<ManagedFile> Files { get; set; } = []; }

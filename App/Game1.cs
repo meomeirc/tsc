@@ -56,6 +56,7 @@ public sealed class Game1 : Game
     private int _mainMenuSelectedIndex;
     private bool _updatePromptShown;
     private int _updateAvailableFrames;
+    private bool _ffmpegStartupPromptChecked;
     private string? _infoMarkdownSource;
     private readonly List<InfoVisualLine> _infoVisualLines = new();
     private int _infoLayoutWidth = -1;
@@ -1493,6 +1494,7 @@ public sealed class Game1 : Game
         if (!IsWindowInputActive())
             return;
 
+        TryPromptForMissingFfmpegAtStartup();
         TryPromptForUpdate();
         var mouse = GlobalInput.Mouse;
         var mousePressed = mouse.LeftButton == Microsoft.Xna.Framework.Input.ButtonState.Pressed &&
@@ -1587,6 +1589,26 @@ public sealed class Game1 : Game
                 return;
             }
         }
+    }
+
+    private void TryPromptForMissingFfmpegAtStartup()
+    {
+        if (_ffmpegStartupPromptChecked)
+            return;
+
+        // Only Windows has the built-in FFmpeg Essentials downloader. Check the
+        // same resolver used by actions so an environment variable, PATH entry,
+        // existing executable, or bundled archive prevents an unnecessary prompt.
+        _ffmpegStartupPromptChecked = true;
+        if (!OperatingSystem.IsWindows() || FfmpegExecutableResolver.FindExecutable() is not null)
+            return;
+
+        Program.LogRuntime("FFMPEG_MISSING_STARTUP_PROMPT");
+        var result = ShowFfmpegPrompt("use TSC's audio and media conversion features");
+        if (result.Installed)
+            Program.LogRuntime("FFMPEG_STARTUP_INSTALL_SUCCEEDED");
+        else if (!string.IsNullOrWhiteSpace(result.ErrorMessage))
+            Program.LogRuntime($"FFMPEG_STARTUP_INSTALL_FAILED error={result.ErrorMessage}");
     }
 
     private void TryPromptForUpdate()

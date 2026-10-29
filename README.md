@@ -13,8 +13,7 @@ TSC is a rhythm game and chart-editing project built with Monogame.
 From the project directory, run:
 
 ```powershell
-dotnet restore .\TSC.csproj
-dotnet run --project .\TSC.csproj
+dotnet run
 ```
 
 To publish using the included Windows x64 profile:

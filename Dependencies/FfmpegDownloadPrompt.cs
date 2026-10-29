@@ -286,9 +286,19 @@ internal static class FfmpegDownloadPrompt
 
         try
         {
-            using var http = new HttpClient(new HttpClientHandler { AutomaticDecompression = DecompressionMethods.All })
+            using var http = new HttpClient(new HttpClientHandler
             {
-                Timeout = TimeSpan.FromMinutes(10)
+                // The archive is already compressed. Advertising gzip/Brotli adds no
+                // useful compression and can cause needless work on some servers.
+                AutomaticDecompression = DecompressionMethods.None
+            })
+            {
+                Timeout = TimeSpan.FromMinutes(10),
+                // Browsers generally use HTTP/2 or newer. The previous default of
+                // HTTP/1.1 can be noticeably slower on some networks and servers.
+                // Fall back automatically when HTTP/2 is unavailable.
+                DefaultRequestVersion = HttpVersion.Version20,
+                DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
             };
             http.DefaultRequestHeaders.UserAgent.ParseAdd("TSC-FFmpeg-Installer/1.0");
 
@@ -296,15 +306,19 @@ internal static class FfmpegDownloadPrompt
             using var response = await http.GetAsync(ArchiveUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
             var downloadedArchiveUri = response.RequestMessage?.RequestUri ?? new Uri(ArchiveUrl);
+            Program.LogRuntime($"FFMPEG_DOWNLOAD_HTTP negotiated={response.Version} source={downloadedArchiveUri.Host}");
 
             var contentLength = response.Content.Headers.ContentLength;
             if (contentLength is > maximumArchiveBytes)
                 throw new InvalidDataException("The FFmpeg archive is unexpectedly large, so TSC stopped the download.");
 
             await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
-            await using (var output = new FileStream(archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var output = new FileStream(archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                var buffer = new byte[128 * 1024];
+                // Use larger chunks to reduce per-read/write overhead during the download.
+                const int bufferSize = 1024 * 1024;
+                const long progressReportInterval = 1024 * 1024;
+                var buffer = new byte[bufferSize];
                 long totalBytes = 0;
                 long nextReport = 0;
                 while (true)
@@ -327,7 +341,7 @@ internal static class FfmpegDownloadPrompt
                             ? 3 + (int)Math.Clamp((double)totalBytes / contentLength.Value * 65.0, 0.0, 65.0)
                             : 3;
                         progress.Report(new FfmpegDownloadProgress(status, percent, contentLength is not > 0));
-                        nextReport = totalBytes + 256 * 1024;
+                        nextReport = totalBytes + progressReportInterval;
                     }
                 }
                 await output.FlushAsync(cancellationToken).ConfigureAwait(false);

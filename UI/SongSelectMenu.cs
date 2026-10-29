@@ -325,7 +325,10 @@ public sealed class SongSelectMenu : IDisposable
         _pixel.SetData(new[] { XnaColor.White });
         _songsRoot = FindSongsRoot();
         _songSelectStateDirectory = FindSongSelectStateDirectory(_songsRoot);
+#if !TSC_PUBLISH
+        // Published builds use AppData directly and do not import legacy cache files from the songs folder.
         MigrateLegacySongSelectStateFiles();
+#endif
         Program.LogRuntime($"SONG_SELECT_CONSTRUCTOR songsRoot={_songsRoot}");
 #if TSC_PUBLISH
         _skinDirectory = string.IsNullOrWhiteSpace(skinDirectory)
@@ -2745,20 +2748,10 @@ public sealed class SongSelectMenu : IDisposable
         if (OperatingSystem.IsWindows())
             normalizedSongsRoot = normalizedSongsRoot.ToUpperInvariant();
         var rootHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedSongsRoot)))[..16].ToLowerInvariant();
-#if TSC_PUBLISH
-        return Path.Combine(UserDataPaths.GameRootDirectory, "State", rootHash);
-#else
-        var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        if (string.IsNullOrWhiteSpace(root))
-            root = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        if (string.IsNullOrWhiteSpace(root))
-            root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share");
-        if (string.IsNullOrWhiteSpace(root))
-            root = AppContext.BaseDirectory;
-        return Path.Combine(root, "TSC", "State", rootHash);
-#endif
+        return Path.Combine(UserDataPaths.RootDirectory, "State", rootHash);
     }
 
+#if !TSC_PUBLISH
     private void MigrateLegacySongSelectStateFiles()
     {
         try
@@ -2791,6 +2784,8 @@ public sealed class SongSelectMenu : IDisposable
             Program.LogRuntime($"SONG_SELECT_LEGACY_STATE_MIGRATION_FAILED file={Path.GetFileName(legacyPath)} error={ex.Message}");
         }
     }
+
+#endif
 
     private bool TryLoadSongListCache(out CacheLoadResult result)
     {
