@@ -39,25 +39,78 @@ local function clamp(value, low, high)
     return value
 end
 
+local function forEachLiteralLine(text, callback)
+    local source = tostring(text or "")
+    local start_index = 1
+    while true do
+        local newline = string.find(source, "\n", start_index, true)
+        if newline == nil then
+            callback(string.sub(source, start_index))
+            break
+        end
+        callback(string.sub(source, start_index, newline - 1))
+        start_index = newline + 1
+    end
+end
+
+local function forEachWord(source_line, callback)
+    local index = 1
+    while index <= #source_line do
+        if string.byte(source_line, index) <= 32 then
+            index = index + 1
+        else
+            local start_index = index
+            while index <= #source_line and string.byte(source_line, index) > 32 do
+                index = index + 1
+            end
+            callback(string.sub(source_line, start_index, index - 1))
+        end
+    end
+end
+
 local function wrap_description(text, max_width)
     local result = {}
-    for source_line in (tostring(text or "") .. "\n"):gmatch("(.-)\n") do
-        local line = ""
-        for word in source_line:gmatch("%S+") do
-            local candidate = line == "" and word or (line .. " " .. word)
-            local measured = draw.measure_text and draw.measure_text(candidate, {
-                font = UI.fonts.regular,
-                size = UI.sizes.description,
-            }) or (#candidate * UI.sizes.description * 0.55)
-            if line ~= "" and measured > max_width then
-                table.insert(result, line)
-                line = word
-            else
-                line = candidate
-            end
-        end
-        table.insert(result, line)
+    local function measured(value)
+        return draw.measure_text and draw.measure_text(value, {
+            font = UI.fonts.regular,
+            size = UI.sizes.description,
+        }) or (#value * UI.sizes.description * 0.55)
     end
+
+    forEachLiteralLine(text, function(source_line)
+        local line = ""
+        local function append_word(word)
+            local candidate = line == "" and word or (line .. " " .. word)
+            if measured(candidate) <= max_width then
+                line = candidate
+                return
+            end
+
+            if line ~= "" then
+                table.insert(result, line)
+                line = ""
+            end
+
+            -- Also wrap long unbroken paths/tokens instead of leaving them clipped.
+            local chunk = ""
+            local index = 1
+            while index <= #word do
+                local first = string.byte(word, index)
+                local length = first < 128 and 1 or first < 224 and 2 or first < 240 and 3 or 4
+                local glyph = string.sub(word, index, math.min(#word, index + length - 1))
+                if chunk ~= "" and measured(chunk .. glyph) > max_width then
+                    table.insert(result, chunk)
+                    chunk = glyph
+                else
+                    chunk = chunk .. glyph
+                end
+                index = index + length
+            end
+            line = chunk
+        end
+        forEachWord(source_line, append_word)
+        table.insert(result, line)
+    end)
     return table.concat(result, "\n")
 end
 
@@ -165,7 +218,9 @@ function render()
             local description = wrap_description(item.description, list_layout.width - UI.spacing.row_padding_x * 2)
             row_descriptions[index] = description
             local lines = 1
-            for _ in description:gmatch("\n") do lines = lines + 1 end
+            for char_index = 1, #description do
+                if string.byte(description, char_index) == 10 then lines = lines + 1 end
+            end
             local content_height = description_gap + lines * description_line_height
             row_heights[index] = math.max(minimum_height,
                 math.ceil(row_padding_y * 2 + content_height))

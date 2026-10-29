@@ -2211,12 +2211,34 @@ public sealed partial class Playfield
         var unit = _projection.ScalePixels(1f);
         var padding = (int)MathF.Round(12f * unit);
         var contentTop = panel.Y + (int)MathF.Round(156f * unit);
-        var contentBottom = GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight).Y - padding;
+        var contentBottom = string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase)
+            ? panel.Bottom - padding
+            : GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight).Y - padding;
         return new Rectangle(
             panel.X + padding,
             contentTop,
             Math.Max(1, panel.Width - padding * 2),
             Math.Max(0, contentBottom - contentTop));
+    }
+
+    private Rectangle GetEditorMetaLanTestButtonBounds(int action, int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var height = Math.Max(1, (int)MathF.Round(38f * unit));
+        var bottomGap = (int)MathF.Round(8f * unit);
+        var y = content.Bottom - height - bottomGap;
+        if (!_editorLanTestRunning)
+            return action == 0 ? new Rectangle(content.X, y, content.Width, height) : Rectangle.Empty;
+
+        var gap = Math.Max(1, (int)MathF.Round(8f * unit));
+        var halfWidth = Math.Max(1, (content.Width - gap) / 2);
+        return action switch
+        {
+            1 => new Rectangle(content.X, y, halfWidth, height),
+            2 => new Rectangle(content.X + halfWidth + gap, y, Math.Max(1, content.Width - halfWidth - gap), height),
+            _ => Rectangle.Empty
+        };
     }
 
     private int GetEditorMetaLabelHeight(float unit)
@@ -2625,6 +2647,26 @@ public sealed partial class Playfield
             _editorMetaScrollOffset = 0;
             return true;
         }
+        if (string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase))
+        {
+            if (GetEditorMetaLanTestButtonBounds(0, virtualWidth, virtualHeight).Contains(pixel))
+            {
+                StartEditorLanTest();
+                return true;
+            }
+            if (GetEditorMetaLanTestButtonBounds(1, virtualWidth, virtualHeight).Contains(pixel))
+            {
+                RefreshEditorLanTest();
+                return true;
+            }
+            if (GetEditorMetaLanTestButtonBounds(2, virtualWidth, virtualHeight).Contains(pixel))
+            {
+                StopEditorLanTest();
+                return true;
+            }
+            if (GetEditorMetaContentBounds(virtualWidth, virtualHeight).Contains(pixel))
+                return true;
+        }
         if (string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
         {
             if (GetEditorMediaMusicButtonBounds(virtualWidth, virtualHeight).Contains(pixel) ||
@@ -2669,6 +2711,9 @@ public sealed partial class Playfield
             if (GetEditorMetaContentBounds(virtualWidth, virtualHeight).Contains(pixel))
                 return true;
         }
+
+        if (string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase))
+            return true;
 
         var metaRows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
         var elementRowIndex = metaRows.FindIndex(row => row.Label == "ELEMENT");

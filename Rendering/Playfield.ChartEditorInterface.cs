@@ -623,7 +623,7 @@ public sealed partial class Playfield
         const string editorControls = "EDITOR: Ctrl+S TSC  Ctrl+Shift+S ARES  Ctrl+Alt+S FPK. Select a tool and tap a lane to place notes.";
 #endif
 
-        return new Dictionary<string, object?>
+        var state = new Dictionary<string, object?>
         {
             ["actions_right"] = rightActions,
             ["actions_left"] = leftActions,
@@ -754,6 +754,8 @@ public sealed partial class Playfield
             ["dirty"] = _editorHasUnsavedChanges,
             ["preview_mode"] = _editorPreviewMode
         };
+        AddEditorLanTestUiState(state);
+        return state;
     }
 
     private string GetEditorLuaMenuTitle() => _editorMenuSection switch
@@ -1093,6 +1095,9 @@ public sealed partial class Playfield
             case "editor.preview.scrub":
                 UpdateEditorPreviewRangeFromValue(value is double scrubValue ? scrubValue : 0.0); return true;
             case "editor.meta.media_music": ImportEditorSongRequested?.Invoke(); return true;
+            case "editor.lan_test.start": StartEditorLanTest(); return true;
+            case "editor.lan_test.refresh": RefreshEditorLanTest(); return true;
+            case "editor.lan_test.stop": StopEditorLanTest(); return true;
             default:
                 return true;
         }

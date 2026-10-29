@@ -253,19 +253,27 @@ public sealed partial class Playfield
             if (!string.IsNullOrWhiteSpace(_sourceName)) bottomLines.Add((_sourceName!, Muted));
             if (!string.IsNullOrWhiteSpace(_statusMessage)) bottomLines.Add((_statusMessage!, Hold));
 
-            // Keep source/file and status information directly above the Problems
-            // panel, rather than in the old bottom-left HUD area. The Problems panel
-            // is drawn later as part of the top-most editor UI layer.
+            // Keep source/file and status information above the Problems panel, but
+            // do not size it to the Problems panel itself. Use all remaining screen
+            // width and wrap long messages onto additional lines instead of trimming.
             var problemsPanel = GetEditorProblemsPanelBounds(viewWidth, viewHeight);
-            var bottomLineGap = _projection.ScalePixels(21f);
             var infoGap = _projection.ScalePixels(5f);
-            var infoWidth = Math.Max(_projection.ScalePixels(10f), actionPanel.X - problemsPanel.X - padX);
-            var bottomTextTop = problemsPanel.Y - infoGap - bottomLines.Count * bottomLineGap;
-            for (var i = 0; i < bottomLines.Count; i++)
+            var rightMargin = _projection.ScalePixels(12f);
+            var infoWidth = Math.Max(_projection.ScalePixels(10f), viewWidth - problemsPanel.X - rightMargin);
+            var lineHeight = Math.Max(_projection.ScalePixels(20f),
+                UnicodeTextRenderer.GetLogicalLineSpacing(editorHudFont) * _projection.ScalePixels(1f));
+            var wrappedBottomLines = new List<(string Text, Color Color)>();
+            foreach (var item in bottomLines)
             {
-                var text = FitHudText(editorHudFont, FontSafeText(editorHudFont, bottomLines[i].Text), infoWidth);
-                UnicodeTextRenderer.DrawString(_spriteBatch, editorHudFont, text,
-                    new Vector2(problemsPanel.X, bottomTextTop + i * bottomLineGap), bottomLines[i].Color);
+                var safeText = FontSafeText(editorHudFont, item.Text);
+                foreach (var line in WrapEditorHudText(editorHudFont, safeText, infoWidth))
+                    wrappedBottomLines.Add((line, item.Color));
+            }
+            var bottomTextTop = problemsPanel.Y - infoGap - wrappedBottomLines.Count * lineHeight;
+            for (var i = 0; i < wrappedBottomLines.Count; i++)
+            {
+                UnicodeTextRenderer.DrawString(_spriteBatch, editorHudFont, wrappedBottomLines[i].Text,
+                    new Vector2(problemsPanel.X, bottomTextTop + i * lineHeight), wrappedBottomLines[i].Color);
             }
         }
         else
@@ -1248,6 +1256,65 @@ public sealed partial class Playfield
         return ResolveEditorButtonFill(fill, style);
     }
 
+    private static List<string> WrapEditorHudText(SpriteFont font, string? rawText, float maxWidth)
+    {
+        var text = (rawText ?? string.Empty).Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        maxWidth = Math.Max(1f, maxWidth);
+        var lines = new List<string>();
+
+        foreach (var paragraph in text.Split('\n'))
+        {
+            if (string.IsNullOrWhiteSpace(paragraph))
+            {
+                lines.Add(string.Empty);
+                continue;
+            }
+
+            var current = string.Empty;
+            foreach (var word in paragraph.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var candidate = current.Length == 0 ? word : current + " " + word;
+                if (UnicodeTextRenderer.MeasureString(font, candidate).X <= maxWidth)
+                {
+                    current = candidate;
+                    continue;
+                }
+
+                if (current.Length > 0)
+                {
+                    lines.Add(current);
+                    current = string.Empty;
+                }
+
+                // Long paths, URLs, or network errors may not contain spaces. Break
+                // those at Unicode text-element boundaries rather than losing text.
+                var chunk = string.Empty;
+                var elementEnumerator = StringInfo.GetTextElementEnumerator(word);
+                while (elementEnumerator.MoveNext())
+                {
+                    var element = elementEnumerator.GetTextElement();
+                    if (chunk.Length > 0 && UnicodeTextRenderer.MeasureString(font, chunk + element).X > maxWidth)
+                    {
+                        lines.Add(chunk);
+                        chunk = element;
+                    }
+                    else
+                    {
+                        chunk += element;
+                    }
+                }
+                current = chunk;
+            }
+
+            if (current.Length > 0)
+                lines.Add(current);
+        }
+
+        if (lines.Count == 0)
+            lines.Add(string.Empty);
+        return lines;
+    }
+
     private (SpriteFont Font, string Text, Vector2 Measured, float Scale) FitChartEditorText(
         string rawText, string requestedFont, float requestedPixelHeight, float maxWidth, float maxHeight)
     {
@@ -1813,6 +1880,7 @@ public sealed partial class Playfield
                 ("AUX EVENTS", events.Count(ev => ev.RawType != 1).ToString("N0", CultureInfo.InvariantCulture)),
                 ("INSTRUMENTS", _chart.Instruments.Count.ToString("N0", CultureInfo.InvariantCulture))
             },
+            "TEST" => new List<(string Label, string Value)>(),
             _ => new List<(string Label, string Value)>()
         };
         // SC passcodes are only meaningful on the Extra difficulty tab.
@@ -1917,6 +1985,80 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(x, y, w, h), Text);
     }
 
+    private void DrawEditorLanTestTab(int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var font = _chartEditorInterfaceLayout.LabelFont;
+        var muted = _chartEditorInterfaceLayout.MutedTextColor;
+        var normal = _chartEditorInterfaceLayout.ButtonTextColor;
+        string status;
+        string details;
+        string address;
+        bool running;
+        bool busy;
+        bool stale;
+        lock (_editorLanTestSync)
+        {
+            status = _editorLanTestStatus;
+            details = _editorLanTestDetails;
+            address = _editorLanTestAddress;
+            running = _editorLanTestRunning;
+            busy = _editorLanTestBusy;
+            stale = _editorLanTestDataStale;
+        }
+        var chartSummary = GetEditorLanTestChartSummary();
+        var musicAvailable = IsEditorLanTestMusicAvailable();
+        var textFont = GetChartEditorFont(font, 24f);
+        float cursorY = content.Y + (int)MathF.Round(8f * unit);
+        var textLineHeight = Math.Max(16f * unit,
+            UnicodeTextRenderer.GetLogicalLineSpacing(textFont) * unit);
+        var textWidth = Math.Max(1f, content.Width);
+
+        void Line(string value, Color color)
+        {
+            var safeText = FontSafeText(textFont, value);
+            foreach (var wrapped in WrapEditorHudText(textFont, safeText, textWidth))
+            {
+                UnicodeTextRenderer.DrawString(_spriteBatch, textFont, wrapped,
+                    new Vector2(content.X, cursorY), color);
+                cursorY += textLineHeight;
+            }
+            cursorY += 4f * unit;
+        }
+
+        Line("STATUS: " + status, running ? new Color(52, 211, 153) : normal);
+        Line("MUSIC: " + (musicAvailable ? "Ready" : "Missing — import music under MEDIA first"),
+            musicAvailable ? normal : _chartEditorInterfaceLayout.DangerColor);
+        Line("CHARTS: " + chartSummary, normal);
+        if (!string.IsNullOrWhiteSpace(address))
+            Line("ADDRESS: " + address, normal);
+        Line(details, muted);
+        if (stale && running)
+            Line("TEST DATA IS OUT OF DATE — refresh before the next play.", new Color(251, 191, 36));
+        Line("Enable Local beatmap testing in your ReSONANCE account settings.", muted);
+        Line("Keep the PC and phone on the same private Wi-Fi. Allow TCP/UDP 8765 through Windows Firewall.", muted);
+
+        if (running)
+        {
+            DrawEditorMetaButton(GetEditorMetaLanTestButtonBounds(1, virtualWidth, virtualHeight),
+                busy ? "REFRESHING…" : "REFRESH TEST DATA",
+                busy ? new Color(44, 44, 46, 250) : new Color(28, 28, 30, 250),
+                busy ? new Color(100, 100, 102) : Active);
+            DrawEditorMetaButton(GetEditorMetaLanTestButtonBounds(2, virtualWidth, virtualHeight), "STOP",
+                new Color(55, 30, 35, 245), _chartEditorInterfaceLayout.DangerColor);
+        }
+        else
+        {
+            var enabled = !busy && _chart is not null && musicAvailable &&
+                chartSummary is not ("No enabled charts" or "Open a chart first");
+            DrawEditorMetaButton(GetEditorMetaLanTestButtonBounds(0, virtualWidth, virtualHeight),
+                busy ? "PREPARING…" : "START LAN TEST",
+                enabled ? new Color(22, 52, 42, 250) : new Color(38, 38, 40, 245),
+                enabled ? Active : new Color(100, 100, 102));
+        }
+    }
+
     private void DrawEditorMetaPanel(int virtualWidth, int virtualHeight)
     {
         var panel = GetEditorMetaPanelBounds(virtualWidth, virtualHeight);
@@ -1968,7 +2110,11 @@ public sealed partial class Playfield
         }
 
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
-        if (string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase))
+        {
+            DrawEditorLanTestTab(virtualWidth, virtualHeight);
+        }
+        else if (string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
         {
             DrawEditorMediaTab(virtualWidth, virtualHeight);
         }
@@ -2063,20 +2209,23 @@ public sealed partial class Playfield
 
         }
 
-        var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
-        var activeDifficultyEnabled = HasEditorDifficultyChart(activeCode) && IsEditorDifficultyEnabled(activeCode);
-        var difficultyToggleBounds = GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight);
-        DrawEditorMetaButton(difficultyToggleBounds,
-            $"{GetEditorDifficultyName(activeCode).ToUpperInvariant()} DIFFICULTY  {(activeDifficultyEnabled ? "ENABLED" : "DISABLED")}",
-            activeDifficultyEnabled ? new Color(22, 52, 42, 250) : new Color(55, 30, 35, 245),
-            activeDifficultyEnabled ? Active : interfaceUi.DangerColor);
-        var exportToggle = GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight);
-        DrawEditorMetaButton(exportToggle, "EXPORT", new Color(28, 28, 30, 250), Active);
-        if (_editorMetaDeleteConfirmOpen) DrawEditorMetaDeleteConfirmation(virtualWidth, virtualHeight);
-        if (_editorPreviewEditorOpen)
-            DrawEditorPreviewEditorOverlay(virtualWidth, virtualHeight);
-        if (_editorMetaExportExpanded)
-            DrawEditorMetaExportPopup(virtualWidth, virtualHeight);
+        if (!string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase))
+        {
+            var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+            var activeDifficultyEnabled = HasEditorDifficultyChart(activeCode) && IsEditorDifficultyEnabled(activeCode);
+            var difficultyToggleBounds = GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight);
+            DrawEditorMetaButton(difficultyToggleBounds,
+                $"{GetEditorDifficultyName(activeCode).ToUpperInvariant()} DIFFICULTY  {(activeDifficultyEnabled ? "ENABLED" : "DISABLED")}",
+                activeDifficultyEnabled ? new Color(22, 52, 42, 250) : new Color(55, 30, 35, 245),
+                activeDifficultyEnabled ? Active : interfaceUi.DangerColor);
+            var exportToggle = GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight);
+            DrawEditorMetaButton(exportToggle, "EXPORT", new Color(28, 28, 30, 250), Active);
+            if (_editorMetaDeleteConfirmOpen) DrawEditorMetaDeleteConfirmation(virtualWidth, virtualHeight);
+            if (_editorPreviewEditorOpen)
+                DrawEditorPreviewEditorOverlay(virtualWidth, virtualHeight);
+            if (_editorMetaExportExpanded)
+                DrawEditorMetaExportPopup(virtualWidth, virtualHeight);
+        }
     }
 
     private void DrawEditorMetaDeleteConfirmation(int virtualWidth, int virtualHeight)

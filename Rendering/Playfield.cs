@@ -44,7 +44,7 @@ public sealed partial class Playfield
 
     private static readonly string[] EditorDifficultyCodes = { "ez", "nm", "hd", "ex", "xt" };
     private static readonly string[] EditorDifficultyNames = { "Easy", "Normal", "Hard", "Expert", "Extra" };
-    private static readonly string[] EditorMetaCategories = { "SONG", "MEDIA", "JUDGEMENT", "STATS" };
+    private static readonly string[] EditorMetaCategories = { "SONG", "MEDIA", "JUDGEMENT", "STATS", "TEST" };
     private readonly Dictionary<string, EditorDifficultyState> _editorDifficultyStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _editorDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _editorCommittedDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
@@ -1324,6 +1324,12 @@ public sealed partial class Playfield
         {
             _editorHasUnsavedChanges = true;
             _editorDiagnosticsDirty = true;
+            lock (_editorLanTestSync)
+            {
+                _editorLanTestChangeRevision++;
+                if (_editorLanTestRunning || _editorLanTestBusy)
+                    _editorLanTestDataStale = true;
+            }
         }
     }
 
@@ -2935,6 +2941,7 @@ public sealed partial class Playfield
 
     public void LoadChart(string path)
     {
+        StopEditorLanTest();
         var fullInputPath = Path.GetFullPath(path);
         // Reopening a chart file from the current extracted TSTS workspace must
         // not delete the directory before that file is read.
@@ -10932,6 +10939,7 @@ public sealed partial class Playfield
 
     public void Dispose()
     {
+        StopEditorLanTest();
         StopEditorPreviewPlayback();
         ReleaseTstsWorkingDirectory();
         _audio.Dispose();

@@ -33,6 +33,12 @@
     <!-- The updater UI and update engine are part of TSC.exe now. Exclude only stale
          nested build artifacts left by older versions of the separate updater project. -->
     <Compile Remove="obj\**\*.cs;bin\**\*.cs;Updater\obj\**\*.cs;Updater\bin\**\*.cs;Launcher\**\*.cs" />
+    <!-- State contains generated song-list/cache data and updater bookkeeping, not project assets.
+         Never allow a developer's State files to flow into build or publish outputs. -->
+    <Compile Remove="State\**\*.cs" />
+    <None Remove="State\**\*" />
+    <Content Remove="State\**\*" />
+    <EmbeddedResource Remove="State\**\*" />
     <None Update="Updater\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
     <MonoGameContentReference Include="Content\Content.mgcb" />
     <EmbeddedResource Include="info.md" LogicalName="TSC.info.md" />
@@ -42,6 +48,11 @@
     <!-- Tool payloads are staged beside the root launcher after publish. Never publish a
          locally downloaded FFmpeg executable; users can install that one themselves. -->
     <None Update="tools\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <!-- The LAN test helper is part of the game runtime, not a root-level tool. -->
+    <None Update="tools\LanEditorServer\**\*"
+          TargetPath="LanEditorServer\%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never"
+          Condition="'$(Configuration)' != 'Publish'" />
   </ItemGroup>
   <!-- Final install layout: the game and its self-contained .NET 8 runtime live in data/;
        the tiny Native AOT launcher, user files, Default skin, and tools stay at the install root. -->
@@ -54,6 +65,9 @@
           Condition="'$(Configuration)' == 'Publish' and '$(PublishDir)' != ''">
     <MakeDir Directories="$(TSCInstallRoot)" />
 
+    <!-- Runtime/user state belongs beside the launcher, never inside data/. Remove stale
+         generated State/Logs folders from older publishes; root user data is preserved. -->
+    <RemoveDir Directories="$(PublishDir)State;$(PublishDir)Logs" />
     <!-- Never ship a second copy of the skin under data/. -->
     <RemoveDir Directories="$(PublishDir)Skins\Default;$(PublishDir)Skins;$(PublishDir)updater;$(PublishDir)updater.next;$(PublishDir)updater.old;$(TSCInstallRoot)updater;$(TSCInstallRoot)updater.next;$(TSCInstallRoot)updater.old" />
 
@@ -61,7 +75,8 @@
          excluding ffmpeg.exe (a user-installed dependency that must not ship). -->
     <ItemGroup>
       <_TscRootToolFiles Include="$(MSBuildProjectDirectory)\tools\**\*"
-                         Exclude="$(MSBuildProjectDirectory)\tools\**\ffmpeg.exe" />
+                         Exclude="$(MSBuildProjectDirectory)\tools\**\ffmpeg.exe;$(MSBuildProjectDirectory)\tools\LanEditorServer\**\*" />
+      <_TscLanEditorServerFiles Include="$(MSBuildProjectDirectory)\tools\LanEditorServer\**\*" />
       <_TscPublishedToolFiles Include="$(PublishDir)tools\**\*" />
     </ItemGroup>
     <MakeDir Directories="$(TSCInstallRoot)tools" />
@@ -73,6 +88,14 @@
           Condition="'@(_TscRootToolFiles)' != ''" />
     <Delete Files="@(_TscPublishedToolFiles)" />
     <RemoveDir Directories="$(PublishDir)tools" />
+
+    <!-- Ship the LAN editor test service beside the game runtime under data/, not root/tools/. -->
+    <RemoveDir Directories="$(TSCInstallRoot)data\LanEditorServer" />
+    <MakeDir Directories="$(TSCInstallRoot)data\LanEditorServer" />
+    <Copy SourceFiles="@(_TscLanEditorServerFiles)"
+          DestinationFiles="@(_TscLanEditorServerFiles->'$(TSCInstallRoot)data\LanEditorServer\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="'@(_TscLanEditorServerFiles)' != ''" />
 
     <!-- Refresh only the shipped Default skin folder; custom skins stay separate. -->
     <RemoveDir Directories="$(TSCInstallRoot)Skins\Default" />

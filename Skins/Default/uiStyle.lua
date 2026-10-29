@@ -462,7 +462,12 @@ function UI.draw_row(options)
         local description_size = options.description_size or UI.sizes.description
         local description_line_height = description_size * 1.25
         local description_line = 0
-        for line in (tostring(options.description) .. "\n"):gmatch("(.-)\n") do
+        local description_text = tostring(options.description)
+        local description_start = 1
+        while true do
+            local newline = string.find(description_text, "\n", description_start, true)
+            local line = newline and string.sub(description_text, description_start, newline - 1)
+                or string.sub(description_text, description_start)
             if line ~= "" then
                 draw.text(line, {
                     parent = frame_id,
@@ -476,6 +481,8 @@ function UI.draw_row(options)
                 })
             end
             description_line = description_line + 1
+            if newline == nil then break end
+            description_start = newline + 1
         end
     else
         draw.text(options.label or "", {

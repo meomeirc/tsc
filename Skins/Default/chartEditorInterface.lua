@@ -104,6 +104,39 @@ local function fittedMeasuredText(text, width, size, font)
     return best
 end
 
+-- Split on literal separators instead of Lua patterns. MoonSharp can report
+-- "pattern too complex" when a long single-line error message is passed to a
+-- non-greedy pattern such as (.-)\n.
+local function forEachLiteralLine(text, callback)
+    local source = tostring(text or "")
+    local startIndex = 1
+    while true do
+        local newline = string.find(source, "\n", startIndex, true)
+        if newline == nil then
+            callback(string.sub(source, startIndex))
+            break
+        end
+        callback(string.sub(source, startIndex, newline - 1))
+        startIndex = newline + 1
+    end
+end
+
+local function forEachWord(sourceLine, callback)
+    local index = 1
+    while index <= #sourceLine do
+        local byte = string.byte(sourceLine, index)
+        if byte <= 32 then
+            index = index + 1
+        else
+            local startIndex = index
+            while index <= #sourceLine and string.byte(sourceLine, index) > 32 do
+                index = index + 1
+            end
+            callback(string.sub(sourceLine, startIndex, index - 1))
+        end
+    end
+end
+
 -- Wrap complete descriptions into measured lines instead of shortening them.
 -- This mirrors chartEditorMenu.lua so choice buttons can grow to fit their text.
 local function wrapMeasuredText(text, maxWidth, size, font)
@@ -111,20 +144,47 @@ local function wrapMeasuredText(text, maxWidth, size, font)
     size = math.max(1, tonumber(size) or 1)
     maxWidth = math.max(1, tonumber(maxWidth) or 1)
     font = font or F.regular
-    for sourceLine in (tostring(text or "") .. "\n"):gmatch("(.-)\n") do
-        local line = ""
-        for word in sourceLine:gmatch("%S+") do
-            local candidate = line == "" and word or (line .. " " .. word)
-            local measured = draw.measure_text(candidate, { font = font, size = size })
-            if line ~= "" and measured > maxWidth then
-                table.insert(lines, line)
-                line = word
-            else
-                line = candidate
-            end
-        end
-        table.insert(lines, line)
+    local measureOptions = { font = font, size = size }
+    local function measured(value)
+        return draw.measure_text(value, measureOptions)
     end
+
+    forEachLiteralLine(text, function(sourceLine)
+        local line = ""
+        local function appendWord(word)
+            local candidate = line == "" and word or (line .. " " .. word)
+            if measured(candidate) <= maxWidth then
+                line = candidate
+                return
+            end
+
+            if line ~= "" then
+                table.insert(lines, line)
+                line = ""
+            end
+
+            -- A single long path, URL, or error token must not escape the menu.
+            -- Split it only at UTF-8 code-point boundaries, never by raw byte.
+            local chunk = ""
+            local index = 1
+            while index <= #word do
+                local first = string.byte(word, index)
+                local length = first < 128 and 1 or first < 224 and 2 or first < 240 and 3 or 4
+                local glyph = string.sub(word, index, math.min(#word, index + length - 1))
+                if chunk ~= "" and measured(chunk .. glyph) > maxWidth then
+                    table.insert(lines, chunk)
+                    chunk = glyph
+                else
+                    chunk = chunk .. glyph
+                end
+                index = index + length
+            end
+            line = chunk
+        end
+
+        forEachWord(sourceLine, appendWord)
+        table.insert(lines, line)
+    end)
     if #lines == 0 then lines[1] = "" end
     return lines
 end
@@ -845,7 +905,7 @@ local function drawMeta(state, w, h, layer)
     local exportToggleY = y + panelH - padding - exportToggleH
     local difficultyToggleH = 34 * scale
     local difficultyToggleY = exportToggleY - 6 * scale - difficultyToggleH
-    local contentBottom = difficultyToggleY - padding
+    local contentBottom = state.meta_category == "TEST" and (y + panelH - padding) or (difficultyToggleY - padding)
     local contentTop = y + 156 * scale
     local rowLabelH = 20 * scale
     local rowLabelGap = 5 * scale
@@ -919,7 +979,82 @@ local function drawMeta(state, w, h, layer)
         end
     end
 
-    if state.meta_category == "MEDIA" then
+    if state.meta_category == "TEST" then
+        local textWidth = math.max(1, panelW - padding * 2)
+        local textX = x + padding
+        local textY = contentTop + 2 * scale
+        local bodySize = fontSize("body")
+        local smallSize = fontSize("small")
+        local bodyLineHeight = math.max(18 * scale, bodySize * 1.35)
+        local smallLineHeight = math.max(16 * scale, smallSize * 1.4)
+        local bodyLayer = (layer or 100) + 5
+        local labelLayer = (layer or 100) + 4
+
+        local function drawWrappedValue(value, size, color, font, lineHeight, drawLayer)
+            local wrapped = wrapMeasuredText(value, textWidth, size, font)
+            -- Match editorChartMenu's description renderer: draw each line separately.
+            -- A single draw.text call containing many lines can be scaled against the
+            -- full block height by legacy UI sizing, making the text look tiny.
+            for lineIndex, line in ipairs(wrapped) do
+                draw.text(line, {
+                    x = textX, y = textY + (lineIndex - 1) * lineHeight,
+                    size = size, color = color, font = font,
+                    anchor = "top-left", layer = drawLayer or bodyLayer })
+            end
+            textY = textY + #wrapped * lineHeight + 5 * scale
+        end
+
+        local function drawTestField(caption, value, color, font)
+            label(caption, textX, textY, smallSize, C.muted, nil, labelLayer)
+            textY = textY + math.max(17 * scale, smallSize * 1.3)
+            drawWrappedValue(value, bodySize, color, font or F.regular, bodyLineHeight, bodyLayer)
+        end
+
+        drawTestField("STATUS", state.meta_test_status or "Not running",
+            state.meta_test_running and C.accent or C.text, F.medium)
+        local musicStatus = state.meta_test_music_available and "Ready" or "Missing — import music in MEDIA first"
+        drawTestField("MUSIC", musicStatus,
+            state.meta_test_music_available and C.text or C.error, F.regular)
+        drawTestField("AVAILABLE CHARTS", state.meta_test_chart_summary or "No charts exported", C.text, F.regular)
+        drawTestField("LAN ADDRESS",
+            (state.meta_test_address and state.meta_test_address ~= "" and state.meta_test_address) or "Shown after the server starts",
+            C.text, F.regular)
+
+        if state.meta_test_details and state.meta_test_details ~= "" then
+            drawWrappedValue(state.meta_test_details, smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
+        end
+        if state.meta_test_data_stale == true then
+            drawWrappedValue("TEST DATA CHANGED — refresh before the next play.", smallSize,
+                C.warning or C.accent, F.medium, smallLineHeight, (layer or 100) + 6)
+        end
+        drawWrappedValue("Enable Local beatmap testing in your ReSONANCE account settings.",
+            smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
+        drawWrappedValue("Keep the phone and PC on the same private Wi-Fi; allow TCP/UDP 8765 in Windows Firewall.",
+            smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
+
+        -- Keep actions docked to the bottom of the panel; the text above them can
+        -- now take as many wrapped lines as necessary without being ellipsized.
+        local testButtonY = contentBottom - 38 * scale - 8 * scale
+        if state.meta_test_running == true then
+            local gap = 8 * scale
+            local half = (panelW - padding * 2 - gap) / 2
+            UI.draw_button({ id = "editor_lan_test_refresh", x = x + padding, y = testButtonY,
+                width = half, height = 38 * scale,
+                label = state.meta_test_busy and "REFRESHING..." or "REFRESH TEST DATA",
+                action = "editor.lan_test.refresh", enabled = state.meta_test_refresh_enabled == true,
+                variant = "secondary", font = F.medium, text_size = fontSize("small"), layer = (layer or 100) + 7 })
+            UI.draw_button({ id = "editor_lan_test_stop", x = x + padding + half + gap, y = testButtonY,
+                width = half, height = 38 * scale, label = "STOP", action = "editor.lan_test.stop",
+                enabled = state.meta_test_stop_enabled == true, variant = "danger", font = F.medium,
+                text_size = fontSize("small"), layer = (layer or 100) + 7 })
+        else
+            UI.draw_button({ id = "editor_lan_test_start", x = x + padding, y = testButtonY,
+                width = math.max(1, panelW - padding * 2), height = 38 * scale,
+                label = state.meta_test_busy and "PREPARING..." or "START LAN TEST",
+                action = "editor.lan_test.start", enabled = state.meta_test_start_enabled == true,
+                variant = "success", font = F.medium, text_size = fontSize("body"), layer = (layer or 100) + 7 })
+        end
+    elseif state.meta_category == "MEDIA" then
         -- Keep music and preview controls at the top and give album artwork its own
         -- square-card area, matching the C# fallback Info panel. The native renderer
         -- draws the loaded textures over these frames without cropping them.
@@ -996,6 +1131,7 @@ local function drawMeta(state, w, h, layer)
         end
     end
 
+    if state.meta_category ~= "TEST" then
     local difficultyToggleLabel = tostring(state.meta_difficulty_label or "DIFFICULTY") ..
         (state.meta_difficulty_enabled and "  ENABLED" or "  DISABLED")
     if state.meta_difficulty_has_chart == false then
@@ -1016,6 +1152,7 @@ local function drawMeta(state, w, h, layer)
         width = math.max(1, panelW - padding * 2), height = exportToggleH, label = "EXPORT",
         action = "editor.meta.export_toggle", font = F.medium, text_size = fontSize("body"),
         layer = (layer or 100) + 6 })
+    end
 
     -- Register the element options after the rows, scrollbar, and export controls.
     -- Expanded options can overlap those controls, and the UI dispatcher gives
@@ -1163,7 +1300,7 @@ function drawPreviewEditor(state, w, h, layer)
         font = F.medium, text_size = fontSize("body"), layer = (layer or 130) + 5 })
 end
 
-local function drawInfo(state, x, y, width, problemsY, layer)
+local function drawInfo(state, x, y, width, problemsY, layer, screenWidth)
     if state.hud_visible ~= true then return end
     local lineGap = 30 * ACTIVE_SCALE
     local infoLines = {
@@ -1200,15 +1337,39 @@ local function drawInfo(state, x, y, width, problemsY, layer)
     end
 
     local bottomLines = {}
-    if state.source_name and state.source_name ~= "" then table.insert(bottomLines, state.source_name) end
-    if state.status_message and state.status_message ~= "" then table.insert(bottomLines, state.status_message) end
-    local bottomY = problemsY - (#bottomLines * 28 + 8) * ACTIVE_SCALE
-    for i, line in ipairs(bottomLines) do
-        draw.text(fittedText(line, width, fontSize("small")), {
-            x = x, y = bottomY + (i - 1) * 28 * ACTIVE_SCALE,
-            size = fontSize("small"), color = i == #bottomLines and C.text or C.muted,
-            font = F.regular, anchor = "top-left", layer = layer,
-        })
+    if state.source_name and state.source_name ~= "" then
+        table.insert(bottomLines, { text = state.source_name, color = C.muted })
+    end
+    if state.status_message and state.status_message ~= "" then
+        table.insert(bottomLines, { text = state.status_message, color = C.text })
+    end
+    if #bottomLines == 0 then return end
+
+    -- Status/source info is not part of the Problems panel: give it the remaining
+    -- screen width, then wrap it into as many lines as needed instead of ellipsizing.
+    local rightMargin = LAYOUT.margin * ACTIVE_SCALE
+    local bottomWidth = math.max(width, (tonumber(screenWidth) or (x + width)) - x - rightMargin)
+    local textSize = fontSize("small")
+    local wrappedGroups = {}
+    local totalHeight = 0
+    local lineHeight = math.max(20 * ACTIVE_SCALE, textSize * 1.4)
+    for _, item in ipairs(bottomLines) do
+        local lines = wrapMeasuredText(item.text, bottomWidth, textSize, F.regular)
+        table.insert(wrappedGroups, { lines = lines, color = item.color })
+        totalHeight = totalHeight + #lines * lineHeight
+    end
+    if #wrappedGroups > 1 then totalHeight = totalHeight + (#wrappedGroups - 1) * 4 * ACTIVE_SCALE end
+
+    local bottomY = problemsY - totalHeight - 8 * ACTIVE_SCALE
+    for groupIndex, group in ipairs(wrappedGroups) do
+        for _, line in ipairs(group.lines) do
+            draw.text(line, {
+                x = x, y = bottomY, size = textSize, color = group.color,
+                font = F.regular, anchor = "top-left", layer = layer,
+            })
+            bottomY = bottomY + lineHeight
+        end
+        if groupIndex < #wrappedGroups then bottomY = bottomY + 4 * ACTIVE_SCALE end
     end
 end
 
@@ -1431,7 +1592,7 @@ function render()
     local problemY = math.max(margin + 70 * scale, leftPanelY - problemsHeight - 10 * scale)
     drawProblems(s, problemX, problemY, problemW, 2)
     drawInfo(s, problemX, margin + speedH + 10 * scale,
-        math.max(100 * scale, actionX - problemX - gap), problemY, 3)
+        math.max(100 * scale, actionX - problemX - gap), problemY, 3, w)
     drawAuxDebug(s, w, margin, actionX, scale)
 
     -- Bank indicators use the same projected note-lane positions as the editor.
