@@ -2546,7 +2546,7 @@ public sealed partial class Playfield
         {
             var fileName = _editorBundleTemplate == ChartBundleTemplate.Tsts &&
                            string.Equals(Path.GetFileName(directory), "charts", StringComparison.OrdinalIgnoreCase)
-                ? GetTstsBundleChartFileName(code) + ".ares"
+                ? GetTstsBundleChartFileName(code)
                 : GetAresFileNameForTemplate(code, _editorBundleTemplate);
             return Path.Combine(directory, fileName);
         }
