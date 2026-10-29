@@ -589,7 +589,9 @@ public sealed partial class Playfield
         if (GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pixel) || pointerOverToolbar)
             return false;
 
-        var shift = KeybindSettings.IsDown("editor_connect_modifier");
+        var shift = _editorConnectorMode
+            ? KeybindSettings.IsModifierBindingDown("editor_connect_modifier")
+            : KeybindSettings.IsDown("editor_connect_modifier");
         if (!area.Contains(pixel))
         {
             if (!_editorPlacementEnabled && !_editorConnectorMode && (leftPressed || touchPressed))

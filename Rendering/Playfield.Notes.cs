@@ -25,11 +25,33 @@ public sealed partial class Playfield
 
         _editorConnectorPreviewTargetHead = null;
         _editorConnectorPreviewSourceTap = null;
-        if (TryGetEditorConnectorPreviewTarget(out var previewSource, out var previewTargetHead))
+        _editorConnectorPreviewAbsorbedTargetBody = null;
+        _editorConnectorPreviewBody3DCommands.Clear();
+        _editorConnectorPreviewHeadCommands.Clear();
+        // The inactive-bank pass is only used to prepare the faded background
+        // layer. Keep the connector preview and its source/target replacements in
+        // the main pass so the preview is composited once over the complete frame.
+        if (!_editorInactiveBankLayerPass &&
+            TryGetEditorConnectorPreviewTarget(out var previewSource, out var previewTargetHead))
         {
             _editorConnectorPreviewTargetHead = previewTargetHead;
             if (previewSource.NoteType == NoteType.Single && previewSource.Attr == 0)
                 _editorConnectorPreviewSourceTap = previewSource;
+
+            if (previewTargetHead.NoteType == NoteType.SingleLong)
+            {
+                var sameTrackTarget = previewTargetHead.Track == previewSource.Track;
+                var horizontalFirstTarget = !sameTrackTarget &&
+                    KeybindSettings.IsModifierBindingDown("editor_connector_horizontal_first");
+                var connectionTick = horizontalFirstTarget &&
+                    (previewSource.NoteType == NoteType.SingleLong ||
+                     (previewSource.NoteType == NoteType.LinkTail && previewSource.Duration > 6))
+                        ? previewSource.EndTick
+                        : previewSource.Tick;
+                if (sameTrackTarget || (horizontalFirstTarget && _hoverBeatTick.HasValue &&
+                    _hoverBeatTick.Value > connectionTick))
+                    _editorConnectorPreviewAbsorbedTargetBody = previewTargetHead;
+            }
         }
 
         ClearNoteGeometryCache();
@@ -44,8 +66,8 @@ public sealed partial class Playfield
         // per event. These values are immutable for the duration of DrawNotes.
         var renderAhead = _projection.GetRenderDistanceAhead();
         var renderBehind = _projection.GetRenderDistanceBehind();
-        var activeLeftBank = _compact ? GearTimeline.ActiveBankForSide(currentState, "left") : string.Empty;
-        var activeRightBank = _compact ? GearTimeline.ActiveBankForSide(currentState, "right") : string.Empty;
+        var activeLeftBank = GearTimeline.ActiveBankForSide(currentState, "left");
+        var activeRightBank = GearTimeline.ActiveBankForSide(currentState, "right");
 
         // Track geometry is static; calculate the 16 normalized centers once per
         // frame instead of repeating GearState/column resolution for every event.
@@ -198,27 +220,33 @@ public sealed partial class Playfield
             if (_projection.BeyondLaneStart(startTravel, endTravel))
                 continue;
 
-            if (_gameplayMode && ev.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail)
+            if (_gameplayMode && ev.NoteType is NoteType.SingleLong or NoteType.Vibrato)
             {
-                if (ev.NoteType == NoteType.LinkHead)
-                {
-                    if (_performanceDebugInstrumentFrame)
-                        _debugVisibleGameplayChains++;
-                    if (_performanceDebugInstrumentFrame)
-                    {
-                        var gameplayLinkStartTimestamp = Stopwatch.GetTimestamp();
-                        DrawLinkChainUnified(ev, currentState, counts, bodyCommands, connectorCommands, headCommands, currentTick);
-                        _debugGameplayLinkBuildMs += ElapsedMilliseconds(gameplayLinkStartTimestamp);
-                    }
-                    else
-                    {
-                        DrawLinkChainUnified(ev, currentState, counts, bodyCommands, connectorCommands, headCommands, currentTick);
-                    }
-                }
-                else if (ev.NoteType is NoteType.SingleLong or NoteType.Vibrato)
-                    DrawGameplayRegularHold(ev, currentState, counts, bodyCommands, headCommands, currentTick);
+                DrawGameplayRegularHold(ev, currentState, counts, bodyCommands, headCommands, currentTick);
                 continue;
             }
+
+            if (_gameplayMode && ev.NoteType == NoteType.LinkHead && _linkHeadKeys.Contains(eventKey))
+            {
+                if (_performanceDebugInstrumentFrame)
+                {
+                    _debugVisibleGameplayChains++;
+                    var gameplayLinkStartTimestamp = Stopwatch.GetTimestamp();
+                    DrawLinkChainUnified(ev, currentState, counts, bodyCommands, connectorCommands, headCommands, currentTick);
+                    _debugGameplayLinkBuildMs += ElapsedMilliseconds(gameplayLinkStartTimestamp);
+                }
+                else
+                {
+                    DrawLinkChainUnified(ev, currentState, counts, bodyCommands, connectorCommands, headCommands, currentTick);
+                }
+                continue;
+            }
+
+            // A connected LinkTail is drawn by its chain's LinkHead pass. An
+            // orphaned tail has no chain pass to draw it, so let it fall through
+            // to the ordinary note rendering below instead of silently dropping it.
+            if (_gameplayMode && ev.NoteType == NoteType.LinkTail && _linkHeadByTailKey.ContainsKey(eventKey))
+                continue;
 
             // Real link chains use the exact same renderer in autoplay and gameplay.
             // Only their state model differs; geometry, projection, connectors and tails
@@ -405,9 +433,12 @@ public sealed partial class Playfield
                 continue;
             }
 
-            var simultaneous = ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
+            var noteIsInActiveBank = notePosition.Side == "left"
+                ? string.Equals(activeLeftBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase)
+                : string.Equals(activeRightBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase);
+            var simultaneous = (noteIsInActiveBank) && (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
                 ? IsLinkChainSimultaneous(ev, counts)
-                : IsSimultaneous(ev, counts);
+                : IsSimultaneous(ev, counts));
 
             if (ev.IsFlick)
             {
@@ -456,7 +487,8 @@ public sealed partial class Playfield
                     : simultaneous ? bodyMultiTextureDefault : bodyTextureDefault;
                 var bodyPosition = position;
                 if (body is not null && bodyPosition is not null &&
-                    !IsEditorConnectorPreviewReplacingExistingLongBody(ev))
+                    !IsEditorConnectorPreviewReplacingExistingLongBody(ev) &&
+                    !IsEditorConnectorPreviewReplacingAbsorbedTargetBody(ev))
                 {
                     // start/end travel is already cached for this render event. Avoid
                     // converting ticks -> seconds -> tempo-map scroll a second time just
@@ -505,7 +537,8 @@ public sealed partial class Playfield
                 }
             }
             else if ((ev.NoteType == NoteType.SingleLong || isTerminalLinkTail || isLinkHeadHoldWithoutSegment) &&
-                     showAutoplayEndpointOverlay)
+                     showAutoplayEndpointOverlay &&
+                     !IsEditorConnectorPreviewReplacingAbsorbedTargetBody(ev))
             {
                 var dim = simultaneous ? dimMultiTexture : dimTexture;
                 var light = simultaneous ? lightMultiTexture : lightLongTexture;
@@ -643,6 +676,7 @@ public sealed partial class Playfield
             var headDrawStartTimestamp = Stopwatch.GetTimestamp();
             DrawHeadsAndSuperFlicks(headCommands, head3DCommands, superFlicks, currentTick);
             _debugTexturedDrawMs += ElapsedMilliseconds(headDrawStartTimestamp);
+            DrawEditorConnectorPreviewComposite();
         }
         else
         {
@@ -653,6 +687,7 @@ public sealed partial class Playfield
             DrawTexturedBodyCommands(bodyCommands);
             DrawTexturedCommands(connectorCommands);
             DrawHeadsAndSuperFlicks(headCommands, head3DCommands, superFlicks, currentTick);
+            DrawEditorConnectorPreviewComposite();
         }
 
         // Texture fallbacks for machines missing part of the external texture
@@ -700,7 +735,7 @@ public sealed partial class Playfield
         var hoveredExistingNote = FindEditorNoteAtGridCell(targetTick, targetTrack);
         if (hoveredExistingNote is not null)
         {
-            var connectModifierHeld = KeybindSettings.IsDown("editor_connect_modifier");
+            var connectModifierHeld = KeybindSettings.IsModifierBindingDown("editor_connect_modifier");
             if (!connectModifierHeld || hoveredExistingNote.NoteType is not
                     (NoteType.Single or NoteType.SingleLong or NoteType.LinkHead or NoteType.LinkTail))
                 return false;
@@ -720,8 +755,9 @@ public sealed partial class Playfield
             }
         }
 
-        // A same-tick cross-track connector is horizontal and does not replace the
-        // existing longitudinal body.
+        // This helper suppresses an existing long link body's full rendering only
+        // when a cross-track connector preview replaces it. Same-track extensions
+        // keep the old body and preview only the additional segment.
         if (targetTick <= source.Tick || (hoveredExistingNote is not null && targetTrack == source.Track))
             return false;
 
@@ -730,18 +766,10 @@ public sealed partial class Playfield
         if (sourcePosition is null || targetPosition is null)
             return false;
 
-        if (targetTrack == source.Track)
-        {
-            if (targetTick - source.Tick <= 6)
-                return false;
-        }
-        else
-        {
-            var sourceFamily = LinkBuilder.Family(source.Track);
-            var targetFamily = LinkBuilder.Family(targetTrack);
-            if (sourceFamily is null || !string.Equals(sourceFamily, targetFamily, StringComparison.Ordinal))
-                return false;
-        }
+        var sourceFamily = LinkBuilder.Family(source.Track);
+        var targetFamily = LinkBuilder.Family(targetTrack);
+        if (sourceFamily is null || !string.Equals(sourceFamily, targetFamily, StringComparison.Ordinal))
+            return false;
 
         return true;
     }
@@ -751,7 +779,6 @@ public sealed partial class Playfield
         source = null!;
         targetHead = null!;
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
-            !KeybindSettings.IsDown("editor_connect_modifier") ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
             return false;
@@ -767,36 +794,57 @@ public sealed partial class Playfield
         var targetTick = Math.Max(0, _hoverBeatTick.Value);
         var targetTrack = Math.Clamp(_hoverTrack.Value, 0, 15);
         var existingTarget = FindEditorNoteAtGridCell(targetTick, targetTrack);
-        if (existingTarget is null || ReferenceEquals(existingTarget, source) ||
-            existingTarget.NoteType is not (NoteType.Single or NoteType.SingleLong or NoteType.LinkHead or NoteType.LinkTail))
-            return false;
-
-        var targetRoot = GetEditorLinkRoot(existingTarget);
-        if (targetRoot is not null)
+        if (existingTarget is not null)
         {
-            if (ReferenceEquals(targetRoot, GetEditorLinkRoot(source)) || targetRoot.Tick < source.Tick)
+            // Existing-note connections require the dedicated Connect modifier;
+            // blank grid cells can preview a connector without that modifier.
+            if (!KeybindSettings.IsModifierBindingDown("editor_connect_modifier") ||
+                ReferenceEquals(existingTarget, source) ||
+                existingTarget.NoteType is not (NoteType.Single or NoteType.SingleLong or NoteType.LinkHead or NoteType.LinkTail))
                 return false;
-            targetHead = targetRoot;
-            targetTick = targetRoot.Tick;
-            targetTrack = targetRoot.Track;
+
+            var targetRoot = GetEditorLinkRoot(existingTarget);
+            if (targetRoot is not null)
+            {
+                if (ReferenceEquals(targetRoot, GetEditorLinkRoot(source)) || targetRoot.Tick < source.Tick)
+                    return false;
+                targetHead = targetRoot;
+                targetTick = targetRoot.Tick;
+                targetTrack = targetRoot.Track;
+            }
+            else
+            {
+                targetHead = existingTarget;
+                targetTick = existingTarget.Tick;
+                targetTrack = existingTarget.Track;
+            }
+
+            if (targetTick < source.Tick || (targetTick == source.Tick && targetTrack == source.Track))
+                return false;
+            if (targetTrack == source.Track)
+            {
+                if (targetHead.NoteType is not (NoteType.Single or NoteType.SingleLong) ||
+                    targetTick - source.Tick <= 6 ||
+                    ((source.NoteType is NoteType.SingleLong or NoteType.LinkTail) && targetTick < source.EndTick))
+                    return false;
+            }
         }
         else
         {
-            targetHead = existingTarget;
-            targetTick = existingTarget.Tick;
-            targetTrack = existingTarget.Track;
+            // A blank-cell preview still replaces a plain tap with the translucent
+            // LinkHead appearance. The source tap would otherwise be drawn twice.
+            targetHead = null!;
+            if (targetTick < source.Tick)
+                return false;
+            if (targetTrack == source.Track && targetTick - source.Tick <= 6)
+                return false;
         }
-
-        // Existing targets are only valid when the connector reaches another lane;
-        // same-lane existing notes are edited with the duration handle instead.
-        if (targetTick < source.Tick || targetTrack == source.Track)
-            return false;
 
         var supportedSource = source.NoteType switch
         {
             NoteType.Single => source.Attr == 0,
             NoteType.SingleLong => true,
-            NoteType.Vibrato => false,
+            NoteType.Vibrato => targetTrack == source.Track,
             NoteType.LinkHead or NoteType.LinkTail => true,
             _ => false
         };
@@ -808,11 +856,17 @@ public sealed partial class Playfield
         if (sourcePosition is null || targetPosition is null)
             return false;
 
-        var sourceFamily = LinkBuilder.Family(source.Track);
-        var targetFamily = LinkBuilder.Family(targetTrack);
-        if (sourceFamily is null || !string.Equals(sourceFamily, targetFamily, StringComparison.Ordinal))
-            return false;
+        if (targetTrack != source.Track)
+        {
+            var sourceFamily = LinkBuilder.Family(source.Track);
+            var targetFamily = LinkBuilder.Family(targetTrack);
+            if (sourceFamily is null || !string.Equals(sourceFamily, targetFamily, StringComparison.Ordinal))
+                return false;
+        }
         if (source.NoteType == NoteType.SingleLong && targetTick < source.EndTick)
+            return false;
+        if (targetTrack != source.Track && KeybindSettings.IsModifierBindingDown("editor_connector_horizontal_first") &&
+            source.NoteType == NoteType.LinkTail && source.Duration > 6 && targetTick < source.EndTick)
             return false;
 
         return true;
@@ -820,6 +874,10 @@ public sealed partial class Playfield
 
     private bool IsEditorConnectorPreviewReplacingTargetHead(ChartEvent ev)
         => _editorConnectorPreviewTargetHead is not null && ReferenceEquals(_editorConnectorPreviewTargetHead, ev);
+
+    private bool IsEditorConnectorPreviewReplacingAbsorbedTargetBody(ChartEvent ev)
+        => _editorConnectorPreviewAbsorbedTargetBody is not null &&
+           ReferenceEquals(_editorConnectorPreviewAbsorbedTargetBody, ev);
 
     private bool IsEditorConnectorPreviewReplacingSourceTapHead(ChartEvent ev)
         => _editorConnectorPreviewSourceTap is not null && ReferenceEquals(_editorConnectorPreviewSourceTap, ev);
@@ -829,7 +887,7 @@ public sealed partial class Playfield
         GearState currentState,
         Dictionary<int, int> counts)
     {
-        if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
+        if (_editorInactiveBankLayerPass || !_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
             return;
@@ -849,7 +907,7 @@ public sealed partial class Playfield
         var hoveredExistingNote = FindEditorNoteAtGridCell(targetTick, targetTrack);
         if (hoveredExistingNote is not null)
         {
-            var connectModifierHeld = KeybindSettings.IsDown("editor_connect_modifier");
+            var connectModifierHeld = KeybindSettings.IsModifierBindingDown("editor_connect_modifier");
             if (!connectModifierHeld || ReferenceEquals(hoveredExistingNote, source) ||
                 hoveredExistingNote.NoteType is not (NoteType.Single or NoteType.SingleLong or NoteType.LinkHead or NoteType.LinkTail))
                 return;
@@ -876,7 +934,8 @@ public sealed partial class Playfield
             return;
 
         var sameTrack = targetTrack == source.Track;
-        if (hoveredExistingNote is not null && sameTrack)
+        if (hoveredExistingNote is not null && sameTrack &&
+            hoveredExistingNote.NoteType is not (NoteType.Single or NoteType.SingleLong))
             return;
         var supportedSource = source.NoteType switch
         {
@@ -896,9 +955,10 @@ public sealed partial class Playfield
 
         if (sameTrack)
         {
-            // A same-track connector becomes a hold end and requires a visible
-            // long body; smaller spans are rejected by the real placement path.
-            if (targetTick - source.Tick <= 6)
+            // A same-track existing tap/hold becomes the duration endpoint; a
+            // target hold contributes its existing end tick to the combined hold.
+            if (targetTick - source.Tick <= 6 ||
+                ((source.NoteType is NoteType.SingleLong or NoteType.LinkTail) && targetTick < source.EndTick))
                 return;
         }
         else
@@ -911,22 +971,98 @@ public sealed partial class Playfield
                 return;
         }
 
-        const float previewAlpha = 0.42f;
+        var horizontalFirstRequested = !sameTrack &&
+            KeybindSettings.IsModifierBindingDown("editor_connector_horizontal_first");
+        var connectionTick = horizontalFirstRequested &&
+            (source.NoteType == NoteType.SingleLong ||
+             (source.NoteType == NoteType.LinkTail && source.Duration > 6))
+                ? source.EndTick
+                : source.Tick;
+        var horizontalFirst = horizontalFirstRequested;
+        if (horizontalFirst && targetTick < connectionTick)
+            return;
+        var absorbsHoveredExistingNote = hoveredExistingNote is not null &&
+            (sameTrack || (horizontalFirst && targetTick > connectionTick)) &&
+            (hoveredExistingNote.NoteType is NoteType.Single or NoteType.SingleLong);
+        var previewEndTick = absorbsHoveredExistingNote && hoveredExistingNote!.NoteType == NoteType.SingleLong
+            ? hoveredExistingNote.EndTick
+            : targetTick;
+        if (horizontalFirst && targetTick > connectionTick)
+        {
+            var sourceRootForPreview = GetEditorLinkRoot(source);
+            var hoveredRootForPreview = hoveredExistingNote is null ? null : GetEditorLinkRoot(hoveredExistingNote);
+            var occupiedAtConnection = FindEditorNoteAtGridCell(connectionTick, targetTrack);
+            if (occupiedAtConnection is not null &&
+                !ReferenceEquals(occupiedAtConnection, hoveredExistingNote) &&
+                !(sourceRootForPreview is not null &&
+                  ReferenceEquals(GetEditorLinkRoot(occupiedAtConnection), sourceRootForPreview)) &&
+                !(hoveredRootForPreview is not null &&
+                  ReferenceEquals(GetEditorLinkRoot(occupiedAtConnection), hoveredRootForPreview)))
+                return;
+        }
+
         var root = GetEditorLinkRoot(source) ?? source;
-        var simultaneous = root.NoteType is NoteType.LinkHead or NoteType.LinkTail
+        var activeLeft = GearTimeline.ActiveBankForSide(currentState, "left");
+        var activeRight = GearTimeline.ActiveBankForSide(currentState, "right");
+        var sourceIsActive = sourcePosition.Value.Side == "left"
+            ? string.Equals(activeLeft, sourcePosition.Value.Bank, StringComparison.OrdinalIgnoreCase)
+            : string.Equals(activeRight, sourcePosition.Value.Bank, StringComparison.OrdinalIgnoreCase);
+        var simultaneous = sourceIsActive && (root.NoteType is NoteType.LinkHead or NoteType.LinkTail
             ? IsLinkChainSimultaneous(root, counts)
-            : IsSimultaneous(root, counts);
+            : IsSimultaneous(root, counts));
         var bodyTexture = _textures.Get(simultaneous ? "body-multi" : "body");
         var tailTexture = _textures.Get(simultaneous ? "tail-multi" : "tail");
-        var targetSeconds = _tempo.TickToSeconds(targetTick);
-        var targetTravel = (float)_projection.ScrollPixels(targetSeconds, _playSeconds);
+        var targetSeconds = _tempo.TickToSeconds(previewEndTick);
+        var connectionSeconds = _tempo.TickToSeconds(horizontalFirst ? connectionTick : targetTick);
+        var connectionTravel = (float)_projection.ScrollPixels(connectionSeconds, _playSeconds);
 
-        // The target-tail and connector are positioned at the same target tick,
-        // just like the final LinkTail and BuildConnectorCommand in the real chain.
+        // Render the preview at full opacity into its own transparent layer, then
+        // fade the finished layer once. Tinting each component separately made
+        // overlapping bodies, connectors, heads, and tails look darker.
         if (bodyTexture is not null)
         {
-            var bodyStartTick = sameTrack ? source.Tick :
-                source.NoteType == NoteType.SingleLong ? source.EndTick : source.Tick;
+            // A long terminal LinkTail keeps its authored source-lane body until
+            // its end. In horizontal-first mode that body stops at the horizontal
+            // connector, then a separate body continues down the destination lane.
+            if (horizontalFirst && source.NoteType == NoteType.LinkTail &&
+                source.Duration > 6 && connectionTick > source.Tick)
+            {
+                var sourceBodyStartSeconds = _tempo.TickToSeconds(source.Tick);
+                if (currentTick > source.Tick)
+                    sourceBodyStartSeconds = _playSeconds;
+                var sourceBodyEndSeconds = _tempo.TickToSeconds(connectionTick);
+                if (sourceBodyEndSeconds > sourceBodyStartSeconds + 1e-7)
+                {
+                    var sourceBodyPreview = BuildBodyCommand(
+                        bodyTexture,
+                        sourcePosition.Value.Side,
+                        sourcePosition.Value.Bank,
+                        _projection.LaneNormalizedX(source.Track),
+                        sourceBodyStartSeconds,
+                        sourceBodyEndSeconds,
+                        _projection.BodyTextureWidth,
+                        allowPastJudgement: false,
+                        layer: 3);
+                    if (sourceBodyPreview.Vertices is { Length: > 0 })
+                    {
+                        for (var i = 0; i < sourceBodyPreview.Vertices.Length; i++)
+                        {
+                            var vertex = sourceBodyPreview.Vertices[i];
+                            sourceBodyPreview.Vertices[i] = new VertexPositionColorTexture(
+                                vertex.Position, Color.White, vertex.TextureCoordinate);
+                        }
+                        _editorConnectorPreviewBody3DCommands.Add(sourceBodyPreview);
+                    }
+                }
+            }
+
+            var bodyTrack = horizontalFirst ? targetTrack : source.Track;
+            var bodyPosition = horizontalFirst ? targetPosition.Value : sourcePosition.Value;
+            var bodyStartTick = horizontalFirst
+                ? connectionTick
+                : sameTrack && (source.NoteType is NoteType.SingleLong or NoteType.LinkTail) && source.Duration > 6
+                    ? source.EndTick
+                    : sameTrack ? source.Tick : source.NoteType == NoteType.SingleLong ? source.EndTick : source.Tick;
             var bodyStartSeconds = _tempo.TickToSeconds(bodyStartTick);
             if (currentTick > bodyStartTick)
                 bodyStartSeconds = _playSeconds;
@@ -935,9 +1071,9 @@ public sealed partial class Playfield
             {
                 var bodyPreview = BuildBodyCommand(
                     bodyTexture,
-                    sourcePosition.Value.Side,
-                    sourcePosition.Value.Bank,
-                    _projection.LaneNormalizedX(source.Track),
+                    bodyPosition.Side,
+                    bodyPosition.Bank,
+                    _projection.LaneNormalizedX(bodyTrack),
                     bodyStartSeconds,
                     targetSeconds,
                     _projection.BodyTextureWidth,
@@ -948,24 +1084,18 @@ public sealed partial class Playfield
                     for (var i = 0; i < bodyPreview.Vertices.Length; i++)
                     {
                         var vertex = bodyPreview.Vertices[i];
-                        var color = vertex.Color;
-                        vertex.Color = new Color(color.R, color.G, color.B,
-                            Math.Clamp((int)MathF.Round(color.A * previewAlpha), 0, 255));
-                        bodyPreview.Vertices[i] = vertex;
+                        bodyPreview.Vertices[i] = new VertexPositionColorTexture(
+                            vertex.Position, Color.White, vertex.TextureCoordinate);
                     }
-                    _body3DCommands.Add(bodyPreview);
+                    _editorConnectorPreviewBody3DCommands.Add(bodyPreview);
                 }
             }
 
-            // The cross-track connector exists even when the target is on the
-            // same tick as the source/hold-end. Do not gate it on the presence of
-            // a longitudinal body: horizontal connectors are valid link segments.
+            // Horizontal-first connects across tracks at the source (or hold-end)
+            // tick, then carries the hold body along the destination lane.
             if (!sameTrack)
             {
-                var connectorBankOpacity = (
-                    GetEditorBankOpacity(sourcePosition.Value.Side, sourcePosition.Value.Bank, currentState) +
-                    GetEditorBankOpacity(targetPosition.Value.Side, targetPosition.Value.Bank, currentState)) * 0.5f;
-                _body3DCommands.Add(BuildConnectorCommand(
+                _editorConnectorPreviewBody3DCommands.Add(BuildConnectorCommand(
                     bodyTexture,
                     _projection.LaneNormalizedX(source.Track),
                     sourcePosition.Value.Side,
@@ -973,42 +1103,50 @@ public sealed partial class Playfield
                     _projection.LaneNormalizedX(targetTrack),
                     targetPosition.Value.Side,
                     targetPosition.Value.Bank,
-                    targetTravel,
+                    connectionTravel,
                     Math.Max(0.5f, _projection.BodyTextureWidth),
                     _projection.BankSwitchFlipV(sourcePosition.Value.Side, sourcePosition.Value.Bank),
-                    Color.White * (previewAlpha * connectorBankOpacity),
+                    Color.White,
                     layer: 4));
             }
         }
 
-        if (tailTexture is not null && _projection.WithinRenderDistance(targetTravel))
+        if (tailTexture is not null)
         {
-            var targetPoint = _projection.ProjectAtTicks(targetTrack, targetTick, currentTick, currentState);
-            var exactTargetTravel = (float)_projection.ScrollPixelsAtTicks(targetTick, currentTick);
-            // Use the same endpoint-tail builder as a real link chain so the
-            // preview follows the exact same 3D lane basis and tail texture.
-            AddLanePlaneTailCommand(
-                _headCommands,
-                targetPoint,
-                targetTrack,
-                exactTargetTravel,
-                tailTexture,
-                _projection.TailTextureWidth,
-                Color.White * previewAlpha,
-                layer: 5);
+            void AddPreviewTail(int tick)
+            {
+                var travel = (float)_projection.ScrollPixelsAtTicks(tick, currentTick);
+                if (!_projection.WithinRenderDistance(travel))
+                    return;
+                var point = _projection.ProjectAtTicks(targetTrack, tick, currentTick, currentState);
+                AddLanePlaneTailCommand(
+                    _editorConnectorPreviewHeadCommands,
+                    point,
+                    targetTrack,
+                    travel,
+                    tailTexture,
+                    _projection.TailTextureWidth,
+                    Color.White,
+                    layer: 5);
+            }
+
+            // In horizontal-first mode, a simple target note becomes the duration
+            // end of the LinkTail at the connection tick. The endpoint is therefore
+            // the old tap tick or (for a target hold) its original end tick, not a
+            // second link point at the target's old head.
+            AddPreviewTail(horizontalFirst ? connectionTick : previewEndTick);
+            if (horizontalFirst && hoveredExistingNote is not null && targetTick > connectionTick)
+                AddPreviewTail(previewEndTick);
         }
 
-        // A plain tap becomes a LinkHead after placement. Overlay its real long
-        // head and indicator textures at low opacity so the preview shows the
-        // final appearance rather than only a connecting line.
+        // A plain tap becomes a LinkHead after placement. Replacing it in the
+        // preview layer prevents its original opaque head from showing through.
         if (source.NoteType == NoteType.Single && source.Attr == 0)
         {
             var sourceTravel = (float)_projection.ScrollPixelsAtTicks(source.Tick, currentTick);
             if (_projection.WithinRenderDistance(sourceTravel))
             {
                 var sourcePoint = _projection.ProjectAtTicks(source.Track, source.Tick, currentTick, currentState);
-                var sourceOpacity = previewAlpha * GetEditorBankOpacity(
-                    sourcePosition.Value.Side, sourcePosition.Value.Bank, currentState);
                 var longHead = _textures.Get(simultaneous ? "note-multi" : "note-long");
                 var longIndicator = _textures.Get(simultaneous ? "indicator-long-multi" : "indicator-long");
                 var sourceSurface = GetNoteSurface(sourcePosition.Value.Side, sourcePosition.Value.Bank);
@@ -1022,33 +1160,97 @@ public sealed partial class Playfield
                 {
                     var previewHead = BuildNoteCommand(
                         longHead, sourcePoint, source.Track, _projection.NoteWidth,
-                        Color.White * sourceOpacity, 0, sourceTravel,
+                        Color.White, 0, sourceTravel,
                         surface: sourceSurface,
                         noteBasisOverride: sourceBasis,
                         bankJudgeBasis: sourceJudgeBasis,
                         sideOverride: sourcePosition.Value.Side,
                         bankOverride: sourcePosition.Value.Bank,
                         normalizedXOverride: sourceNormalizedX);
-                    // The original tap head is suppressed while this preview is
-                    // valid. Keep the translucent replacement in the same 3D pass
-                    // as its body, connector and tail to avoid double alpha blending.
-                    _body3DCommands.Add(previewHead with { Depth = previewHead.Depth - 0.05f });
+                    _editorConnectorPreviewBody3DCommands.Add(previewHead with { Depth = previewHead.Depth - 0.05f });
                 }
                 if (longIndicator is not null)
                 {
                     var previewIndicator = BuildNoteCommand(
                         longIndicator, sourcePoint, source.Track, _projection.HoldIndicatorWidth,
-                        Color.White * sourceOpacity, 1, sourceTravel,
+                        Color.White, 1, sourceTravel,
                         surface: sourceSurface,
                         noteBasisOverride: sourceBasis,
                         bankJudgeBasis: sourceJudgeBasis,
                         sideOverride: sourcePosition.Value.Side,
                         bankOverride: sourcePosition.Value.Bank,
                         normalizedXOverride: sourceNormalizedX);
-                    _body3DCommands.Add(previewIndicator with { Depth = previewIndicator.Depth - 0.05f });
+                    _editorConnectorPreviewBody3DCommands.Add(previewIndicator with { Depth = previewIndicator.Depth - 0.05f });
                 }
             }
         }
+    }
+
+    private void DrawEditorConnectorPreviewComposite()
+    {
+        const float previewOpacity = 0.42f;
+        if (_editorInactiveBankLayerPass ||
+            (_editorConnectorPreviewBody3DCommands.Count == 0 &&
+             _editorConnectorPreviewHeadCommands.Count == 0))
+            return;
+
+        var width = Math.Max(1, _graphics.Viewport.Width);
+        var height = Math.Max(1, _graphics.Viewport.Height);
+        if (_editorConnectorPreviewRenderTarget is null ||
+            _editorConnectorPreviewRenderTarget.Width != width ||
+            _editorConnectorPreviewRenderTarget.Height != height)
+        {
+            _editorConnectorPreviewRenderTarget?.Dispose();
+            _editorConnectorPreviewRenderTarget = new RenderTarget2D(
+                _graphics,
+                width,
+                height,
+                false,
+                SurfaceFormat.Color,
+                DepthFormat.None,
+                0,
+                RenderTargetUsage.DiscardContents);
+        }
+
+        var originalTargets = _graphics.GetRenderTargets();
+        var originalViewport = _graphics.Viewport;
+        try
+        {
+            _graphics.SetRenderTarget(_editorConnectorPreviewRenderTarget);
+            _graphics.Viewport = new Viewport(0, 0, width, height);
+            // Render only the connector into a transparent layer. The gameplay
+            // target is preserved while this layer is active, so the scene behind
+            // it remains untouched when the preview is composited back.
+            _graphics.Clear(Color.Transparent);
+            if (_editorConnectorPreviewBody3DCommands.Count > 0)
+            {
+                DrawTextured3DCommands(_editorConnectorPreviewBody3DCommands);
+                ReturnBody3DVertices(_editorConnectorPreviewBody3DCommands);
+                _editorConnectorPreviewBody3DCommands.Clear();
+            }
+            DrawTexturedCommands(_editorConnectorPreviewHeadCommands);
+        }
+        finally
+        {
+            if (_editorConnectorPreviewBody3DCommands.Count > 0)
+            {
+                ReturnBody3DVertices(_editorConnectorPreviewBody3DCommands);
+                _editorConnectorPreviewBody3DCommands.Clear();
+            }
+            _editorConnectorPreviewHeadCommands.Clear();
+            if (originalTargets.Length == 0)
+                _graphics.SetRenderTarget(null);
+            else
+                _graphics.SetRenderTargets(originalTargets);
+            _graphics.Viewport = originalViewport;
+        }
+
+        // Composite only the transparent preview layer, applying its opacity once.
+        // This leaves lane and track pixels in the original frame exactly unchanged.
+        _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        _spriteBatch.Draw(_editorConnectorPreviewRenderTarget,
+            new Rectangle(0, 0, width, height), Color.White * previewOpacity);
+        _spriteBatch.End();
     }
 
     private void AddFlickNoteCommands(
@@ -1450,7 +1652,13 @@ public sealed partial class Playfield
         }
 
         var position = GearState.Position(ev.Track);
-        var simultaneous = IsSimultaneous(ev, counts);
+        var activeLeft = GearTimeline.ActiveBankForSide(currentState, "left");
+        var activeRight = GearTimeline.ActiveBankForSide(currentState, "right");
+        var inActiveBank = position is { } holdPosition &&
+            (holdPosition.Side == "left"
+                ? string.Equals(activeLeft, holdPosition.Bank, StringComparison.OrdinalIgnoreCase)
+                : string.Equals(activeRight, holdPosition.Bank, StringComparison.OrdinalIgnoreCase));
+        var simultaneous = inActiveBank && IsSimultaneous(ev, counts);
         var body = ev.NoteType == NoteType.Vibrato
             ? _textures.Get(simultaneous ? "vibrato-multi" : "vibrato")
             : _textures.Get(missVisual

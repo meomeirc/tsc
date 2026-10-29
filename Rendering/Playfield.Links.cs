@@ -43,7 +43,14 @@ public sealed partial class Playfield
             _debugLinkChainCalls++;
 
         var terminal = nodeList[^1];
-        var simultaneous = IsLinkChainSimultaneous(root, counts);
+        var rootPosition = GearState.Position(root.Track);
+        var activeLeftBank = GearTimeline.ActiveBankForSide(currentState, "left");
+        var activeRightBank = GearTimeline.ActiveBankForSide(currentState, "right");
+        var rootIsInActiveBank = rootPosition is { } activePosition &&
+            (activePosition.Side == "left"
+                ? string.Equals(activeLeftBank, activePosition.Bank, StringComparison.OrdinalIgnoreCase)
+                : string.Equals(activeRightBank, activePosition.Bank, StringComparison.OrdinalIgnoreCase));
+        var simultaneous = rootIsInActiveBank && IsLinkChainSimultaneous(root, counts);
         var missVisual = interactive && (runtime!.StartMissed || runtime.Dropped);
         var body = _textures.Get(missVisual ? "body-miss" : (simultaneous ? "body-multi" : "body"));
         var tailTexture = _textures.Get(missVisual ? "tail-miss" : (simultaneous ? "tail-multi" : "tail"));

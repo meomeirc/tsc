@@ -23,6 +23,19 @@ local UI = {
         primary_hover = "#FFDA45",
         primary_pressed = "#C99B00",
         primary_text = "#111111",
+        success = "#267A45",
+        success_hover = "#329454",
+        success_pressed = "#1B5D34",
+        warning = "#A96F12",
+        warning_hover = "#C88920",
+        warning_pressed = "#80530C",
+        danger = "#963838",
+        danger_hover = "#B44848",
+        danger_pressed = "#702929",
+        info = "#155A8A",
+        info_hover = "#1D76AE",
+        info_pressed = "#10456B",
+        status_text = "#FFFFFF",
         error = "#FF7777",
         black = "#000000",
         transparent = { r = 0, g = 0, b = 0, a = 0 },
@@ -195,6 +208,30 @@ function UI.stack_position(parent_id, axis, index, child_width, child_height, ga
 end
 
 function UI.button_color(state, selected, variant)
+    local attribute = type(variant) == "string" and string.sub(variant, 1, 10) == "attribute_"
+        and string.sub(variant, 11) or nil
+    if attribute then
+        local colors = {
+            ["101"] = { base = "#691B18", hover = "#8B2925", pressed = "#4F1412", active = "#FF3B30" },
+            ["102"] = { base = "#704114", hover = "#92571B", pressed = "#56310F", active = "#FF9500" },
+            ["103"] = { base = "#71600C", hover = "#917B12", pressed = "#514509", active = "#FFD60A" },
+            ["104"] = { base = "#1E572F", hover = "#287641", pressed = "#164222", active = "#34C759" },
+            ["105"] = { base = "#15545D", hover = "#1D7480", pressed = "#103E45", active = "#30D1E8" },
+            ["106"] = { base = "#123E78", hover = "#19559B", pressed = "#0D2F5A", active = "#007AFF" },
+            ["107"] = { base = "#54286A", hover = "#71358D", pressed = "#3D1D4E", active = "#AF52DE" },
+            ["108"] = { base = "#6A1F44", hover = "#8D295C", pressed = "#4C1731", active = "#FF2D92" },
+        }
+        local palette = colors[attribute]
+        if state == "pressed" then return palette.pressed end
+        if state == "hovered" then return palette.hover end
+        if selected then return palette.active end
+        return palette.base
+    end
+    if variant == "success" or variant == "warning" or variant == "danger" or variant == "info" then
+        if state == "pressed" then return UI.colors[variant .. "_pressed"] end
+        if state == "hovered" then return UI.colors[variant .. "_hover"] end
+        return UI.colors[variant]
+    end
     if variant == "primary" then
         if state == "pressed" then return UI.colors.primary_pressed end
         if state == "hovered" then return UI.colors.primary_hover end
@@ -220,6 +257,7 @@ function UI.draw_button(options)
         x = x, y = y, width = width, height = height,
         action = options.action,
         value = options.value,
+        hit_test_priority = options.hit_test_priority,
     })
 
     local state = ui.state(id)
@@ -236,10 +274,14 @@ function UI.draw_button(options)
 -- Primary buttons use a filled accent without a secondary side strip.
     if options.accent ~= false and variant ~= "primary" then
         local accent_active = options.selected == true or state == "hovered" or state == "pressed"
+        local accent_color = options.accent_color or (accent_active and UI.colors.accent or UI.colors.accent_dim)
+        if state == "hovered" or state == "pressed" then
+            accent_color = options.accent_hover_color or accent_color
+        end
         draw.rect({
             parent = frame_id,
             x = 0, y = 0, width = math.max(2, (options.accent_width or 4)), height = height,
-            color = options.accent_color or (accent_active and UI.colors.accent or UI.colors.accent_dim),
+            color = accent_color,
             alpha = options.alpha == nil and 1 or options.alpha,
             layer = layer + 1,
         })
@@ -250,7 +292,9 @@ function UI.draw_button(options)
         x = width * 0.5,
         y = height * 0.5,
         size = options.text_size or UI.sizes.button,
-        color = options.text_color or (variant == "primary" and UI.colors.primary_text or UI.colors.text),
+        color = options.text_color or
+            ((variant == "primary") and UI.colors.primary_text or
+             ((variant == "success" or variant == "warning" or variant == "danger" or variant == "info") and UI.colors.status_text or UI.colors.text)),
         font = options.font or UI.fonts.medium,
         anchor = "center",
         shadow = options.shadow,
@@ -415,15 +459,24 @@ function UI.draw_row(options)
             anchor = "top-left",
             layer = layer + 2,
         })
-        draw.text(options.description, {
-            parent = frame_id,
-            x = pad_x, y = pad_y + (options.description_gap or 26),
-            size = options.description_size or UI.sizes.description,
-            color = UI.colors.muted,
-            font = UI.fonts.regular,
-            anchor = "top-left",
-            layer = layer + 2,
-        })
+        local description_size = options.description_size or UI.sizes.description
+        local description_line_height = description_size * 1.25
+        local description_line = 0
+        for line in (tostring(options.description) .. "\n"):gmatch("(.-)\n") do
+            if line ~= "" then
+                draw.text(line, {
+                    parent = frame_id,
+                    x = pad_x,
+                    y = pad_y + (options.description_gap or 26) + description_line * description_line_height,
+                    size = description_size,
+                    color = UI.colors.muted,
+                    font = UI.fonts.regular,
+                    anchor = "top-left",
+                    layer = layer + 2,
+                })
+            end
+            description_line = description_line + 1
+        end
     else
         draw.text(options.label or "", {
             parent = frame_id,

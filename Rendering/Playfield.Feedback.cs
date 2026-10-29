@@ -230,6 +230,7 @@ public sealed partial class Playfield
         _hitAnimations.Add(new HitAnimationState
         {
             Variant = variant,
+            Track = ev.Track,
             Position = position,
             BaseWidth = baseWidth,
             Rotation = rotation,
@@ -355,6 +356,19 @@ public sealed partial class Playfield
 
         foreach (var animation in _hitAnimations)
         {
+            // Hold effects follow the active projection while the hold is still live.
+            // This lets them switch between top-down 2D and perspective 3D immediately,
+            // rather than keeping the view captured at the initial hit until release.
+            if (animation.IsHold && _tempo is not null && _chart is not null)
+            {
+                var tick = _tempo.SecondsToTick(_playSeconds);
+                var gearState = RenderGearState(tick);
+                var projected = _projection.Project(animation.Track, _playSeconds, _playSeconds, gearState);
+                animation.Position = projected.Position;
+                var holdConfig = GetActiveViewRenderConfig().HitAnimation.Long;
+                animation.BaseWidth = Math.Max(1f, holdConfig.Width * projected.Scale * projected.LaneRotationDepthScale);
+                animation.Rotation = 0f;
+            }
             var frame = GetHitAnimationFrame(animation);
             var texture = _textures.GetHitFrame(animation.Variant, frame);
             if (texture is null)

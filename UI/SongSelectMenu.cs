@@ -36,6 +36,9 @@ namespace TSC;
 /// </summary>
 public sealed class SongSelectMenu : IDisposable
 {
+    private const string ImportedBundleMarkerFileName = ".tsc-bundle-import.sha256";
+    private const string BundleImportStagingDirectoryName = "bundle-import-staging";
+    private static readonly TimeSpan BundleImportStagingRetention = TimeSpan.FromDays(1);
     private sealed class ChartEntry
     {
         public required string Path { get; init; }
@@ -109,6 +112,7 @@ public sealed class SongSelectMenu : IDisposable
     private readonly SpriteBatch _spriteBatch;
     private readonly Texture2D _pixel;
     private readonly string _songsRoot;
+    private readonly HashSet<string> _importedBundlePaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _songSelectStateDirectory;
     private readonly string _skinDirectory;
     private readonly ScoreSaveStore _scoreSaves = ScoreSaveStore.Shared;
@@ -325,7 +329,7 @@ public sealed class SongSelectMenu : IDisposable
         Program.LogRuntime($"SONG_SELECT_CONSTRUCTOR songsRoot={_songsRoot}");
 #if TSC_PUBLISH
         _skinDirectory = string.IsNullOrWhiteSpace(skinDirectory)
-            ? Path.Combine(AppContext.BaseDirectory, "skins", "Default")
+            ? Path.Combine(UserDataPaths.GameRootDirectory, "Skins", "Default")
             : Path.GetFullPath(skinDirectory);
 #else
         _skinDirectory = string.IsNullOrWhiteSpace(skinDirectory)
@@ -446,6 +450,9 @@ public sealed class SongSelectMenu : IDisposable
     {
         if (!_open)
             return;
+
+        if (_previewAudio is not null)
+            _previewAudio.Volume = _gameConfig.MusicVolume;
 
         var wasLoading = _initialLoadInProgress;
         CompleteInitialLoad();
@@ -737,7 +744,7 @@ public sealed class SongSelectMenu : IDisposable
             if (encoded.Length == 0)
                 return;
 
-            player = new OpusAudioPlayer { IsLooped = true };
+            player = new OpusAudioPlayer { IsLooped = true, Volume = _gameConfig.MusicVolume };
             player.LoadOpus(encoded);
             player.PrepareInitialPlayback(retainPcmForSeeking: false);
             player.Resume();
@@ -1416,14 +1423,246 @@ public sealed class SongSelectMenu : IDisposable
     {
         if (!Directory.Exists(_songsRoot)) return Array.Empty<string>();
         return Directory.EnumerateFiles(_songsRoot, "*.tsts", SearchOption.AllDirectories)
-            .Where(path => !IsInsideSongCache(path));
+            .Where(path => !IsInsideSongCache(path) && !_importedBundlePaths.Contains(Path.GetFullPath(path)));
     }
 
     private IEnumerable<string> EnumerateZipBundleFiles()
     {
         if (!Directory.Exists(_songsRoot)) return Array.Empty<string>();
         return Directory.EnumerateFiles(_songsRoot, "*.zip", SearchOption.AllDirectories)
-            .Where(path => !IsInsideSongCache(path));
+            .Where(path => !IsInsideSongCache(path) && !_importedBundlePaths.Contains(Path.GetFullPath(path)));
+    }
+
+    /// <summary>
+    /// Import supported archives anywhere inside the songs library (including pack
+    /// folders) into a sibling song folder. For example, songs/Pack 1/track.tsts
+    /// becomes songs/Pack 1/track/. Each bundle gets its own folder to prevent its
+    /// files from colliding with other songs. Archives are deleted only after a full
+    /// extraction and at least one playable chart has been validated.
+    /// </summary>
+    private void ImportSongBundles()
+    {
+        if (!Directory.Exists(_songsRoot))
+            return;
+
+        CleanupInterruptedBundleImportStaging();
+
+        string[] archivePaths;
+        try
+        {
+            archivePaths = Directory.EnumerateFiles(_songsRoot, "*", SearchOption.AllDirectories)
+                .Where(path => !IsInsideSongCache(path))
+                .Where(path =>
+                {
+                    var extension = Path.GetExtension(path);
+                    return extension.Equals(".tsts", StringComparison.OrdinalIgnoreCase) ||
+                           extension.Equals(".zip", StringComparison.OrdinalIgnoreCase);
+                })
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"SONG_BUNDLE_IMPORT_ENUM_ERROR {_songsRoot} :: {ex.Message}");
+            return;
+        }
+
+        foreach (var archivePath in archivePaths)
+        {
+            try
+            {
+                ImportSongBundle(archivePath);
+            }
+            catch (Exception ex)
+            {
+                // Import is maintenance on the user's library; a bad archive must
+                // remain on disk and must never prevent Song Select from opening.
+                Program.LogRuntime($"SONG_BUNDLE_IMPORT_ERROR {archivePath} :: {ex.Message}");
+            }
+        }
+    }
+
+    private void ImportSongBundle(string archivePath)
+    {
+        var fullArchivePath = Path.GetFullPath(archivePath);
+        var songsRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_songsRoot));
+        var relativeArchivePath = Path.GetRelativePath(songsRoot, fullArchivePath);
+        if (Path.IsPathRooted(relativeArchivePath) ||
+            relativeArchivePath.Equals("..", StringComparison.Ordinal) ||
+            relativeArchivePath.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) ||
+            relativeArchivePath.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal) ||
+            IsInsideSongCache(fullArchivePath))
+            return;
+
+        var parent = Path.GetDirectoryName(fullArchivePath) ?? songsRoot;
+        var extension = Path.GetExtension(fullArchivePath);
+        var archiveBaseName = Path.GetFileNameWithoutExtension(fullArchivePath);
+        if (string.IsNullOrWhiteSpace(archiveBaseName))
+            return;
+
+        var destination = Path.Combine(parent, archiveBaseName);
+        var identity = GetSongBundleImportIdentity(fullArchivePath);
+        var markerPath = Path.Combine(destination, ImportedBundleMarkerFileName);
+
+        if (Directory.Exists(destination))
+        {
+            // Recover the narrow crash case where extraction completed and the
+            // archive remained because deleting it failed or the process stopped.
+            if (File.Exists(markerPath) &&
+                string.Equals(File.ReadAllText(markerPath, Encoding.UTF8), identity, StringComparison.Ordinal) &&
+                IsUsableImportedBundle(fullArchivePath, destination, extension, out _))
+            {
+                _importedBundlePaths.Add(fullArchivePath);
+                File.Delete(fullArchivePath);
+                TryDeleteImportedBundleMarker(markerPath);
+                Program.LogRuntime($"SONG_BUNDLE_IMPORT_RECOVERED {fullArchivePath} -> {destination}");
+                return;
+            }
+
+            Program.LogRuntime($"SONG_BUNDLE_IMPORT_SKIPPED_DESTINATION_EXISTS {fullArchivePath} :: {destination}");
+            return;
+        }
+        if (File.Exists(destination))
+        {
+            Program.LogRuntime($"SONG_BUNDLE_IMPORT_SKIPPED_DESTINATION_FILE {fullArchivePath} :: {destination}");
+            return;
+        }
+
+        var stagingParent = Path.Combine(Path.GetFullPath(_songsRoot), "_cache", BundleImportStagingDirectoryName);
+        Directory.CreateDirectory(stagingParent);
+        var stagingRoot = Path.Combine(stagingParent, "TSC-bundle-import-" + Guid.NewGuid().ToString("N"));
+
+        try
+        {
+            ChartZipBundleSupport.ExtractToDirectory(fullArchivePath, stagingRoot);
+            if (!string.Equals(identity, GetSongBundleImportIdentity(fullArchivePath), StringComparison.Ordinal))
+                throw new IOException("The bundle changed while it was being extracted; the original archive was kept.");
+
+            if (!IsUsableImportedBundle(fullArchivePath, stagingRoot, extension, out var validationError))
+                throw new InvalidDataException(string.IsNullOrWhiteSpace(validationError)
+                    ? "The archive does not contain a supported, playable chart bundle."
+                    : validationError);
+
+            var markerInStaging = Path.Combine(stagingRoot, ImportedBundleMarkerFileName);
+            if (File.Exists(markerInStaging))
+                throw new InvalidDataException($"The bundle uses the reserved import-marker path: {ImportedBundleMarkerFileName}");
+
+            File.WriteAllText(markerInStaging, identity, new UTF8Encoding(false));
+            try { File.SetAttributes(markerInStaging, File.GetAttributes(markerInStaging) | FileAttributes.Hidden); }
+            catch { }
+
+            // Stage under _cache so incomplete imports never appear in the song scan.
+            // Directory.Move is same-volume and makes the completed import visible at once.
+            Directory.Move(stagingRoot, destination);
+            _importedBundlePaths.Add(fullArchivePath);
+
+            // The source is removed only after the final destination is in place and
+            // was validated. If deletion fails, the marker enables safe retry next run.
+            File.Delete(fullArchivePath);
+            TryDeleteImportedBundleMarker(Path.Combine(destination, ImportedBundleMarkerFileName));
+            Program.LogRuntime($"SONG_BUNDLE_IMPORTED {fullArchivePath} -> {destination}");
+        }
+        catch
+        {
+            // If the move already happened, leave both the imported directory and
+            // marker intact. A later startup can verify the marker and retry deletion.
+            try
+            {
+                if (Directory.Exists(stagingRoot))
+                    Directory.Delete(stagingRoot, recursive: true);
+            }
+            catch { }
+            throw;
+        }
+    }
+
+    private bool IsUsableImportedBundle(string sourceArchivePath, string extractionRoot, string extension, out string error)
+    {
+        error = string.Empty;
+        var kind = ChartZipBundleSupport.Detect(extractionRoot);
+        if (extension.Equals(".tsts", StringComparison.OrdinalIgnoreCase))
+        {
+            if (kind != ChartZipBundleKind.Tsts)
+            {
+                error = "TSTS bundle does not contain song.json and recognized ARES difficulty charts.";
+                return false;
+            }
+            return TryLoadTstsSongFromRoot(sourceArchivePath, extractionRoot, out error) is not null;
+        }
+
+        if (!extension.Equals(".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            error = "Unsupported bundle extension.";
+            return false;
+        }
+
+        if (kind == ChartZipBundleKind.Tsts)
+        {
+            var tstsGroups = ChartZipBundleSupport.EnumerateAresCharts(extractionRoot)
+                .Select(path => (Path: path, Root: ChartZipBundleSupport.FindTstsSongRootForChart(path, extractionRoot)))
+                .Where(item => !string.IsNullOrWhiteSpace(item.Root))
+                .GroupBy(item => Path.GetFullPath(item.Root!), StringComparer.OrdinalIgnoreCase);
+            foreach (var group in tstsGroups)
+            {
+                if (TryLoadTstsSongFromRoot(sourceArchivePath, group.Key, out _) is not null)
+                    return true;
+            }
+            error = "ZIP contains no playable TSTS song.";
+            return false;
+        }
+
+        if (kind == ChartZipBundleKind.Tsc)
+        {
+            foreach (var chartPath in ChartZipBundleSupport.EnumerateTscCharts(extractionRoot))
+            {
+                if (TryReadLightweightMetadata(chartPath, out _, out _))
+                    return true;
+            }
+            error = "ZIP contains no playable TSC chart.";
+            return false;
+        }
+
+        error = "ZIP does not contain a recognized TSC chart set or TSTS song.json + ARES chart layout.";
+        return false;
+    }
+
+    private static string GetSongBundleImportIdentity(string archivePath)
+    {
+        var fullPath = Path.GetFullPath(archivePath);
+        using var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        var contentHash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+        return fullPath.ToUpperInvariant() + "\n" + contentHash;
+    }
+
+    private void CleanupInterruptedBundleImportStaging()
+    {
+        var stagingParent = Path.Combine(Path.GetFullPath(_songsRoot), "_cache", BundleImportStagingDirectoryName);
+        if (!Directory.Exists(stagingParent))
+            return;
+
+        var cutoff = DateTime.UtcNow - BundleImportStagingRetention;
+        foreach (var stagingRoot in Directory.EnumerateDirectories(stagingParent, "TSC-bundle-import-*", SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                if (Directory.GetLastWriteTimeUtc(stagingRoot) < cutoff)
+                    Directory.Delete(stagingRoot, recursive: true);
+            }
+            catch (Exception ex)
+            {
+                Program.LogRuntime($"SONG_BUNDLE_IMPORT_STAGING_CLEANUP_FAILED {stagingRoot} :: {ex.Message}");
+            }
+        }
+    }
+
+    private static void TryDeleteImportedBundleMarker(string markerPath)
+    {
+        try
+        {
+            if (File.Exists(markerPath))
+                File.Delete(markerPath);
+        }
+        catch { }
     }
 
     private IEnumerable<string> EnumerateLooseTstsChartFiles()
@@ -2257,11 +2496,58 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
+    private void CleanupObsoleteBundleCaches()
+    {
+        // Take a complete snapshot before deleting anything. If enumeration or a
+        // bundle identity read fails, skip cleanup rather than mistaking valid
+        // extractions for obsolete ones.
+        var tstsBundles = EnumerateTstsBundleFiles().Select(Path.GetFullPath).ToArray();
+        var zipBundles = EnumerateZipBundleFiles().Select(Path.GetFullPath).ToArray();
+        var expectedTsts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var expectedZip = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var path in tstsBundles)
+            expectedTsts.Add(TscTemporaryStorage.BundleCacheHash(path));
+        foreach (var path in zipBundles)
+            expectedZip.Add(TscTemporaryStorage.BundleCacheHash(path));
+
+        // A week of grace protects a cache that another TSC process may still
+        // be using, while ensuring changed/removed bundles do not leave old media
+        // copies on disk forever. A current bundle's identity hash is always kept.
+        var cutoff = DateTime.UtcNow - TimeSpan.FromDays(7);
+        TscTemporaryStorage.CleanupObsoleteBundleCacheRoot(
+            Path.Combine(_songsRoot, "_cache", "tsts"), expectedTsts, cutoff);
+        TscTemporaryStorage.CleanupObsoleteBundleCacheRoot(
+            Path.Combine(_songsRoot, "_cache", "zip-bundles"), expectedZip, cutoff);
+    }
+
     private InitialLoadResult PrepareSongListCache()
     {
         var result = new InitialLoadResult();
 
         SetLoadProgress("CHECKING SONG LIST", 0, 1, "Checking cached song list...");
+
+        try
+        {
+            Directory.CreateDirectory(_songsRoot);
+            ImportSongBundles();
+        }
+        catch (Exception ex)
+        {
+            // Import is best-effort; keep Song Select available even if the library
+            // contains an unexpected filesystem problem.
+            LogStandalone($"SONG BUNDLE IMPORT PREPARATION FAILED :: {ex.Message}");
+        }
+
+        try
+        {
+            CleanupObsoleteBundleCaches();
+        }
+        catch (Exception ex)
+        {
+            // Cache cleanup is maintenance only; it must never block Song Select.
+            LogStandalone($"OBSOLETE BUNDLE CACHE CLEANUP FAILED :: {ex.Message}");
+        }
 
         try
         {
@@ -2455,6 +2741,13 @@ public sealed class SongSelectMenu : IDisposable
 
     private static string FindSongSelectStateDirectory(string songsRoot)
     {
+        var normalizedSongsRoot = Path.GetFullPath(songsRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (OperatingSystem.IsWindows())
+            normalizedSongsRoot = normalizedSongsRoot.ToUpperInvariant();
+        var rootHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedSongsRoot)))[..16].ToLowerInvariant();
+#if TSC_PUBLISH
+        return Path.Combine(UserDataPaths.GameRootDirectory, "State", rootHash);
+#else
         var root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         if (string.IsNullOrWhiteSpace(root))
             root = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
@@ -2462,12 +2755,8 @@ public sealed class SongSelectMenu : IDisposable
             root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share");
         if (string.IsNullOrWhiteSpace(root))
             root = AppContext.BaseDirectory;
-
-        var normalizedSongsRoot = Path.GetFullPath(songsRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        if (OperatingSystem.IsWindows())
-            normalizedSongsRoot = normalizedSongsRoot.ToUpperInvariant();
-        var rootHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedSongsRoot)))[..16].ToLowerInvariant();
         return Path.Combine(root, "TSC", "State", rootHash);
+#endif
     }
 
     private void MigrateLegacySongSelectStateFiles()
@@ -4348,9 +4637,8 @@ public sealed class SongSelectMenu : IDisposable
     private static string FindSongsRoot()
     {
 #if TSC_PUBLISH
-        // Only read songs explicitly placed beside the published executable.
-        // Do not walk up to a source-project folder that may contain development songs.
-        return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "songs"));
+        // Songs are user-managed and live beside the root launcher.
+        return Path.GetFullPath(Path.Combine(UserDataPaths.GameRootDirectory, "songs"));
 #else
         var candidates = new List<string>();
         AddCandidateChain(candidates, AppContext.BaseDirectory);

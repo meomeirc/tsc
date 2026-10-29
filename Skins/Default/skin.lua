@@ -1190,13 +1190,14 @@ function render()
     local center_x = screen.width * 0.5
 
     if measure_skin then skinperf.begin(4) end
-    if is_editor_mode() or resolved_display.rank_up ~= false then
+    -- Editor dimming is handled by the C# editor renderer so 2D/3D view
+    -- changes can control it independently of the gameplay skin.
+    if not is_editor_mode() and game.editor_preview_mode ~= true and resolved_display.rank_up ~= false then
         draw_rank_black.x = center_x
         draw_rank_black.y = screen.height * 0.5
         draw_rank_black.width = screen.width
         draw_rank_black.height = screen.height
-        draw_rank_black.alpha = (not is_editor_mode() and rank_up_black_released)
-            and 0 or RANK_UP_BLACK_ALPHA
+        draw_rank_black.alpha = rank_up_black_released and 0 or RANK_UP_BLACK_ALPHA
         hud_draw.rect(draw_rank_black)
     end
 

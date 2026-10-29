@@ -30,14 +30,75 @@
     <PackageReference Include="Concentus.Oggfile" Version="1.0.7" />
   </ItemGroup>
   <ItemGroup>
+    <!-- The updater UI and update engine are part of TSC.exe now. Exclude only stale
+         nested build artifacts left by older versions of the separate updater project. -->
+    <Compile Remove="obj\**\*.cs;bin\**\*.cs;Updater\obj\**\*.cs;Updater\bin\**\*.cs;Launcher\**\*.cs" />
+    <None Update="Updater\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
     <MonoGameContentReference Include="Content\Content.mgcb" />
     <EmbeddedResource Include="info.md" LogicalName="TSC.info.md" />
     <EmbeddedResource Include="version.txt" LogicalName="TSC.version.txt" />
     <None Update="info.md" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
     <None Update="version.txt" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
-    <!-- Optional local FFmpeg Essentials archive; runtime extracts only ffmpeg.exe from it. -->
-    <None Update="tools\ffmpeg.7z" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- Tool payloads are staged beside the root launcher after publish. Never publish a
+         locally downloaded FFmpeg executable; users can install that one themselves. -->
+    <None Update="tools\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
   </ItemGroup>
+  <!-- Final install layout: the game and its self-contained .NET 8 runtime live in data/;
+       the tiny Native AOT launcher, user files, Default skin, and tools stay at the install root. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Publish'">
+    <TSCInstallRoot Condition="'$(TSCInstallRoot)' == ''">$(MSBuildProjectDirectory)\bin\Publish\win-x64\</TSCInstallRoot>
+    <TSCLauncherStage>$(MSBuildProjectDirectory)\obj\tsc-launcher-publish</TSCLauncherStage>
+  </PropertyGroup>
+
+  <Target Name="FinalizeTscPublishLayout" AfterTargets="Publish"
+          Condition="'$(Configuration)' == 'Publish' and '$(PublishDir)' != ''">
+    <MakeDir Directories="$(TSCInstallRoot)" />
+
+    <!-- Never ship a second copy of the skin under data/. -->
+    <RemoveDir Directories="$(PublishDir)Skins\Default;$(PublishDir)Skins;$(PublishDir)updater;$(PublishDir)updater.next;$(PublishDir)updater.old;$(TSCInstallRoot)updater;$(TSCInstallRoot)updater.next;$(TSCInstallRoot)updater.old" />
+
+    <!-- Include all project tools beside the launcher, preserving nested folders but
+         excluding ffmpeg.exe (a user-installed dependency that must not ship). -->
+    <ItemGroup>
+      <_TscRootToolFiles Include="$(MSBuildProjectDirectory)\tools\**\*"
+                         Exclude="$(MSBuildProjectDirectory)\tools\**\ffmpeg.exe" />
+      <_TscPublishedToolFiles Include="$(PublishDir)tools\**\*" />
+    </ItemGroup>
+    <MakeDir Directories="$(TSCInstallRoot)tools" />
+    <MakeDir Directories="@(_TscRootToolFiles->'$(TSCInstallRoot)tools\%(RecursiveDir)')"
+             Condition="'@(_TscRootToolFiles)' != ''" />
+    <Copy SourceFiles="@(_TscRootToolFiles)"
+          DestinationFiles="@(_TscRootToolFiles->'$(TSCInstallRoot)tools\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="'@(_TscRootToolFiles)' != ''" />
+    <Delete Files="@(_TscPublishedToolFiles)" />
+    <RemoveDir Directories="$(PublishDir)tools" />
+
+    <!-- Refresh only the shipped Default skin folder; custom skins stay separate. -->
+    <RemoveDir Directories="$(TSCInstallRoot)Skins\Default" />
+    <MakeDir Directories="$(TSCInstallRoot)Skins\Default" />
+    <ItemGroup>
+      <_TscDefaultSkinFiles Include="$(MSBuildProjectDirectory)\Skins\Default\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_TscDefaultSkinFiles)"
+          DestinationFiles="@(_TscDefaultSkinFiles->'$(TSCInstallRoot)Skins\Default\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+
+    <!-- Publish a self-contained Native AOT launcher. It needs no .NET runtime and has no sidecar files. -->
+    <RemoveDir Directories="$(TSCLauncherStage)" />
+    <Exec Command="dotnet publish &quot;$(MSBuildProjectDirectory)\Launcher\TSC.Launcher.csproj&quot; --configuration Release --runtime win-x64 --self-contained true -p:PublishAot=true -p:OptimizationPreference=Size -o &quot;$(TSCLauncherStage)&quot;" />
+    <Error Condition="!Exists('$(TSCLauncherStage)\TSC.exe')" Text="Native AOT launcher publish failed: $(TSCLauncherStage)\TSC.exe was not created." />
+    <Copy SourceFiles="$(TSCLauncherStage)\TSC.exe" DestinationFiles="$(TSCInstallRoot)TSC.exe" />
+    <RemoveDir Directories="$(TSCLauncherStage)" />
+
+    <!-- Remove stale game-side files left at root by older publish layouts. Preserve user folders/files. -->
+    <ItemGroup>
+      <_TscLegacyRootSidecars Include="$(TSCInstallRoot)*.dll;$(TSCInstallRoot)*.pdb;$(TSCInstallRoot)*.deps.json;$(TSCInstallRoot)*.runtimeconfig.json;$(TSCInstallRoot)createdump.exe" />
+    </ItemGroup>
+    <Delete Files="@(_TscLegacyRootSidecars);$(TSCInstallRoot)TSC.Updater.exe;$(TSCInstallRoot)DefaultFont.spritefont" />
+    <RemoveDir Directories="$(TSCInstallRoot)runtimes;$(TSCInstallRoot)Content;$(TSCInstallRoot)Samples;$(TSCInstallRoot)textures" />
+  </Target>
+
   <ItemGroup>
     <!-- Song bundles are runtime data, not C# source. -->
     <Compile Remove="songs\**\*.cs" />
@@ -47,15 +108,17 @@
     <!-- Developer builds keep the editable root-level Lua scripts beside the executable. -->
     <None Update="*.lua" Condition="'$(Configuration)' != 'Publish'" CopyToOutputDirectory="PreserveNewest" />
     <None Update="*.lua" Condition="'$(Configuration)' == 'Publish'" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
-    <!-- Publish the Default skin tree as-is. -->
-    <None Update="skins\Default\**\*" Condition="'$(Configuration)' == 'Publish'"
-          CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
-    <Content Include="skins\Default\**\*" Condition="'$(Configuration)' == 'Publish'">
-      <Link>skins\Default\%(RecursiveDir)%(Filename)%(Extension)</Link>
-      <TargetPath>skins\Default\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    <!-- Publish the shipped Default skin tree. Use the directory's actual casing,
+         remove the SDK's default None items, and re-add the files as publishable Content. -->
+    <None Remove="Skins\Default\**\*" Condition="'$(Configuration)' == 'Publish'" />
+    <Content Include="Skins\Default\**\*" Condition="'$(Configuration)' == 'Publish'">
+      <Link>Skins\Default\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <TargetPath>Skins\Default\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </Content>
     <None Include="textures\**\*.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
+
 </Project>

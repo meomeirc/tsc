@@ -7,9 +7,11 @@ namespace TSC;
 public sealed class GameConfig
 {
     public string Skin { get; set; } = "Default";
+    public float MusicVolume { get; set; } = 1.0f;
     public float TapVolume { get; set; } = 1.0f;
     public float LinkVolume { get; set; } = 1.0f;
     public float LaneSwitchVolume { get; set; } = 1.0f;
+    public float MetronomeVolume { get; set; } = 0.75f;
     public float ScrollSpeedScale { get; set; } = ChartProjection.DefaultScrollSpeedScale;
     public string ScrollMode { get; set; } = "xmod";
     public string Gauge { get; set; } = "hard";
@@ -130,6 +132,12 @@ public sealed class SkinSettingsView
         }
     }
 
+    public double music_volume
+    {
+        get => _config.MusicVolume;
+        set => SetFloat(_config.MusicVolume, (float)value, 0.0f, 1.0f, v => _config.MusicVolume = v);
+    }
+
     public double tap_volume
     {
         get => _config.TapVolume;
@@ -146,6 +154,12 @@ public sealed class SkinSettingsView
     {
         get => _config.LaneSwitchVolume;
         set => SetFloat(_config.LaneSwitchVolume, (float)value, 0.0f, 1.0f, v => _config.LaneSwitchVolume = v);
+    }
+
+    public double metronome_volume
+    {
+        get => _config.MetronomeVolume;
+        set => SetFloat(_config.MetronomeVolume, (float)value, 0.0f, 1.0f, v => _config.MetronomeVolume = v);
     }
 
     public double scroll_speed
@@ -541,9 +555,9 @@ public static class SkinConfigStore
     private static string FindRootDirectory()
     {
 #if TSC_PUBLISH
-        // A published build is self-contained: never treat the launch working
-        // directory (which may be the source project) as its data root.
-        return Path.GetFullPath(AppContext.BaseDirectory);
+        // The published game executable lives in data/, while skins are beside
+        // the tiny root launcher.
+        return UserDataPaths.GameRootDirectory;
 #else
         var cwd = Directory.GetCurrentDirectory();
         if (File.Exists(Path.Combine(cwd, "gameConfig.json")) || Directory.Exists(Path.Combine(cwd, "skins")))

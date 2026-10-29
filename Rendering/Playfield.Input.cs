@@ -31,6 +31,15 @@ public sealed partial class Playfield
         var dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         _editorTextInputDeltaSeconds = Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
 
+        // Skin reload is a global recovery shortcut. Handle it before modal and
+        // text-field early returns so F10 remains available throughout the editor.
+        if (Pressed(keyboard, Keys.F10))
+            RefreshSkinUiConfig();
+        // F4 is only a legacy shortcut outside the chart editor. In the editor,
+        // gameplay/autoplay is controlled by editor_toggle_gameplay_mode instead.
+        if (!_lockMenuPlayMode && !_chartEditorMode && Pressed(keyboard, Keys.F4))
+            ToggleGameplayMode();
+
         // The in-game music-preview modal exclusively owns keyboard and pointer
         // input until it closes. Handle it before editor scroll timers or global
         // shortcuts so nothing can resume or modify chart playback behind it.
@@ -44,13 +53,51 @@ public sealed partial class Playfield
         UpdateEditorWheelScrollPause(dt);
         UpdateEditorSeekPauseState();
 
+        // Preview mode does not run the regular chart-editor command handler,
+        // so dispatch its three playback actions from the configured keybinds.
+        // Restart takes priority if the user assigns the same chord to multiple
+        // actions, matching the normal editor command order.
+        if (_chartEditorMode && _editorPreviewMode)
+        {
+            // Preview mode keeps the same configured timeline controls as the
+            // ordinary editor, but disables chart-editing commands. Toggle the
+            // mode first and return so the same key press cannot immediately
+            // re-enter preview through the normal editor command handler.
+            if (KeybindSettings.IsPressed("editor_toggle_preview_mode"))
+            {
+                SetEditorPreviewMode(false);
+                UpdateLaneHighlights(keyboard, dt);
+                return;
+            }
+            if (KeybindSettings.IsPressed("editor_restart_preview"))
+            {
+                _playSeconds = 0;
+                ResetGameplayState();
+            }
+            else if (KeybindSettings.IsPressed("editor_seek_backward_1_beat"))
+                SeekEditorByBeats(-1.0);
+            else if (KeybindSettings.IsPressed("editor_seek_forward_1_beat"))
+                SeekEditorByBeats(1.0);
+            else if (KeybindSettings.IsPressed("editor_seek_backward_5_beats"))
+                SeekEditorByBeats(-5.0);
+            else if (KeybindSettings.IsPressed("editor_seek_forward_5_beats"))
+                SeekEditorByBeats(5.0);
+            else if (KeybindSettings.IsPressed("editor_toggle_play_preview") &&
+                     !_editorTimelineScrubbing && !_editorWheelScrollPauseActive)
+            {
+                _playing = !_playing;
+            }
+            else if (KeybindSettings.IsPressed("editor_toggle_gameplay_mode") && !_lockMenuPlayMode)
+            {
+                ToggleGameplayMode();
+            }
+        }
+
         // Main-menu Play is a locked gameplay session. Most editor/debug
         // controls remain disabled here, but F8 is temporarily allowed so the
         // memory diagnostics can be inspected during a normal play session.
         if (_lockMenuPlayMode)
         {
-            if (Pressed(keyboard, Keys.F10))
-                RefreshSkinUiConfig();
 #if !TSC_PUBLISH
             if (Pressed(keyboard, Keys.F12))
                 OpenGameplayResult(manualTrigger: true);
@@ -64,12 +111,12 @@ public sealed partial class Playfield
             return;
         }
 
-        if (_chartEditorMode)
+        if (_chartEditorMode && !_editorPreviewMode)
             HandleChartEditorInput(keyboard, _previousKeyboard);
 
         // While an inline Meta input has focus, swallow all editor/gameplay keybinds.
         // Mouse handling still runs so an outside click can confirm the edit.
-        if (_chartEditorMode && _editorMetaEditingField is not null)
+        if (_chartEditorMode && !_editorPreviewMode && _editorMetaEditingField is not null)
         {
             HandleMouseSelection();
             UpdateLaneHighlights(keyboard, dt);
@@ -79,7 +126,7 @@ public sealed partial class Playfield
         // While the BPM field is being edited, numeric shortcuts and editor hotkeys
         // must not leak through to gameplay (for example, B toggling the grid).
         // Mouse selection still runs so clicking a lane can place a tempo change.
-        if (_chartEditorMode && _editorBpmInputFocused)
+        if (_chartEditorMode && !_editorPreviewMode && _editorBpmInputFocused)
         {
             HandleMouseSelection();
             UpdateLaneHighlights(keyboard, dt);
@@ -89,7 +136,7 @@ public sealed partial class Playfield
         // Numeric generator/duration fields also own Left/Right while editing.
         // Mouse selection still runs so an outside click confirms or discards the
         // draft, but do not let those same arrows seek the chart on this frame.
-        if (_chartEditorMode &&
+        if (_chartEditorMode && !_editorPreviewMode &&
             (_editorDurationInputFocused || _editorStutterInputField != EditorStutterInputField.None))
         {
             HandleMouseSelection();
@@ -97,7 +144,7 @@ public sealed partial class Playfield
             return;
         }
 
-        if (_chartEditorMode &&
+        if (_chartEditorMode && !_editorPreviewMode &&
             (keyboard.IsKeyDown(Keys.LeftControl) || keyboard.IsKeyDown(Keys.RightControl)))
         {
             HandleMouseSelection();
@@ -106,19 +153,20 @@ public sealed partial class Playfield
         }
 
         var shift = keyboard.IsKeyDown(Keys.LeftShift) || keyboard.IsKeyDown(Keys.RightShift);
+        // Outside the chart editor, retain the legacy Space shortcut. Editor
+        // preview playback is handled by editor_toggle_play_preview above.
         if (!_chartEditorMode && Pressed(keyboard, Keys.Space) && !_editorTimelineScrubbing && !_editorWheelScrollPauseActive)
             _playing = !_playing;
         // These shortcuts are retained for ordinary gameplay sessions. During
         // chart editing the same actions are reached only through keybinds.
-        if (!_chartEditorMode && !_lockMenuPlayMode && Pressed(keyboard, Keys.F4)) ToggleGameplayMode();
-        if (!_chartEditorMode && Pressed(keyboard, Keys.F10)) RefreshSkinUiConfig();
-
         HandleMouseSelection();
         HandleEditorMouseWheelScroll();
 
-        if (!_chartEditorMode && !shift)
+        if ((!_chartEditorMode || _editorPreviewMode) && !shift)
         {
-            if (Pressed(keyboard, Keys.R)) { _playSeconds = 0; ResetGameplayState(); }
+            // R remains a legacy restart shortcut for ordinary gameplay only.
+            // Editor preview uses editor_restart_preview from the user's keybinds.
+            if (!_chartEditorMode && Pressed(keyboard, Keys.R)) { _playSeconds = 0; ResetGameplayState(); }
             if (!_lockMenuPlayMode && Pressed(keyboard, Keys.C) &&
                 !keyboard.IsKeyDown(Keys.LeftControl) && !keyboard.IsKeyDown(Keys.RightControl))
                 ToggleCompactMode();
@@ -233,6 +281,29 @@ public sealed partial class Playfield
             var pointer = new Microsoft.Xna.Framework.Point(
                 (int)MathF.Round(GlobalInput.Mouse.X * virtualWidth / (float)Math.Max(1, viewport.Width)),
                 (int)MathF.Round(GlobalInput.Mouse.Y * virtualHeight / (float)Math.Max(1, viewport.Height)));
+            if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+            {
+                var uiOverMeta = _editorMetaPanelOpen && GetEditorMetaPanelBounds(virtualWidth, virtualHeight).Contains(pointer) &&
+                    _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_meta_");
+                var uiOverProblems = _editorProblemsExpanded &&
+                    (_chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problems_") ||
+                     _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problem_"));
+                var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
+                if (uiOverMeta)
+                {
+                    var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+                    _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset + (wheelDelta < 0 ? steps : -steps),
+                        0, Math.Max(0, rows.Count - GetEditorMetaVisibleRowCount(virtualWidth, virtualHeight)));
+                    return;
+                }
+                if (uiOverProblems)
+                {
+                    RefreshEditorDiagnostics();
+                    _editorProblemsScrollOffset = Math.Clamp(_editorProblemsScrollOffset + (wheelDelta < 0 ? steps : -steps),
+                        0, Math.Max(0, _editorProblems.Count - 5));
+                    return;
+                }
+            }
             if (GetEditorProblemsPanelBounds(virtualWidth, virtualHeight).Contains(pointer))
             {
                 if (_editorProblemsExpanded && GetEditorProblemsListBounds(virtualWidth, virtualHeight).Contains(pointer))
@@ -450,6 +521,35 @@ public sealed partial class Playfield
 
     private void ToggleGameplayMode()
     {
+        if (_chartEditorMode)
+        {
+            if (!_gameplayMode)
+            {
+                // Keep the editor preview's current route and Perfect+ score as the
+                // starting point for manual play. Only discard in-flight judgement
+                // state so a hold/link cannot be inherited halfway through.
+                _gameplayMode = true;
+                _gameplayState = EnsureEditorPreviewGearState().Copy();
+                ResetGameplayTransientState(preserveEditorPreviewRoute: true);
+                _gameplayState = EnsureEditorPreviewGearState().Copy();
+                _autoSoundSeconds = _playSeconds;
+            }
+            else
+            {
+                // Returning to autoplay restores the score for an all-Perfect+
+                // run through the current playhead, but keeps the route reached by
+                // manual gameplay so the gear does not jump on mode changes.
+                _gameplayMode = false;
+                ResetGameplayTransientState(preserveEditorPreviewRoute: true);
+                RebuildEditorAutoplayResultsToCurrentTime();
+                _autoSoundSeconds = _playSeconds;
+            }
+
+            _statusMessage = _gameplayMode ? "GAMEPLAY ON" : "GAMEPLAY OFF";
+            RefreshSkinGameState();
+            return;
+        }
+
         _gameplayMode = !_gameplayMode;
         ResetGameplayState();
         _statusMessage = _gameplayMode ? "GAMEPLAY ON" : "GAMEPLAY OFF";

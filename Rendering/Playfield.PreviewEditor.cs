@@ -92,6 +92,30 @@ public sealed partial class Playfield
         return $"{minutes:00}:{remainder:00.000}";
     }
 
+    private static string FormatEditorProgressTimestamp(double seconds)
+    {
+        var milliseconds = (long)Math.Round(
+            Math.Max(0, double.IsFinite(seconds) ? seconds : 0) * 1000.0,
+            MidpointRounding.AwayFromZero);
+        var minutes = milliseconds / 60_000;
+        var remainingSeconds = milliseconds / 1000 % 60;
+        var remainingMilliseconds = milliseconds % 1000;
+        return $"{minutes:00}:{remainingSeconds:00}:{remainingMilliseconds:000}";
+    }
+
+    private string GetEditorSavedPreviewPositionLabel()
+    {
+        if (_chart is null || string.IsNullOrWhiteSpace(_chart.PreviewPath))
+            return "Not set";
+
+        var duration = _editorPreviewPlayer?.DurationSeconds ?? GetEditorSavedPreviewDurationSeconds();
+        if (!double.IsFinite(duration) || duration <= 0)
+            return "00:00:000 / --:--:---";
+
+        var elapsed = _editorPreviewPlayer is null ? 0 : GetEditorPreviewPlaybackElapsedSeconds();
+        return $"{FormatEditorProgressTimestamp(elapsed)} / {FormatEditorProgressTimestamp(duration)}";
+    }
+
     private void WriteEditorSharedPreviewAsset(string directory)
     {
         if (_editorSharedPreviewBytes is not { Length: > 0 })
@@ -407,6 +431,7 @@ public sealed partial class Playfield
             }
             _editorPreviewPlayer = new OpusAudioPlayer();
             _editorPreviewPlayer.LoadOpus(bytes);
+            _editorPreviewPlayer.Volume = _skin.GameConfig.MusicVolume;
             _editorPreviewPlayer.PrepareInitialPlayback(retainPcmForSeeking: true);
             _editorPreviewPlayer.SyncToChartTime(0.0, 0.0);
             _editorPreviewPlaybackDurationSeconds = _editorPreviewPlayer.DurationSeconds;
@@ -499,6 +524,7 @@ public sealed partial class Playfield
         StopEditorPreviewPlayback();
         _editorPreviewPlayer = new OpusAudioPlayer();
         _editorPreviewPlayer.LoadOpus(bakedBytes);
+        _editorPreviewPlayer.Volume = _skin.GameConfig.MusicVolume;
         _editorPreviewPlayer.PrepareInitialPlayback(retainPcmForSeeking: true);
         _editorPreviewPlayer.SyncToChartTime(0.0, 0.0);
         _editorPreviewPlaybackDurationSeconds = _editorPreviewPlayer.DurationSeconds;
@@ -713,6 +739,45 @@ public sealed partial class Playfield
         var point = new Microsoft.Xna.Framework.Point(
             (int)MathF.Round(mouse.X * virtualWidth / (float)Math.Max(1, _graphics.Viewport.Width)),
             (int)MathF.Round(mouse.Y * virtualHeight / (float)Math.Max(1, _graphics.Viewport.Height)));
+
+        if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+        {
+            _chartEditorInterfaceRuntime.UpdateUiPointer(point.X, point.Y, leftDown);
+            if (leftPressed)
+            {
+                var hit = _chartEditorInterfaceRuntime.HandleUiPointerPressed(point.X, point.Y);
+                var action = _chartEditorInterfaceRuntime.ConsumeUiAction();
+                if (hit)
+                {
+                    DispatchChartEditorInterfaceAction(action, virtualWidth, virtualHeight);
+                    if (action?.Name == "editor.preview.focus_start" &&
+                        _chartEditorInterfaceRuntime.TryGetUiButtonBounds("editor_preview_start_input", out var startBounds))
+                    {
+                        _editorPreviewStartCaret = GetEditorPreviewTextCaretIndex(startBounds, _editorPreviewStartText, point, _projection.ScalePixels(1f));
+                        _editorPreviewStartSelectionAnchor = _editorPreviewStartCaret;
+                    }
+                    else if (action?.Name == "editor.preview.focus_end" &&
+                             _chartEditorInterfaceRuntime.TryGetUiButtonBounds("editor_preview_end_input", out var endBounds))
+                    {
+                        _editorPreviewEndCaret = GetEditorPreviewTextCaretIndex(endBounds, _editorPreviewEndText, point, _projection.ScalePixels(1f));
+                        _editorPreviewEndSelectionAnchor = _editorPreviewEndCaret;
+                    }
+                    return;
+                }
+            }
+            else if (leftDown && _chartEditorInterfaceRuntime.HandleUiPointerDrag(point.X, point.Y))
+            {
+                DispatchChartEditorInterfaceAction(_chartEditorInterfaceRuntime.ConsumeUiAction(), virtualWidth, virtualHeight);
+                return;
+            }
+            if (leftDown && (_editorPreviewDraggingStart || _editorPreviewDraggingEnd))
+                return;
+            if (leftReleased)
+            {
+                _editorPreviewDraggingStart = false;
+                _editorPreviewDraggingEnd = false;
+            }
+        }
         var dialog = GetEditorPreviewEditorDialogBounds(virtualWidth, virtualHeight);
 
         if (_editorPreviewFocusedField >= 0)
@@ -1044,7 +1109,7 @@ public sealed partial class Playfield
         {
             var placeholder = isBig && _editorBundleTemplate == ChartBundleTemplate.Tsts
                 ? "NOT SUPPORTED BY TSTS"
-                : "NO IMAGE SET";
+                : HasEditorMediaResource(field) ? "IMAGE PREVIEW UNAVAILABLE" : "NO IMAGE SET";
             DrawEditorPreviewLabel(placeholder, frame, Muted, unit);
         }
 
@@ -1064,6 +1129,73 @@ public sealed partial class Playfield
             DrawEditorMetaButton(GetEditorMediaArtworkPickButtonBounds(isBig, virtualWidth, virtualHeight),
                 HasEditorMediaResource(field) ? "CHANGE IMAGE" : "SET IMAGE",
                 new Color(28, 28, 30, 250), accent);
+        }
+    }
+
+    private void DrawEditorMediaArtworkPreviewOverlay(int virtualWidth, int virtualHeight)
+    {
+        if (_pixel is null || !_editorMetaPanelOpen ||
+            !string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase) ||
+            !_chartEditorInterfaceRuntime.IsLoaded || _chartEditorInterfaceRuntime.LastError is not null)
+            return;
+
+        if (!_chartEditorInterfaceRuntime.TryGetUiButtonBounds("editor_meta_album", out var albumButton) ||
+            albumButton.IsEmpty)
+            return;
+
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        DrawFrame("album", albumButton);
+        if (_editorBundleTemplate != ChartBundleTemplate.Tsts &&
+            _chartEditorInterfaceRuntime.TryGetUiButtonBounds("editor_meta_album_big", out var albumBigButton) &&
+            !albumBigButton.IsEmpty)
+            DrawFrame("album_big", albumBigButton);
+        _spriteBatch.End();
+
+        void DrawFrame(string field, Rectangle button)
+        {
+            // chartEditorInterface.lua places the album card after the two media rows:
+            // content top + 2 * (20 label + 5 gap + 46 field + 8 row gap), then a
+            // 34-unit label/header allowance and an 8-unit gap above the button.
+            // Derive the frame from the registered button bounds so Lua and C# hit boxes
+            // stay aligned at every UI scale.
+            var sizeFromHeight = button.Y - content.Y - (int)MathF.Round(200f * unit);
+            var sizeFromWidth = button.Width - (int)MathF.Round(4f * unit);
+            var size = Math.Max(1, Math.Min((int)MathF.Round(220f * unit), Math.Min(sizeFromHeight, sizeFromWidth)));
+            var gap = Math.Max(1, (int)MathF.Round(8f * unit));
+            var frame = new Rectangle(button.X + (button.Width - size) / 2,
+                button.Y - gap - size, size, size);
+            var edge = Math.Max(1, (int)MathF.Round(2f * unit));
+            var interfaceUi = _chartEditorInterfaceLayout;
+            _spriteBatch.Draw(_pixel, frame, interfaceUi.ButtonColor);
+
+            var imageBounds = new Rectangle(frame.X + edge, frame.Y + edge,
+                Math.Max(1, frame.Width - edge * 2), Math.Max(1, frame.Height - edge * 2));
+            var texture = GetEditorArtworkTexture(field);
+            if (texture is not null && texture.Width > 0 && texture.Height > 0)
+            {
+                var scale = Math.Min(imageBounds.Width / (float)texture.Width,
+                    imageBounds.Height / (float)texture.Height);
+                var width = Math.Max(1, (int)MathF.Round(texture.Width * scale));
+                var height = Math.Max(1, (int)MathF.Round(texture.Height * scale));
+                var fitted = new Rectangle(imageBounds.X + (imageBounds.Width - width) / 2,
+                    imageBounds.Y + (imageBounds.Height - height) / 2, width, height);
+                _spriteBatch.Draw(texture, fitted, Color.White);
+            }
+            else
+            {
+                var placeholder = HasEditorMediaResource(field)
+                    ? "IMAGE PREVIEW UNAVAILABLE"
+                    : "NO IMAGE SET";
+                DrawEditorPreviewLabel(placeholder, imageBounds, interfaceUi.MutedTextColor, unit);
+            }
+
+            var border = interfaceUi.AccentColor;
+            _spriteBatch.Draw(_pixel, new Rectangle(frame.X, frame.Y, frame.Width, edge), border);
+            _spriteBatch.Draw(_pixel, new Rectangle(frame.X, frame.Bottom - edge, frame.Width, edge), border);
+            _spriteBatch.Draw(_pixel, new Rectangle(frame.X, frame.Y, edge, frame.Height), border);
+            _spriteBatch.Draw(_pixel, new Rectangle(frame.Right - edge, frame.Y, edge, frame.Height), border);
         }
     }
 
@@ -1153,10 +1285,24 @@ public sealed partial class Playfield
         }
         catch
         {
-            // Texture2D.FromStream does not support every format used by song
-            // bundles (notably WebP). Convert just this one image to a temporary
-            // PNG so the MEDIA tab can preview it without cropping or changing
-            // the original saved asset.
+            // Try the Windows image decoder next. MonoGame's decoder does not
+            // support every ordinary image format (or extensionless legacy art),
+            // but GDI+ can normalize PNG/JPEG/BMP/GIF/TIFF images to PNG without
+            // asking the user to install FFmpeg. WebP continues to the FFmpeg path.
+        }
+
+        var normalizedPng = TryNormalizeEditorArtworkToPng(bytes);
+        if (normalizedPng is { Length: > 0 })
+        {
+            try
+            {
+                using var normalizedStream = new MemoryStream(normalizedPng, writable: false);
+                return Texture2D.FromStream(_graphics, normalizedStream);
+            }
+            catch
+            {
+                // Fall through to FFmpeg only if the normalized image still cannot load.
+            }
         }
 
         var ffmpeg = FindTstsFfmpegExecutable();
@@ -1189,6 +1335,37 @@ public sealed partial class Playfield
         finally
         {
             try { Directory.Delete(temporaryDirectory, recursive: true); } catch { }
+        }
+    }
+
+    private static byte[]? TryNormalizeEditorArtworkToPng(byte[] bytes)
+    {
+        if (bytes.Length == 0)
+            return null;
+
+        try
+        {
+            using var source = new MemoryStream(bytes, writable: false);
+            using var image = System.Drawing.Image.FromStream(source, useEmbeddedColorManagement: true, validateImageData: true);
+            if (image.Width <= 0 || image.Height <= 0)
+                return null;
+
+            using var bitmap = new System.Drawing.Bitmap(image.Width, image.Height,
+                System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
+            {
+                graphics.Clear(System.Drawing.Color.Transparent);
+                graphics.DrawImage(image, new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height));
+            }
+
+            using var output = new MemoryStream();
+            bitmap.Save(output, System.Drawing.Imaging.ImageFormat.Png);
+            return output.ToArray();
+        }
+        catch
+        {
+            // Formats such as WebP that GDI+ cannot read are handled by FFmpeg below.
+            return null;
         }
     }
 
@@ -1359,18 +1536,21 @@ public sealed partial class Playfield
 
     private void DrawEditorPreviewEditorOverlay(int virtualWidth, int virtualHeight)
     {
+        var interfaceUi = _chartEditorInterfaceLayout;
+        var headerFont = GetChartEditorFont(interfaceUi.HeaderFont);
+        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorPreviewEditorDialogBounds(virtualWidth, virtualHeight);
         _spriteBatch.Draw(_pixel, new Rectangle(0, 0, virtualWidth, virtualHeight), new Color(0, 0, 0, 185));
-        _spriteBatch.Draw(_pixel, panel, new Color(8, 8, 9, 252));
+        _spriteBatch.Draw(_pixel, panel, interfaceUi.PanelColor);
         var edge = Math.Max(2, (int)MathF.Round(2f * unit));
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, panel.Width, edge), Active);
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Bottom - edge, panel.Width, edge), new Color(78, 78, 80, 245));
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, edge, panel.Height), Active);
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.Right - edge, panel.Y, edge, panel.Height), new Color(78, 78, 80, 245));
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, panel.Width, edge), interfaceUi.AccentColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Bottom - edge, panel.Width, edge), interfaceUi.HeaderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, edge, panel.Height), interfaceUi.AccentColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.Right - edge, panel.Y, edge, panel.Height), interfaceUi.HeaderColor);
 
-        var title = FontSafeText(_font, "MUSIC PREVIEW");
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, title, new Vector2(panel.X + 28f * unit, panel.Y + 22f * unit), Text);
+        var title = FontSafeText(headerFont, "MUSIC PREVIEW");
+        UnicodeTextRenderer.DrawString(_spriteBatch, headerFont, title, new Vector2(panel.X + 28f * unit, panel.Y + 22f * unit), interfaceUi.ButtonTextColor);
         var sourceDuration = EditorPreviewSourceDurationSeconds;
         var subtitle = sourceDuration > 0
             ? $"Choose a section of the full song. Length: {FormatEditorPreviewTimestamp(sourceDuration)}. A subtle fade is added at each end."
@@ -1390,14 +1570,14 @@ public sealed partial class Playfield
         DrawEditorPreviewSliderThumb(GetEditorPreviewStartThumbBounds(virtualWidth, virtualHeight), Active);
         DrawEditorPreviewSliderThumb(GetEditorPreviewEndThumbBounds(virtualWidth, virtualHeight), new Color(52, 211, 153));
 
-        var minLabel = FontSafeText(_font, "00:00.000");
-        var maxLabel = FontSafeText(_font, FormatEditorPreviewTimestamp(sourceDuration));
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, minLabel, new Vector2(slider.X, slider.Bottom + 8f * unit), Muted);
-        var maxSize = UnicodeTextRenderer.MeasureString(_font, maxLabel);
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, maxLabel, new Vector2(slider.Right - maxSize.X, slider.Bottom + 8f * unit), Muted);
+        var minLabel = FontSafeText(labelFont, "00:00.000");
+        var maxLabel = FontSafeText(labelFont, FormatEditorPreviewTimestamp(sourceDuration));
+        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, minLabel, new Vector2(slider.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor);
+        var maxSize = UnicodeTextRenderer.MeasureString(labelFont, maxLabel);
+        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, maxLabel, new Vector2(slider.Right - maxSize.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor);
 
-        DrawEditorPreviewLabel("START TIME (SECONDS)", new Rectangle(GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), Muted, unit);
-        DrawEditorPreviewLabel("END TIME (SECONDS)", new Rectangle(GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), Muted, unit);
+        DrawEditorPreviewLabel("START TIME (SECONDS)", new Rectangle(GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), interfaceUi.MutedTextColor, unit);
+        DrawEditorPreviewLabel("END TIME (SECONDS)", new Rectangle(GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), interfaceUi.MutedTextColor, unit);
         DrawEditorPreviewInput(GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight), _editorPreviewStartText, _editorPreviewFocusedField == 0, _editorPreviewStartCaret, unit);
         DrawEditorPreviewInput(GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight), _editorPreviewEndText, _editorPreviewFocusedField == 1, _editorPreviewEndCaret, unit);
 
@@ -1429,36 +1609,40 @@ public sealed partial class Playfield
     {
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return;
-        var text = FontSafeText(_font, rawText);
-        var measured = UnicodeTextRenderer.MeasureString(_font, text);
         var maxWidth = Math.Max(1f, bounds.Width - 4f * unit);
-        var scale = Math.Min(1f, maxWidth / Math.Max(1f, measured.X));
-        var maxHeightScale = bounds.Height / Math.Max(1f, measured.Y);
-        scale = Math.Min(scale, maxHeightScale);
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, text,
-            new Vector2(bounds.X + 2f * unit, bounds.Y + (bounds.Height - measured.Y * scale) * 0.5f),
-            color, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+        var fitted = FitChartEditorText(rawText, _chartEditorInterfaceLayout.LabelFont, 24f,
+            maxWidth, bounds.Height - 2f * unit);
+        var size = fitted.Measured * fitted.Scale;
+        UnicodeTextRenderer.DrawString(_spriteBatch, fitted.Font, fitted.Text,
+            new Vector2(bounds.X + 2f * unit, bounds.Y + (bounds.Height - size.Y) * 0.5f),
+            color, 0f, Vector2.Zero, fitted.Scale, SpriteEffects.None, 0f);
     }
 
     private void DrawEditorPreviewInput(Rectangle bounds, string text, bool focused, int caretIndex, float unit)
     {
+        var interfaceUi = _chartEditorInterfaceLayout;
+        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
         var accent = focused ? Active : new Color(100, 100, 102);
-        _spriteBatch.Draw(_pixel, bounds, new Color(12, 12, 13, 250));
+        _spriteBatch.Draw(_pixel, bounds, interfaceUi.ButtonColor);
         var edge = Math.Max(1, (int)MathF.Round(1.5f * unit));
         _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, bounds.Width, edge), accent);
-        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Bottom - edge, bounds.Width, edge), new Color(68, 68, 70, 245));
+        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Bottom - edge, bounds.Width, edge), interfaceUi.HeaderColor);
         var caretPrefix = string.Empty;
         var visibleStart = 0;
         var visibleEnd = text.Length;
         var textWidth = Math.Max(1f, bounds.Width - 20f * unit);
         var textScale = Math.Min(1f, Math.Max(0.55f,
-            (bounds.Height - 8f * unit) / Math.Max(1f, UnicodeTextRenderer.MeasureString(_font, "Ag").Y)));
+            (bounds.Height - 8f * unit) / Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y)));
+        labelFont = GetChartEditorFont(interfaceUi.LabelFont, 24f * textScale);
+        textScale = Math.Min(1f, (bounds.Height - 8f * unit) /
+            Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y));
+        text = FontSafeText(labelFont, text);
         var display = focused
-            ? FitEditorTextAroundCaret(_font, text, caretIndex, textWidth,
+            ? FitEditorTextAroundCaret(labelFont, text, caretIndex, textWidth,
                 _editorPreviewFocusedField == 0 ? "preview-start" : "preview-end", textScale,
                 out caretPrefix, out visibleStart, out visibleEnd)
-            : FitHudText(_font, FontSafeText(_font, text), textWidth);
-        var measured = UnicodeTextRenderer.MeasureString(_font, display);
+            : FitHudText(labelFont, FontSafeText(labelFont, text), textWidth);
+        var measured = UnicodeTextRenderer.MeasureString(labelFont, display);
         var textPosition = new Vector2(bounds.X + 10f * unit, bounds.Y + (bounds.Height - measured.Y * textScale) * 0.5f);
         if (focused)
         {
@@ -1466,9 +1650,9 @@ public sealed partial class Playfield
             var mappedAnchor = Math.Clamp(anchor, visibleStart, visibleEnd) - visibleStart;
             var mappedCaret = Math.Clamp(caretIndex, visibleStart, visibleEnd) - visibleStart;
             DrawEditorTextSelectionHighlight(bounds, display, mappedAnchor, mappedCaret, textPosition.X, textPosition.Y,
-                textScale, textWidth, unit);
+                textScale, textWidth, unit, font: labelFont);
         }
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, display, textPosition, Text, 0f, Vector2.Zero, new Vector2(textScale, textScale), SpriteEffects.None, 0f);
-        if (focused) DrawEditorTextCaret(caretPrefix, textPosition, textScale, unit);
+        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, display, textPosition, interfaceUi.ButtonTextColor, 0f, Vector2.Zero, new Vector2(textScale, textScale), SpriteEffects.None, 0f);
+        if (focused) DrawEditorTextCaret(caretPrefix, textPosition, textScale, unit, labelFont);
     }
 }

@@ -105,10 +105,11 @@ function render()
         transition.reason == "retry_gameplay" or transition.reason == "result_continue"
 
     if transition.phase == "out" then
+        local eased
         if (gameplay_to_result or return_to_song_select or menu_to_song_select or song_select_to_menu)
             and not result_or_game_over_action then
 -- Ordinary menu handoffs and gameplay-to-result transitions use fades.
-            local eased = apply_easing(transition.out_easing, p)
+            eased = apply_easing(transition.out_easing, p)
             draw.rect({
                 parent = "transition_viewport",
                 x = 0,
@@ -122,7 +123,7 @@ function render()
             })
         else
             -- Default transition: wipe black from left to right over the source screen.
-            local eased = apply_easing(transition.out_easing, p)
+            eased = apply_easing(transition.out_easing, p)
             draw.rect({
                 parent = "transition_viewport",
                 x = 0,
@@ -133,6 +134,19 @@ function render()
                 alpha = 1,
                 anchor = "top-left",
                 layer = 10000,
+            })
+        end
+        -- Show preparation as the outgoing transition closes, instead of making
+        -- the user wait until the opaque loading hold begins.
+        if not gameplay_to_result and not result_or_game_over_action and eased >= 0.52 then
+            draw.text("PREPARING...", {
+                parent = "transition_viewport",
+                x = width * 0.5,
+                y = height * 0.5,
+                size = UI.sizes.heading,
+                color = "#FFFFFF",
+                anchor = "center",
+                layer = 10001,
             })
         end
         return

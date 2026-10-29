@@ -1,4 +1,5 @@
 using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
 using Color = Microsoft.Xna.Framework.Color;
 using Rectangle = Microsoft.Xna.Framework.Rectangle;
 using XnaPoint = Microsoft.Xna.Framework.Point;
@@ -386,19 +387,20 @@ public sealed partial class Playfield
 
     /// <summary>Maps a click into the text currently visible inside a single-line field.</summary>
     private int GetEditorTextCaretIndexFromMouse(string fieldId, string value, float mouseX,
-        float textLeft, float textWidth, float textScale)
+        float textLeft, float textWidth, float textScale, SpriteFont? font = null)
     {
-        if (_font is null)
+        var measureFont = font ?? _font;
+        if (measureFont is null)
             return value.Length;
 
-        var safeValue = FontSafeText(_font, value);
+        var safeValue = FontSafeText(measureFont, value);
         var start = string.Equals(_editorTextActiveFieldId, fieldId, StringComparison.Ordinal) &&
                     _editorTextHorizontalScrollStarts.TryGetValue(fieldId, out var savedStart)
             ? Math.Clamp(savedStart, 0, safeValue.Length)
             : 0;
         var end = start;
         while (end < safeValue.Length &&
-               UnicodeTextRenderer.MeasureString(_font, safeValue[start..(end + 1)]).X * Math.Max(0.01f, textScale) <= textWidth)
+               UnicodeTextRenderer.MeasureString(measureFont, safeValue[start..(end + 1)]).X * Math.Max(0.01f, textScale) <= textWidth)
             end++;
         if (end == start && end < safeValue.Length)
             end++;
@@ -407,7 +409,7 @@ public sealed partial class Playfield
         var previousWidth = 0f;
         for (var index = start + 1; index <= end; index++)
         {
-            var nextWidth = UnicodeTextRenderer.MeasureString(_font, safeValue[start..index]).X;
+            var nextWidth = UnicodeTextRenderer.MeasureString(measureFont, safeValue[start..index]).X;
             if (clickX < (previousWidth + nextWidth) * 0.5f)
                 return index - 1;
             previousWidth = nextWidth;
@@ -473,14 +475,18 @@ public sealed partial class Playfield
 
     private int GetEditorPreviewTextCaretIndex(Rectangle bounds, string value, XnaPoint pixel, float unit)
     {
-        if (_font is null) return value.Length;
+        var interfaceUi = _chartEditorInterfaceLayout;
+        var font = GetChartEditorFont(interfaceUi.LabelFont);
         var fieldId = _editorPreviewFocusedField == 0 ? "preview-start" : "preview-end";
         var textLeft = bounds.X + 10f * unit;
         var textWidth = Math.Max(1f, bounds.Width - 20f * unit);
-        var measured = UnicodeTextRenderer.MeasureString(_font, FontSafeText(_font, value));
+        var measured = UnicodeTextRenderer.MeasureString(font, FontSafeText(font, value));
         var scale = Math.Min(1f, Math.Max(0.55f,
             (bounds.Height - 8f * unit) / Math.Max(1f, measured.Y)));
-        return GetEditorTextCaretIndexFromMouse(fieldId, value, pixel.X, textLeft, textWidth, scale);
+        font = GetChartEditorFont(interfaceUi.LabelFont, 24f * scale);
+        scale = Math.Min(1f, (bounds.Height - 8f * unit) /
+            Math.Max(1f, UnicodeTextRenderer.MeasureString(font, "Ag").Y));
+        return GetEditorTextCaretIndexFromMouse(fieldId, value, pixel.X, textLeft, textWidth, scale, font);
     }
 
     private void UpdateEditorTextFieldMouseDrag()
@@ -517,20 +523,22 @@ public sealed partial class Playfield
     }
 
     private void DrawEditorTextSelectionHighlight(Rectangle bounds, string text, int anchor, int caret,
-        float textLeft, float textTop, float textScale, float availableWidth, float unit, float paddingTop = 0f)
+        float textLeft, float textTop, float textScale, float availableWidth, float unit,
+        float paddingTop = 0f, SpriteFont? font = null)
     {
-        if (_font is null || _pixel is null) return;
+        var measureFont = font ?? _font;
+        if (measureFont is null || _pixel is null) return;
         var (start, end) = GetEditorTextSelection(text, caret, anchor);
         if (end <= start) return;
-        var safePrefix = FontSafeText(_font, text[..start]);
-        var safeSelected = FontSafeText(_font, text[start..end]);
-        var x1 = textLeft + UnicodeTextRenderer.MeasureString(_font, safePrefix).X * textScale;
-        var width = UnicodeTextRenderer.MeasureString(_font, safeSelected).X * textScale;
+        var safePrefix = FontSafeText(measureFont, text[..start]);
+        var safeSelected = FontSafeText(measureFont, text[start..end]);
+        var x1 = textLeft + UnicodeTextRenderer.MeasureString(measureFont, safePrefix).X * textScale;
+        var width = UnicodeTextRenderer.MeasureString(measureFont, safeSelected).X * textScale;
         var x2 = x1 + width;
         var left = Math.Max(bounds.Left + 2f * unit, x1);
         var right = Math.Min(bounds.Right - 2f * unit, Math.Min(x2, textLeft + availableWidth));
         if (right <= left) return;
-        var fontHeight = UnicodeTextRenderer.MeasureString(_font, "Ag").Y * textScale;
+        var fontHeight = UnicodeTextRenderer.MeasureString(measureFont, "Ag").Y * textScale;
         var y = textTop - paddingTop;
         var h = Math.Max(1f, fontHeight + paddingTop * 2f);
         var rect = new Rectangle((int)MathF.Floor(left), (int)MathF.Floor(y),

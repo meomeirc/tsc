@@ -16,6 +16,12 @@ public static class LinkBuilder
             // are destinations. Do not use track number to infer path order.
             var nodes = group.OrderBy(e => e.Tick)
                 .ThenBy(e => e.NoteType == NoteType.LinkHead ? 0 : 1)
+                // At one tick, an existing short LinkTail is the prior point;
+                // a longer tail is the horizontal-first continuation that follows
+                // it. EventIndex is only a stable tie-break for equal durations.
+                .ThenBy(e => e.Duration > 6 ? 1 : 0)
+                .ThenByDescending(e => e.Duration)
+                .ThenBy(e => e.EventIndex)
                 .ToList();
             var pending = new Dictionary<int, ChartEvent>();
             (ChartEvent Head, ChartEvent Last, long Expiry)? active = null;

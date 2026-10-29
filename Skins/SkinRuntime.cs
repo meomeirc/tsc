@@ -5,6 +5,7 @@ using XnaRectangle = Microsoft.Xna.Framework.Rectangle;
 using XnaMatrix = Microsoft.Xna.Framework.Matrix;
 using MoonSharp.Interpreter;
 using System.Diagnostics;
+using System.Collections;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Drawing;
@@ -50,6 +51,7 @@ public sealed class SkinGameView
     private SkinAssetHandle? _albumBig;
     private bool _playing;
     private bool _autoplay;
+    private bool _editorPreviewMode;
     private double _aspectRatio;
     private double _accuracy;
     private double _scrollSpeed = Rendering.ChartProjection.DefaultScrollSpeedScale;
@@ -88,6 +90,8 @@ public sealed class SkinGameView
     public SkinAssetHandle? album_big => _albumBig;
     public bool playing => _playing;
     public bool autoplay => _autoplay;
+    /// <summary>True while editor-owned preview playback is using the gameplay skin.</summary>
+    public bool editor_preview_mode => _editorPreviewMode;
     public double aspect_ratio => _aspectRatio;
     public double accuracy => _accuracy;
     public double scroll_speed => _scrollSpeed;
@@ -155,6 +159,9 @@ public sealed class SkinGameView
 
     internal void SetEditorMode(bool enabled)
         => _editorMode = enabled;
+
+    internal void SetEditorPreviewMode(bool enabled)
+        => _editorPreviewMode = enabled;
 
     internal void UpdatePauseState(double scrollSpeed, bool paused, int selection)
     {
@@ -1801,6 +1808,7 @@ public sealed class SkinRuntime : IDisposable
     private readonly SkinGameView _game;
     private readonly SkinScreenView _screen = new();
     private Table? _songSelect;
+    private Table? _chartEditor;
     private Table? _mainMenu;
     private Table? _transition;
     private Table? _skinPerfApi;
@@ -1846,6 +1854,9 @@ public sealed class SkinRuntime : IDisposable
     private float _uiPointerX;
     private float _uiPointerY;
     private bool _uiPointerLeftDown;
+
+    public float UiPointerX => _uiPointerX;
+    public float UiPointerY => _uiPointerY;
     private string? _uiPressedButtonId;
     private string? _uiPressedSliderId;
     private double? _uiPressedSliderValue;
@@ -1979,6 +1990,7 @@ public sealed class SkinRuntime : IDisposable
         public DynValue? OnClick { get; }
         public string? Action { get; }
         public object? ActionValue { get; }
+        public int HitTestPriority { get; }
 
         public SkinUiButton(
             string id,
@@ -1989,7 +2001,8 @@ public sealed class SkinRuntime : IDisposable
             float height,
             DynValue? onClick,
             string? action,
-            object? actionValue)
+            object? actionValue,
+            int hitTestPriority)
         {
             Id = id;
             ParentId = parentId;
@@ -2000,6 +2013,7 @@ public sealed class SkinRuntime : IDisposable
             OnClick = onClick;
             Action = action;
             ActionValue = actionValue;
+            HitTestPriority = hitTestPriority;
         }
 
         internal void SetResolvedPosition(Vector2 topLeft)
@@ -2024,6 +2038,8 @@ public sealed class SkinRuntime : IDisposable
         public double Max { get; }
         public double Step { get; }
         public string Action { get; }
+        public bool Vertical { get; }
+        public bool Reverse { get; }
 
         public SkinUiSlider(
             string id,
@@ -2035,7 +2051,9 @@ public sealed class SkinRuntime : IDisposable
             double min,
             double max,
             double step,
-            string action)
+            string action,
+            bool vertical,
+            bool reverse)
         {
             Id = id;
             ParentId = parentId;
@@ -2047,6 +2065,8 @@ public sealed class SkinRuntime : IDisposable
             Max = max;
             Step = step;
             Action = action;
+            Vertical = vertical;
+            Reverse = reverse;
         }
 
         internal void SetResolvedPosition(Vector2 topLeft)
@@ -2058,9 +2078,12 @@ public sealed class SkinRuntime : IDisposable
         public bool Contains(float px, float py)
             => px >= X && px <= X + Width && py >= Y && py <= Y + Height;
 
-        public double ValueFromPointer(float px)
+        public double ValueFromPointer(float px, float py)
         {
-            var ratio = Math.Clamp((px - X) / Math.Max(0.0001f, Width), 0f, 1f);
+            var ratio = Vertical
+                ? Math.Clamp((py - Y) / Math.Max(0.0001f, Height), 0f, 1f)
+                : Math.Clamp((px - X) / Math.Max(0.0001f, Width), 0f, 1f);
+            if (Reverse) ratio = 1f - ratio;
             var value = Min + (Max - Min) * ratio;
             if (Step > 0.0)
                 value = Min + Math.Round((value - Min) / Step, MidpointRounding.AwayFromZero) * Step;
@@ -2192,6 +2215,7 @@ public sealed class SkinRuntime : IDisposable
             string.Equals(screenScriptName, "settingsMenu.lua", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(screenScriptName, "chartEditorMenu.lua", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(screenScriptName, "songSelect.lua", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(screenScriptName, "chartEditorInterface.lua", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(screenScriptName, "gameplayPause.lua", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(screenScriptName, "transition.lua", StringComparison.OrdinalIgnoreCase);
         _fallbackScriptPath = string.Equals(scriptFileName, "skin.lua", StringComparison.OrdinalIgnoreCase)
@@ -2252,6 +2276,7 @@ public sealed class SkinRuntime : IDisposable
         _importCache.Clear();
         _importsLoading.Clear();
         _songSelect = null;
+        _chartEditor = null;
         _mainMenu = null;
         _transition = null;
         DisposeSkin3DBackgroundTextures();
@@ -2286,6 +2311,8 @@ public sealed class SkinRuntime : IDisposable
             script.Globals["screen"] = _screen;
             _songSelect = new Table(script);
             script.Globals["song_select"] = _songSelect;
+            _chartEditor = new Table(script);
+            script.Globals["chart_editor"] = _chartEditor;
             _mainMenu = new Table(script);
             script.Globals["menu"] = _mainMenu;
             _transition = new Table(script);
@@ -2327,6 +2354,14 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu?.Set("error", string.IsNullOrWhiteSpace(error) ? DynValue.Nil : DynValue.NewString(error));
         _mainMenu?.Set("selected", DynValue.NewNumber(Math.Max(0, selectedIndex)));
         _mainMenu?.Set("version", DynValue.NewString(GameVersion.Current));
+        UpdateMainMenuUpdateStatus();
+    }
+
+    public void UpdateMainMenuUpdateStatus()
+    {
+        _mainMenu?.Set("update_status", string.IsNullOrWhiteSpace(UpdateCheckService.StatusText)
+            ? DynValue.Nil
+            : DynValue.NewString(UpdateCheckService.StatusText));
     }
 
     /// <summary>Updates live values and controls for the Lua settings screen.</summary>
@@ -2351,7 +2386,8 @@ public sealed class SkinRuntime : IDisposable
         float editingSelectionWidth = 0f,
         string? keybindCategory = "navigation",
         string? keybindEditorSubcategory = "file",
-        string? keybindCapturePreview = null)
+        string? keybindCapturePreview = null,
+        string? settingsTab = "general")
     {
         if (_mainMenu is null || _script is null)
             return;
@@ -2376,6 +2412,7 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("keybind_category", DynValue.NewString(string.Equals(keybindCategory, "gameplay", StringComparison.OrdinalIgnoreCase) ? "gameplay" : string.Equals(keybindCategory, "editor", StringComparison.OrdinalIgnoreCase) ? "editor" : "navigation"));
         _mainMenu.Set("keybind_editor_subcategory", DynValue.NewString(keybindEditorSubcategory ?? "file"));
         _mainMenu.Set("keybind_capture_preview", DynValue.NewString(keybindCapturePreview ?? string.Empty));
+        _mainMenu.Set("settings_tab", DynValue.NewString(settingsTab is "audio" or "display" ? settingsTab : "general"));
 
         var keybinds = new Table(_script);
         if (keybindRows is not null)
@@ -2410,6 +2447,9 @@ public sealed class SkinRuntime : IDisposable
             case "scroll_speed" when value is double scrollSpeed && double.IsFinite(scrollSpeed):
                 _game.settings.scroll_speed = scrollSpeed;
                 return true;
+            case "music_volume" when value is double musicVolume && double.IsFinite(musicVolume):
+                _game.settings.music_volume = musicVolume;
+                return true;
             case "tap_volume" when value is double tapVolume && double.IsFinite(tapVolume):
                 _game.settings.tap_volume = tapVolume;
                 return true;
@@ -2418,6 +2458,9 @@ public sealed class SkinRuntime : IDisposable
                 return true;
             case "lane_switch_volume" when value is double laneSwitchVolume && double.IsFinite(laneSwitchVolume):
                 _game.settings.lane_switch_volume = laneSwitchVolume;
+                return true;
+            case "metronome_volume" when value is double metronomeVolume && double.IsFinite(metronomeVolume):
+                _game.settings.metronome_volume = metronomeVolume;
                 return true;
             case "max_frame_rate" when value is double maxFrameRate && double.IsFinite(maxFrameRate):
                 _game.settings.max_frame_rate = maxFrameRate;
@@ -2470,8 +2513,8 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("hint", DynValue.NewString(hint ?? string.Empty));
         _mainMenu.Set("selected", DynValue.NewNumber(Math.Max(0, selectedIndex)));
         _mainMenu.Set("error", string.IsNullOrWhiteSpace(error) ? DynValue.Nil : DynValue.NewString(error));
-        _mainMenu.Set("row_height", DynValue.NewNumber(Math.Max(1, rowHeight)));
-        _mainMenu.Set("row_gap", DynValue.NewNumber(Math.Max(0, rowGap)));
+        _mainMenu.Set("row_height", rowHeight > 0 ? DynValue.NewNumber(Math.Max(1, rowHeight)) : DynValue.Nil);
+        _mainMenu.Set("row_gap", rowGap > 0 ? DynValue.NewNumber(Math.Max(0, rowGap)) : DynValue.Nil);
 
         var rows = new Table(_script);
         for (var i = 0; i < items.Count; i++)
@@ -2660,6 +2703,10 @@ public sealed class SkinRuntime : IDisposable
     public void SetEditorMode(bool enabled)
         => _game.SetEditorMode(enabled);
 
+    /// <summary>Marks gameplay-skin use as preview playback owned by the chart editor.</summary>
+    public void SetEditorPreviewMode(bool enabled)
+        => _game.SetEditorPreviewMode(enabled);
+
     public void UpdatePauseState(double scrollSpeed, bool paused, int selection)
         => _game.UpdatePauseState(scrollSpeed, paused, selection);
 
@@ -2836,6 +2883,51 @@ public sealed class SkinRuntime : IDisposable
             return null;
 
         return new SkinUiAction(action.String!, ReadUiActionValue(value));
+    }
+
+    /// <summary>Replaces the state table consumed by chartEditorInterface.lua.</summary>
+    public void UpdateChartEditorInterfaceState(IReadOnlyDictionary<string, object?> state)
+    {
+        if (_chartEditor is null || _script is null)
+            return;
+
+        foreach (var key in _chartEditor.Pairs.Select(pair => pair.Key.String).Where(key => key is not null).ToArray())
+            _chartEditor.Set(key!, DynValue.Nil);
+
+        foreach (var (key, value) in state)
+            _chartEditor.Set(key, ToLuaValue(_script, value));
+    }
+
+    private static DynValue ToLuaValue(Script script, object? value)
+    {
+        if (value is null) return DynValue.Nil;
+        if (value is DynValue dynValue) return dynValue;
+        if (value is string text) return DynValue.NewString(text);
+        if (value is bool boolean) return DynValue.NewBoolean(boolean);
+        if (value is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal)
+            return DynValue.NewNumber(Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture));
+
+        if (value is IDictionary dictionary)
+        {
+            var table = new Table(script);
+            foreach (DictionaryEntry entry in dictionary)
+            {
+                if (entry.Key is string key)
+                    table.Set(key, ToLuaValue(script, entry.Value));
+            }
+            return DynValue.NewTable(table);
+        }
+
+        if (value is IEnumerable enumerable)
+        {
+            var table = new Table(script);
+            var index = 1;
+            foreach (var item in enumerable)
+                table.Set(index++, ToLuaValue(script, item));
+            return DynValue.NewTable(table);
+        }
+
+        return DynValue.NewString(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty);
     }
 
     // Compatibility name for the song-select caller while ui.button routing is
@@ -3102,12 +3194,12 @@ public sealed class SkinRuntime : IDisposable
     /// Renders the current skin script command list into a caller-owned SpriteBatch.
     /// Used by startup/menu screens that share the same Lua drawing API as gameplay.
     /// </summary>
-    public void RenderDrawCommands(SpriteBatch spriteBatch, Texture2D fallbackPixel, SpriteFont fallbackFont, int width, int height)
+    public bool RenderDrawCommands(SpriteBatch spriteBatch, Texture2D fallbackPixel, SpriteFont fallbackFont, int width, int height)
     {
         _defaultFallbackFont = fallbackFont;
         var commands = BuildDrawCommands(width, height);
-        if (commands.Count == 0)
-            return;
+        if (!commands.Any(HasVisibleDrawContent))
+            return false;
 
         // Draw commands are already sorted by layer/order. Keep that ordering across
         // sprites, text, rects and lines. The old implementation split sprites and
@@ -3368,6 +3460,30 @@ public sealed class SkinRuntime : IDisposable
             if (batchOpen)
                 spriteBatch.End();
         }
+
+        return true;
+    }
+
+    private static bool HasVisibleDrawContent(SkinDrawCommand command)
+    {
+        if (command.Alpha <= 0.001f)
+            return false;
+
+        return command.Kind switch
+        {
+            SkinDrawCommandKind.Sprite => command.Asset is not null && command.Fill > 0f &&
+                command.Scale.X > 0f && command.Scale.Y > 0f && command.Size.X > 0f && command.Size.Y > 0f,
+            SkinDrawCommandKind.Text => !string.IsNullOrEmpty(command.Text) &&
+                command.Scale.X > 0f && command.Scale.Y > 0f,
+            SkinDrawCommandKind.Rect => command.Size.X > 0f && command.Size.Y > 0f,
+            SkinDrawCommandKind.Line => Vector2.DistanceSquared(command.Position, command.EndPosition) > 0.000001f &&
+                command.LineWidth > 0f,
+            SkinDrawCommandKind.LineBatch => command.LineSegments is not null && command.LineSegmentCount > 0,
+            SkinDrawCommandKind.Shadow => command.BoxShadow is not null && command.Size.X > 0f && command.Size.Y > 0f,
+            SkinDrawCommandKind.Quad3D => command.Size.X > 0f && command.Size.Y > 0f,
+            SkinDrawCommandKind.Sparkles => command.Sparkles is not null || command.SparkleAnimation is not null,
+            _ => false,
+        };
     }
 
     private static bool FontContainsCharacter(SpriteFont font, char character)
@@ -4812,7 +4928,7 @@ public sealed class SkinRuntime : IDisposable
         // Shared scripts beside the executable are deliberately not used.
         var candidates = new[]
         {
-            Path.Combine(AppContext.BaseDirectory, "skins", "Default", fileName)
+            Path.Combine(UserDataPaths.GameRootDirectory, "Skins", "Default", fileName)
         };
 #else
         var candidates = new[]
@@ -4850,7 +4966,7 @@ public sealed class SkinRuntime : IDisposable
 #if TSC_PUBLISH
             var fallbackDirectories = new[]
             {
-                Path.Combine(AppContext.BaseDirectory, "skins", "Default")
+                Path.Combine(UserDataPaths.GameRootDirectory, "Skins", "Default")
             };
 #else
             var fallbackDirectories = new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory };
@@ -5106,6 +5222,10 @@ public sealed class SkinRuntime : IDisposable
 
         var actionValue = options.Get("value");
         var action = GetOptionalString(options, "action")?.Trim();
+        var priorityValue = GetOptionalNumber(options, "hit_test_priority", 0.0);
+        var hitTestPriority = double.IsFinite(priorityValue)
+            ? (int)Math.Clamp(Math.Round(priorityValue), -1000.0, 1000.0)
+            : 0;
         if (string.IsNullOrWhiteSpace(action))
             action = null;
 
@@ -5141,7 +5261,8 @@ public sealed class SkinRuntime : IDisposable
             (float)height,
             onClick,
             action,
-            parsedActionValue);
+            parsedActionValue,
+            hitTestPriority);
         _uiButtons[id] = button;
         RegisterInteractiveLayoutNode(id, parentId, (float)x, (float)y, (float)width, (float)height, button, null);
 
@@ -5172,6 +5293,8 @@ public sealed class SkinRuntime : IDisposable
         var min = GetOptionalNumber(options, "min", 0.0);
         var max = GetOptionalNumber(options, "max", 1.0);
         var step = GetOptionalNumber(options, "step", 0.0);
+        var vertical = string.Equals(GetOptionalString(options, "axis"), "vertical", StringComparison.OrdinalIgnoreCase);
+        var reverse = GetOptionalNumber(options, "reverse", 0.0) != 0.0;
         var action = GetOptionalString(options, "action")?.Trim();
         if (string.IsNullOrWhiteSpace(action))
             throw new ScriptRuntimeException($"ui.slider '{id}' requires an action");
@@ -5190,7 +5313,9 @@ public sealed class SkinRuntime : IDisposable
             min,
             max,
             step,
-            action);
+            action,
+            vertical,
+            reverse);
         _uiSliders[id] = slider;
         RegisterInteractiveLayoutNode(id, parentId, (float)x, (float)y, (float)width, (float)height, null, slider);
 
@@ -5344,6 +5469,25 @@ public sealed class SkinRuntime : IDisposable
         return false;
     }
 
+    public bool IsUiPointOverControl(float x, float y)
+    {
+        foreach (var button in _uiButtons.Values)
+            if (button.Contains(x, y)) return true;
+        foreach (var slider in _uiSliders.Values)
+            if (slider.Contains(x, y)) return true;
+        return false;
+    }
+
+    public bool IsUiPointOverControlWithIdPrefix(float x, float y, string idPrefix)
+    {
+        if (string.IsNullOrEmpty(idPrefix)) return false;
+        foreach (var button in _uiButtons.Values)
+            if (button.Id.StartsWith(idPrefix, StringComparison.OrdinalIgnoreCase) && button.Contains(x, y)) return true;
+        foreach (var slider in _uiSliders.Values)
+            if (slider.Id.StartsWith(idPrefix, StringComparison.OrdinalIgnoreCase) && slider.Contains(x, y)) return true;
+        return false;
+    }
+
     /// <summary>
     /// Dispatches a left-button press against the interactive UI regions declared
     /// by the current Lua render(). Buttons invoke their action; sliders capture
@@ -5384,7 +5528,8 @@ public sealed class SkinRuntime : IDisposable
             }
             else
             {
-                hitButton = button;
+                if (hitButton is null || button.HitTestPriority >= hitButton.HitTestPriority)
+                    hitButton = button;
             }
         }
 
@@ -5421,11 +5566,11 @@ public sealed class SkinRuntime : IDisposable
         }
         else
         {
-            // A slider is an overlay control and must win over buttons underneath it.
-            // Song cards and even the speed-toggle button can geometrically overlap
-            // the slider popup in narrow layouts. Letting any ordinary button win
-            // here makes a slider click select a card instead of adjusting it.
-            if (hitSlider is not null)
+            // Sliders win ties to preserve their established overlay behavior.
+            // Explicitly raised popup buttons can sit above sliders when their
+            // visible overlay covers the slider's bounds.
+            if (hitSlider is not null &&
+                (hitButton is null || hitButton.HitTestPriority <= 0))
                 hitButton = null;
 
             // The full-screen popup backdrop is only a fallback when no real control
@@ -5467,7 +5612,7 @@ public sealed class SkinRuntime : IDisposable
         _uiPressedSliderId = hitSlider.Id;
         try
         {
-            var value = hitSlider.ValueFromPointer(x);
+            var value = hitSlider.ValueFromPointer(x, y);
             _uiPressedSliderValue = value;
             EmitUiAction(hitSlider.Action, value);
             return true;
@@ -5495,7 +5640,7 @@ public sealed class SkinRuntime : IDisposable
 
         try
         {
-            var value = slider.ValueFromPointer(x);
+            var value = slider.ValueFromPointer(x, y);
             if (_uiPressedSliderValue.HasValue &&
                 Math.Abs(_uiPressedSliderValue.Value - value) < 0.0000001)
                 return false;

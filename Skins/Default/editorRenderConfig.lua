@@ -15,7 +15,7 @@ return {
     lane = {
         position = {
             x = screen.width / 2,
-            y = screen.height - 180,
+            y = screen.height - 220,
         },
         gap = { start = 40, judge = 40 },
         rotation = {
@@ -29,7 +29,7 @@ return {
         depth = {
             farCameraDistance = 0,
             length = 100,
-            endLength = 300,
+            endLength = 400,
         },
         texture = { width = track },
         line = {
@@ -92,9 +92,9 @@ return {
     },
 
     superFlick = {
-        texture = { width = track },
+        texture = { width = track * 0.8 },
         scroll = { speed = 2.25, gap = 0.2 },
-        highlight = { width = track, speed = 1, opacity = 1 },
+        highlight = { width = track*3, speed = 1, opacity = 1 },
         transition = {
             durationSeconds = 0.5,
             angleDegrees = 180,
@@ -108,7 +108,7 @@ return {
 
     renderDistance = {
         ahead = 2900,
-        behind = 300,
+        behind = 400,
     },
 
     transitionFlash = {

@@ -5,6 +5,7 @@ using System.Globalization;
 using TSC.Rendering;
 using TSC.Ares;
 using TSC.Input;
+using TSC.Updater;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
@@ -53,6 +54,8 @@ public sealed class Game1 : Game
     private SkinRuntime? _editorMenuRuntime;
     private SkinRuntime? _settingsMenuRuntime;
     private int _mainMenuSelectedIndex;
+    private bool _updatePromptShown;
+    private int _updateAvailableFrames;
     private string? _infoMarkdownSource;
     private readonly List<InfoVisualLine> _infoVisualLines = new();
     private int _infoLayoutWidth = -1;
@@ -65,6 +68,7 @@ public sealed class Game1 : Game
     private bool _settingsMouseSelecting;
     private int _settingsMouseAnchor;
     private bool _settingsKeybindsOpen;
+    private string _settingsTab = "general";
     private string? _keybindCaptureAction;
     private string _keybindCaptureSlot = "primary";
     private int[] _keybindPendingScancodes = Array.Empty<int>();
@@ -83,8 +87,8 @@ public sealed class Game1 : Game
     private int _fallbackSettingsSelectedIndex;
     private static readonly string[] FallbackSettingsLabels =
     {
-        "Chart scroll speed", "Scroll mode", "Tap volume", "Link volume", "Lane switch volume",
-        "Frame rate limit", "VSync", "Gauge", "Display mode", "Skin", "Back"
+        "Chart scroll speed", "Scroll mode", "Music volume", "Tap volume", "Link volume", "Lane switch volume",
+        "Metronome volume", "Frame rate limit", "VSync", "Gauge", "Display mode", "Skin", "Back"
     };
     private static readonly int[] FallbackFrameRateOptions = { 0, 30, 60, 120, 144, 165, 240, 360, 500, 1000 };
 
@@ -119,6 +123,7 @@ public sealed class Game1 : Game
     private double _transitionDuration;
     private bool _transitionLoadPending;
     private bool _transitionTargetReady;
+    private bool _transitionFrameDrawnSinceUpdate;
     private string? _transitionError;
     private Playfield.PreparedFpkLoad? _preparedFpk;
     // Editor chart loads use the shared transition.lua loading cycle and keep
@@ -182,7 +187,11 @@ public sealed class Game1 : Game
             SynchronizeWithVerticalRetrace = true,
             IsFullScreen = false
         };
+#if TSC_PUBLISH
+        Content.RootDirectory = Path.Combine(AppContext.BaseDirectory, "Content");
+#else
         Content.RootDirectory = "Content";
+#endif
         IsMouseVisible = true;
         Window.AllowUserResizing = true;
         Window.Title = "TSC";
@@ -207,6 +216,11 @@ public sealed class Game1 : Game
         // Read the saved display mode before the first menu frame is shown.
         _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
         ApplyDisplayMode(_skin.GameConfig.DisplayMode, persistConfiguration: false);
+        // Only published installations offer updates. The updater runs from the same
+        // TSC.exe, using a temporary copy so the installed executable can be replaced.
+#if TSC_PUBLISH
+        UpdateCheckService.Start();
+#endif
     }
 
     protected override void LoadContent()
@@ -840,12 +854,27 @@ public sealed class Game1 : Game
             }
         }
 
-        if (_transitionRuntime is not null)
+        var transitionRendered = false;
+        if (_transitionRuntime is { IsLoaded: true })
         {
             var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
             var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
-            _transitionRuntime.RenderDrawCommands(_startupSpriteBatch!, _startupPixel!, _font!, width, height);
+            transitionRendered = _transitionRuntime.RenderDrawCommands(
+                _startupSpriteBatch!, _startupPixel!, _font!, width, height);
         }
+
+        // A loaded transition script can still fail to produce a drawable frame
+        // (for example, when its layout hierarchy cannot be resolved). In that
+        // case, keep chart opening visibly animated rather than loading over the
+        // source screen with no transition feedback.
+        if (_transitionReason == "chart_editor_load" && !transitionRendered)
+            DrawFallbackChartEditorTransitionOverlay();
+
+        // Only advance a transition after its previous frame was actually drawn.
+        // Native file dialogs can stall the game loop, after which MonoGame may
+        // run several catch-up updates before drawing again. Without this gate,
+        // the entire outgoing animation can finish before the player sees a frame.
+        _transitionFrameDrawnSinceUpdate = true;
     }
 
     /// <summary>
@@ -1212,7 +1241,7 @@ public sealed class Game1 : Game
                 UpdateSettingsMenu(keyboard, gameTime);
                 break;
             case StartupScreen.SongSelect:
-                UpdateSongSelect(keyboard);
+                UpdateSongSelect(keyboard, gameTime);
                 break;
             case StartupScreen.ChartPicker:
                 UpdateChartPicker(keyboard);
@@ -1464,13 +1493,18 @@ public sealed class Game1 : Game
         if (!IsWindowInputActive())
             return;
 
+        TryPromptForUpdate();
         var mouse = GlobalInput.Mouse;
         var mousePressed = mouse.LeftButton == Microsoft.Xna.Framework.Input.ButtonState.Pressed &&
                            GlobalInput.PreviousMouse.LeftButton != Microsoft.Xna.Framework.Input.ButtonState.Pressed;
 
         if (EnsureMainMenuRuntime())
         {
-            _mainMenuRuntime!.UpdateScreen(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
+            // The GitHub check runs in the background, so keep this live field
+            // refreshed while the main menu is open. This changes the footer from
+            // "Checking for updates" to either "Update available" or no text.
+            _mainMenuRuntime!.UpdateMainMenuUpdateStatus();
+            _mainMenuRuntime.UpdateScreen(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
             _mainMenuRuntime.UpdateUiPointer(
                 mouse.Position.X,
                 mouse.Position.Y,
@@ -1552,6 +1586,48 @@ public sealed class Game1 : Game
                 Exit();
                 return;
             }
+        }
+    }
+
+    private void TryPromptForUpdate()
+    {
+        if (_updatePromptShown || !UpdateCheckService.UpdateAvailable)
+            return;
+
+        // Allow one frame for the main-menu footer to render "Update available"
+        // before opening the confirmation dialog.
+        if (_updateAvailableFrames++ == 0)
+            return;
+
+        _updatePromptShown = true;
+        var latestTag = UpdateCheckService.LatestTag ?? "a newer version";
+        var result = ShowNativeMessageBox(
+            $"A new TSC version ({latestTag}) is available.\n\nUpdate now? The game will close while the updater downloads and installs the update.",
+            "TSC update available",
+            System.Windows.Forms.MessageBoxButtons.YesNo,
+            System.Windows.Forms.MessageBoxIcon.Information);
+
+        if (result != System.Windows.Forms.DialogResult.Yes)
+            return;
+
+        try
+        {
+            var installRoot = UserDataPaths.GameRootDirectory;
+            _ = UpdateRunnerLauncher.StartTemporaryHost(
+                AppContext.BaseDirectory,
+                installRoot,
+                UpdateCheckService.RepositoryName,
+                GameVersion.Current,
+                Environment.ProcessId);
+            Exit();
+        }
+        catch (Exception ex)
+        {
+            ShowNativeMessageBox(
+                $"Could not start the updater: {ex.Message}",
+                "TSC updater error",
+                System.Windows.Forms.MessageBoxButtons.OK,
+                System.Windows.Forms.MessageBoxIcon.Error);
         }
     }
 
@@ -1855,7 +1931,8 @@ public sealed class Game1 : Game
                 settingsTextMetrics.SelectionWidth,
                 _keybindCategory,
                 _keybindEditorSubcategory,
-                _keybindCapturePreview);
+                _keybindCapturePreview,
+                _settingsTab);
 
             _settingsMenuRuntime.UpdateScreen(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
             _settingsMenuRuntime.UpdateUiPointer(mouse.Position.X, mouse.Position.Y, mouseDown);
@@ -1970,14 +2047,16 @@ public sealed class Game1 : Game
         {
             0 => $"{config.ScrollSpeedScale:0.00}x",
             1 => GameConfig.NormalizeScrollMode(config.ScrollMode).ToUpperInvariant(),
-            2 => $"{config.TapVolume * 100:0}%",
-            3 => $"{config.LinkVolume * 100:0}%",
-            4 => $"{config.LaneSwitchVolume * 100:0}%",
-            5 => config.MaxFrameRate <= 0 ? "DEFAULT" : $"{config.MaxFrameRate} FPS",
-            6 => config.VSync ? "ON" : "OFF",
-            7 => GameConfig.NormalizeGaugeType(config.Gauge).ToUpperInvariant(),
-            8 => GameConfig.NormalizeDisplayMode(config.DisplayMode).ToUpperInvariant(),
-            9 => string.IsNullOrWhiteSpace(config.Skin) ? "Default" : config.Skin,
+            2 => $"{config.MusicVolume * 100:0}%",
+            3 => $"{config.TapVolume * 100:0}%",
+            4 => $"{config.LinkVolume * 100:0}%",
+            5 => $"{config.LaneSwitchVolume * 100:0}%",
+            6 => $"{config.MetronomeVolume * 100:0}%",
+            7 => config.MaxFrameRate <= 0 ? "DEFAULT" : $"{config.MaxFrameRate} FPS",
+            8 => config.VSync ? "ON" : "OFF",
+            9 => GameConfig.NormalizeGaugeType(config.Gauge).ToUpperInvariant(),
+            10 => GameConfig.NormalizeDisplayMode(config.DisplayMode).ToUpperInvariant(),
+            11 => string.IsNullOrWhiteSpace(config.Skin) ? "Default" : config.Skin,
             _ => "OPEN"
         };
 
@@ -2053,15 +2132,21 @@ public sealed class Game1 : Game
                 config.ScrollMode = string.Equals(GameConfig.NormalizeScrollMode(config.ScrollMode), "mmod", StringComparison.OrdinalIgnoreCase) ? "xmod" : "mmod";
                 break;
             case 2:
-                config.TapVolume = Math.Clamp(config.TapVolume + direction * 0.05f, 0f, 1f);
+                config.MusicVolume = Math.Clamp(config.MusicVolume + direction * 0.05f, 0f, 1f);
                 break;
             case 3:
-                config.LinkVolume = Math.Clamp(config.LinkVolume + direction * 0.05f, 0f, 1f);
+                config.TapVolume = Math.Clamp(config.TapVolume + direction * 0.05f, 0f, 1f);
                 break;
             case 4:
-                config.LaneSwitchVolume = Math.Clamp(config.LaneSwitchVolume + direction * 0.05f, 0f, 1f);
+                config.LinkVolume = Math.Clamp(config.LinkVolume + direction * 0.05f, 0f, 1f);
                 break;
             case 5:
+                config.LaneSwitchVolume = Math.Clamp(config.LaneSwitchVolume + direction * 0.05f, 0f, 1f);
+                break;
+            case 6:
+                config.MetronomeVolume = Math.Clamp(config.MetronomeVolume + direction * 0.05f, 0f, 1f);
+                break;
+            case 7:
             {
                 var current = GameConfig.NormalizeMaxFrameRate(config.MaxFrameRate);
                 var currentIndex = Array.IndexOf(FallbackFrameRateOptions, current);
@@ -2073,13 +2158,13 @@ public sealed class Game1 : Game
                 config.MaxFrameRate = FallbackFrameRateOptions[Math.Clamp(currentIndex + direction, 0, FallbackFrameRateOptions.Length - 1)];
                 break;
             }
-            case 6:
+            case 8:
                 config.VSync = !config.VSync;
                 break;
-            case 7:
+            case 9:
                 config.Gauge = string.Equals(GameConfig.NormalizeGaugeType(config.Gauge), "hard", StringComparison.OrdinalIgnoreCase) ? "easy" : "hard";
                 break;
-            case 8:
+            case 10:
             {
                 var current = GameConfig.NormalizeDisplayMode(config.DisplayMode);
                 var modes = new[] { "windowed", "borderless", "fullscreen" };
@@ -2089,7 +2174,7 @@ public sealed class Game1 : Game
                 ApplyMaxFrameRateConfig();
                 return;
             }
-            case 9:
+            case 11:
             {
                 var skins = GetAvailableSkinNames();
                 if (skins.Count == 0) return;
@@ -2101,7 +2186,7 @@ public sealed class Game1 : Game
                 ReloadActiveSkinFromSettings();
                 return;
             }
-            case 10:
+            case 12:
                 ReturnToMainMenuFromSettings();
                 return;
             default:
@@ -2201,9 +2286,11 @@ public sealed class Game1 : Game
     private static string SettingsValueButtonId(string settingKey) => settingKey switch
     {
         "scroll_speed" => "setting_scroll_speed_value",
+        "music_volume" => "setting_music_volume_value",
         "tap_volume" => "setting_tap_volume_value",
         "link_volume" => "setting_link_volume_value",
         "lane_switch_volume" => "setting_lane_switch_volume_value",
+        "metronome_volume" => "setting_metronome_volume_value",
         "early_late_minimum_offset_ms" => "setting_early_late_value",
         "timing_offset_minimum_offset_ms" => "setting_timing_offset_value",
         "max_frame_rate" => "setting_max_frame_rate_value",
@@ -2304,6 +2391,14 @@ public sealed class Game1 : Game
         if (name == "back_main_menu")
         {
             ReturnToMainMenuFromSettings();
+            return;
+        }
+
+        if (name == "set_settings_tab" && action.Value is string settingsTab &&
+            settingsTab is "general" or "audio" or "display")
+        {
+            _settingsTab = settingsTab;
+            _settingsSkinDropdownOpen = false;
             return;
         }
 
@@ -2471,9 +2566,11 @@ public sealed class Game1 : Game
         var value = settingKey switch
         {
             "scroll_speed" => config.ScrollSpeedScale.ToString("0.##", CultureInfo.InvariantCulture),
+            "music_volume" => (config.MusicVolume * 100.0f).ToString("0.##", CultureInfo.InvariantCulture),
             "tap_volume" => (config.TapVolume * 100.0f).ToString("0.##", CultureInfo.InvariantCulture),
             "link_volume" => (config.LinkVolume * 100.0f).ToString("0.##", CultureInfo.InvariantCulture),
             "lane_switch_volume" => (config.LaneSwitchVolume * 100.0f).ToString("0.##", CultureInfo.InvariantCulture),
+            "metronome_volume" => (config.MetronomeVolume * 100.0f).ToString("0.##", CultureInfo.InvariantCulture),
             "early_late_minimum_offset_ms" => config.EarlyLateMinimumOffsetMs.ToString("0.##", CultureInfo.InvariantCulture),
             "timing_offset_minimum_offset_ms" => config.TimingOffsetMinimumOffsetMs.ToString("0.##", CultureInfo.InvariantCulture),
             "max_frame_rate" => config.MaxFrameRate.ToString(CultureInfo.InvariantCulture),
@@ -2499,7 +2596,7 @@ public sealed class Game1 : Game
 
         if (settingKey == "scroll_speed")
             value = Math.Clamp(value, 0.25, 9.0);
-        else if (settingKey is "tap_volume" or "link_volume" or "lane_switch_volume")
+        else if (settingKey is "music_volume" or "tap_volume" or "link_volume" or "lane_switch_volume" or "metronome_volume")
             value = Math.Clamp(value / 100.0, 0.0, 1.0);
         else if (settingKey is "early_late_minimum_offset_ms" or "timing_offset_minimum_offset_ms")
             value = Math.Clamp(value, 0.0, 250.0);
@@ -2671,7 +2768,7 @@ public sealed class Game1 : Game
             PrepareSongSelectForTransition);
     }
 
-    private void UpdateSongSelect(KeyboardState keyboard)
+    private void UpdateSongSelect(KeyboardState keyboard, GameTime gameTime)
     {
         if (_songSelect is null)
         {
@@ -2680,7 +2777,8 @@ public sealed class Game1 : Game
         }
 
         var mouse = GlobalInput.Mouse;
-        _songSelect.Update(keyboard, _previousKeyboard, mouse, GlobalInput.PreviousMouse, 1.0 / 60.0);
+        _songSelect.Update(keyboard, _previousKeyboard, mouse, GlobalInput.PreviousMouse,
+            Math.Clamp(gameTime.ElapsedGameTime.TotalSeconds, 0.0, 0.25));
         if (_songSelect.ConsumeEditorRequest(out var editorChartPath))
         {
             // Song Select has already resolved the chosen difficulty to a playable
@@ -2944,13 +3042,25 @@ public sealed class Game1 : Game
 
     private void UpdateTransition(GameTime gameTime)
     {
-        if (_transitionRuntime is null)
+        if (!_transitionFrameDrawnSinceUpdate)
+            return;
+        _transitionFrameDrawnSinceUpdate = false;
+
+        if (_transitionRuntime is null || !_transitionRuntime.IsLoaded)
         {
+            if (_transitionPhase != TransitionPhase.None && _transitionReason == "chart_editor_load")
+            {
+                UpdateFallbackChartEditorTransition(gameTime);
+                return;
+            }
+
             _transitionPhase = TransitionPhase.None;
             return;
         }
 
-        var dt = Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
+        // Ignore long pauses (such as returning from the native Open Chart dialog)
+        // so a single elapsed-time spike cannot skip the outgoing transition.
+        var dt = Math.Clamp(gameTime.ElapsedGameTime.TotalSeconds, 0.0, 0.05);
 
         switch (_transitionPhase)
         {
@@ -3092,6 +3202,194 @@ public sealed class Game1 : Game
         }
     }
 
+    private void BeginFallbackChartEditorLoadingTransition(StartupScreen target)
+    {
+        _transitionFromScreen = _startupScreen;
+        _transitionToScreen = target;
+        _transitionReason = "chart_editor_load";
+        _transitionTargetLoader = StartChartEditorLoadTransition;
+        _transitionTargetCommit = null;
+        _transitionTargetStarted = false;
+        _transitionElapsed = 0.0;
+        _transitionProgress = 0.0;
+        _transitionDuration = 0.30;
+        _transitionLoadPending = false;
+        _transitionTargetReady = false;
+        _transitionError = null;
+        _transitionPhase = TransitionPhase.Out;
+    }
+
+    private void UpdateFallbackChartEditorTransition(GameTime gameTime)
+    {
+        var dt = Math.Clamp(gameTime.ElapsedGameTime.TotalSeconds, 0.0, 0.05);
+
+        switch (_transitionPhase)
+        {
+            case TransitionPhase.Out:
+                _transitionElapsed += dt;
+                _transitionProgress = _transitionDuration <= 0.0
+                    ? 1.0
+                    : Math.Clamp(_transitionElapsed / _transitionDuration, 0.0, 1.0);
+                if (_transitionProgress >= 1.0)
+                {
+                    _transitionPhase = TransitionPhase.Hold;
+                    _transitionElapsed = 0.0;
+                    _transitionProgress = 1.0;
+                    _transitionLoadPending = true;
+                }
+                break;
+
+            case TransitionPhase.Hold:
+                if (_transitionLoadPending)
+                {
+                    _transitionLoadPending = false;
+                    var loader = _transitionTargetLoader;
+                    if (loader is null || !loader())
+                    {
+                        FailFallbackChartEditorTransition();
+                        break;
+                    }
+
+                    _transitionTargetStarted = true;
+                }
+
+                if (_transitionTargetStarted && !_transitionTargetReady)
+                    UpdateTransitionTargetPreparation();
+
+                if (_transitionTargetStarted && IsTransitionTargetFailed())
+                {
+                    FailFallbackChartEditorTransition();
+                }
+                else if (_transitionTargetStarted && IsTransitionTargetReady())
+                {
+                    _transitionTargetReady = true;
+                    _transitionTargetCommit?.Invoke();
+                    _startupScreen = _transitionToScreen;
+                    _transitionDuration = 0.45;
+                    _transitionElapsed = 0.0;
+                    _transitionProgress = 1.0;
+                    _transitionPhase = TransitionPhase.In;
+                }
+                break;
+
+            case TransitionPhase.In:
+                _transitionElapsed += dt;
+                _transitionProgress = _transitionDuration <= 0.0
+                    ? 0.0
+                    : Math.Clamp(1.0 - (_transitionElapsed / _transitionDuration), 0.0, 1.0);
+                if (_transitionProgress <= 0.0)
+                {
+                    _transitionPhase = TransitionPhase.None;
+                    _transitionTargetLoader = null;
+                    _transitionTargetCommit = null;
+                    _transitionTargetStarted = false;
+                    _transitionTargetReady = false;
+                    _transitionElapsed = 0.0;
+                    _transitionProgress = 0.0;
+                    if (_transitionReason == "chart_editor_load" &&
+                        !(_transitionToScreen == StartupScreen.ChartPicker &&
+                          (_chartEditorLoadKind is ChartEditorLoadKind.FpkPicker or ChartEditorLoadKind.ZipPicker)))
+                    {
+                        _chartEditorLoadKind = ChartEditorLoadKind.None;
+                        _chartEditorLoadSourcePath = null;
+                    }
+                    _transitionError = null;
+                    _transitionReason = string.Empty;
+                }
+                break;
+        }
+    }
+
+    private void FailFallbackChartEditorTransition()
+    {
+        _transitionError = _chartEditorLoadError ?? _errorMessage ?? "Chart/editor load failed.";
+        _transitionTargetReady = false;
+        _transitionTargetStarted = false;
+        _transitionDuration = 0.45;
+        _transitionElapsed = 0.0;
+        _transitionProgress = 1.0;
+        _transitionPhase = TransitionPhase.In;
+        _transitionToScreen = _transitionFromScreen;
+        _startupScreen = _transitionFromScreen;
+
+        if (_transitionFromScreen == StartupScreen.SongSelect)
+        {
+            _chartEditorMode = false;
+            _returnToSongSelectAfterEditor = false;
+        }
+    }
+
+    private void DrawFallbackChartEditorTransitionOverlay()
+    {
+        if (_font is null || _startupPixel is null || _startupSpriteBatch is null)
+            return;
+
+        var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
+        var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
+        var progress = (float)Math.Clamp(_transitionProgress, 0.0, 1.0);
+        var alpha = _transitionPhase switch
+        {
+            TransitionPhase.Out => (byte)Math.Clamp((int)Math.Round(progress * 255.0), 0, 255),
+            TransitionPhase.Hold => (byte)255,
+            TransitionPhase.In => (byte)Math.Clamp((int)Math.Round(progress * 255.0), 0, 255),
+            _ => (byte)0
+        };
+
+        _startupSpriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        _startupSpriteBatch.Draw(_startupPixel, new Rectangle(0, 0, width, height), new Color(0, 0, 0, (int)alpha));
+
+        void DrawCentered(string text, float y, Color color)
+        {
+            var size = UnicodeTextRenderer.MeasureString(_font, text);
+            UnicodeTextRenderer.DrawString(
+                _startupSpriteBatch,
+                _font,
+                text,
+                new Vector2(Math.Max(0f, (width - size.X) * 0.5f), y),
+                color);
+        }
+
+        if (_transitionPhase == TransitionPhase.Out)
+        {
+            if (progress >= 0.52f)
+                DrawCentered("PREPARING...", height * 0.5f, Color.White);
+        }
+        else if (_transitionPhase == TransitionPhase.Hold)
+        {
+            DrawCentered("CHART EDITOR", height * 0.5f - 92f, new Color(138, 138, 138));
+            DrawCentered(_chartEditorLoadStageLabel, height * 0.5f - 55f, Color.White);
+
+            var barWidth = Math.Max(120, (int)Math.Round(width * 0.42));
+            const int barHeight = 14;
+            var barX = (width - barWidth) / 2;
+            var barY = (int)(height * 0.5f);
+            _startupSpriteBatch.Draw(_startupPixel, new Rectangle(barX, barY, barWidth, barHeight), new Color(38, 38, 38));
+            var fillWidth = (int)Math.Round(barWidth * Math.Clamp(_chartEditorLoadProgress, 0.0, 1.0));
+            if (fillWidth > 0)
+                _startupSpriteBatch.Draw(_startupPixel, new Rectangle(barX, barY, Math.Min(barWidth, fillWidth), barHeight), Color.White);
+
+            DrawCentered($"{Math.Clamp((int)Math.Round(_chartEditorLoadProgress * 100.0), 0, 100)}%", barY + 22f, Color.White);
+            if (!string.IsNullOrWhiteSpace(_chartEditorLoadItem))
+            {
+                var item = _chartEditorLoadItem;
+                if (item.Length > 90)
+                    item = item[^90..];
+                DrawCentered(item, barY + 54f, new Color(138, 138, 138));
+            }
+        }
+        else if (_transitionPhase == TransitionPhase.In && !string.IsNullOrWhiteSpace(_transitionError))
+        {
+            DrawCentered("LOAD FAILED", height * 0.5f - 24f, Color.White);
+            var error = _transitionError!;
+            error = string.Join(" ", error.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+            if (error.Length > 110)
+                error = error[..107] + "...";
+            DrawCentered(error, height * 0.5f + 14f, new Color(240, 160, 160));
+        }
+
+        _startupSpriteBatch.End();
+    }
+
     private void UpdateTransitionTargetPreparation()
     {
         if (_transitionReason == "chart_editor_load")
@@ -3228,7 +3526,7 @@ public sealed class Game1 : Game
     private static readonly string[] ChartEditorSourceDescriptions =
     {
         "Create a blank chart and choose its bundle type and starting difficulty.",
-        "Open a .tsc, .ares, .tsts, or .fpk file; the bundle type is detected automatically."
+        "Open a .tsc, .ares, .tsts, or .zip file, the bundle type is detected automatically."
     };
 
     private void OpenChartEditorSourcePicker()
@@ -3283,7 +3581,7 @@ public sealed class Game1 : Game
         if (TryUpdateEditorMenuUi(
                 "source", "Choose Chart Source",
                 "Choose what to open or create  |  Up/Down + Enter  |  Esc to go back",
-                _chartEditorSourceIndex, items, 66, 10, keyboard, out var action))
+                _chartEditorSourceIndex, items, 0, 0, keyboard, out var action))
         {
             if (TryGetMenuItemIndex(action, out var selected) && selected < ChartEditorSourceLabels.Length)
             {
@@ -3523,8 +3821,8 @@ public sealed class Game1 : Game
             return Path.GetFullPath(_songSelect.SongsRoot);
 
 #if TSC_PUBLISH
-        // Published builds never search parent folders for development song data.
-        return Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "songs"));
+        // Songs are user-managed and live beside the root launcher, not in data/.
+        return Path.GetFullPath(Path.Combine(UserDataPaths.GameRootDirectory, "songs"));
 #else
         var candidates = new List<string>();
         static void AddCandidateChain(List<string> target, string start)
@@ -3553,6 +3851,13 @@ public sealed class Game1 : Game
 
     private void LoadPickedChartIntoExistingPlayfield(string chartPath)
     {
+        if (_chartEditorMode)
+        {
+            BeginSimpleChartLoad(chartPath,
+                isTsc: string.Equals(Path.GetExtension(chartPath), ".tsc", StringComparison.OrdinalIgnoreCase));
+            return;
+        }
+
         if (_playfield is null)
         {
             BeginSimpleChartLoad(chartPath,
@@ -3692,7 +3997,7 @@ public sealed class Game1 : Game
         if (TryUpdateEditorMenuUi(
                 "template", "Choose Bundle Template",
                 "Choose the target bundle layout  |  Up/Down + Enter  |  Esc to go back",
-                _chartEditorBundleTemplateIndex, items, 90, 14, keyboard, out var action))
+                _chartEditorBundleTemplateIndex, items, 0, 0, keyboard, out var action))
         {
             if (TryGetMenuItemIndex(action, out var selected) && selected < ChartEditorBundleTemplates.Length)
             {
@@ -3716,10 +4021,13 @@ public sealed class Game1 : Game
     private int ChartEditorBundleTemplateRowAt(Microsoft.Xna.Framework.Point point)
     {
         var viewport = GraphicsDevice.Viewport;
-        const int rowHeight = 104;
+        const int rowStride = 140;
         var top = (int)(viewport.Height * 0.31f);
-        var row = (point.Y - top) / rowHeight;
+        var row = (point.Y - top) / rowStride;
         if (point.Y < top || row < 0 || row >= ChartEditorBundleTemplates.Length)
+            return -1;
+        var rowTop = top + row * rowStride;
+        if (point.Y >= rowTop + 124)
             return -1;
         var left = Math.Max(80, (viewport.Width - 900) / 2);
         var right = Math.Min(viewport.Width - 80, left + 900);
@@ -3757,7 +4065,7 @@ public sealed class Game1 : Game
         var top = (int)(viewport.Height * 0.31f);
         for (var i = 0; i < ChartEditorBundleTemplates.Length; i++)
         {
-            var row = new Rectangle(left, top + i * 104, width, 90);
+            var row = new Rectangle(left, top + i * 140, width, 124);
             var mouseOver = row.Contains(GlobalInput.Mouse.Position);
             var selected = i == _chartEditorBundleTemplateIndex;
             var fill = selected ? new Color(62, 62, 65) : mouseOver ? new Color(38, 38, 40) : new Color(25, 25, 27);
@@ -3767,7 +4075,7 @@ public sealed class Game1 : Game
             UnicodeTextRenderer.DrawString(_startupSpriteBatch, _font, ChartEditorBundleTemplateLabels[i],
                 new Vector2(row.X + 24, row.Y + 12), Color.White);
             UnicodeTextRenderer.DrawString(_startupSpriteBatch, _font, ChartEditorBundleTemplateDescriptions[i],
-                new Vector2(row.X + 24, row.Y + 47), new Color(166, 174, 188));
+                new Vector2(row.X + 24, row.Y + 48), new Color(166, 174, 188));
         }
     }
 
@@ -3814,7 +4122,7 @@ public sealed class Game1 : Game
         if (TryUpdateEditorMenuUi(
                 "difficulty", "Choose Chart Difficulty",
                 "Choose the difficulty to edit first  |  Up/Down + Enter  |  Esc to go back",
-                _chartEditorDifficultyIndex, items, 62, 10, keyboard, out var action))
+                _chartEditorDifficultyIndex, items, 0, 0, keyboard, out var action))
         {
             if (TryGetMenuItemIndex(action, out var selected) && selected < ChartEditorDifficultyNames.Length)
             {
@@ -3944,15 +4252,10 @@ public sealed class Game1 : Game
         EnsureTransitionRuntime();
         if (_transitionRuntime is null || !_transitionRuntime.IsLoaded)
         {
-            // Fallback only for an unavailable transition skin. Run the same
-            // staged loader synchronously rather than dropping the chart request.
-            var source = _startupScreen;
-            _transitionFromScreen = source;
-            _transitionToScreen = target;
-            StartChartEditorLoadTransition();
-            for (var guard = 0; guard < 12 && !_chartEditorLoadReady && !_chartEditorLoadFailed; guard++)
-                AdvanceChartEditorLoadTransition();
-            _startupScreen = _chartEditorLoadFailed ? source : _transitionToScreen;
+            // The transition.lua file may exist but still fail to initialize or
+            // execute. Do not turn that into a synchronous chart load: keep the
+            // staged C# transition visible while each loading stage runs.
+            BeginFallbackChartEditorLoadingTransition(target);
             return;
         }
 
@@ -3992,7 +4295,6 @@ public sealed class Game1 : Game
                         _chartEditorLoadPlayfield = new Playfield(GraphicsDevice, _font!, _skin, _laneLineEffect!, _skinSparklesEffect, _skinQuad3DEffect);
                         _chartEditorLoadPlayfield.ConfigureMenuPlayMode(false);
                         _chartEditorLoadPlayfield.ConfigureChartEditor(true);
-                        _chartEditorLoadPlayfield.SaveTscRequested += HandleSaveTscRequested;
                         _chartEditorLoadPlayfield.SaveTscOnlyRequested += HandleSaveTscOnlyRequested;
                         _chartEditorLoadPlayfield.SaveJsonRequested += HandleSaveJsonRequested;
                         _chartEditorLoadPlayfield.SaveTscZipRequested += HandleSaveTscZipRequested;
@@ -4709,41 +5011,6 @@ public sealed class Game1 : Game
         return requiredPath;
     }
 
-    private void HandleSaveTscRequested()
-    {
-        if (_playfield?.Chart is null)
-            return;
-
-        try
-        {
-            var defaultTscFileName = GetTscDifficultyFileName(_playfield.CurrentEditorDifficultyCode);
-            using var dialog = new System.Windows.Forms.SaveFileDialog
-            {
-                Filter = "TSC chart files (*.tsc)|*.tsc|All files (*.*)|*.*",
-                DefaultExt = "tsc",
-                AddExtension = true,
-                OverwritePrompt = true,
-                RestoreDirectory = true,
-                FileName = defaultTscFileName,
-                Title = "Export Chart as TSC + JSON"
-            };
-            if (ShowNativeDialog(dialog) != System.Windows.Forms.DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
-                return;
-            var outputPath = ResolveDifficultyOutputPath(dialog.FileName,
-                defaultTscFileName, "TSC chart");
-            if (outputPath is null)
-                return;
-            _playfield.SaveEditorChartAsTsc(outputPath);
-            _errorMessage = null;
-            _playfield.SetStatusMessage($"Exported TSC + JSON: {outputPath}");
-        }
-        catch (Exception ex)
-        {
-            _errorMessage = $"Could not export TSC + JSON: {ex.Message}";
-            _playfield?.SetStatusMessage(_errorMessage);
-        }
-    }
-
     private void HandleSaveTscOnlyRequested()
     {
         if (_playfield?.Chart is null)
@@ -4911,7 +5178,7 @@ public sealed class Game1 : Game
                     _playfield.SaveEditorChartAsTsts(bundlePath, adoptOutputAsSource: true);
 #if TSC_PUBLISH
                 else
-                    throw new InvalidOperationException("Quick Save cannot write an FPK bundle in this publish build. Use Export ARES or Export TSC instead.");
+                    throw new InvalidOperationException("Quick Save cannot write an FPK bundle in this publish build. Use Export ARES or TSC ZIP instead.");
 #else
                 else
                     _playfield.SaveEditorChartAsFpk(bundlePath, adoptOutputAsSource: true);
@@ -4921,12 +5188,23 @@ public sealed class Game1 : Game
             }
 
             var source = _playfield.CurrentEditorSourcePath;
-            if (!string.IsNullOrWhiteSpace(source) && File.Exists(source) &&
-                !source.Contains("TSC-TSTS-", StringComparison.OrdinalIgnoreCase))
+            var logicalSource = !string.IsNullOrWhiteSpace(source) &&
+                                source.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase)
+                ? source[..^9]
+                : source;
+            var sourceExtension = string.IsNullOrWhiteSpace(logicalSource) ? string.Empty : Path.GetExtension(logicalSource);
+            var sourceDirectory = string.IsNullOrWhiteSpace(logicalSource) ? null : Path.GetDirectoryName(logicalSource);
+            var canSaveToDifficultyPath = !string.IsNullOrWhiteSpace(source) &&
+                (File.Exists(source) ||
+                 (sourceExtension.Equals(".tsc", StringComparison.OrdinalIgnoreCase) ||
+                  sourceExtension.Equals(".ares", StringComparison.OrdinalIgnoreCase)) &&
+                 !string.IsNullOrWhiteSpace(sourceDirectory) && Directory.Exists(sourceDirectory) &&
+                 FolderContainsSongData(sourceDirectory));
+            if (canSaveToDifficultyPath && !source!.Contains("TSC-TSTS-", StringComparison.OrdinalIgnoreCase))
             {
-                var ext = Path.GetExtension(source);
-                if (ext.Equals(".tsc", StringComparison.OrdinalIgnoreCase)) _playfield.SaveEditorChartAsTsc(source, adoptOutputAsSource: true);
-                else if (ext.Equals(".ares", StringComparison.OrdinalIgnoreCase)) _playfield.SaveEditorChartAsAres(source, adoptOutputAsSource: true);
+                var ext = sourceExtension;
+                if (ext.Equals(".tsc", StringComparison.OrdinalIgnoreCase)) _playfield.SaveEditorChartAsTsc(source!, adoptOutputAsSource: true);
+                else if (ext.Equals(".ares", StringComparison.OrdinalIgnoreCase)) _playfield.SaveEditorChartAsAres(source!, adoptOutputAsSource: true);
                 else throw new InvalidOperationException("Quick Save does not support this source file type.");
                 _playfield.SetStatusMessage($"Quick-saved: {source}");
                 return;
@@ -5057,7 +5335,6 @@ public sealed class Game1 : Game
             _playfield = new Playfield(GraphicsDevice, _font!, _skin, _laneLineEffect!, _skinSparklesEffect, _skinQuad3DEffect);
             _playfield.ConfigureMenuPlayMode(_pendingPlayMode);
             _playfield.ConfigureChartEditor(_chartEditorMode);
-            _playfield.SaveTscRequested += HandleSaveTscRequested;
             _playfield.SaveTscOnlyRequested += HandleSaveTscOnlyRequested;
             _playfield.SaveJsonRequested += HandleSaveJsonRequested;
             _playfield.SaveTscZipRequested += HandleSaveTscZipRequested;
@@ -5274,6 +5551,12 @@ public sealed class Game1 : Game
 
     private void LoadAres(string path)
     {
+        if (_chartEditorMode)
+        {
+            BeginSimpleChartLoad(path, isTsc: false);
+            return;
+        }
+
         if (_playfield is null)
         {
             _errorMessage = "Playfield is not loaded.";

@@ -38,13 +38,16 @@ public sealed partial class Playfield
         public string? FpkChartName { get; set; }
         public byte[]? MusicBytes { get; set; }
         public bool ImportedSongAudio { get; set; }
+        public bool HasSourceChart { get; set; }
         public byte[]? AresHeaderTemplate { get; set; }
     }
 
     private static readonly string[] EditorDifficultyCodes = { "ez", "nm", "hd", "ex", "xt" };
     private static readonly string[] EditorDifficultyNames = { "Easy", "Normal", "Hard", "Expert", "Extra" };
-    private static readonly string[] EditorMetaCategories = { "SONG", "MEDIA", "JUDGEMENT", "CHART STATS" };
+    private static readonly string[] EditorMetaCategories = { "SONG", "MEDIA", "JUDGEMENT", "STATS" };
     private readonly Dictionary<string, EditorDifficultyState> _editorDifficultyStates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _editorDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _editorCommittedDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private bool _editorDifficultySessionActive;
     private bool _switchingEditorDifficulty;
     private string? _editorActiveDifficultyCode;
@@ -56,6 +59,7 @@ public sealed partial class Playfield
     private string? _resultArtworkAlbumPathOverride;
     private string? _resultArtworkAlbumBigPathOverride;
     private readonly HashSet<string> _editorCustomJudgementWindowEnabledDifficulties = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _editorDisabledDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private bool _editorCustomJudgementWindowsEnabled
     {
         get => IsEditorCustomJudgementWindowsEnabled(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName));
@@ -70,6 +74,7 @@ public sealed partial class Playfield
     private string _editorMetaCategory = "SONG";
     private int _editorMetaScrollOffset;
     private bool _editorMetaExportExpanded;
+    private bool _editorMetaDeleteConfirmOpen;
     private bool _editorExtraDifficultyEnabled = true;
     private bool _editorElementDropdownOpen;
     private bool _editorProblemsExpanded;
@@ -78,6 +83,8 @@ public sealed partial class Playfield
     private AresChart? _editorDiagnosticsChart;
     private readonly List<EditorChartProblem> _editorProblems = new();
     private readonly HashSet<ChartEventKey> _editorProblemEventKeys = new();
+    private int _editorProblemErrorCount;
+    private int _editorProblemWarningCount;
 
     private readonly record struct ChartEventKey(int Tick, int Track, int EventIndex);
     private readonly record struct SuperFlickVisualKey(int Tick, string Side, string Bank, SuperFlickFamily Family, string TrackSide, int Direction);
@@ -205,9 +212,10 @@ public sealed partial class Playfield
     private sealed class HitAnimationState
     {
         public required string Variant { get; init; }
-        public required Vector2 Position { get; init; }
-        public required float BaseWidth { get; init; }
-        public required float Rotation { get; init; }
+        public required int Track { get; init; }
+        public required Vector2 Position { get; set; }
+        public required float BaseWidth { get; set; }
+        public required float Rotation { get; set; }
         public required int FrameCount { get; init; }
         public required float TotalDurationSeconds { get; init; }
         public required bool IsHold { get; init; }
@@ -234,6 +242,10 @@ public sealed partial class Playfield
     private readonly SkinRuntime _skinRuntime;
     private readonly SkinRuntime _pauseSkinRuntime;
     private readonly SkinRuntime _resultSkinRuntime;
+    private readonly SkinRuntime _chartEditorInterfaceRuntime;
+    private ChartEditorInterfaceLayout _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Default;
+    private readonly SkinFontStore _chartEditorFontStore;
+    private readonly SkinFontStore? _chartEditorDefaultFontStore;
     private readonly HitSoundPlayer _hitSounds;
     private readonly SpriteBatch _spriteBatch;
     private readonly BasicEffect _primitiveEffect;
@@ -244,7 +256,11 @@ public sealed partial class Playfield
     private readonly SpriteFont _font;
     private readonly NoteTextures _textures;
     private RenderTarget2D? _gameplayRenderTarget;
+    private bool _gameplayRenderTargetPreservesContents;
     private RenderTarget2D? _editorInactiveBankRenderTarget;
+    private RenderTarget2D? _editorConnectorPreviewRenderTarget;
+    private readonly List<Textured3DQuadCommand> _editorConnectorPreviewBody3DCommands = new();
+    private readonly List<TexturedQuadCommand> _editorConnectorPreviewHeadCommands = new();
     // During editor rendering, the inactive banks and their notes are rendered
     // together into one transparent layer, then faded once as a group.
     private bool _editorActiveBanksOnlyPass;
@@ -455,6 +471,10 @@ public sealed partial class Playfield
     private int _lastEditorHoverSignature;
     private bool _editorHoverCacheValid;
     private bool _chartEditorMode;
+    private bool _editorPreviewMode;
+    private bool _editorPreviewPreviousBeatLines;
+    private bool _editorPreviewPreviousTempoLines;
+    private bool _editorPreviewPreviousTopDownViewEnabled;
     private bool _editorHasUnsavedChanges;
     // The preview bank buttons show the current active bank. These separate
     // seed values preserve the user's chosen starting route when a preview is
@@ -564,6 +584,7 @@ public sealed partial class Playfield
     // target/source heads without scanning the chart for every rendered event.
     private ChartEvent? _editorConnectorPreviewTargetHead;
     private ChartEvent? _editorConnectorPreviewSourceTap;
+    private ChartEvent? _editorConnectorPreviewAbsorbedTargetBody;
     private ChartEvent? _editorSelectedLinkRoot;
     private readonly record struct EditorMultiDragItem(
         ChartEvent Event, int Tick, int Track, int Duration, int EventIndex);
@@ -949,7 +970,14 @@ public sealed partial class Playfield
         }
     }
     public ChartBundleTemplate CurrentEditorBundleTemplate => _editorBundleTemplate;
-    public string? CurrentEditorSourcePath => _loadedSourcePath;
+    public string? CurrentEditorSourcePath
+    {
+        get
+        {
+            var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+            return _editorCommittedDeletedDifficultyCodes.Contains(code) ? null : _loadedSourcePath;
+        }
+    }
     public string CurrentEditorDifficultyCode => GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
 
     public static string GetEditorDifficultyCode(string? difficulty, string? sourceName = null)
@@ -993,13 +1021,121 @@ public sealed partial class Playfield
             _ => "Expert"
         };
 
+    private bool IsEditorDifficultyEnabled(string? difficultyCode)
+    {
+        var code = GetEditorDifficultyCode(difficultyCode);
+        // A deletion is staged while the editor is open. Treat it as disabled
+        // for exports and metadata, but do not remove the file until a save
+        // successfully commits the change.
+        if (_editorDeletedDifficultyCodes.Contains(code) || _editorCommittedDeletedDifficultyCodes.Contains(code))
+            return false;
+        return code == "xt"
+            ? _editorExtraDifficultyEnabled
+            : !_editorDisabledDifficultyCodes.Contains(code);
+    }
+
+    private bool HasEditorDifficultyChart(string? difficultyCode)
+    {
+        var code = GetEditorDifficultyCode(difficultyCode);
+        if (_editorDeletedDifficultyCodes.Contains(code) || _editorCommittedDeletedDifficultyCodes.Contains(code)) return false;
+        var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+        if (_editorDifficultyStates.TryGetValue(code, out var state))
+        {
+            // Cached chart data can outlive its file (or point at a planned path
+            // for a new blank chart). The enable button reflects a file on disk,
+            // not merely the presence of an in-memory difficulty state.
+            if (!state.HasSourceChart || string.IsNullOrWhiteSpace(state.SourcePath))
+                return false;
+            if (File.Exists(state.SourcePath))
+                return true;
+
+            // A save or external rename may have changed the enabled suffix
+            // while this in-memory state still holds the old path.
+            if (state.FpkChartName is null)
+            {
+                var logicalPath = StripEditorDisabledSuffix(state.SourcePath);
+                if (File.Exists(logicalPath))
+                    return true;
+                var disabledPath = logicalPath + ".disabled";
+                if (File.Exists(disabledPath))
+                {
+                    // Re-anchor stale cached paths to the actual file. Once the
+                    // user toggles this .disabled chart back on, the path still
+                    // exists and we won't re-apply the on-disk state every frame.
+                    state.SourcePath = disabledPath;
+                    state.SourceName = Path.GetFileName(disabledPath);
+                    if (string.Equals(code, activeCode, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _loadedSourcePath = disabledPath;
+                        _sourceName = state.SourceName;
+                    }
+                    if (code == "xt")
+                        _editorExtraDifficultyEnabled = false;
+                    else
+                        _editorDisabledDifficultyCodes.Add(code);
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (string.Equals(code, activeCode, StringComparison.OrdinalIgnoreCase))
+            return !string.IsNullOrWhiteSpace(_loadedSourcePath) && File.Exists(_loadedSourcePath);
+        try
+        {
+            var loaded = TryLoadSiblingEditorDifficulty(code, _editorSharedMusicBytes ?? _loadedMusicBytes);
+            if (loaded is null) return false;
+            loaded.HasSourceChart = true;
+            _editorDifficultyStates[code] = loaded;
+            if (IsEditorDifficultySourceDisabled(loaded.SourcePath, loaded.FpkChartName, loaded.SourceName))
+            {
+                if (code == "xt")
+                    _editorExtraDifficultyEnabled = false;
+                else
+                    _editorDisabledDifficultyCodes.Add(code);
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void DeleteEditorDifficultyFromSession()
+    {
+        var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+        _editorDifficultyStates.Remove(code);
+        _editorDeletedDifficultyCodes.Add(code);
+        _editorMetaDeleteConfirmOpen = false;
+        _editorMetaScrollOffset = 0;
+        MarkEditorDirty();
+        _statusMessage = $"{GetEditorDifficultyName(code)} difficulty marked for deletion. The file will be deleted when you save.";
+    }
+
+    private void ToggleEditorDifficultyEnabled(string? difficultyCode)
+    {
+        var code = GetEditorDifficultyCode(difficultyCode);
+        // The enable control only applies to chart files that already exist.
+        // A missing difficulty remains selectable so the user can create it,
+        // but cannot be toggled on until it has been saved once.
+        if (!HasEditorDifficultyChart(code))
+            return;
+        if (code == "xt")
+        {
+            _editorExtraDifficultyEnabled = !_editorExtraDifficultyEnabled;
+            return;
+        }
+
+        if (!_editorDisabledDifficultyCodes.Add(code))
+            _editorDisabledDifficultyCodes.Remove(code);
+    }
+
     private static string GetTscDifficultyStem(string? code)
     {
         var normalized = GetEditorDifficultyCode(code);
         return normalized == "xt" ? "sc" : normalized;
     }
 
-    public event Action? SaveTscRequested;
     public event Action? SaveTscOnlyRequested;
     public event Action? SaveJsonRequested;
     public event Action? SaveTscZipRequested;
@@ -1012,6 +1148,8 @@ public sealed partial class Playfield
 
     public void ConfigureChartEditor(bool enabled)
     {
+        if (!enabled && _editorPreviewMode)
+            SetEditorPreviewMode(false);
         var enteringEditor = enabled && !_chartEditorMode;
         _chartEditorMode = enabled;
         if (enteringEditor)
@@ -1031,9 +1169,11 @@ public sealed partial class Playfield
             _compact = _editorPreferredCompact;
             ApplyActiveViewRenderConfig();
         }
-        _skinRuntime.SetEditorMode(enabled);
-        _pauseSkinRuntime.SetEditorMode(enabled);
-        _resultSkinRuntime.SetEditorMode(enabled);
+        var gameplaySkinEditorMode = enabled && !_editorPreviewMode;
+        _skinRuntime.SetEditorMode(gameplaySkinEditorMode);
+        _pauseSkinRuntime.SetEditorMode(gameplaySkinEditorMode);
+        _resultSkinRuntime.SetEditorMode(gameplaySkinEditorMode);
+        _chartEditorInterfaceRuntime.SetEditorMode(enabled);
         if (enabled)
         {
             _editorMetaPanelOpen = false;
@@ -1087,6 +1227,73 @@ public sealed partial class Playfield
         }
     }
 
+    private void SetEditorPreviewMode(bool enabled)
+    {
+        if (!_chartEditorMode || _editorPreviewMode == enabled)
+            return;
+
+        if (enabled)
+        {
+            _editorPreviewPreviousBeatLines = _beatLines;
+            _editorPreviewPreviousTempoLines = _tempoLines;
+            _editorPreviewPreviousTopDownViewEnabled = _topDownViewEnabled;
+            _beatLines = false;
+            _tempoLines = false;
+            _editorMetaPanelOpen = false;
+            _editorElementDropdownOpen = false;
+            _editorMenuSection = EditorMenuSection.None;
+            _editorPlacementEnabled = false;
+            _editorConnectorMode = false;
+            _editorBpmInputFocused = false;
+            _editorBpmInputReplaceOnNextKey = false;
+            _editorBpmPlacementPending = false;
+            _editorDurationInputFocused = false;
+            _editorStutterInputField = EditorStutterInputField.None;
+            _editorStutterInputReplaceOnNextKey = false;
+            _editorSelectLineDragging = false;
+            _editorRectSelecting = false;
+            _editorRectSelectionArmed = false;
+            CancelEditorMetaField();
+            _editorPreviewMode = true;
+
+            // Gameplay preview always uses the 3D playfield, with all banks
+            // collapsed to the active route. Keep the editor's 2D/3D preference
+            // and expanded/collapsed preference so leaving preview restores them.
+            if (_topDownViewEnabled)
+            {
+                ToggleTopDownView();
+            }
+            else if (!_compact)
+            {
+                _compact = true;
+                _projection.Compact = true;
+                _projection.InvalidateGeometryCaches();
+                InvalidateLaneMeshCache();
+            }
+
+            _skinRuntime.SetEditorMode(false);
+            _pauseSkinRuntime.SetEditorMode(false);
+            _resultSkinRuntime.SetEditorMode(false);
+            _statusMessage = "In-game preview. Use the configured preview and gameplay keybinds.";
+        }
+        else
+        {
+            _editorPreviewMode = false;
+            if (_editorPreviewPreviousTopDownViewEnabled && !_topDownViewEnabled)
+                ToggleTopDownView();
+            _beatLines = _editorPreviewPreviousBeatLines;
+            _tempoLines = _editorPreviewPreviousTempoLines;
+            _skinRuntime.SetEditorMode(true);
+            _pauseSkinRuntime.SetEditorMode(true);
+            _resultSkinRuntime.SetEditorMode(true);
+            _statusMessage = "Chart editor view.";
+        }
+
+        _skinRuntime.SetEditorPreviewMode(_editorPreviewMode);
+        _editorHoverCacheValid = false;
+        RefreshSkinGameState();
+    }
+
     public void SetStatusMessage(string? message) => _statusMessage = message;
 
     public void ToggleEditorInfoMenu()
@@ -1126,9 +1333,9 @@ public sealed partial class Playfield
         // base-BPM-normalized tick distance in ChartProjection, so tempo changes
         // continue to change note velocity instead of forcing constant px/sec.
         var shouldUseConstantScroll = _chartEditorMode && _constantScroll;
-        var desiredScrollMode = _chartEditorMode
-            ? "xmod"
-            : GameConfig.NormalizeScrollMode(_skin.GameConfig.ScrollMode);
+        // The editor shares the user's XMOD/MMOD preference with gameplay;
+        // constant-scroll remains a separate editor-only toggle.
+        var desiredScrollMode = GameConfig.NormalizeScrollMode(_skin.GameConfig.ScrollMode);
         var constantScrollChanged = _projection.ConstantScroll != shouldUseConstantScroll;
         var scrollModeChanged = !string.Equals(
             GameConfig.NormalizeScrollMode(_projection.ScrollMode),
@@ -1177,6 +1384,8 @@ public sealed partial class Playfield
         // editor-mode flag until the transition commits and disposes this object.
         if (!preserveEditorModeForTransition)
         {
+            ReleaseTstsWorkingDirectory();
+            _loadedTstsBundlePath = null;
             _skinRuntime.SetEditorMode(false);
             _pauseSkinRuntime.SetEditorMode(false);
             _resultSkinRuntime.SetEditorMode(false);
@@ -1738,6 +1947,13 @@ public sealed partial class Playfield
     {
         _graphics = graphics;
         _skin = skin;
+        _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Load(skin);
+        _chartEditorFontStore = new SkinFontStore(graphics, skin.SkinDirectory);
+        var defaultSkinDirectory = Path.Combine(skin.RootDirectory, "skins", "Default");
+        _chartEditorDefaultFontStore = string.Equals(
+            Path.GetFullPath(defaultSkinDirectory), Path.GetFullPath(skin.SkinDirectory), StringComparison.OrdinalIgnoreCase)
+            ? null
+            : new SkinFontStore(graphics, defaultSkinDirectory);
         _laneLineEffect = laneLineEffect ?? throw new ArgumentNullException(nameof(laneLineEffect));
         var gameConfigPath = UserDataPaths.GameConfigPath;
         var (initialVirtualWidth, initialVirtualHeight) = GetVirtualResolution(graphics.Viewport.Width, graphics.Viewport.Height);
@@ -1765,6 +1981,16 @@ public sealed partial class Playfield
             skin.SkinDirectory,
             graphics,
             "gameplayResult.lua",
+            skin.GameConfig,
+            gameConfigPath,
+            initialVirtualWidth,
+            initialVirtualHeight,
+            skinSparklesEffect: skinSparklesEffect,
+            skinQuad3DEffect: skinQuad3DEffect);
+        _chartEditorInterfaceRuntime = new SkinRuntime(
+            skin.SkinDirectory,
+            graphics,
+            "chartEditorInterface.lua",
             skin.GameConfig,
             gameConfigPath,
             initialVirtualWidth,
@@ -1836,7 +2062,7 @@ public sealed partial class Playfield
         var difficultyCode = GetEditorDifficultyCode(difficulty);
         _loadedSourcePath = null;
         _loadedTstsBundlePath = null;
-        _tstsWorkingDirectory = null;
+        ReleaseTstsWorkingDirectory();
         _loadedFpkChartName = null;
         _loadedAresHeaderTemplate = null;
         _loadedMusicBytes = null;
@@ -1844,6 +2070,8 @@ public sealed partial class Playfield
         _editorSharedMusicBytes = null;
         _editorSharedSongImportedAudio = false;
         _editorDifficultyStates.Clear();
+        _editorDeletedDifficultyCodes.Clear();
+        _editorCommittedDeletedDifficultyCodes.Clear();
         _editorDifficultySessionActive = false;
         _editorActiveDifficultyCode = null;
         _editorDifficultyDiscoverySourcePath = null;
@@ -2041,11 +2269,18 @@ public sealed partial class Playfield
             return true;
         }
 
+        // Selecting a committed-deleted difficulty again starts a fresh chart.
+        // Simply remaining on the deleted tab does not silently recreate its file.
+        if (_editorCommittedDeletedDifficultyCodes.Remove(nextCode))
+            _editorDifficultyStates.Remove(nextCode);
+
         try
         {
             if (!_editorDifficultySessionActive)
             {
                 _editorDifficultyStates.Clear();
+                _editorDeletedDifficultyCodes.Clear();
+                _editorCommittedDeletedDifficultyCodes.Clear();
                 _editorDifficultySessionActive = true;
                 _editorActiveDifficultyCode = currentCode;
                 _editorSharedMusicBytes = _loadedMusicBytes?.ToArray();
@@ -2138,7 +2373,16 @@ public sealed partial class Playfield
     }
 
     private EditorDifficultyState CaptureEditorDifficultyState(string code)
-        => new()
+    {
+        // Do not turn a blank difficulty into an existing chart merely because
+        // it is now the active editor tab. New difficulties have an in-memory
+        // chart state, but no source file until their first save.
+        var hasSourceChart = !_editorDeletedDifficultyCodes.Contains(code) &&
+            !_editorCommittedDeletedDifficultyCodes.Contains(code) &&
+            (_editorDifficultyStates.TryGetValue(code, out var existing)
+                ? existing.HasSourceChart
+                : !string.IsNullOrWhiteSpace(_loadedSourcePath) && File.Exists(_loadedSourcePath));
+        return new EditorDifficultyState
         {
             Chart = _chart ?? throw new InvalidOperationException("No active chart."),
             SourcePath = _loadedSourcePath,
@@ -2146,14 +2390,18 @@ public sealed partial class Playfield
             FpkChartName = _loadedFpkChartName,
             MusicBytes = (_loadedMusicBytes ?? _editorSharedMusicBytes)?.ToArray(),
             ImportedSongAudio = _editorImportedSongAudio || _editorSharedSongImportedAudio,
+            HasSourceChart = hasSourceChart,
             AresHeaderTemplate = _loadedAresHeaderTemplate?.ToArray()
         };
+    }
 
     private void StoreActiveEditorDifficulty()
     {
         if (!_editorDifficultySessionActive || _chart is null)
             return;
         var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+        if (_editorCommittedDeletedDifficultyCodes.Contains(code))
+            return;
         _editorActiveDifficultyCode = code;
         _editorDifficultyStates[code] = CaptureEditorDifficultyState(code);
     }
@@ -2222,6 +2470,36 @@ public sealed partial class Playfield
         chart.TempoEvents.Add((0, tempo));
     }
 
+    private string? GetNewEditorDifficultySourcePath(string code)
+    {
+        var sourcePath = _editorDifficultyDiscoverySourcePath ?? _loadedSourcePath;
+        if (string.IsNullOrWhiteSpace(sourcePath))
+            return null;
+
+        var logicalPath = StripEditorDisabledSuffix(sourcePath);
+        var extension = Path.GetExtension(logicalPath);
+        if (extension.Equals(".fpk", StringComparison.OrdinalIgnoreCase))
+            return Path.GetFullPath(sourcePath);
+
+        var directory = Path.GetDirectoryName(logicalPath);
+        if (string.IsNullOrWhiteSpace(directory))
+            return null;
+
+        if (extension.Equals(".tsc", StringComparison.OrdinalIgnoreCase))
+            return Path.Combine(directory, GetTscDifficultyStem(code) + ".tsc");
+
+        if (extension.Equals(".ares", StringComparison.OrdinalIgnoreCase))
+        {
+            var fileName = _editorBundleTemplate == ChartBundleTemplate.Tsts &&
+                           string.Equals(Path.GetFileName(directory), "charts", StringComparison.OrdinalIgnoreCase)
+                ? GetTstsBundleChartFileName(code) + ".ares"
+                : GetAresFileNameForTemplate(code, _editorBundleTemplate);
+            return Path.Combine(directory, fileName);
+        }
+
+        return null;
+    }
+
     private EditorDifficultyState CreateBlankEditorDifficultyState(string code, AresChart basis, byte[]? sharedMusic)
     {
         var chart = new AresChart
@@ -2254,7 +2532,7 @@ public sealed partial class Playfield
         return new EditorDifficultyState
         {
             Chart = chart,
-            SourcePath = _editorDifficultyDiscoverySourcePath,
+            SourcePath = GetNewEditorDifficultySourcePath(code),
             SourceName = _editorBundleTemplate switch
             {
                 ChartBundleTemplate.Bold => GetAresFileNameForTemplate(code, ChartBundleTemplate.Bold),
@@ -2295,6 +2573,7 @@ public sealed partial class Playfield
                 Chart = chart,
                 SourcePath = sourcePath,
                 SourceName = entry.Name,
+                HasSourceChart = true,
                 FpkChartName = entry.Name,
                 MusicBytes = music is null ? sharedMusic?.ToArray() : package.Extract(music),
                 ImportedSongAudio = _editorSharedSongImportedAudio,
@@ -2315,7 +2594,7 @@ public sealed partial class Playfield
             if (File.Exists(candidate)) musicBytes = File.ReadAllBytes(candidate);
             return new EditorDifficultyState
             {
-                Chart = chart, SourcePath = siblingPath, SourceName = Path.GetFileName(siblingPath),
+                Chart = chart, SourcePath = siblingPath, SourceName = Path.GetFileName(siblingPath), HasSourceChart = true,
                 MusicBytes = musicBytes, ImportedSongAudio = _editorSharedSongImportedAudio
             };
         }
@@ -2339,7 +2618,7 @@ public sealed partial class Playfield
             if (File.Exists(musicPath)) musicBytes = File.ReadAllBytes(musicPath);
             return new EditorDifficultyState
             {
-                Chart = chart, SourcePath = siblingPath, SourceName = Path.GetFileName(siblingPath),
+                Chart = chart, SourcePath = siblingPath, SourceName = Path.GetFileName(siblingPath), HasSourceChart = true,
                 MusicBytes = musicBytes, ImportedSongAudio = _editorSharedSongImportedAudio,
                 AresHeaderTemplate = bytes.Length >= 28 && bytes.AsSpan(0, 4).SequenceEqual("ARES"u8) ? bytes.AsSpan(0, 28).ToArray() : null
             };
@@ -2354,19 +2633,29 @@ public sealed partial class Playfield
             return;
 
         var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
-        _editorExtraDifficultyEnabled = _editorExtraDifficultyEnabledFromMetadata ??
-            !HasDisabledExtraDifficultySibling(_loadedSourcePath ?? _editorDifficultyDiscoverySourcePath, _editorBundleTemplate);
+        var extraDifficultyHasDisabledFile = HasDisabledExtraDifficultySibling(
+            _loadedSourcePath ?? _editorDifficultyDiscoverySourcePath, _editorBundleTemplate);
+        // A .disabled chart file is authoritative over stale enabled metadata.
+        // The user can still re-enable it explicitly from the Info button.
+        _editorExtraDifficultyEnabled = extraDifficultyHasDisabledFile
+            ? false
+            : _editorExtraDifficultyEnabledFromMetadata ?? true;
         _editorExtraDifficultyEnabledFromMetadata = null;
         _editorElementDropdownOpen = false;
         _editorProblemsScrollOffset = 0;
         _editorDiagnosticsDirty = true;
         _editorDifficultyStates.Clear();
+        _editorDeletedDifficultyCodes.Clear();
+        _editorCommittedDeletedDifficultyCodes.Clear();
+        _editorDisabledDifficultyCodes.Clear();
         _editorDifficultySessionActive = true;
         _editorActiveDifficultyCode = activeCode;
         _editorSharedMusicBytes = _loadedMusicBytes?.ToArray();
         _editorSharedSongImportedAudio = _editorImportedSongAudio;
         _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
         StoreActiveEditorDifficulty();
+        if (activeCode != "xt" && IsEditorDifficultySourceDisabled(_loadedSourcePath, _loadedFpkChartName, _sourceName))
+            _editorDisabledDifficultyCodes.Add(activeCode);
 
         // Parse every sibling chart now while opening the source. Difficulty
         // buttons then switch only the in-memory chart state rather than doing
@@ -2390,6 +2679,9 @@ public sealed partial class Playfield
             if (state is null)
                 continue;
 
+            if (code != "xt" && IsEditorDifficultySourceDisabled(state.SourcePath, state.FpkChartName, state.SourceName))
+                _editorDisabledDifficultyCodes.Add(code);
+
             CopySharedEditorMetadata(_chart, state.Chart);
             state.Chart.Difficulty = GetEditorDifficultyName(code);
             // PlayTick is authored independently of PlayTime; preserve each
@@ -2405,6 +2697,10 @@ public sealed partial class Playfield
 
         StoreActiveEditorDifficulty();
     }
+
+    private static bool IsEditorDifficultySourceDisabled(params string?[] paths)
+        => paths.Any(path => !string.IsNullOrWhiteSpace(path) &&
+            path.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase));
 
     public void SetEditorAlbumArt(string field, byte[] assetBytes, string importedFilePath)
     {
@@ -2616,70 +2912,107 @@ public sealed partial class Playfield
         }
     }
 
+    private void ReleaseTstsWorkingDirectory()
+    {
+        var previous = _tstsWorkingDirectory;
+        _tstsWorkingDirectory = null;
+        if (!string.IsNullOrWhiteSpace(previous))
+            TscTemporaryStorage.DeleteOwnedDirectory(previous);
+    }
+
+    private bool IsInsideTstsWorkingDirectory(string path)
+    {
+        if (string.IsNullOrWhiteSpace(_tstsWorkingDirectory))
+            return false;
+        try
+        {
+            var root = Path.GetFullPath(_tstsWorkingDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return Path.GetFullPath(path).StartsWith(root, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
     public void LoadChart(string path)
     {
+        var fullInputPath = Path.GetFullPath(path);
+        // Reopening a chart file from the current extracted TSTS workspace must
+        // not delete the directory before that file is read.
+        var keepExistingWorkspace = Path.GetExtension(fullInputPath).Equals(".ares", StringComparison.OrdinalIgnoreCase) &&
+                                    IsInsideTstsWorkingDirectory(fullInputPath);
         StopEditorPreviewPlayback();
+        if (!keepExistingWorkspace)
+        {
+            ReleaseTstsWorkingDirectory();
+            _loadedTstsBundlePath = null;
+        }
         _editorSharedPreviewBytes = null;
         InvalidateEditorSavedPreviewDuration();
         _editorPreviewEditorOpen = false;
         _editorPreviewRangeInitialized = false;
-        var fullInputPath = Path.GetFullPath(path);
         if (string.Equals(Path.GetExtension(fullInputPath), ".tsts", StringComparison.OrdinalIgnoreCase))
         {
-            var extractDirectory = Path.Combine(Path.GetTempPath(), "TSC-TSTS-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(extractDirectory);
-            using (var archive = ZipFile.OpenRead(fullInputPath))
-            {
-                foreach (var entry in archive.Entries)
-                {
-                    var destination = Path.GetFullPath(Path.Combine(extractDirectory, entry.FullName.Replace('/', Path.DirectorySeparatorChar)));
-                    var root = Path.GetFullPath(extractDirectory) + Path.DirectorySeparatorChar;
-                    if (!destination.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException("The TSTS bundle contains an invalid path.");
-                    if (string.IsNullOrEmpty(entry.Name))
-                    {
-                        Directory.CreateDirectory(destination);
-                        continue;
-                    }
-                    Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                    entry.ExtractToFile(destination, overwrite: true);
-                }
-            }
-            if (!File.Exists(Path.Combine(extractDirectory, "song.json")))
-                throw new InvalidDataException("The TSTS bundle is missing song.json metadata.");
-            var firstChart = new[]
-                {
-                    Path.Combine("charts", "expert.ares"), Path.Combine("charts", "hard.ares"),
-                    Path.Combine("charts", "normal.ares"), Path.Combine("charts", "easy.ares"),
-                    Path.Combine("charts", "sc.ares"),
-                    "ex.ares", "hd.ares", "nm.ares", "ez.ares", "sc.ares",
-                    "pattern_ex.ares", "pattern_hd.ares", "pattern_nm.ares", "pattern_ez.ares", "pattern_xt.ares", "pattern_sc.ares"
-                }
-                .Select(name => Path.Combine(extractDirectory, name)).FirstOrDefault(File.Exists)
-                ?? Directory.GetFiles(extractDirectory, "*.ares", SearchOption.AllDirectories).FirstOrDefault()
-                ?? throw new InvalidDataException("The TSTS bundle does not contain an ARES chart.");
-            _loadingTstsBundleChart = true;
+            var extractDirectory = TscTemporaryStorage.CreateOwnedDirectory("TSC-TSTS-");
             try
             {
-                LoadChart(firstChart);
+                using (var archive = ZipFile.OpenRead(fullInputPath))
+                {
+                    foreach (var entry in archive.Entries)
+                    {
+                        var destination = Path.GetFullPath(Path.Combine(extractDirectory, entry.FullName.Replace('/', Path.DirectorySeparatorChar)));
+                        var root = Path.GetFullPath(extractDirectory) + Path.DirectorySeparatorChar;
+                        if (!destination.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                            throw new InvalidDataException("The TSTS bundle contains an invalid path.");
+                        if (string.IsNullOrEmpty(entry.Name))
+                        {
+                            Directory.CreateDirectory(destination);
+                            continue;
+                        }
+                        Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                        entry.ExtractToFile(destination, overwrite: true);
+                    }
+                }
+                if (!File.Exists(Path.Combine(extractDirectory, "song.json")))
+                    throw new InvalidDataException("The TSTS bundle is missing song.json metadata.");
+                var firstChart = new[]
+                    {
+                        Path.Combine("charts", "expert.ares"), Path.Combine("charts", "hard.ares"),
+                        Path.Combine("charts", "normal.ares"), Path.Combine("charts", "easy.ares"),
+                        Path.Combine("charts", "sc.ares"),
+                        "ex.ares", "hd.ares", "nm.ares", "ez.ares", "sc.ares",
+                        "pattern_ex.ares", "pattern_hd.ares", "pattern_nm.ares", "pattern_ez.ares", "pattern_xt.ares", "pattern_sc.ares"
+                    }
+                    .Select(name => Path.Combine(extractDirectory, name)).FirstOrDefault(File.Exists)
+                    ?? Directory.GetFiles(extractDirectory, "*.ares", SearchOption.AllDirectories).FirstOrDefault()
+                    ?? throw new InvalidDataException("The TSTS bundle does not contain an ARES chart.");
+                _loadingTstsBundleChart = true;
+                try
+                {
+                    LoadChart(firstChart);
+                }
+                finally
+                {
+                    _loadingTstsBundleChart = false;
+                }
+                _loadedTstsBundlePath = fullInputPath;
+                _tstsWorkingDirectory = extractDirectory;
+                _editorBundleTemplate = ChartBundleTemplate.Tsts;
+                if (_chart is not null)
+                {
+                    _chart.Series = null;
+                    RefreshResultSongInfo();
+                }
+                _statusMessage = $"TSTS bundle opened: {Path.GetFileName(fullInputPath)}";
+                return;
             }
-            finally
+            catch
             {
-                _loadingTstsBundleChart = false;
+                if (string.Equals(_tstsWorkingDirectory, extractDirectory, StringComparison.OrdinalIgnoreCase))
+                    _tstsWorkingDirectory = null;
+                TscTemporaryStorage.DeleteOwnedDirectory(extractDirectory);
+                throw;
             }
-            _loadedTstsBundlePath = fullInputPath;
-            _tstsWorkingDirectory = extractDirectory;
-            _editorBundleTemplate = ChartBundleTemplate.Tsts;
-            if (_chart is not null)
-            {
-                _chart.Series = null;
-                RefreshResultSongInfo();
-            }
-            _statusMessage = $"TSTS bundle opened: {Path.GetFileName(fullInputPath)}";
-            return;
         }
-        _loadedTstsBundlePath = null;
-        _tstsWorkingDirectory = null;
         _loadedSourcePath = fullInputPath;
         if (string.Equals(Path.GetExtension(path), ".tsc", StringComparison.OrdinalIgnoreCase))
         {
@@ -2801,15 +3134,12 @@ public sealed partial class Playfield
     private static string StripEditorDisabledSuffix(string path)
         => path.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase) ? path[..^9] : path;
 
-    private string PrepareExtraDifficultyExportPath(string path, string difficultyCode)
+    private string PrepareEditorDifficultyExportPath(string path, string difficultyCode)
     {
         var fullPath = Path.GetFullPath(path);
-        if (!string.Equals(GetEditorDifficultyCode(difficultyCode), "xt", StringComparison.OrdinalIgnoreCase))
-            return StripEditorDisabledSuffix(fullPath);
-
         var normalPath = StripEditorDisabledSuffix(fullPath);
         var disabledPath = normalPath + ".disabled";
-        if (!_editorExtraDifficultyEnabled)
+        if (!IsEditorDifficultyEnabled(difficultyCode))
         {
             if (File.Exists(normalPath))
                 File.Move(normalPath, disabledPath, overwrite: true);
@@ -2832,7 +3162,7 @@ public sealed partial class Playfield
             "pattern_xt.ares" or "pattern_sc.ares" or "pattern_extra.ares" or "pattern_secret.ares";
     }
 
-    private void ApplyExtraDifficultyFilePolicyInDirectory(string directory, bool useAresFileNames)
+    private void ApplyDifficultyFilePolicyInDirectory(string directory, bool useAresFileNames)
     {
         if (string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
             return;
@@ -2842,19 +3172,21 @@ public sealed partial class Playfield
 
         foreach (var file in files)
         {
-            if (!IsExtraDifficultyFileName(file))
+            var code = GetEditorDifficultyCodeFromChartFileName(file);
+            if (code is null)
                 continue;
             var logicalPath = StripEditorDisabledSuffix(file);
             var extension = Path.GetExtension(logicalPath);
             if (useAresFileNames != extension.Equals(".ares", StringComparison.OrdinalIgnoreCase))
                 continue;
             var isDisabled = file.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase);
-            if (!_editorExtraDifficultyEnabled && !isDisabled)
+            var enabled = IsEditorDifficultyEnabled(code);
+            if (!enabled && !isDisabled)
             {
                 try { File.Move(file, file + ".disabled", overwrite: true); }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             }
-            else if (_editorExtraDifficultyEnabled && isDisabled)
+            else if (enabled && isDisabled)
             {
                 var normal = StripEditorDisabledSuffix(file);
                 try
@@ -2865,6 +3197,92 @@ public sealed partial class Playfield
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
             }
         }
+    }
+
+    private void CommitEditorDifficultyDeletionsInDirectory(string directory, bool useAresFileNames)
+    {
+        if (_editorDeletedDifficultyCodes.Count == 0 || string.IsNullOrWhiteSpace(directory) || !Directory.Exists(directory))
+            return;
+
+        // Deletions are only staged by the Info menu. Removing the file here,
+        // after the save has written its other outputs, makes Save the commit
+        // point and keeps canceling/reloading the editor non-destructive.
+        foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.TopDirectoryOnly).ToArray())
+        {
+            var code = GetEditorDifficultyCodeFromChartFileName(file);
+            if (code is null || !_editorDeletedDifficultyCodes.Contains(code))
+                continue;
+
+            var logicalPath = StripEditorDisabledSuffix(file);
+            var isAres = Path.GetExtension(logicalPath).Equals(".ares", StringComparison.OrdinalIgnoreCase);
+            if (isAres != useAresFileNames)
+                continue;
+
+            // Let a failed delete abort the save commit instead of silently
+            // clearing the staged deletion while leaving the chart on disk.
+            File.Delete(file);
+        }
+
+        FinalizeEditorDifficultyDeletions();
+
+        // If the active difficulty was deleted, keep sibling discovery anchored
+        // to another chart that still exists in the folder instead of the now-
+        // missing file. The deleted active chart itself remains marked as absent.
+        var extension = useAresFileNames ? ".ares" : ".tsc";
+        var discoveryPath = Directory.EnumerateFiles(directory, "*", SearchOption.TopDirectoryOnly)
+            .Where(file => Path.GetExtension(StripEditorDisabledSuffix(file)).Equals(extension, StringComparison.OrdinalIgnoreCase))
+            .Where(file => GetEditorDifficultyCodeFromChartFileName(file) is not null)
+            .OrderBy(file => Array.IndexOf(EditorDifficultyCodes, GetEditorDifficultyCodeFromChartFileName(file)))
+            .FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(discoveryPath))
+            _editorDifficultyDiscoverySourcePath = Path.GetFullPath(discoveryPath);
+        else if (!string.IsNullOrWhiteSpace(_loadedSourcePath) && !File.Exists(_loadedSourcePath))
+            _editorDifficultyDiscoverySourcePath = null;
+    }
+
+    private void FinalizeEditorDifficultyDeletions()
+    {
+        foreach (var code in _editorDeletedDifficultyCodes)
+        {
+            _editorCommittedDeletedDifficultyCodes.Add(code);
+            _editorDifficultyStates.Remove(code);
+        }
+        _editorDeletedDifficultyCodes.Clear();
+    }
+
+    private void MarkActiveEditorDifficultySourceFile(string difficultyCode, string path)
+    {
+        var code = GetEditorDifficultyCode(difficultyCode);
+        if (_editorDeletedDifficultyCodes.Contains(code) || _editorCommittedDeletedDifficultyCodes.Contains(code) ||
+            !_editorDifficultyStates.TryGetValue(code, out var state))
+            return;
+
+        state.SourcePath = Path.GetFullPath(path);
+        state.SourceName = Path.GetFileName(path);
+        state.HasSourceChart = File.Exists(path);
+        state.FpkChartName = null;
+    }
+
+    private static string? GetEditorDifficultyCodeFromChartFileName(string pathOrName)
+    {
+        var logicalName = Path.GetFileName(StripEditorDisabledSuffix(pathOrName));
+        var extension = Path.GetExtension(logicalName);
+        if (!extension.Equals(".tsc", StringComparison.OrdinalIgnoreCase) &&
+            !extension.Equals(".ares", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var stem = Path.GetFileNameWithoutExtension(logicalName).ToLowerInvariant();
+        if (stem.StartsWith("pattern_", StringComparison.Ordinal))
+            stem = stem[8..];
+        return stem switch
+        {
+            "ez" or "easy" => "ez",
+            "nm" or "normal" => "nm",
+            "hd" or "hard" => "hd",
+            "ex" or "expert" => "ex",
+            "xt" or "extra" or "sc" or "secret" => "xt",
+            _ => null
+        };
     }
 
     private static bool HasDisabledExtraDifficultySibling(string? sourcePath, ChartBundleTemplate template)
@@ -2934,6 +3352,29 @@ public sealed partial class Playfield
         root.Remove("sc_passcode");
     }
 
+    private void ApplyDisabledDifficultyMetadata(JsonObject root)
+    {
+        RemoveMissingDifficultyLevels(root);
+        foreach (var code in EditorDifficultyCodes.Where(code => !IsEditorDifficultyEnabled(code)))
+        {
+            var aliases = code switch
+            {
+                "ez" => new[] { "ez", "easy" },
+                "nm" => new[] { "nm", "normal" },
+                "hd" => new[] { "hd", "hard" },
+                "ex" => new[] { "ex", "expert" },
+                _ => new[] { "sc", "xt", "extra", "secret" }
+            };
+            foreach (var sectionName in new[] { "difficulty_levels", "judgment_windows_ms", "judgement_windows_ms" })
+            {
+                if (root[sectionName] is not JsonObject values)
+                    continue;
+                foreach (var alias in aliases)
+                    values.Remove(alias);
+            }
+        }
+    }
+
     private static void ApplyExtraDifficultyEnabledMetadata(JsonObject root, AresChart? savedExtraChart, AresChart? activeExtraChart = null)
     {
         RemoveMissingDifficultyLevels(root);
@@ -2974,6 +3415,7 @@ public sealed partial class Playfield
         else
             ApplyExtraDifficultyEnabledMetadata(root, _editorDifficultyStates.TryGetValue("xt", out var extraState) ? extraState.Chart : null,
                 _chart is not null && GetEditorDifficultyCode(_chart.Difficulty, _sourceName) == "xt" ? _chart : null);
+        ApplyDisabledDifficultyMetadata(root);
         File.WriteAllText(sidecar, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine,
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     }
@@ -3111,8 +3553,8 @@ public sealed partial class Playfield
         InvalidateEditorSavedPreviewDuration();
         _editorPreviewEditorOpen = false;
         _editorPreviewRangeInitialized = false;
+        ReleaseTstsWorkingDirectory();
         _loadedTstsBundlePath = null;
-        _tstsWorkingDirectory = null;
         _loadedSourcePath = Path.GetFullPath(path);
         _editorBundleTemplate = ChartBundleTemplate.Tsc;
         var assetDirectory = GetSongAssetDirectoryForChartPath(_loadedSourcePath);
@@ -3179,8 +3621,8 @@ public sealed partial class Playfield
         InvalidateEditorSavedPreviewDuration();
         _editorPreviewEditorOpen = false;
         _editorPreviewRangeInitialized = false;
+        ReleaseTstsWorkingDirectory();
         _loadedTstsBundlePath = null;
-        _tstsWorkingDirectory = null;
         _loadedSourcePath = Path.GetFullPath(prepared.SourcePath);
         _editorBundleTemplate = ChartBundleTemplate.Bold;
         LoadBundleMetadataFromFpk(prepared.SourcePath, prepared.ChartName);
@@ -3473,6 +3915,8 @@ public sealed partial class Playfield
         if (!_switchingEditorDifficulty)
         {
             _editorDifficultyStates.Clear();
+            _editorDeletedDifficultyCodes.Clear();
+            _editorCommittedDeletedDifficultyCodes.Clear();
             _editorDifficultySessionActive = false;
             _editorActiveDifficultyCode = null;
             _editorSharedMusicBytes = musicBytes is null ? null : musicBytes.ToArray();
@@ -3624,7 +4068,7 @@ public sealed partial class Playfield
 
         AresLoader.SynchronizePlayTickMarker(_chart);
         var activeDifficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
-        var fullTarget = PrepareExtraDifficultyExportPath(path, activeDifficultyCode);
+        var fullTarget = PrepareEditorDifficultyExportPath(path, activeDifficultyCode);
         var targetDirectory = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
         Directory.CreateDirectory(targetDirectory);
         string? musicPathOverride = _chart.MusicPath;
@@ -3699,7 +4143,7 @@ public sealed partial class Playfield
             if (!adoptOutputAsSource)
                 RestoreEditorChartMediaState(_chart, originalMediaState);
         }
-        ApplyExtraDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: false);
+        ApplyDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: false);
         UpdateEditorExtraDifficultySongJson(fullTarget, createIfMissing: writeSongJsonSidecar);
 
         if (adoptOutputAsSource)
@@ -3710,6 +4154,8 @@ public sealed partial class Playfield
             _sourceName = Path.GetFileName(fullTarget);
             _lastLoadedSourceName = _sourceName;
             _editorDifficultyDiscoverySourcePath = fullTarget;
+            CommitEditorDifficultyDeletionsInDirectory(targetDirectory, useAresFileNames: false);
+            MarkActiveEditorDifficultySourceFile(activeDifficultyCode, fullTarget);
         }
         StoreActiveEditorDifficulty();
         MarkEditorSaved();
@@ -3730,6 +4176,7 @@ public sealed partial class Playfield
             ?? throw new InvalidDataException("Could not create song.json metadata.");
         if (!_editorExtraDifficultyEnabled)
             ApplyExtraDifficultyDisabledMetadata(json);
+        ApplyDisabledDifficultyMetadata(json);
         if (isTsts)
         {
             json["schema"] = 3;
@@ -3757,16 +4204,49 @@ public sealed partial class Playfield
         Directory.CreateDirectory(staging);
         try
         {
+            SyncSharedEditorMetadataToDifficultyStates();
+            StoreActiveEditorDifficulty();
             var difficulty = GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
             var chartPath = Path.Combine(staging, GetTscDifficultyStem(difficulty) + ".tsc");
             SaveEditorChartAsTsc(chartPath, adoptOutputAsSource: false, writeSongJsonSidecar: true);
+            var bundleMusicPath = _loadedMusicBytes is { Length: > 0 }
+                ? "music.opus"
+                : (string.IsNullOrWhiteSpace(_chart.MusicPath) ? "music.opus" : _chart.MusicPath.Replace('\\', '/'));
+
+            // A TSC ZIP is a song bundle, so include every currently loaded difficulty
+            // state that is enabled, not just the difficulty selected in the editor.
+            foreach (var pair in _editorDifficultyStates.OrderBy(pair => Array.IndexOf(EditorDifficultyCodes, pair.Key)))
+            {
+                var code = GetEditorDifficultyCode(pair.Key);
+                if (string.Equals(code, difficulty, StringComparison.OrdinalIgnoreCase) || !IsEditorDifficultyEnabled(code))
+                    continue;
+                var stateChart = pair.Value.Chart;
+                var stateMedia = CaptureEditorChartMediaState(stateChart);
+                try
+                {
+                    AresLoader.SynchronizePlayTickMarker(stateChart);
+                    ApplyFixedMediaPaths(stateChart, ChartBundleTemplate.Tsc);
+                    var statePath = Path.Combine(staging, GetTscDifficultyStem(code) + ".tsc");
+                    TscLoader.Save(statePath, stateChart, bundleMusicPath,
+                        includeJudgementWindows: IsEditorCustomJudgementWindowsEnabled(code),
+                        writeSongJsonSidecar: true);
+                }
+                finally
+                {
+                    RestoreEditorChartMediaState(stateChart, stateMedia);
+                }
+            }
             IncludeExistingExtraDifficultyInTscZip(staging, difficulty);
+            UpdateEditorExtraDifficultySongJson(chartPath, createIfMissing: true);
             if (File.Exists(temporaryZip))
                 File.Delete(temporaryZip);
             using (var archive = ZipFile.Open(temporaryZip, ZipArchiveMode.Create))
             {
                 foreach (var file in Directory.EnumerateFiles(staging, "*", SearchOption.AllDirectories))
                 {
+                    var chartCode = GetEditorDifficultyCodeFromChartFileName(file);
+                    if (chartCode is not null && !IsEditorDifficultyEnabled(chartCode))
+                        continue;
                     var relative = Path.GetRelativePath(staging, file).Replace('\\', '/');
                     archive.CreateEntryFromFile(file, relative, CompressionLevel.Optimal);
                 }
@@ -3785,11 +4265,13 @@ public sealed partial class Playfield
         // The active Extra chart has already been exported by SaveEditorChartAsTsc.
         // For another selected difficulty, carry the existing Extra chart into the
         // ZIP in TSC format, preserving it under the requested disabled suffix.
-        if (string.Equals(GetEditorDifficultyCode(activeDifficultyCode), "xt", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(GetEditorDifficultyCode(activeDifficultyCode), "xt", StringComparison.OrdinalIgnoreCase) ||
+            !_editorExtraDifficultyEnabled)
             return;
 
-        var enabled = _editorExtraDifficultyEnabled;
-        var outputPath = Path.Combine(stagingDirectory, enabled ? "sc.tsc" : "sc.tsc.disabled");
+        var outputPath = Path.Combine(stagingDirectory, "sc.tsc");
+        if (File.Exists(outputPath))
+            return;
         AresChart? extraChart = null;
         if (_editorDifficultyStates.TryGetValue("xt", out var extraState))
         {
@@ -3812,9 +4294,7 @@ public sealed partial class Playfield
                 catch { /* A non-file source path simply has no sibling chart. */ }
             }
 
-            var names = enabled
-                ? new[] { "sc.tsc", "xt.tsc", "extra.tsc", "secret.tsc", "sc.tsc.disabled", "xt.tsc.disabled", "extra.tsc.disabled", "secret.tsc.disabled" }
-                : new[] { "sc.tsc", "xt.tsc", "extra.tsc", "secret.tsc", "sc.tsc.disabled", "xt.tsc.disabled", "extra.tsc.disabled", "secret.tsc.disabled" };
+            var names = new[] { "sc.tsc", "xt.tsc", "extra.tsc", "secret.tsc", "sc.tsc.disabled", "xt.tsc.disabled", "extra.tsc.disabled", "secret.tsc.disabled" };
             foreach (var directory in directories)
             {
                 var found = names.Select(name => Path.Combine(directory, name)).FirstOrDefault(File.Exists);
@@ -3841,7 +4321,7 @@ public sealed partial class Playfield
             ApplyFixedMediaPaths(extraChart, ChartBundleTemplate.Tsc);
             TscLoader.Save(outputPath, extraChart, "music.opus",
                 includeJudgementWindows: IsEditorCustomJudgementWindowsEnabled("xt"),
-                writeSongJsonSidecar: enabled);
+                writeSongJsonSidecar: true);
         }
         finally
         {
@@ -3857,7 +4337,7 @@ public sealed partial class Playfield
         AresLoader.SynchronizePlayTickMarker(_chart);
         var originalMediaState = CaptureEditorChartMediaState(_chart);
         var activeDifficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
-        var fullTarget = PrepareExtraDifficultyExportPath(path, activeDifficultyCode);
+        var fullTarget = PrepareEditorDifficultyExportPath(path, activeDifficultyCode);
         var targetDirectory = Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory();
         Directory.CreateDirectory(targetDirectory);
         string? musicPathOverride = _chart.MusicPath;
@@ -3986,7 +4466,7 @@ public sealed partial class Playfield
             if (!adoptOutputAsSource)
                 RestoreEditorChartMediaState(_chart, originalMediaState);
         }
-        ApplyExtraDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: _editorBundleTemplate != ChartBundleTemplate.Tsc);
+        ApplyDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: _editorBundleTemplate != ChartBundleTemplate.Tsc);
         UpdateEditorExtraDifficultySongJson(fullTarget, createIfMissing: _editorBundleTemplate != ChartBundleTemplate.Tsc);
 
         if (adoptOutputAsSource)
@@ -3995,6 +4475,9 @@ public sealed partial class Playfield
             _sourceName = Path.GetFileName(fullTarget);
             _lastLoadedSourceName = _sourceName;
             _editorDifficultyDiscoverySourcePath = fullTarget;
+            CommitEditorDifficultyDeletionsInDirectory(targetDirectory,
+                useAresFileNames: _editorBundleTemplate != ChartBundleTemplate.Tsc);
+            MarkActiveEditorDifficultySourceFile(activeDifficultyCode, fullTarget);
         }
         StoreActiveEditorDifficulty();
         MarkEditorSaved();
@@ -4032,20 +4515,16 @@ public sealed partial class Playfield
             if (string.IsNullOrWhiteSpace(sourceChartEntryName))
                 throw new InvalidOperationException("The original FPK chart entry name is not available.");
             var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
-            var targetChartEntryName = string.Equals(activeCode, "xt", StringComparison.OrdinalIgnoreCase)
-                ? GetFpkExportChartEntryName("xt")
-                : sourceChartEntryName;
+            var targetChartEntryName = GetFpkExportChartEntryName(activeCode);
 
             var replaced = false;
             foreach (var entry in sourcePackage.Entries)
             {
                 if (string.Equals(entry.Name, sourceChartEntryName, StringComparison.OrdinalIgnoreCase))
                 {
-                    // Match using the original entry name, but write using the
-                    // output policy name so a disabled Extra chart is preserved
-                    // as pattern_xt.ares.disabled (and can be re-enabled later).
-                    entries.Add(new FpkWriteEntry(targetChartEntryName, chartBytes));
                     replaced = true;
+                    if (IsEditorDifficultyEnabled(activeCode))
+                        entries.Add(new FpkWriteEntry(targetChartEntryName, chartBytes));
                 }
                 else if (!IsBundleMetadataEntry(entry.Name))
                 {
@@ -4054,22 +4533,17 @@ public sealed partial class Playfield
                         continue;
 
                     var entryData = sourcePackage.Extract(entry);
-                    if (!_editorExtraDifficultyEnabled && IsExtraDifficultyFileName(entry.Name) &&
-                        string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase) &&
-                        !entry.Name.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase))
-                    {
-                        entries.Add(new FpkWriteEntry(entry.Name + ".disabled", entryData));
-                    }
-                    else if (_editorExtraDifficultyEnabled && IsExtraDifficultyFileName(entry.Name) &&
-                             entry.Name.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase) &&
-                             string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase))
-                    {
-                        entries.Add(new FpkWriteEntry(StripEditorDisabledSuffix(entry.Name), entryData));
-                    }
+                    var entryCode = GetEditorDifficultyCodeFromChartFileName(entry.Name);
+                    if (entryCode is not null && !IsEditorDifficultyEnabled(entryCode))
+                        continue;
+                    var outputName = entryCode is not null &&
+                                     string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase)
+                        ? StripEditorDisabledSuffix(entry.Name)
+                        : entry.Name;
+                    if (!string.Equals(outputName, entry.Name, StringComparison.OrdinalIgnoreCase))
+                        entries.Add(new FpkWriteEntry(outputName, entryData));
                     else
-                    {
                         entries.Add(new FpkWriteEntry(entry.Name, entryData));
-                    }
                 }
             }
 
@@ -4081,9 +4555,10 @@ public sealed partial class Playfield
             var sourcePath = _loadedSourcePath;
             var chartEntryName = GetFpkChartEntryName(sourcePath, _sourceName);
             var activeCodeForName = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
-            if (activeCodeForName == "xt")
-                chartEntryName = GetFpkExportChartEntryName(activeCodeForName);
-            entries.Add(new FpkWriteEntry(chartEntryName, chartBytes));
+            chartEntryName = GetFpkExportChartEntryName(activeCodeForName);
+            var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+            if (IsEditorDifficultyEnabled(activeCode))
+                entries.Add(new FpkWriteEntry(chartEntryName, chartBytes));
 
             musicBytesForExport ??= GetEditorMusicBytesForFpkExport();
 
@@ -4201,25 +4676,22 @@ public sealed partial class Playfield
                     string.Equals(candidate.Value.FpkChartName, entry.Name, StringComparison.OrdinalIgnoreCase));
                 if (state.Value is not null && string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase))
                 {
-                    var targetName = GetFpkExportChartEntryName(state.Key);
-                    AddEntry(targetName, AresWriter.BuildBytes(state.Value.Chart, state.Value.AresHeaderTemplate));
                     exportedCodes.Add(state.Key);
-                }
-                else if (!_editorExtraDifficultyEnabled && IsExtraDifficultyFileName(entry.Name) &&
-                         string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase) &&
-                         !entry.Name.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase))
-                {
-                    AddEntry(entry.Name + ".disabled", sourcePackage.Extract(entry));
-                }
-                else if (_editorExtraDifficultyEnabled && IsExtraDifficultyFileName(entry.Name) &&
-                         entry.Name.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase) &&
-                         string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase))
-                {
-                    AddEntry(StripEditorDisabledSuffix(entry.Name), sourcePackage.Extract(entry));
+                    if (IsEditorDifficultyEnabled(state.Key))
+                    {
+                        var targetName = GetFpkExportChartEntryName(state.Key);
+                        AddEntry(targetName, AresWriter.BuildBytes(state.Value.Chart, state.Value.AresHeaderTemplate));
+                    }
                 }
                 else
                 {
-                    AddEntry(entry.Name, sourcePackage.Extract(entry));
+                    var code = GetEditorDifficultyCodeFromChartFileName(entry.Name);
+                    var isChart = code is not null &&
+                                  string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase);
+                    if (isChart && !IsEditorDifficultyEnabled(code))
+                        continue;
+                    var outputName = isChart ? StripEditorDisabledSuffix(entry.Name) : entry.Name;
+                    AddEntry(outputName, sourcePackage.Extract(entry));
                 }
             }
         }
@@ -4228,9 +4700,12 @@ public sealed partial class Playfield
         {
             if (exportedCodes.Contains(state.Key))
                 continue;
-            var targetName = GetFpkExportChartEntryName(state.Key);
-            AddEntry(targetName, AresWriter.BuildBytes(state.Value.Chart, state.Value.AresHeaderTemplate));
             exportedCodes.Add(state.Key);
+            if (IsEditorDifficultyEnabled(state.Key))
+            {
+                var targetName = GetFpkExportChartEntryName(state.Key);
+                AddEntry(targetName, AresWriter.BuildBytes(state.Value.Chart, state.Value.AresHeaderTemplate));
+            }
         }
 
         var musicBytes = _editorSharedMusicBytes ?? _loadedMusicBytes;
@@ -4280,7 +4755,8 @@ public sealed partial class Playfield
             AddOrReplaceBundleMetadataEntry(entries, BuildBundleMetadataIni());
             entries.RemoveAll(entry => string.Equals(Path.GetFileName(entry.Name), "song.json", StringComparison.OrdinalIgnoreCase));
             entries.Add(new FpkWriteEntry("song.json", BuildSongJsonBytesForStates(
-                states.Where(state => _editorExtraDifficultyEnabled || !string.Equals(state.Key, "xt", StringComparison.OrdinalIgnoreCase))
+                states.Where(state => IsEditorDifficultyEnabled(state.Key) &&
+                                      (_editorExtraDifficultyEnabled || !string.Equals(state.Key, "xt", StringComparison.OrdinalIgnoreCase)))
                     .Select(state => state.Value), _chart, schema: 3, supportsSeries: true,
                 musicPathOverride: musicBytes is { Length: > 0 } ? "music.opus" : _chart.MusicPath)));
             FpkWriter.Save(fullTarget, entries, sourcePackage);
@@ -4296,8 +4772,11 @@ public sealed partial class Playfield
 
         if (adoptOutputAsSource)
         {
+            FinalizeEditorDifficultyDeletions();
             foreach (var state in states)
             {
+                if (_editorCommittedDeletedDifficultyCodes.Contains(state.Key))
+                    continue;
                 state.Value.SourcePath = fullTarget;
                 state.Value.FpkChartName = GetFpkExportChartEntryName(state.Key);
                 state.Value.SourceName = state.Value.FpkChartName;
@@ -4352,6 +4831,7 @@ public sealed partial class Playfield
                 ApplyExtraDifficultyEnabledMetadata(generated,
                     _editorDifficultyStates.TryGetValue("xt", out var extraState) ? extraState.Chart : null,
                     GetEditorDifficultyCode(chart.Difficulty, _sourceName) == "xt" ? chart : null);
+            ApplyDisabledDifficultyMetadata(generated);
             return Encoding.UTF8.GetBytes(generated.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
         }
         finally
@@ -4397,6 +4877,7 @@ public sealed partial class Playfield
                 ApplyExtraDifficultyEnabledMetadata(generated,
                     _editorDifficultyStates.TryGetValue("xt", out var extraState) ? extraState.Chart : null,
                     GetEditorDifficultyCode(fallbackChart.Difficulty, _sourceName) == "xt" ? fallbackChart : null);
+            ApplyDisabledDifficultyMetadata(generated);
             return Encoding.UTF8.GetBytes(generated.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
         }
         finally
@@ -4458,12 +4939,12 @@ public sealed partial class Playfield
             .ToList();
         var fullTarget = Path.GetFullPath(path);
         Directory.CreateDirectory(Path.GetDirectoryName(fullTarget) ?? Directory.GetCurrentDirectory());
-        var staging = Path.Combine(Path.GetTempPath(), "TSC-TSTS-save-" + Guid.NewGuid().ToString("N"));
+        var staging = TscTemporaryStorage.CreateOwnedDirectory("TSC-TSTS-save-");
         var chartsDirectory = Path.Combine(staging, "charts");
         var previousWorkingDirectory = _tstsWorkingDirectory;
-        Directory.CreateDirectory(chartsDirectory);
         try
         {
+            Directory.CreateDirectory(chartsDirectory);
             var states = _editorDifficultyStates.Count > 0
                 ? _editorDifficultyStates.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase)
                 : new Dictionary<string, EditorDifficultyState>(StringComparer.OrdinalIgnoreCase)
@@ -4503,6 +4984,8 @@ public sealed partial class Playfield
 
             foreach (var pair in states)
             {
+                if (!IsEditorDifficultyEnabled(pair.Key))
+                    continue;
                 var chart = pair.Value.Chart;
                 chart.Series = null;
                 chart.MusicPath = "song.opus";
@@ -4513,13 +4996,6 @@ public sealed partial class Playfield
                 var chartPath = Path.Combine(chartsDirectory, chartFileName);
                 File.WriteAllBytes(chartPath, AresWriter.BuildBytes(chart, pair.Value.AresHeaderTemplate));
             }
-            if (!_editorExtraDifficultyEnabled && !states.ContainsKey("xt"))
-            {
-                var disabledExtraSource = FindExistingTstsExtraChartFile(sourceDirectory);
-                if (disabledExtraSource is not null)
-                    File.Copy(disabledExtraSource, Path.Combine(chartsDirectory, Path.GetFileName(disabledExtraSource) + ".disabled"), overwrite: true);
-            }
-
             // Generate the single root-level song.json by updating it once for
             // each difficulty. Passing chart paths at the root makes the helper
             // keep song.json out of charts/.
@@ -4542,6 +5018,7 @@ public sealed partial class Playfield
             songJson["schema"] = 3;
             if (!_editorExtraDifficultyEnabled)
                 ApplyExtraDifficultyDisabledMetadata(songJson);
+            ApplyDisabledDifficultyMetadata(songJson);
             songJson.Remove("series");
             songJson.Remove("album_big");
             songJson.Remove("music");
@@ -4580,10 +5057,13 @@ public sealed partial class Playfield
                 _editorImportedSongAudio = false;
                 _bundleSeries = null;
                 _editorDifficultySessionActive = true;
+                FinalizeEditorDifficultyDeletions();
                 _editorDifficultyStates.Clear();
                 _bundleJudgementWindows.Clear();
                 foreach (var pair in states)
                 {
+                    if (_editorCommittedDeletedDifficultyCodes.Contains(pair.Key))
+                        continue;
                     var chartFile = GetTstsExportChartFileName(pair.Key);
                     pair.Value.SourcePath = Path.Combine(chartsDirectory, chartFile);
                     pair.Value.SourceName = chartFile;
@@ -4597,10 +5077,19 @@ public sealed partial class Playfield
                     ? activeState.AresHeaderTemplate
                     : _loadedAresHeaderTemplate;
 
+                if (_editorCommittedDeletedDifficultyCodes.Contains(activeCode))
+                {
+                    var remainingChart = Directory.EnumerateFiles(chartsDirectory, "*", SearchOption.TopDirectoryOnly)
+                        .Where(file => Path.GetExtension(StripEditorDisabledSuffix(file)).Equals(".ares", StringComparison.OrdinalIgnoreCase))
+                        .Where(file => GetEditorDifficultyCodeFromChartFileName(file) is not null)
+                        .FirstOrDefault();
+                    _editorDifficultyDiscoverySourcePath = remainingChart;
+                }
+
                 if (!string.IsNullOrWhiteSpace(previousWorkingDirectory) &&
                     !string.Equals(Path.GetFullPath(previousWorkingDirectory), Path.GetFullPath(staging), StringComparison.OrdinalIgnoreCase))
                 {
-                    try { Directory.Delete(previousWorkingDirectory, recursive: true); } catch { /* best-effort temp cleanup */ }
+                    TscTemporaryStorage.DeleteOwnedDirectory(previousWorkingDirectory);
                 }
                 _statusMessage = $"Quick-saved TSTS bundle: {fullTarget}";
             }
@@ -4608,19 +5097,21 @@ public sealed partial class Playfield
             {
                 foreach (var snapshot in originalMediaStates)
                     RestoreEditorChartMediaState(snapshot.Chart, snapshot.Media);
-                try { Directory.Delete(staging, recursive: true); } catch { }
+                TscTemporaryStorage.DeleteOwnedDirectory(staging);
                 StoreActiveEditorDifficulty();
                 _statusMessage = $"Exported TSTS bundle: {fullTarget}";
             }
         }
         catch
         {
+            if (string.Equals(_tstsWorkingDirectory, staging, StringComparison.OrdinalIgnoreCase))
+                _tstsWorkingDirectory = previousWorkingDirectory;
             if (!adoptOutputAsSource)
             {
                 foreach (var snapshot in originalMediaStates)
                     RestoreEditorChartMediaState(snapshot.Chart, snapshot.Media);
             }
-            try { Directory.Delete(staging, recursive: true); } catch { }
+            TscTemporaryStorage.DeleteOwnedDirectory(staging);
             try { if (File.Exists(fullTarget + ".tmp")) File.Delete(fullTarget + ".tmp"); } catch { }
             throw;
         }
@@ -4742,7 +5233,7 @@ public sealed partial class Playfield
         if (_editorBundleTemplate == ChartBundleTemplate.Bold)
         {
 #if TSC_PUBLISH
-            throw new InvalidOperationException("Quick Save to a new BOLD/FPK bundle is unavailable in this publish build. Use Export ARES or Export TSC instead.");
+            throw new InvalidOperationException("Quick Save to a new BOLD/FPK bundle is unavailable in this publish build. Use Export ARES or TSC ZIP instead.");
 #else
             SaveEditorChartAsFpk(Path.Combine(fullFolder, SafeFileStem(_chart.Name ?? "song") + ".fpk"), adoptOutputAsSource: true);
             return;
@@ -5005,13 +5496,13 @@ public sealed partial class Playfield
     private string GetFpkExportChartEntryName(string? difficulty)
     {
         var code = GetEditorDifficultyCode(difficulty);
-        return $"pattern_{code}.ares" + (code == "xt" && !_editorExtraDifficultyEnabled ? ".disabled" : string.Empty);
+        return $"pattern_{code}.ares" + (IsEditorDifficultyEnabled(code) ? string.Empty : ".disabled");
     }
 
     private string GetTstsExportChartFileName(string? difficulty)
     {
         var code = GetEditorDifficultyCode(difficulty);
-        return GetTstsBundleChartFileName(code) + (code == "xt" && !_editorExtraDifficultyEnabled ? ".disabled" : string.Empty);
+        return GetTstsBundleChartFileName(code) + (IsEditorDifficultyEnabled(code) ? string.Empty : ".disabled");
     }
 
     private static string GetTstsBundleChartFileName(string? difficulty)
@@ -5371,6 +5862,13 @@ public sealed partial class Playfield
         if (!_chartEditorMode || _chart is null || _tempo is null)
             return;
 
+        if (_editorMetaExportExpanded && KeybindSettings.IsPressed("editor_cancel"))
+        {
+            _editorMetaExportExpanded = false;
+            _statusMessage = "Export options closed.";
+            return;
+        }
+
         UpdateEditorTextFieldMouseDrag();
         if (_editorMetaEditingField is not null)
         {
@@ -5553,7 +6051,9 @@ public sealed partial class Playfield
         {
             if (HandleEditorCommandKeybinds())
                 return;
-            if (KeybindSettings.IsPressed("editor_delete"))
+            if (KeybindSettings.IsPressed("editor_delete_family"))
+                DeleteSelectedEditorNoteFamily();
+            else if (KeybindSettings.IsPressed("editor_delete"))
                 DeleteSelectedEditorNote();
             return; // Ordinary gameplay note tools must not leak into panel tracks.
         }
@@ -8155,9 +8655,10 @@ public sealed partial class Playfield
                 _statusMessage = "Choose a different note as the connector target.";
                 return;
             }
-            if (targetTrack == source.Track)
+            if (targetTrack == source.Track &&
+                existingTarget.NoteType is not (NoteType.Single or NoteType.SingleLong))
             {
-                _statusMessage = "To connect two notes, choose a target on a different track. Same-track connectors set a hold end.";
+                _statusMessage = "A same-track connector can use a tap or hold as its duration endpoint.";
                 return;
             }
             if (existingTarget.NoteType is not (NoteType.Single or NoteType.SingleLong or NoteType.LinkHead or NoteType.LinkTail))
@@ -8166,18 +8667,21 @@ public sealed partial class Playfield
                 return;
             }
         }
-        var sourceTypeAfterConnector = source.NoteType is NoteType.Single or NoteType.SingleLong
-            ? NoteType.LinkHead
-            : source.NoteType;
-        if (!IsEditorTrackAllowedForNoteType(source.Track, sourceTypeAfterConnector))
+        if (targetTrack != source.Track)
         {
-            _statusMessage = "In 1K, a connector head must be on L2/R2; only link tails may use L1/L3/R1/R3.";
-            return;
-        }
-        if (!IsEditorTrackAllowedForNoteType(targetTrack, NoteType.LinkTail))
-        {
-            _statusMessage = "That lane cannot accept a link tail under the current track rules.";
-            return;
+            var sourceTypeAfterConnector = source.NoteType is NoteType.Single or NoteType.SingleLong
+                ? NoteType.LinkHead
+                : source.NoteType;
+            if (!IsEditorTrackAllowedForNoteType(source.Track, sourceTypeAfterConnector))
+            {
+                _statusMessage = "In 1K, a connector head must be on L2/R2; only link tails may use L1/L3/R1/R3.";
+                return;
+            }
+            if (!IsEditorTrackAllowedForNoteType(targetTrack, NoteType.LinkTail))
+            {
+                _statusMessage = "That lane cannot accept a link tail under the current track rules.";
+                return;
+            }
         }
         if (targetTick < source.Tick || (targetTick == source.Tick && targetTrack == source.Track))
         {
@@ -8185,11 +8689,45 @@ public sealed partial class Playfield
             return;
         }
 
+        // Holding the horizontal-first modifier creates the lane change at the
+        // source point (or at the end of an existing hold), then keeps the new
+        // destination-lane point alive until the clicked tick.
+        var horizontalFirst = targetTrack != source.Track &&
+            KeybindSettings.IsModifierBindingDown("editor_connector_horizontal_first");
+        var connectionTick = horizontalFirst &&
+            (source.NoteType == NoteType.SingleLong ||
+             (source.NoteType == NoteType.LinkTail && source.Duration > 6))
+                ? source.EndTick
+                : source.Tick;
+        if (horizontalFirst && targetTick < connectionTick)
+        {
+            _statusMessage = $"Choose a target at or after the hold end at tick {connectionTick} for a horizontal-first connector.";
+            return;
+        }
+
         if (targetTrack == source.Track)
         {
-            // A same-track connector becomes the selected point's hold end; it is
-            // not stored as a separate note. Durations <= 6 render as a normal head.
-            var duration = targetTick - source.Tick;
+            // Shift-clicking an existing note on the same track uses that note as
+            // the duration endpoint. A target hold contributes its full end tick,
+            // so the resulting duration contains both notes without overlapping a
+            // second head at the new endpoint.
+            if (existingTarget is not null &&
+                existingTarget.NoteType is not (NoteType.Single or NoteType.SingleLong))
+            {
+                _statusMessage = "A same-track connector can use a tap or hold as its duration endpoint.";
+                return;
+            }
+
+            if ((source.NoteType is NoteType.SingleLong or NoteType.LinkTail) && targetTick < source.EndTick)
+            {
+                _statusMessage = $"Choose a target at or after the current hold end at tick {source.EndTick}.";
+                return;
+            }
+
+            var durationEndTick = existingTarget?.NoteType == NoteType.SingleLong
+                ? existingTarget.EndTick
+                : targetTick;
+            var duration = durationEndTick - source.Tick;
             if (duration <= 6)
             {
                 _statusMessage = "Choose a hold-end at least 6 ticks after the selected point.";
@@ -8217,13 +8755,20 @@ public sealed partial class Playfield
             }
 
             source.Duration = duration;
+            if (existingTarget is not null)
+            {
+                foreach (var track in _chart.Tracks)
+                    track.Events.RemoveAll(candidate => ReferenceEquals(candidate, existingTarget));
+            }
             CommitEditorUndoSnapshot(undoSnapshot);
             RefreshAfterEditorMutation();
             _selectedEventKey = KeyOf(source);
             _selectedBeatTick = null;
             _selectedBeatTrack = source.Track;
             _editorSelectedLinkRoot = GetEditorLinkRoot(source);
-            _statusMessage = $"Set hold end: tick {source.EndTick}, track {source.Track}.";
+            _statusMessage = existingTarget is not null
+                ? $"Connected the same-track note into a duration ending at tick {source.EndTick}, track {source.Track}."
+                : $"Set hold end: tick {source.EndTick}, track {source.Track}.";
             return;
         }
 
@@ -8235,7 +8780,7 @@ public sealed partial class Playfield
             return;
         }
 
-        if (existingTarget is null && source.NoteType == NoteType.LinkTail && targetTick == source.Tick)
+        if (!horizontalFirst && existingTarget is null && source.NoteType == NoteType.LinkTail && targetTick == source.Tick)
         {
             var previousTrack = source.Track;
             var moveUndoSnapshot = CaptureEditorChartSnapshot();
@@ -8263,7 +8808,6 @@ public sealed partial class Playfield
             return;
         }
 
-        var connectorUndoSnapshot = CaptureEditorChartSnapshot();
         var sourceChainNodesForPair = selectedRoot is { NoteType: NoteType.LinkHead }
             ? GetEditorLinkChainNodes(selectedRoot).ToHashSet()
             : new HashSet<ChartEvent> { source };
@@ -8278,6 +8822,27 @@ public sealed partial class Playfield
             else if (existingTarget.NoteType is NoteType.LinkHead or NoteType.LinkTail)
                 ignoredChainEventsForPair.Add(existingTarget);
         }
+
+        // LINK X also creates a real point on the destination lane at the
+        // horizontal-connection tick. Do not place that point over an unrelated
+        // tap or hold already occupying the lane.
+        if (horizontalFirst && targetTick > connectionTick)
+        {
+            var occupiedAtConnection = _chart.Events.FirstOrDefault(ev =>
+                ev.Kind == "Note" && ev.RawType == 1 && ev.Track == targetTrack &&
+                !ignoredChainEventsForPair.Contains(ev) &&
+                (ev.Tick == connectionTick ||
+                 ((ev.IsHoldNote || ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
+                  ev.Tick < connectionTick &&
+                  connectionTick <= (GetEditorNextLinkPoint(ev)?.Tick ?? ev.EndTick))));
+            if (occupiedAtConnection is not null)
+            {
+                _statusMessage = $"Cannot place horizontal-first connector: track {targetTrack} is occupied at tick {connectionTick}.";
+                return;
+            }
+        }
+
+        var connectorUndoSnapshot = CaptureEditorChartSnapshot();
         int pair;
         if (source.NoteType == NoteType.Single && source.Attr == 0)
         {
@@ -8303,7 +8868,7 @@ public sealed partial class Playfield
             source.TwinPairId = null;
             // This segment lasts until its first LinkTail. Keep the duration in
             // sync with that endpoint even though the renderer uses the link map.
-            source.Duration = Math.Max(6, targetTick - source.Tick);
+            source.Duration = Math.Max(6, (horizontalFirst ? connectionTick : targetTick) - source.Tick);
         }
         else if (source.NoteType == NoteType.SingleLong)
         {
@@ -8334,7 +8899,7 @@ public sealed partial class Playfield
             source.Attr = pair;
             source.LinePair = pair;
             source.TwinPairId = null;
-            source.Duration = Math.Max(6, targetTick - source.Tick);
+            source.Duration = Math.Max(6, (horizontalFirst ? connectionTick : targetTick) - source.Tick);
         }
         else if (source.NoteType is NoteType.LinkHead or NoteType.LinkTail)
         {
@@ -8405,7 +8970,7 @@ public sealed partial class Playfield
             // LinkHead and LinkTail can both be terminal while a connector is being
             // placed. Update their segment duration before the derived link map is
             // rebuilt, including a valid same-tick horizontal connection.
-            source.Duration = Math.Max(6, targetTick - source.Tick);
+            source.Duration = Math.Max(6, (horizontalFirst ? connectionTick : targetTick) - source.Tick);
         }
         else
         {
@@ -8421,6 +8986,7 @@ public sealed partial class Playfield
         }
 
         ChartEvent newTail;
+        var absorbedTargetIntoHorizontalDuration = false;
         if (existingTarget is not null)
         {
             if (ReferenceEquals(existingTarget, source) || existingTarget.Tick != targetTick || existingTarget.Track != targetTrack)
@@ -8453,15 +9019,39 @@ public sealed partial class Playfield
                 return;
             }
 
+            // A simple note used as a horizontal-first target becomes the duration
+            // endpoint of the destination-lane LinkTail. Move that existing event to
+            // the connection tick instead of leaving a second LinkTail at the old
+            // head position. If the target was already a hold, retain its old end
+            // tick so the new duration combines the horizontal segment and that hold.
+            var targetOriginalType = existingTarget.NoteType;
+            var targetOriginalEndTick = targetOriginalType == NoteType.SingleLong
+                ? existingTarget.EndTick
+                : existingTarget.Tick;
+            absorbedTargetIntoHorizontalDuration = horizontalFirst && targetTick > connectionTick &&
+                (targetOriginalType is NoteType.Single or NoteType.SingleLong);
+
+            if (absorbedTargetIntoHorizontalDuration)
+            {
+                existingTarget.Tick = connectionTick;
+                existingTarget.Duration = Math.Max(6, targetOriginalEndTick - connectionTick);
+                existingTarget.EventIndex = _chart.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1;
+            }
+            else if (horizontalFirst && source.NoteType == NoteType.LinkTail && targetTick == connectionTick)
+            {
+                // The link builder uses EventIndex to resolve same-tick tails across lanes.
+                existingTarget.EventIndex = _chart.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1;
+            }
+
             newTail = existingTarget;
             newTail.NoteType = NoteType.LinkTail;
             newTail.Attr = pair + 1;
             newTail.LinePair = pair;
             newTail.TwinPairId = null;
-            // Keep the target note's own authored duration. In particular, a tap
-            // converted to LinkTail remains a tap; its duration must not be stretched
-            // to the distance from the source. Internal link-point durations are
-            // synchronized below after the two chains have been rebuilt.
+            // For ordinary direct connections, the target keeps its authored
+            // duration. Horizontal-first simple targets were already converted to
+            // one combined duration above. Internal link-point durations are
+            // synchronized below after the chain is rebuilt.
 
             // If the target was the head of another chain, fold its remaining
             // points into this chain by assigning them the source pair and making
@@ -8476,16 +9066,19 @@ public sealed partial class Playfield
         }
         else
         {
+            var nextEventIndex = horizontalFirst
+                ? _chart.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1
+                : destination.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1;
             newTail = new ChartEvent
             {
-                Tick = targetTick,
+                Tick = horizontalFirst ? connectionTick : targetTick,
                 Track = targetTrack,
                 Attr = pair + 1,
                 RawType = 1,
                 TypeIndex = -1,
-                Duration = _editorDuration,
+                Duration = horizontalFirst ? Math.Max(6, targetTick - connectionTick) : _editorDuration,
                 NoteType = NoteType.LinkTail,
-                EventIndex = destination.Events.Count == 0 ? 0 : destination.Events.Max(e => e.EventIndex) + 1,
+                EventIndex = nextEventIndex,
                 LinePair = pair,
                 Kind = "Note",
                 Instrument = source.Instrument,
@@ -8493,6 +9086,33 @@ public sealed partial class Playfield
                 Pan = source.Pan
             };
             destination.Events.Add(newTail);
+        }
+
+        // When joining an existing link chain horizontally first, retain the
+        // existing chain head at its tick and add a destination-lane point at the
+        // source/hold-end tick. Standalone taps/holds are instead absorbed into
+        // the duration of the new destination-lane point above.
+        if (horizontalFirst && existingTarget is not null && targetTick > connectionTick &&
+            !absorbedTargetIntoHorizontalDuration)
+        {
+            var horizontalTail = new ChartEvent
+            {
+                Tick = connectionTick,
+                Track = targetTrack,
+                Attr = pair + 1,
+                RawType = 1,
+                TypeIndex = -1,
+                Duration = Math.Max(6, targetTick - connectionTick),
+                NoteType = NoteType.LinkTail,
+                EventIndex = _chart.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1,
+                LinePair = pair,
+                TwinPairId = null,
+                Kind = "Note",
+                Instrument = source.Instrument,
+                Velocity = source.Velocity,
+                Pan = source.Pan
+            };
+            destination.Events.Add(horizontalTail);
         }
 
         // Normalize immediately when a just-placed point would create a second
@@ -8540,8 +9160,14 @@ public sealed partial class Playfield
         _statusMessage = normalizedRepeatedPoints > 0
             ? $"Added link tail at tick {finalSelectedLinkPoint.Tick}, track {finalSelectedLinkPoint.Track}; removed {normalizedRepeatedPoints} redundant same-tick link point(s)."
             : existingTarget is not null
-                ? $"Connected existing note at tick {newTail.Tick}, track {newTail.Track} into the link chain."
-                : $"Added link tail: tick {newTail.Tick}, track {newTail.Track}. Select Connector and tap another tick to continue the chain.";
+                ? horizontalFirst
+                    ? absorbedTargetIntoHorizontalDuration
+                        ? $"Connected existing note with a combined duration from tick {newTail.Tick} to tick {newTail.EndTick}, track {newTail.Track}."
+                        : $"Connected existing note at tick {newTail.Tick}, track {newTail.Track} with a horizontal-first route."
+                    : $"Connected existing note at tick {newTail.Tick}, track {newTail.Track} into the link chain."
+                : horizontalFirst
+                    ? $"Added horizontal-first connector at tick {connectionTick}, track {targetTrack}; destination hold ends at tick {targetTick}."
+                    : $"Added link tail: tick {newTail.Tick}, track {newTail.Track}. Select Connector and tap another tick to continue the chain.";
     }
 
     private void ConvertEditorLinkPointToStandaloneNote(ChartEvent ev)
@@ -8578,6 +9204,81 @@ public sealed partial class Playfield
             ? 0
             : targetTrack.Events.Max(candidate => candidate.EventIndex) + 1;
         targetTrack.Events.Add(ev);
+    }
+
+    private void DeleteSelectedEditorNoteFamily()
+    {
+        if (!_chartEditorMode || _chart is null || _editorSelectedTempoEvent is not null ||
+            (!_selectedEventKey.HasValue && _editorMultiSelectedEvents.Count == 0))
+        {
+            _statusMessage = "Select a note before deleting its family.";
+            return;
+        }
+
+        // Unlike normal Delete, family deletion expands every selected link point
+        // to its full chain and never treats a duration-end selection as a request
+        // to shorten the note. A regular long note is removed as one complete event.
+        var selected = GetSelectedEditorNotes(expandLinkFamilies: true);
+        if (selected.Count == 0)
+        {
+            _statusMessage = "The selected event is not an editable note.";
+            return;
+        }
+        if (selected.Any(ev => ev.RawType != 1))
+        {
+            _statusMessage = "A selected note is reconstructed; select its original source note to delete it.";
+            return;
+        }
+
+        var linkPointCount = selected.Count(ev => GetEditorLinkRoot(ev) is { NoteType: NoteType.LinkHead });
+        var snapshot = CaptureEditorChartSnapshot();
+        var replacement = DeleteEditorEvents(selected.ToHashSet());
+        CommitEditorUndoSnapshot(snapshot);
+        _selectedEventKey = replacement is not null ? KeyOf(replacement) : null;
+        _selectedBeatTick = null;
+        _selectedBeatTrack = null;
+        _editorSelectedHoldEnd = false;
+        _editorMultiSelectedEvents.Clear();
+        _editorSelectedLinkRoot = replacement is not null ? GetEditorLinkRoot(replacement) : null;
+        RefreshAfterEditorMutation();
+        if (replacement is not null && _chart.Events.Any(candidate => ReferenceEquals(candidate, replacement)))
+        {
+            _selectedEventKey = KeyOf(replacement);
+            _editorSelectedLinkRoot = GetEditorLinkRoot(replacement);
+        }
+        else
+        {
+            _selectedEventKey = null;
+            _editorSelectedLinkRoot = null;
+        }
+
+        _statusMessage = linkPointCount > 0
+            ? $"Deleted the full note family ({selected.Count} note point(s))."
+            : $"Deleted {selected.Count} note(s), including their full durations.";
+    }
+
+    private void DeleteEditorNoteAtPointer(ChartEvent note, bool deleteFamily)
+    {
+        _editorMultiSelectedEvents.Clear();
+        _selectedEventKey = KeyOf(note);
+        _selectedBeatTick = null;
+        _selectedBeatTrack = null;
+        _editorSelectedTempoEvent = null;
+        _editorSelectedHoldEnd = false;
+        _editorSelectedLinkRoot = GetEditorLinkRoot(note);
+        _editorRectSelectionArmed = false;
+        _editorRectSelecting = false;
+        _editorPendingRectangleUndoSnapshot = null;
+        _editorSelectedGridCells.Clear();
+        _editorPanelsSelectedEmptyCell = null;
+        _editorSelectReferenceLineTick = null;
+        _editorSelectReferenceTickOverride = null;
+        _editorTrack = note.Track;
+
+        if (deleteFamily)
+            DeleteSelectedEditorNoteFamily();
+        else
+            DeleteSelectedEditorNote();
     }
 
     private void DeleteSelectedEditorNote()
@@ -9365,6 +10066,7 @@ public sealed partial class Playfield
 
     private void RefreshSkinUiConfig()
     {
+        _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Load(_skin);
         var renderOk = SkinConfigStore.ReloadRenderConfig(
             _skin,
             _graphics.Viewport.Width,
@@ -9392,6 +10094,8 @@ public sealed partial class Playfield
         var pauseScriptError = _pauseSkinRuntime.LastError;
         var resultScriptOk = _resultSkinRuntime.Reload();
         var resultScriptError = _resultSkinRuntime.LastError;
+        var editorInterfaceScriptOk = _chartEditorInterfaceRuntime.Reload();
+        var editorInterfaceScriptError = _chartEditorInterfaceRuntime.LastError;
         if (scriptOk)
         {
             _skin.UIConfig = _skinRuntime.UIConfig;
@@ -9399,13 +10103,13 @@ public sealed partial class Playfield
             _judgementPulseTimer = 0;
         }
 
-        if (renderOk && editorRenderOk && scriptOk && pauseScriptOk && resultScriptOk)
+        if (renderOk && editorRenderOk && scriptOk && pauseScriptOk && resultScriptOk && editorInterfaceScriptOk)
         {
             _statusMessage = _skinRuntime.IsLoaded
                 ? $"Render + skin.lua loaded (F10) | ahead={_projection.RenderDistanceAhead:0} behind={_projection.RenderDistanceBehind:0} laneEnd={_projection.LaneEndLength:0}"
                 : $"Render refreshed; no skin.lua loaded (F10) | ahead={_projection.RenderDistanceAhead:0} behind={_projection.RenderDistanceBehind:0} laneEnd={_projection.LaneEndLength:0}";
         }
-        else if (!renderOk || !editorRenderOk || !scriptOk || !pauseScriptOk || !resultScriptOk)
+        else if (!renderOk || !editorRenderOk || !scriptOk || !pauseScriptOk || !resultScriptOk || !editorInterfaceScriptOk)
         {
             var errors = new List<string>();
             if (!renderOk) errors.Add($"render={renderError}");
@@ -9413,6 +10117,7 @@ public sealed partial class Playfield
             if (!scriptOk) errors.Add($"script={scriptError}");
             if (!pauseScriptOk) errors.Add($"pause={pauseScriptError}");
             if (!resultScriptOk) errors.Add($"result={resultScriptError}");
+            if (!editorInterfaceScriptOk) errors.Add($"chartEditorInterface={editorInterfaceScriptError}");
             _statusMessage = $"Config refresh failed: {string.Join("; ", errors)}";
         }
     }
@@ -9428,7 +10133,8 @@ public sealed partial class Playfield
             RefreshSkinUiConfig();
             var ok = _skinRuntime.LastError is null &&
                      _pauseSkinRuntime.LastError is null &&
-                     _resultSkinRuntime.LastError is null;
+                     _resultSkinRuntime.LastError is null &&
+                     _chartEditorInterfaceRuntime.LastError is null;
             Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_DONE ok={ok}");
             return ok;
         }
@@ -9444,16 +10150,18 @@ public sealed partial class Playfield
         try
         {
             Program.LogRuntime("PLAYFIELD_SKIN_SCRIPTS_RELOAD_BEGIN");
+            _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Load(_skin);
             var scriptOk = _skinRuntime.Reload();
             var pauseOk = _pauseSkinRuntime.Reload();
             var resultOk = _resultSkinRuntime.Reload();
+            var editorInterfaceOk = _chartEditorInterfaceRuntime.Reload();
 
             if (scriptOk)
                 _skin.UIConfig = _skinRuntime.UIConfig;
 
             RefreshSkinGameState();
-            var ok = scriptOk && pauseOk && resultOk;
-            Program.LogRuntime($"PLAYFIELD_SKIN_SCRIPTS_RELOAD_DONE ok={ok} main={scriptOk} pause={pauseOk} result={resultOk}");
+            var ok = scriptOk && pauseOk && resultOk && editorInterfaceOk;
+            Program.LogRuntime($"PLAYFIELD_SKIN_SCRIPTS_RELOAD_DONE ok={ok} main={scriptOk} pause={pauseOk} result={resultOk} chartEditor={editorInterfaceOk}");
             return ok;
         }
         catch (Exception ex)
@@ -9526,6 +10234,7 @@ public sealed partial class Playfield
             var editorRouteAtSeekStart = _chartEditorMode && !editorRestartPressed
                 ? EnsureEditorPreviewGearState().Copy()
                 : null;
+            var rebuildEditorAutoplayScore = _chartEditorMode && !_gameplayMode && !editorRestartPressed;
 
             _audioResyncPending = true;
             _autoSoundSeconds = _playSeconds;
@@ -9536,6 +10245,13 @@ public sealed partial class Playfield
             ResetGameplayState(preserveEditorPreviewRoute: _chartEditorMode && !editorRestartPressed);
             if (_chartEditorMode && !editorRestartPressed && editorRouteAtSeekStart is not null)
                 RebuildEditorPreviewRouteBetweenSeconds(timeBeforeInput, _playSeconds, editorRouteAtSeekStart);
+
+            // An autoplay seek is a timeline jump, not a new scoring attempt. Rebuild
+            // the Perfect+ results up to the new playhead so jumping forwards or
+            // backwards shows exactly the score autoplay would have reached there.
+            // The rebuild preserves the actual preview gear route reached by the seek.
+            if (rebuildEditorAutoplayScore)
+                RebuildEditorAutoplayResultsToCurrentTime();
         }
 
         var playbackStartedThisFrame = false;
@@ -9660,7 +10376,8 @@ public sealed partial class Playfield
             return;
         }
 
-        if (_lockMenuPlayMode && !_chartEditorMode &&
+        if ((!_chartEditorMode || _editorPreviewMode) &&
+            (_lockMenuPlayMode || _editorPreviewMode) &&
             !_lastPlayableTickReached &&
             _lastPlayableTick >= 0)
         {
@@ -9725,9 +10442,19 @@ public sealed partial class Playfield
         {
             RefreshSkinGameState();
             _skinRuntime.OnSongEnd();
-            _skinOutroStarted = true;
-            _skinRuntime.OnOutroStart();
-            _skinOutroRemainingSeconds = _skinRuntime.GetOutroHoldSeconds();
+            if (_chartEditorMode && _editorPreviewMode)
+            {
+                // Preview playback is a chart-editor tool, not a completed game.
+                // Do not start the skin outro transition when the preview reaches its end.
+                _skinOutroStarted = false;
+                _skinOutroRemainingSeconds = 0;
+            }
+            else
+            {
+                _skinOutroStarted = true;
+                _skinRuntime.OnOutroStart();
+                _skinOutroRemainingSeconds = _skinRuntime.GetOutroHoldSeconds();
+            }
             if (_lockMenuPlayMode)
                 SaveCompletedScoreIfNeeded();
             if (_skinOutroRemainingSeconds <= 0 && _lockMenuPlayMode)
@@ -9754,6 +10481,9 @@ public sealed partial class Playfield
     }
     private void ApplyLiveGameConfigSettings()
     {
+        _audio.Volume = _skin.GameConfig.MusicVolume;
+        if (_editorPreviewPlayer is not null)
+            _editorPreviewPlayer.Volume = _skin.GameConfig.MusicVolume;
         _skin.GameConfig.Gauge = GameConfig.NormalizeGaugeType(_skin.GameConfig.Gauge);
         _skin.GameConfig.ScrollMode = GameConfig.NormalizeScrollMode(_skin.GameConfig.ScrollMode);
         SyncEditorConstantScrollMode();
@@ -10187,6 +10917,7 @@ public sealed partial class Playfield
     public void Dispose()
     {
         StopEditorPreviewPlayback();
+        ReleaseTstsWorkingDirectory();
         _audio.Dispose();
         _hitSounds.Dispose();
         _editorMetronomeSound?.Dispose();
@@ -10201,9 +10932,13 @@ public sealed partial class Playfield
         _editorAlbumBigArtworkCache.Dispose();
         _gameplayRenderTarget?.Dispose();
         _editorInactiveBankRenderTarget?.Dispose();
+        _editorConnectorPreviewRenderTarget?.Dispose();
         _skinRuntime.Dispose();
         _pauseSkinRuntime.Dispose();
         _resultSkinRuntime.Dispose();
+        _chartEditorInterfaceRuntime.Dispose();
+        _chartEditorFontStore.Dispose();
+        _chartEditorDefaultFontStore?.Dispose();
         _debugProcess.Dispose();
     }
     private static Texture2D CreateCircleTexture(GraphicsDevice device, int size)

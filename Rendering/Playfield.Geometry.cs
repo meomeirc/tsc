@@ -2286,6 +2286,8 @@ public sealed partial class Playfield
         var fallback = _fallbackHeadScratch;
         fallback.Clear();
         var currentTick = _tempo.SecondsToTick(_playSeconds);
+        var activeLeftBank = GearTimeline.ActiveBankForSide(currentState, "left");
+        var activeRightBank = GearTimeline.ActiveBankForSide(currentState, "right");
         var renderEventCount = BuildRenderEventIndexScratch(currentTick);
         var renderEventIndices = _renderEventIndexScratch;
         for (var renderIndex = 0; renderIndex < renderEventCount; renderIndex++)
@@ -2297,9 +2299,14 @@ public sealed partial class Playfield
                 !ShouldIncludeRenderableEvent(ev, currentState) || ev.IsSuperFlick)
                 continue;
             var point = _projection.ProjectAtTicks(ev.Track, ev.Tick, currentTick, currentState);
-            var simultaneous = ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
+            var physicalPosition = GearState.Position(ev.Track);
+            var inActiveBank = physicalPosition is { } notePosition &&
+                (notePosition.Side == "left"
+                    ? string.Equals(activeLeftBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase)
+                    : string.Equals(activeRightBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase));
+            var simultaneous = inActiveBank && (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
                 ? IsLinkChainSimultaneous(ev, counts)
-                : IsSimultaneous(ev, counts);
+                : IsSimultaneous(ev, counts));
             var textureMissing = ev.IsFlick
                 ? _textures.Get(simultaneous ? "note-flick-multi" : "note-flick") is null
                 : ev.NoteType switch

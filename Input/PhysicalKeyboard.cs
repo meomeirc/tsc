@@ -115,7 +115,7 @@ internal static class PhysicalKeyboard
         return true;
     }
 
-    private static int ModifierFamily(int scancode) => scancode switch
+    public static int ModifierFamily(int scancode) => scancode switch
     {
         224 or 228 => 0, // Ctrl
         225 or 229 => 1, // Shift
@@ -123,6 +123,15 @@ internal static class PhysicalKeyboard
         227 or 231 => 3, // Windows / Super
         _ => -1
     };
+
+    public static bool IsModifierFamilyDown(int family)
+    {
+        if (family < 0) return false;
+        for (var scan = 224; scan <= 231; scan++)
+            if (ModifierFamily(scan) == family && IsDown(scan))
+                return true;
+        return false;
+    }
 
     public static int[] NewlyPressedScancodes()
     {

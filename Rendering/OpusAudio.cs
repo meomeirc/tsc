@@ -22,6 +22,7 @@ public sealed class OpusAudioPlayer : IDisposable
     private Task<byte[]>? _recoveryPcmTask;
     private double _durationSeconds;
     private bool _isLooped;
+    private float _volume = 1f;
     private SoundEffect? _effect;
     private SoundEffectInstance? _instance;
 
@@ -40,6 +41,15 @@ public sealed class OpusAudioPlayer : IDisposable
     }
     public double DurationSeconds => _durationSeconds;
     public long PcmBytes => _pcm?.LongLength ?? 0;
+    public float Volume
+    {
+        get => _volume;
+        set
+        {
+            _volume = Math.Clamp(float.IsFinite(value) ? value : 1f, 0f, 1f);
+            if (_instance is not null) _instance.Volume = _volume;
+        }
+    }
 
     public void LoadOpus(byte[] opusData)
     {
@@ -96,6 +106,7 @@ public sealed class OpusAudioPlayer : IDisposable
         _effect = new SoundEffect(_pcm!, SampleRate, AudioChannels.Stereo);
         _instance = _effect.CreateInstance();
         _instance.IsLooped = _isLooped;
+        _instance.Volume = _volume;
 
         // The normal menu-play path never seeks. Once the full-song effect is
         // prepared, keeping the decoded PCM around is just another large copy of
@@ -207,6 +218,7 @@ public sealed class OpusAudioPlayer : IDisposable
             newEffect = new SoundEffect(pcm, SampleRate, AudioChannels.Stereo);
             newInstance = newEffect.CreateInstance();
             newInstance.IsLooped = _isLooped;
+            newInstance.Volume = _volume;
             _effect = newEffect;
             _instance = newInstance;
             if (!retainPcm)
@@ -247,6 +259,7 @@ public sealed class OpusAudioPlayer : IDisposable
 
         _instance = _effect.CreateInstance();
         _instance.IsLooped = _isLooped;
+        _instance.Volume = _volume;
 
         // When PCM is retained, SyncAudio will create a correctly trimmed
         // SoundEffect from that PCM in this same game-thread update.
@@ -395,6 +408,7 @@ public sealed class OpusAudioPlayer : IDisposable
         var replacementEffect = new SoundEffect(slice, SampleRate, AudioChannels.Stereo);
         var replacementInstance = replacementEffect.CreateInstance();
         replacementInstance.IsLooped = _isLooped;
+        replacementInstance.Volume = _volume;
         _effect = replacementEffect;
         _instance = replacementInstance;
         try

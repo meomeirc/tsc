@@ -59,13 +59,13 @@ internal static class KeybindSettings
 
         // File/export actions. Quick Save is the first entry for easy access.
         ("editor_quick_save", "QUICK SAVE", "editor_file", new[] { 22, 224 }, Array.Empty<int>()),
-        ("editor_save_tsc", "EXPORT TSC", "editor_file", Array.Empty<int>(), Array.Empty<int>()),
+        ("editor_open_export_modal", "OPEN EXPORT MODAL", "editor_file", new[] { 224, 225, 22 }, Array.Empty<int>()),
         ("editor_save_ares", "EXPORT ARES", "editor_file", Array.Empty<int>(), Array.Empty<int>()),
 #if !TSC_PUBLISH
         ("editor_save_fpk", "EXPORT FPK", "editor_file", Array.Empty<int>(), Array.Empty<int>()),
 #endif
         ("editor_save_tsts", "EXPORT TSTS", "editor_file", Array.Empty<int>(), Array.Empty<int>()),
-        ("editor_save_json", "EXPORT JSON", "editor_file", Array.Empty<int>(), Array.Empty<int>()),
+        ("editor_save_json", "EXPORT JSON META", "editor_file", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_save_tsc_zip", "EXPORT TSC ZIP", "editor_file", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_undo", "UNDO", "editor_editing", new[] { 224, 29 }, Array.Empty<int>()),
         ("editor_redo", "REDO", "editor_editing", new[] { 224, 28 }, new[] { 224, 225, 29 }),
@@ -74,6 +74,8 @@ internal static class KeybindSettings
         ("editor_paste", "PASTE", "editor_editing", new[] { 224, 25 }, Array.Empty<int>()),
         ("editor_paste_fit", "PASTE FIT", "editor_editing", new[] { 224, 225, 25 }, Array.Empty<int>()),
         ("editor_delete", "DELETE SELECTION", "editor_editing", new[] { 76 }, new[] { 42 }),
+        ("editor_delete_family", "DELETE FAMILY", "editor_editing", new[] { 225, 76 }, new[] { 225, 42 }),
+        ("editor_delete_click_modifier", "HOLD TO DELETE CLICKED NOTES", "editor_editing", new[] { 224 }, Array.Empty<int>()),
         ("editor_deselect", "DESELECT", "editor_editing", new[] { 514 }, Array.Empty<int>()),
         ("editor_select_menu", "OPEN SELECT MENU", "editor_editing", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_quick_fix_links", "QUICK FIX LINKS", "editor_editing", Array.Empty<int>(), Array.Empty<int>()),
@@ -85,6 +87,7 @@ internal static class KeybindSettings
         // Editor view commands and text-field navigation. Character and caret editing
         // inside text boxes keeps normal text-entry behavior.
         ("editor_toggle_play_preview", "PLAY / PAUSE PREVIEW", "editor_view", new[] { 44 }, Array.Empty<int>()),
+        ("editor_toggle_preview_mode", "TOGGLE PREVIEW MODE", "editor_view", new[] { 60 }, Array.Empty<int>()),
         ("editor_scroll_speed_decrease", "DECREASE SCROLL SPEED", "editor_view", new[] { 45 }, Array.Empty<int>()),
         ("editor_scroll_speed_increase", "INCREASE SCROLL SPEED", "editor_view", new[] { 46 }, Array.Empty<int>()),
         ("editor_restart_preview", "RESTART PREVIEW", "editor_view", new[] { 21 }, Array.Empty<int>()),
@@ -100,7 +103,7 @@ internal static class KeybindSettings
         ("editor_toggle_tempo_lines", "TOGGLE TEMPO LINES", "editor_view", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_toggle_constant_scroll", "TOGGLE CONSTANT SCROLL", "editor_view", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_toggle_snap_menu", "OPEN SNAP MENU", "editor_view", Array.Empty<int>(), Array.Empty<int>()),
-        ("editor_toggle_panels", "TOGGLE LANE / PANELS", "editor_view", new[] { 19 }, Array.Empty<int>()),
+        ("editor_toggle_panels", "TOGGLE PANELS", "editor_view", new[] { 19 }, Array.Empty<int>()),
         ("editor_toggle_info", "TOGGLE INFO PANEL", "editor_view", new[] { 41 }, Array.Empty<int>()),
         ("editor_menu_notes", "OPEN NOTES MENU", "editor_view", new[] { 54 }, Array.Empty<int>()),
         ("editor_menu_tools", "OPEN TOOLS MENU", "editor_view", new[] { 55 }, Array.Empty<int>()),
@@ -144,6 +147,7 @@ internal static class KeybindSettings
         // Editor note tools
         ("editor_tool_tap", "TAP TOOL", "editor_note_tools", new[] { 30 }, new[] { 89 }),
         ("editor_tool_connector", "CONNECTOR TOOL", "editor_note_tools", new[] { 53 }, new[] { 90 }),
+        ("editor_connector_horizontal_first", "CONNECTOR HORIZONTAL-FIRST MODIFIER", "editor_note_tools", new[] { 226 }, Array.Empty<int>()),
         ("editor_tool_flick_left", "FLICK LEFT TOOL", "editor_note_tools", new[] { 31 }, new[] { 91 }),
         ("editor_tool_flick_right", "FLICK RIGHT TOOL", "editor_note_tools", new[] { 32 }, new[] { 92 }),
         ("editor_tool_vibrato", "VIBRATO TOOL", "editor_note_tools", new[] { 33 }, Array.Empty<int>()),
@@ -164,7 +168,7 @@ internal static class KeybindSettings
 
         // Editor debug / projection controls. These were previously hardcoded
         // shortcuts; they are now ordinary bindings and may all be cleared/rebound.
-                ("editor_toggle_gameplay_mode", "TOGGLE GAMEPLAY MODE", "editor_debug", new[] { 61 }, Array.Empty<int>()),
+                ("editor_toggle_gameplay_mode", "TOGGLE AUTOPLAY", "editor_debug", new[] { 61 }, Array.Empty<int>()),
         // Temporarily hidden and disabled. Retained for a future settings toggle.
         ("editor_toggle_performance_debug", "TOGGLE PERFORMANCE DEBUG", "editor_debug", new[] { 65 }, Array.Empty<int>()),
         ("editor_toggle_superflick_debug", "TOGGLE SUPERFLICK DEBUG", "editor_debug", new[] { 66 }, Array.Empty<int>()),
@@ -241,6 +245,20 @@ internal static class KeybindSettings
 
     private static void MigrateRenamedEditorBindings(Dictionary<string, StoredBinding> stored)
     {
+        // The old EXPORT TSC keybind was replaced by QUICK SAVE. Carry its default
+        // Ctrl+S binding forward only when the saved quick-save action was unbound.
+        if (stored.TryGetValue("editor_save_tsc", out var legacyTsc) &&
+            legacyTsc.Primary?.SequenceEqual(new[] { 224, 22 }) == true &&
+            stored.TryGetValue("editor_quick_save", out var savedQuickSave) &&
+            (savedQuickSave.Primary?.Length ?? 0) == 0)
+        {
+            stored["editor_quick_save"] = new StoredBinding
+            {
+                Primary = new[] { 224, 22 },
+                Secondary = savedQuickSave.Secondary ?? Array.Empty<int>()
+            };
+        }
+
         // Keep saved seek bindings while the seek distances and action IDs evolve.
         // The newest action IDs take precedence over every legacy alias.
         (string OldId, string NewId)[] aliases =
@@ -278,16 +296,6 @@ internal static class KeybindSettings
 
     private static void MigrateLegacyEditorBindings()
     {
-        // Previous defaults used Ctrl+S for SAVE TSC while QUICK SAVE was unbound.
-        // Move only those exact old defaults to the new intended slots; custom bindings
-        // are left alone.
-        if (Bindings.TryGetValue("editor_save_tsc", out var saveTsc) &&
-            saveTsc.Primary.Scancodes.SequenceEqual(new[] { 224, 22 }))
-        {
-            if (Bindings.TryGetValue("editor_quick_save", out var quickSave) && quickSave.Primary.Scancodes.Length == 0)
-                quickSave.Primary.Scancodes = new[] { 224, 22 };
-            saveTsc.Primary.Scancodes = Array.Empty<int>();
-        }
         if (Bindings.TryGetValue("editor_save_ares", out var saveAres) &&
             saveAres.Primary.Scancodes.SequenceEqual(new[] { 224, 225, 22 }))
             saveAres.Primary.Scancodes = Array.Empty<int>();
@@ -461,6 +469,71 @@ internal static class KeybindSettings
         if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;
         return PhysicalKeyboard.IsChordDown(binding.Primary.Scancodes, previous) ||
                PhysicalKeyboard.IsChordDown(binding.Secondary.Scancodes, previous);
+    }
+
+    /// <summary>
+    /// Checks a mouse-interaction modifier without requiring it to be the only
+    /// modifier held. This lets bindings such as Shift+click continue to work
+    /// when another independent modifier (for example Left Alt for horizontal-first
+    /// links) is held at the same time. Single-key modifier bindings stay side-specific.
+    /// </summary>
+    public static bool IsModifierBindingDown(string action, bool previous = false)
+    {
+        if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;
+
+        static bool SlotDown(KeybindSlot slot, bool previous)
+        {
+            var scancodes = slot.Scancodes;
+            if (scancodes is null || scancodes.Length == 0) return false;
+            if (scancodes.Length == 1 && PhysicalKeyboard.IsModifier(scancodes[0]))
+                return PhysicalKeyboard.IsDown(scancodes[0], previous);
+            return PhysicalKeyboard.IsChordDown(scancodes, previous);
+        }
+
+        return SlotDown(binding.Primary, previous) || SlotDown(binding.Secondary, previous);
+    }
+
+    /// <summary>
+    /// True while the modifier portion of a binding is held, ignoring its non-modifier
+    /// key and allowing additional modifiers to be held too. This is useful for
+    /// modifier actions used with mouse clicks, e.g. Ctrl+Shift+click for family delete.
+    /// </summary>
+    public static bool IsModifierBindingHeld(string action)
+    {
+        if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;
+
+        static bool ModifierBindingHeld(IReadOnlyList<int>? scancodes)
+        {
+            if (scancodes is null || scancodes.Count == 0 || !scancodes.All(PhysicalKeyboard.IsModifier))
+                return false;
+            var requiredFamilies = scancodes
+                .Select(PhysicalKeyboard.ModifierFamily)
+                .Where(family => family >= 0)
+                .Distinct()
+                .ToArray();
+            return requiredFamilies.Length > 0 && requiredFamilies.All(PhysicalKeyboard.IsModifierFamilyDown);
+        }
+
+        return ModifierBindingHeld(binding.Primary.Scancodes) || ModifierBindingHeld(binding.Secondary.Scancodes);
+    }
+
+    public static bool IsModifierPartHeld(string action)
+    {
+        if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;
+
+        static bool ModifierPartHeld(IReadOnlyList<int>? scancodes)
+        {
+            if (scancodes is null || scancodes.Count == 0) return false;
+            var requiredFamilies = scancodes
+                .Where(PhysicalKeyboard.IsModifier)
+                .Select(PhysicalKeyboard.ModifierFamily)
+                .Where(family => family >= 0)
+                .Distinct()
+                .ToArray();
+            return requiredFamilies.Length > 0 && requiredFamilies.All(PhysicalKeyboard.IsModifierFamilyDown);
+        }
+
+        return ModifierPartHeld(binding.Primary.Scancodes) || ModifierPartHeld(binding.Secondary.Scancodes);
     }
 
     /// <summary>

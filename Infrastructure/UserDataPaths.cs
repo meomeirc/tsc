@@ -6,47 +6,52 @@ using System.Linq;
 namespace TSC;
 
 /// <summary>
-/// Scores use per-user application data; settings and logs stay beside the game.
+/// In published installs, user data stays beside the root launcher. Developer builds keep
+/// their historic per-user application-data location for scores and temporary state.
 /// </summary>
 public static class UserDataPaths
 {
     private static readonly object Sync = new();
-    private static string? _rootDirectory;
-
     public static string RootDirectory
     {
         get
         {
-            if (_rootDirectory is not null)
-                return _rootDirectory;
-
+#if TSC_PUBLISH
+            return GameRootDirectory;
+#else
             var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             if (!string.IsNullOrWhiteSpace(local))
-                _rootDirectory = Path.Combine(local, "TSC");
-            else
-            {
-                var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-                if (!string.IsNullOrWhiteSpace(roaming))
-                    _rootDirectory = Path.Combine(roaming, "TSC");
-                else
-                {
-                    var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                    _rootDirectory = !string.IsNullOrWhiteSpace(profile)
-                        ? Path.Combine(profile, ".local", "share", "TSC")
-                        : Path.Combine(AppContext.BaseDirectory, "TSC-UserData");
-                }
-            }
+                return Path.Combine(local, "TSC");
 
-            return _rootDirectory;
+            var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (!string.IsNullOrWhiteSpace(roaming))
+                return Path.Combine(roaming, "TSC");
+
+            var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return !string.IsNullOrWhiteSpace(profile)
+                ? Path.Combine(profile, ".local", "share", "TSC")
+                : Path.Combine(AppContext.BaseDirectory, "TSC-UserData");
+#endif
         }
     }
 
+    /// <summary>Folder containing the installed launcher, skins, songs, and user files.</summary>
     public static string GameRootDirectory
     {
         get
         {
+            var configuredRoot = Environment.GetEnvironmentVariable("TSC_INSTALL_ROOT");
+            if (!string.IsNullOrWhiteSpace(configuredRoot) && Path.IsPathRooted(configuredRoot))
+                return Path.GetFullPath(configuredRoot);
+
 #if TSC_PUBLISH
-            return Path.GetFullPath(AppContext.BaseDirectory);
+            // Directly launching data/TSC.exe is also supported: infer the install root
+            // from the standard data/ layout when the tiny launcher wasn't used.
+            var appDirectory = Path.GetFullPath(AppContext.BaseDirectory);
+            var appFolderName = Path.GetFileName(Path.TrimEndingDirectorySeparator(appDirectory));
+            if (appFolderName.Equals("data", StringComparison.OrdinalIgnoreCase))
+                return Directory.GetParent(Path.TrimEndingDirectorySeparator(appDirectory))?.FullName ?? appDirectory;
+            return appDirectory;
 #else
             var cwd = Environment.CurrentDirectory;
             if (File.Exists(Path.Combine(cwd, "gameConfig.json")) || Directory.Exists(Path.Combine(cwd, "skins")))
@@ -61,12 +66,15 @@ public static class UserDataPaths
         }
     }
 
+    /// <summary>The folder containing the game's executable and internal runtime/content files.</summary>
+    public static string ApplicationDirectory => Path.GetFullPath(AppContext.BaseDirectory);
+
     public static string GameConfigPath => Path.Combine(GameRootDirectory, "gameConfig.json");
     public static string KeybindsPath => Path.Combine(GameRootDirectory, "keybinds.json");
     public static string CrashLogPath => Path.Combine(GameRootDirectory, "tsc_crash.log");
     public static string ScoresPath => Path.Combine(RootDirectory, "save", "scores.json");
 
-    /// <summary>Resolve non-score writable files relative to the game folder.</summary>
+    /// <summary>Resolve writable user files relative to the install root.</summary>
     public static string GetPath(params string[] segments)
     {
         var path = GameRootDirectory;
@@ -83,14 +91,19 @@ public static class UserDataPaths
             Directory.CreateDirectory(RootDirectory);
             Directory.CreateDirectory(Path.GetDirectoryName(ScoresPath)!);
 
+#if TSC_PUBLISH
+            // Older installs kept settings, scores, logs, and song-list state in LocalAppData.
+            // Copy those files beside the launcher without deleting the original copies.
+            MigrateLegacyAppDataToInstallRoot();
+#else
             // TSC-268 through TSC-270 stored editable files and logs in app data. Bring
-            // newer app-data copies back to the game folder so existing user changes and
-            // diagnostic history survive this location change; leave old copies intact.
+            // newer app-data copies back to the project/game folder in developer runs.
             MigrateUserFileToGameRootIfNewer("gameConfig.json");
             MigrateUserFileToGameRootIfNewer("keybinds.json");
             MigrateUserFileToGameRootIfNewer(Path.Combine("Logs", "tsc_crash.log"), Path.GetFileName(CrashLogPath));
             MigrateUserFileToGameRootIfNewer(Path.Combine("Logs", "song_select_debug.log"), Path.Combine("Logs", "song_select_debug.log"));
             MigrateUserFileToGameRootIfNewer(Path.Combine("Logs", "superFlick_debug.log"), Path.Combine("Logs", "superFlick_debug.log"));
+#endif
 
             var roots = new List<string>();
             if (!string.IsNullOrWhiteSpace(legacyRoot)) roots.Add(legacyRoot);
@@ -116,6 +129,56 @@ public static class UserDataPaths
 
         }
     }
+
+#if TSC_PUBLISH
+    private static string LegacyAppDataDirectory
+    {
+        get
+        {
+            var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            if (!string.IsNullOrWhiteSpace(local)) return Path.Combine(local, "TSC");
+            var roaming = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            return !string.IsNullOrWhiteSpace(roaming) ? Path.Combine(roaming, "TSC") : string.Empty;
+        }
+    }
+
+    private static void MigrateLegacyAppDataToInstallRoot()
+    {
+        var legacyRoot = LegacyAppDataDirectory;
+        if (string.IsNullOrWhiteSpace(legacyRoot) || !Directory.Exists(legacyRoot)) return;
+
+        foreach (var relative in new[]
+        {
+            "gameConfig.json", "keybinds.json", "save/scores.json",
+            "Logs/tsc_crash.log", "Logs/song_select_debug.log",
+            "Logs/superFlick_debug.log", "Logs/ffmpeg-download.log"
+        })
+            MigrateLegacyFileIfNewer(Path.Combine(legacyRoot, relative), Path.Combine(GameRootDirectory, relative));
+
+        var legacyState = Path.Combine(legacyRoot, "State");
+        if (!Directory.Exists(legacyState)) return;
+        foreach (var source in Directory.EnumerateFiles(legacyState, "*", SearchOption.AllDirectories))
+        {
+            var relative = Path.GetRelativePath(legacyState, source);
+            MigrateLegacyFileIfNewer(source, Path.Combine(GameRootDirectory, "State", relative));
+        }
+    }
+
+    private static void MigrateLegacyFileIfNewer(string source, string destination)
+    {
+        try
+        {
+            if (!File.Exists(source)) return;
+            if (File.Exists(destination) && File.GetLastWriteTimeUtc(destination) >= File.GetLastWriteTimeUtc(source)) return;
+            Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+            File.Copy(source, destination, overwrite: File.Exists(destination));
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"LEGACY_USER_DATA_MIGRATION_FAILED source={source} destination={destination} error={ex.Message}");
+        }
+    }
+#endif
 
     private static void MigrateUserFileToGameRootIfNewer(string fileName)
         => MigrateUserFileToGameRootIfNewer(fileName, fileName);

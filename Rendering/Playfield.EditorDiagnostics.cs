@@ -23,6 +23,8 @@ public sealed partial class Playfield
         {
             _editorProblems.Clear();
             _editorProblemEventKeys.Clear();
+            _editorProblemErrorCount = 0;
+            _editorProblemWarningCount = 0;
             _editorDiagnosticsChart = null;
             _editorDiagnosticsDirty = false;
             return;
@@ -208,8 +210,8 @@ public sealed partial class Playfield
 
         // A hold occupies the lane until its end tick. A later unrelated note
         // inside that interval is an overlap even when the notes start on
-        // different ticks. Connected link endpoints are intentional and are
-        // diagnosed by the link checks below instead.
+        // different ticks. Panel animation notes may hand off exactly at the
+        // hold end tick. Connected link endpoints are diagnosed below instead.
         foreach (var hold in playableNotes
                      .Where(ev => ev.Tick >= 0 && ev.EndTick > ev.Tick &&
                                   (ev.IsHoldNote || ev.Duration > 6))
@@ -217,6 +219,8 @@ public sealed partial class Playfield
         {
             foreach (var next in playableNotes.Where(ev => ev.Track == hold.Track && ev.Tick > hold.Tick && ev.Tick <= hold.EndTick))
             {
+                if (hold.Track is >= 17 and <= 20 && next.Tick == hold.EndTick)
+                    continue;
                 if (expectedLinkEndpoints.Contains((Head: hold, Tail: next)))
                     continue;
 
@@ -309,6 +313,8 @@ public sealed partial class Playfield
             var trackComparison = a.Track.CompareTo(b.Track);
             return trackComparison != 0 ? trackComparison : string.Compare(a.Message, b.Message, StringComparison.Ordinal);
         });
+        _editorProblemErrorCount = _editorProblems.Count(problem => !problem.IsWarning);
+        _editorProblemWarningCount = _editorProblems.Count(problem => problem.IsWarning);
 
         void AddProblem(ChartEvent ev, string message)
         {
@@ -322,17 +328,17 @@ public sealed partial class Playfield
         var unit = _projection.ScalePixels(1f);
         var scrubber = GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight);
         var bottomStrip = GetEditorBottomLeftStripBounds(virtualWidth, virtualHeight);
-        var margin = Math.Max(4, (int)MathF.Round(10f * unit));
+        var margin = Math.Max(4, (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit));
         var x = scrubber.Right + margin;
         // Give the Problems list more room for full diagnostic messages while
         // leaving a clear gap for the fixed right-side editor controls.
-        var widthLimit = Math.Max((int)MathF.Round(300f * unit), virtualWidth - x - margin - (int)MathF.Round(170f * unit));
-        var width = Math.Min((int)MathF.Round(900f * unit), widthLimit);
+        var widthLimit = Math.Max((int)MathF.Round(300f * unit), virtualWidth - x - margin - (int)MathF.Round((float)_chartEditorInterfaceLayout.ActionColumnWidth * unit));
+        var width = Math.Min((int)MathF.Round((float)_chartEditorInterfaceLayout.ProblemsMaxWidth * unit), widthLimit);
         width = Math.Max(1, width);
         var headerHeight = Math.Max(30, (int)MathF.Round(42f * unit));
         var availableHeight = Math.Max(headerHeight, bottomStrip.Y - margin * 2);
         var height = _editorProblemsExpanded
-            ? Math.Min((int)MathF.Round(300f * unit), availableHeight)
+            ? Math.Min((int)MathF.Round((float)_chartEditorInterfaceLayout.ProblemsMaxHeight * unit), availableHeight)
             : headerHeight;
         height = Math.Max(headerHeight, height);
         return new Rectangle(x, Math.Max(margin, bottomStrip.Y - margin - height), width, height);
@@ -374,11 +380,20 @@ public sealed partial class Playfield
         return Math.Max(0, list.Height / pitch);
     }
 
+    private int GetEditorProblemsScrollWindowRows(int virtualWidth, int virtualHeight)
+    {
+        // The normal Lua interface renders a fixed five-row window. The C# fallback
+        // sizes its list to the available panel height, so its window can differ.
+        return _chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null
+            ? LAYOUT_PROBLEM_ROW_COUNT
+            : Math.Max(1, GetEditorProblemsVisibleRows(virtualWidth, virtualHeight));
+    }
+
     private void ClampEditorProblemsScroll(int virtualWidth, int virtualHeight)
     {
-        var visible = GetEditorProblemsVisibleRows(virtualWidth, virtualHeight);
+        var visible = GetEditorProblemsScrollWindowRows(virtualWidth, virtualHeight);
         _editorProblemsScrollOffset = Math.Clamp(_editorProblemsScrollOffset, 0,
-            Math.Max(0, _editorProblems.Count - Math.Max(1, visible)));
+            Math.Max(0, _editorProblems.Count - visible));
     }
 
     private void DrawEditorProblemsPanel(int virtualWidth, int virtualHeight)
@@ -386,29 +401,33 @@ public sealed partial class Playfield
         if (!_chartEditorMode || _chart is null || _tempo is null)
             return;
         RefreshEditorDiagnostics();
+        var interfaceUi = _chartEditorInterfaceLayout;
+        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
+        var buttonFont = GetChartEditorFont(interfaceUi.ButtonFont);
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorProblemsPanelBounds(virtualWidth, virtualHeight);
         var header = GetEditorProblemsHeaderBounds(virtualWidth, virtualHeight);
         var list = GetEditorProblemsListBounds(virtualWidth, virtualHeight);
         var edge = Math.Max(1, (int)MathF.Round(2f * unit));
-        var red = new Color(255, 82, 93);
+        var red = interfaceUi.DangerColor;
         var yellow = new Color(255, 205, 64);
-        var errorCount = _editorProblems.Count(problem => !problem.IsWarning);
-        var warningCount = _editorProblems.Count(problem => problem.IsWarning);
+        var errorCount = _editorProblemErrorCount;
+        var warningCount = _editorProblemWarningCount;
         var statusColor = errorCount > 0 ? red : warningCount > 0 ? yellow : new Color(52, 211, 153);
         _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
-        _spriteBatch.Draw(_pixel, panel, new Color(9, 9, 10, 246));
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, panel.Width, edge), new Color(85, 85, 87, 245));
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Bottom - edge, panel.Width, edge), new Color(85, 85, 87, 245));
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, edge, panel.Height), new Color(85, 85, 87, 245));
-        _spriteBatch.Draw(_pixel, new Rectangle(panel.Right - edge, panel.Y, edge, panel.Height), new Color(85, 85, 87, 245));
-        _spriteBatch.Draw(_pixel, header, new Color(28, 28, 30, 252));
+        _spriteBatch.Draw(_pixel, panel, interfaceUi.PanelColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, panel.Width, edge), interfaceUi.HeaderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Bottom - edge, panel.Width, edge), interfaceUi.HeaderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, edge, panel.Height), interfaceUi.HeaderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.Right - edge, panel.Y, edge, panel.Height), interfaceUi.HeaderColor);
+        _spriteBatch.Draw(_pixel, header,
+            ResolveEditorButtonStateFill(header, interfaceUi.HeaderColor, interfaceUi));
         _spriteBatch.Draw(_pixel, new Rectangle(header.X, header.Y, edge + (int)MathF.Round(2f * unit), header.Height),
             statusColor);
 
         var summary = (errorCount, warningCount) switch
         {
-            (0, 0) => "No problems found in this chart.",
+            (0, 0) => interfaceUi.Label("problems_none", "No problems found in this chart."),
             (0, 1) => "1 panel warning.",
             (0, _) => $"{warningCount} panel warnings.",
             (1, 0) => "1 gameplay error needs to be fixed.",
@@ -418,30 +437,31 @@ public sealed partial class Playfield
         };
         var quickFixButton = GetEditorProblemsQuickFixButtonBounds(virtualWidth, virtualHeight);
         var summaryMax = Math.Max(1f, quickFixButton.X - header.X - 20f * unit);
-        summary = FitHudText(_font, FontSafeText(_font, summary), summaryMax);
-        var summarySize = UnicodeTextRenderer.MeasureString(_font, summary);
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, summary,
+        summary = FitHudText(labelFont, FontSafeText(labelFont, summary), summaryMax);
+        var summarySize = UnicodeTextRenderer.MeasureString(labelFont, summary);
+        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, summary,
             new Vector2(header.X + 12f * unit, header.Y + (header.Height - summarySize.Y) * 0.5f),
             errorCount > 0 ? new Color(255, 205, 208) : warningCount > 0 ? new Color(255, 226, 158) : new Color(165, 239, 198));
-        var quickFixBorder = new Color(255, 205, 64, 235);
-        _spriteBatch.Draw(_pixel, quickFixButton, new Color(38, 38, 40, 250));
+        var quickFixBorder = interfaceUi.AccentColor;
+        var quickFixFill = ResolveEditorButtonStateFill(quickFixButton, interfaceUi.ButtonColor, interfaceUi);
+        _spriteBatch.Draw(_pixel, quickFixButton, quickFixFill);
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.X, quickFixButton.Y, quickFixButton.Width, edge), quickFixBorder);
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.X, quickFixButton.Bottom - edge, quickFixButton.Width, edge), quickFixBorder);
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.X, quickFixButton.Y, edge, quickFixButton.Height), quickFixBorder);
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.Right - edge, quickFixButton.Y, edge, quickFixButton.Height), quickFixBorder);
-        var quickFixLabel = FontSafeText(_font, "QUICK FIX");
-        var quickFixText = UnicodeTextRenderer.MeasureString(_font, quickFixLabel).X <= quickFixButton.Width - 12f * unit
+        var quickFixLabel = FontSafeText(buttonFont, interfaceUi.Label("button:QUICK FIX", "QUICK FIX"));
+        var quickFixText = UnicodeTextRenderer.MeasureString(buttonFont, quickFixLabel).X <= quickFixButton.Width - 12f * unit
             ? quickFixLabel
-            : FitHudText(_font, quickFixLabel, Math.Max(1f, quickFixButton.Width - 12f * unit));
-        var quickFixTextSize = UnicodeTextRenderer.MeasureString(_font, quickFixText);
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, quickFixText,
+            : FitHudText(buttonFont, quickFixLabel, Math.Max(1f, quickFixButton.Width - 12f * unit));
+        var quickFixTextSize = UnicodeTextRenderer.MeasureString(buttonFont, quickFixText);
+        UnicodeTextRenderer.DrawString(_spriteBatch, buttonFont, quickFixText,
             new Vector2(quickFixButton.X + (quickFixButton.Width - quickFixTextSize.X) * 0.5f,
-                quickFixButton.Y + (quickFixButton.Height - quickFixTextSize.Y) * 0.5f), Text);
+                quickFixButton.Y + (quickFixButton.Height - quickFixTextSize.Y) * 0.5f), interfaceUi.ButtonTextColor);
 
         var chevron = _editorProblemsExpanded ? "−" : "+";
-        var chevronSize = UnicodeTextRenderer.MeasureString(_font, chevron);
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, chevron,
-            new Vector2(header.Right - chevronSize.X - 12f * unit, header.Y + (header.Height - chevronSize.Y) * 0.5f), Text);
+        var chevronSize = UnicodeTextRenderer.MeasureString(labelFont, chevron);
+        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, chevron,
+            new Vector2(header.Right - chevronSize.X - 12f * unit, header.Y + (header.Height - chevronSize.Y) * 0.5f), interfaceUi.ButtonTextColor);
 
         if (_editorProblemsExpanded && list.Height > 0 && _editorProblems.Count > 0)
         {
@@ -454,13 +474,14 @@ public sealed partial class Playfield
                 if (index >= _editorProblems.Count) break;
                 var problem = _editorProblems[index];
                 var row = new Rectangle(list.X, list.Y + slot * rowPitch, list.Width, rowPitch);
-                _spriteBatch.Draw(_pixel, row, index % 2 == 0 ? new Color(24, 24, 26, 230) : new Color(18, 18, 20, 230));
+                var rowFill = index % 2 == 0 ? interfaceUi.ButtonColor : interfaceUi.PanelColor;
+                _spriteBatch.Draw(_pixel, row, ResolveEditorButtonStateFill(row, rowFill, interfaceUi));
                 var issueColor = problem.IsWarning ? yellow : red;
                 _spriteBatch.Draw(_pixel, new Rectangle(row.X, row.Y + 3, Math.Max(2, (int)MathF.Round(3f * unit)), row.Height - 6), issueColor);
                 var prefix = problem.Track >= 0 ? $"Tick {problem.Tick} · Track {problem.Track}: " : $"Tick {problem.Tick}: ";
-                var rowText = FitHudText(_font, FontSafeText(_font, prefix + problem.Message), Math.Max(1f, row.Width - 18f * unit));
-                var textSize = UnicodeTextRenderer.MeasureString(_font, rowText);
-                UnicodeTextRenderer.DrawString(_spriteBatch, _font, rowText,
+                var rowText = FitHudText(labelFont, FontSafeText(labelFont, prefix + problem.Message), Math.Max(1f, row.Width - 18f * unit));
+                var textSize = UnicodeTextRenderer.MeasureString(labelFont, rowText);
+                UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, rowText,
                     new Vector2(row.X + 10f * unit, row.Y + (row.Height - textSize.Y) * 0.5f),
                     problem.IsWarning ? new Color(255, 229, 168, 245) : new Color(247, 210, 213, 245));
             }
@@ -468,7 +489,7 @@ public sealed partial class Playfield
             {
                 var railWidth = Math.Max(2, (int)MathF.Round(3f * unit));
                 var rail = new Rectangle(list.Right - railWidth, list.Y, railWidth, list.Height);
-                _spriteBatch.Draw(_pixel, rail, new Color(58, 58, 60, 230));
+                _spriteBatch.Draw(_pixel, rail, interfaceUi.HeaderColor);
                 var thumbHeight = Math.Max(15, (int)MathF.Round(list.Height * visibleRows / (float)_editorProblems.Count));
                 thumbHeight = Math.Min(list.Height, thumbHeight);
                 var maxScroll = Math.Max(1, _editorProblems.Count - Math.Max(1, visibleRows));

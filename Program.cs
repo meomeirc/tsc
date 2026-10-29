@@ -3,16 +3,32 @@ namespace TSC;
 
 public static class Program
 {
-    private static readonly object CrashLogLock = new();
+    private static readonly object LogWriteLock = new();
 
     [STAThread]
     public static void Main(string[] args)
     {
+        // The updater is a mode of the self-contained game executable in data/. It runs
+        // from a temporary copy so Windows can replace game files and the root launcher.
+        if (args.Length > 0 && string.Equals(args[0], "--updater", StringComparison.OrdinalIgnoreCase))
+        {
+            TSC.Updater.UpdaterEntry.Run(args.Skip(1).ToArray());
+            return;
+        }
+
 #if !TSC_PUBLISH
         SkinDebugConsole.Initialize();
 #endif
         InstallGlobalExceptionLogging();
         UserDataPaths.Initialize();
+        try { TscTemporaryStorage.CleanupStaleTemporaryData(); } catch { /* Cleanup is best-effort and must not block startup. */ }
+        EnforceExistingLogSizeLimit(UserDataPaths.CrashLogPath);
+        EnforceExistingLogSizeLimit(UserDataPaths.GetPath("Logs", "song_select_debug.log"));
+        EnforceExistingLogSizeLimit(UserDataPaths.GetPath("Logs", "superFlick_debug.log"));
+        EnforceExistingLogSizeLimit(Path.Combine(UserDataPaths.RootDirectory, "Logs", "tsc_crash.log"));
+        EnforceExistingLogSizeLimit(Path.Combine(UserDataPaths.RootDirectory, "Logs", "song_select_debug.log"));
+        EnforceExistingLogSizeLimit(Path.Combine(UserDataPaths.RootDirectory, "Logs", "superFlick_debug.log"));
+        EnforceExistingLogSizeLimit(Path.Combine(UserDataPaths.RootDirectory, "Logs", "ffmpeg-download.log"));
         LogRuntime("START");
 
         try
@@ -25,7 +41,7 @@ public static class Program
         catch (Exception ex)
         {
             LogFatal("MAIN_CATCH", ex);
-            Console.Error.WriteLine("[TSC] FATAL EXCEPTION — see tsc_crash.log in the game folder");
+            Console.Error.WriteLine("[TSC] FATAL EXCEPTION — see tsc_crash.log in the install folder");
             Console.Error.WriteLine(ex);
             throw;
         }
@@ -93,56 +109,157 @@ public static class Program
         }
     }
 
+    // All file-based TSC logs share one hard limit, including crash and debug logs.
     internal const int MaxLogBytes = 2 * 1024 * 1024;
 
     internal static void AppendBoundedLog(string path, string text)
     {
         var bytes = Encoding.UTF8.GetBytes(text + Environment.NewLine);
-        lock (CrashLogLock)
+        lock (LogWriteLock)
         {
             var fullPath = Path.GetFullPath(path);
             var directory = Path.GetDirectoryName(fullPath);
             if (!string.IsNullOrEmpty(directory))
                 Directory.CreateDirectory(directory);
 
-            using (var stream = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.Read))
+            // Normal writes stay on the fast append path. Check the actual file
+            // length after opening it so the limit decision is not based on a
+            // stale FileInfo value from before another process finished a write.
+            if (bytes.Length < MaxLogBytes)
             {
-                stream.Write(bytes, 0, bytes.Length);
-                stream.Flush();
-                if (stream.Length <= MaxLogBytes)
-                    return;
+                try
+                {
+                    using (var stream = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.Read))
+                    {
+                        if (stream.Length <= MaxLogBytes - bytes.Length)
+                        {
+                            stream.Write(bytes, 0, bytes.Length);
+                            stream.Flush();
+                            return;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Fall through to the bounded path, which will skip safely if
+                    // the current log cannot be read or replaced.
+                }
             }
 
-            TrimLogToLimit(fullPath);
+            byte[] combined;
+            if (bytes.Length >= MaxLogBytes)
+            {
+                combined = KeepRecentLogBytes(bytes, MaxLogBytes);
+            }
+            else
+            {
+                if (!TryReadLogTail(fullPath, MaxLogBytes, out var existing))
+                    return; // Preserve the existing log if it cannot be read safely.
+                combined = new byte[existing.Length + bytes.Length];
+                Buffer.BlockCopy(existing, 0, combined, 0, existing.Length);
+                Buffer.BlockCopy(bytes, 0, combined, existing.Length, bytes.Length);
+                combined = KeepRecentLogBytes(combined, MaxLogBytes);
+            }
+
+            WriteLogReplacement(fullPath, combined);
         }
     }
 
-    private static void TrimLogToLimit(string path)
+    /// <summary>Clamps logs from older builds during startup, even if not written this session.</summary>
+    internal static void EnforceExistingLogSizeLimit(string path)
     {
         try
         {
-            var bytes = File.ReadAllBytes(path);
-            if (bytes.Length <= MaxLogBytes)
-                return;
+            var fullPath = Path.GetFullPath(path);
+            lock (LogWriteLock)
+            {
+                if (!File.Exists(fullPath) || new FileInfo(fullPath).Length <= MaxLogBytes)
+                    return;
 
-            var start = bytes.Length - MaxLogBytes;
-            // Start at the next complete line so truncation removes old entries,
-            // not the beginning of a UTF-8 character or the middle of a line.
-            while (start < bytes.Length && bytes[start] != (byte)'\n')
-                start++;
-            if (start < bytes.Length)
-                start++;
-            if (start >= bytes.Length)
-                start = bytes.Length - MaxLogBytes;
-
-            var length = Math.Min(MaxLogBytes, bytes.Length - start);
-            var temp = path + ".trim.tmp";
-            File.WriteAllBytes(temp, bytes.AsSpan(start, length).ToArray());
-            File.Move(temp, path, true);
+                if (!TryReadLogTail(fullPath, MaxLogBytes + 64 * 1024, out var tail))
+                    return;
+                WriteLogReplacement(fullPath, KeepRecentLogBytes(tail, MaxLogBytes));
+            }
         }
         catch
         {
-            // Best effort only; logging must never crash the game.
+            // Log maintenance must never prevent game startup.
+        }
+    }
+
+    private static bool TryReadLogTail(string path, int maxBytes, out byte[] bytes)
+    {
+        bytes = Array.Empty<byte>();
+        try
+        {
+            if (!File.Exists(path))
+                return true;
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var length = (int)Math.Min(Math.Max(0, stream.Length), maxBytes);
+            if (length == 0)
+                return true;
+
+            stream.Seek(-length, SeekOrigin.End);
+            bytes = new byte[length];
+            var read = 0;
+            while (read < length)
+            {
+                var count = stream.Read(bytes, read, length - read);
+                if (count <= 0)
+                    break;
+                read += count;
+            }
+            if (read != length)
+                Array.Resize(ref bytes, read);
+            return true;
+        }
+        catch
+        {
+            bytes = Array.Empty<byte>();
+            return false;
+        }
+    }
+
+    private static byte[] KeepRecentLogBytes(byte[] bytes, int maxBytes)
+    {
+        if (bytes.Length <= maxBytes)
+            return bytes;
+
+        var start = bytes.Length - maxBytes;
+        // Prefer a complete line boundary so retained logs start at a useful
+        // entry rather than halfway through an older diagnostic.
+        var lineStart = start;
+        while (lineStart < bytes.Length && bytes[lineStart] != (byte)'\n')
+            lineStart++;
+        if (lineStart < bytes.Length)
+            start = lineStart + 1;
+
+        // Do not begin on a UTF-8 continuation byte.
+        while (start < bytes.Length && (bytes[start] & 0xC0) == 0x80)
+            start++;
+        if (start >= bytes.Length)
+        {
+            start = bytes.Length - maxBytes;
+            while (start < bytes.Length && (bytes[start] & 0xC0) == 0x80)
+                start++;
+        }
+
+        return bytes.AsSpan(start).ToArray();
+    }
+
+    private static void WriteLogReplacement(string path, byte[] bytes)
+    {
+        var tempPath = path + ".trim.tmp";
+        try
+        {
+            File.WriteAllBytes(tempPath, bytes);
+            File.Move(tempPath, path, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            throw;
         }
     }
 

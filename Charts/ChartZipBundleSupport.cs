@@ -96,6 +96,85 @@ internal static class ChartZipBundleSupport
         }
     }
 
+    /// <summary>
+    /// Extracts an archive into a new, caller-owned directory. Unlike ExtractToCache,
+    /// this is intended for importing a bundle into the songs library, where the
+    /// extracted files become the permanent song files rather than a cache copy.
+    /// The destination must be absent or empty. Any extraction failure removes the
+    /// partial destination so callers can safely retain the original archive.
+    /// </summary>
+    public static void ExtractToDirectory(string archivePath, string destinationRoot)
+    {
+        var fullArchivePath = Path.GetFullPath(archivePath);
+        if (!File.Exists(fullArchivePath))
+            throw new FileNotFoundException("Chart bundle was not found.", fullArchivePath);
+
+        var root = Path.GetFullPath(destinationRoot);
+        if (Directory.Exists(root) && Directory.EnumerateFileSystemEntries(root).Any())
+            throw new IOException("The extraction destination is not empty.");
+        if (File.Exists(root))
+            throw new IOException("The extraction destination is an existing file.");
+
+        Directory.CreateDirectory(root);
+        var normalizedRoot = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                             + Path.DirectorySeparatorChar;
+        var seenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            using var archive = ZipFile.OpenRead(fullArchivePath);
+            foreach (var entry in archive.Entries)
+            {
+                var rawName = entry.FullName.Replace('\\', '/');
+                if (string.IsNullOrWhiteSpace(rawName))
+                    continue;
+                if (rawName.StartsWith("/", StringComparison.Ordinal) ||
+                    (rawName.Length >= 2 && char.IsLetter(rawName[0]) && rawName[1] == ':'))
+                    throw new InvalidDataException("The bundle contains an absolute path.");
+
+                var segments = rawName.Split('/', StringSplitOptions.RemoveEmptyEntries)
+                    .Where(segment => segment != ".")
+                    .ToArray();
+                if (segments.Length == 0)
+                    continue;
+                if (segments.Any(segment => segment == ".."))
+                    throw new InvalidDataException("The bundle contains an invalid path.");
+
+                var destination = Path.GetFullPath(Path.Combine(root, Path.Combine(segments)));
+                if (!destination.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("The bundle contains an invalid path.");
+
+                if (entry.FullName.EndsWith("/", StringComparison.Ordinal) || string.IsNullOrEmpty(entry.Name))
+                {
+                    if (File.Exists(destination))
+                        throw new InvalidDataException("The bundle contains conflicting file and directory paths.");
+                    Directory.CreateDirectory(destination);
+                    continue;
+                }
+
+                if (!seenFiles.Add(destination))
+                    throw new InvalidDataException("The bundle contains duplicate file paths.");
+                if (Directory.Exists(destination))
+                    throw new InvalidDataException("The bundle contains conflicting file and directory paths.");
+
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                using var input = entry.Open();
+                using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                input.CopyTo(output);
+            }
+        }
+        catch
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, recursive: true);
+            }
+            catch { }
+            throw;
+        }
+    }
+
     private static bool ArchiveContentsPresent(string archivePath, string extractedRoot)
     {
         try

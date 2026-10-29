@@ -293,8 +293,63 @@ public sealed partial class Playfield
         // Mouse hover previews the snapped tick/track used by the active note tool.
         // It is deliberately absent during touch interaction.
         var pointerPixel = new Microsoft.Xna.Framework.Point((int)MathF.Round(point.X), (int)MathF.Round(point.Y));
-        var pointerOverToolbar = IsEditorToolbarPanelContains(pointerPixel, virtualWidth, virtualHeight) ||
-                                 IsEditorBankIndicatorArea(point, virtualWidth, virtualHeight);
+        var editorLuaUiActive = _chartEditorMode && _chartEditorInterfaceRuntime.IsLoaded &&
+                                _chartEditorInterfaceRuntime.LastError is null;
+        if (editorLuaUiActive)
+        {
+            UpdateChartEditorInterfacePointer(point, leftDown || touchActive);
+            if (leftPressed || touchPressed)
+            {
+                var hitLuaControl = _chartEditorInterfaceRuntime.HandleUiPointerPressed(point.X, point.Y);
+                var action = _chartEditorInterfaceRuntime.ConsumeUiAction();
+                if (hitLuaControl)
+                {
+                    DispatchChartEditorInterfaceAction(action, virtualWidth, virtualHeight);
+                    return;
+                }
+            }
+            else if (leftDown && _chartEditorInterfaceRuntime.HandleUiPointerDrag(point.X, point.Y))
+            {
+                DispatchChartEditorInterfaceAction(_chartEditorInterfaceRuntime.ConsumeUiAction(), virtualWidth, virtualHeight);
+                return;
+            }
+        }
+
+        // Preview mode still exposes its two Lua toolbar controls. Let Lua get
+        // first chance to process them above, then keep clicks outside the
+        // toolbar from selecting or placing chart notes beneath the preview.
+        if (_chartEditorMode && _editorPreviewMode)
+        {
+            if (!editorLuaUiActive && (leftPressed || touchPressed))
+                TryHandleChartEditorToolbarClick(point, virtualWidth, virtualHeight);
+            return;
+        }
+
+        // The Lua timeline slider already maps pointer Y to the complete slider
+        // bounds and dispatches seek values while captured. Do not also remap
+        // held frames through the legacy C# track insets: frames with no new Lua
+        // slider value would otherwise jump to a slightly different position.
+        if (editorLuaUiActive && _editorTimelineScrubbing)
+        {
+            if (leftDown || touchActive)
+                return;
+
+            _editorTimelineScrubbing = false;
+            if (_editorTimelineResumeAfterScrub)
+            {
+                _playing = true;
+                _audioResyncPending = true;
+            }
+            _editorTimelineResumeAfterScrub = false;
+            return;
+        }
+
+        if ((leftPressed || touchPressed) && _editorMetaEditingField is not null)
+            CommitEditorMetaFieldOnBlur();
+        var pointerOverToolbar = editorLuaUiActive
+            ? _chartEditorInterfaceRuntime.IsUiPointOverControl(point.X, point.Y)
+            : IsEditorToolbarPanelContains(pointerPixel, virtualWidth, virtualHeight) ||
+              IsEditorBankIndicatorArea(point, virtualWidth, virtualHeight);
 
         // SELECT is an exclusive range-filter mode. The cyan range-line gesture is
         // handled separately; ordinary note hit-testing and the orange marquee are
@@ -321,11 +376,39 @@ public sealed partial class Playfield
 
         // Panels view owns chart input outside its toolbar and never routes those
         // clicks into the ordinary 0-15 gameplay lanes.
-        if (_chartEditorMode && _editorPanelsViewEnabled &&
+        if (_chartEditorMode && _editorPanelsViewEnabled && !_editorTimelineScrubbing &&
             HandleEditorPanelsMouseSelection(point, pointerPixel, currentTick, currentState,
                 leftDown, leftPressed, rightPressed, touchActive, touchPressed, touchMoved,
                 mouseMoved, touchInputThisFrame, pointerOverToolbar, virtualWidth, virtualHeight))
             return;
+
+        // Ctrl+click deletes the note under the pointer instead of selecting,
+        // dragging, or placing. Holding the DELETE FAMILY modifier as well (Shift
+        // by default) removes the whole link chain or complete long note.
+        if (_chartEditorMode && leftPressed && !touchInputThisFrame && !_editorPanelsViewEnabled &&
+            !pointerOverToolbar && _editorMenuSection != EditorMenuSection.Select &&
+            _editorMenuSection != EditorMenuSection.Bpm &&
+            !_editorPreviewMode && !_editorSuperFlickPlacementPending && !_editorBpmPlacementPending &&
+            !_editorStutterStartPlacementPending && !_editorStutterEndPlacementPending &&
+            !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
+            KeybindSettings.IsModifierBindingHeld("editor_delete_click_modifier"))
+        {
+            var clickedNote = FindClickedLinkHeadMarker(point, currentTick, currentState);
+            clickedNote ??= FindClickedHoldEnd(point, currentTick, currentState);
+            clickedNote ??= FindClickedNote(point, currentTick, currentState, out _);
+            clickedNote ??= FindClickedLinkChainBody(point, currentTick, currentState);
+            if (clickedNote is not null)
+            {
+                DeleteEditorNoteAtPointer(clickedNote,
+                    deleteFamily: KeybindSettings.IsModifierPartHeld("editor_delete_family"));
+                return;
+            }
+
+            // Don't accidentally place a new note when the delete-click modifier
+            // is held but the pointer lands on an empty lane cell.
+            if (FindClickedQuarterBeat(point, currentTick, currentState, out _) is not null)
+                return;
+        }
 
         // The left timeline is a continuous scrub surface. Its five timestamps
         // are landmarks only; mouse and touch can seek to any vertical position.
@@ -499,7 +582,7 @@ public sealed partial class Playfield
         // Visible toolbar controls take priority over bank indicators if their
         // screen rectangles overlap. Both are drawn in the same corner regions,
         // so hit-testing must follow visual stacking order.
-        if (_chartEditorMode && TryHandleChartEditorToolbarClick(point, virtualWidth, virtualHeight))
+        if (_chartEditorMode && !editorLuaUiActive && TryHandleChartEditorToolbarClick(point, virtualWidth, virtualHeight))
             return;
         if (_chartEditorMode && _editorSuperFlickPlacementPending)
         {
@@ -725,7 +808,7 @@ public sealed partial class Playfield
                         _selectedEventKey.HasValue && KeyOf(ev) == _selectedEventKey.Value &&
                         ev.Kind == "Note" && ev.RawType == 1);
                     // Modifier-click connects to the note; a normal click selects a source.
-                    var connectModifierHeld = KeybindSettings.IsDown("editor_connect_modifier");
+                    var connectModifierHeld = KeybindSettings.IsModifierBindingDown("editor_connect_modifier");
                     if (connectModifierHeld && previouslySelected is not null &&
                         !ReferenceEquals(previouslySelected, existingNote))
                     {
@@ -775,7 +858,7 @@ public sealed partial class Playfield
                 }
                 // Modifier-clicking any visible part of a link chain targets the whole chain.
                 // Connecting resolves it to the head; a normal click selects the chain.
-                var connectModifierHeld = KeybindSettings.IsDown("editor_connect_modifier");
+                var connectModifierHeld = KeybindSettings.IsModifierBindingDown("editor_connect_modifier");
                 var previouslySelectedSource = _chart?.Events.FirstOrDefault(ev =>
                     _selectedEventKey.HasValue && KeyOf(ev) == _selectedEventKey.Value &&
                     ev.Kind == "Note" && ev.RawType == 1);
@@ -830,7 +913,7 @@ public sealed partial class Playfield
                     var previouslySelected = _chart?.Events.FirstOrDefault(ev =>
                         _selectedEventKey.HasValue && KeyOf(ev) == _selectedEventKey.Value &&
                         ev.Kind == "Note" && ev.RawType == 1);
-                    var connectModifierHeld = KeybindSettings.IsDown("editor_connect_modifier");
+                    var connectModifierHeld = KeybindSettings.IsModifierBindingDown("editor_connect_modifier");
                     if (_editorConnectorMode && connectModifierHeld && previouslySelected is not null &&
                         !ReferenceEquals(previouslySelected, occupiedNote))
                     {
@@ -987,20 +1070,21 @@ public sealed partial class Playfield
     private static readonly int[] EditorSnapDivisors = { 2, 3, 4, 6, 8, 12, 16, 32 };
     private static readonly int[] EditorMetronomeDivisors = { 0, 1, 2, 3, 4, 6, 8, 12, 16, 32 };
 
-    // Stable action IDs are shared by the bottom-left playback/view strip and
-    // the bottom-right edit strip. The right strip reserves fixed slots so its
-    // lower actions never move when selection changes.
+    // Stable action IDs are shared by the full-width bottom toolbar and the
+    // upper-right edit-action rail. The bottom toolbar stays in one row.
     private static readonly string[] EditorActionLabels =
     {
         "PLAY", "DELETE", "UNDO", "REDO", "COPY", "CUT", "PASTE", "DESELECT",
         "INFO", "VIEW 2D/3D", "EXPAND/COLLAPSE", "GRIDS", "SAVE", "PANELS",
-        "PASTE FIT", "SELECT", "SNAPS", "TEMPO LINES", "CONSTANT", "SETTINGS", "METRONOME"
+        "PASTE FIT", "SELECT", "SNAPS", "TEMPO LINES", "CONSTANT", "SETTINGS", "METRONOME",
+        "EDITOR/PREVIEW", "AUTOPLAY"
     };
-    // Keep the playback/view toggles, INFO, and SAVE in the bottom-left strip.
     private static readonly int[] EditorBottomLeftActionIds =
-        { EditorActionPlay, EditorActionViewMode, EditorActionExpand, EditorActionBeatLines,
-          EditorActionTempoLines, EditorActionConstantScroll, EditorActionSnap, EditorActionMetronome, EditorActionPanels,
-          EditorActionMeta, EditorActionQuickSave, EditorActionSettings };
+        { EditorActionPlay, EditorActionEditorPreview, EditorActionGameplayMode,
+          EditorActionViewMode, EditorActionExpand, EditorActionBeatLines,
+          EditorActionTempoLines, EditorActionConstantScroll, EditorActionPanels,
+          EditorActionMetronome, EditorActionSnap, EditorActionMeta,
+          EditorActionQuickSave, EditorActionSettings };
     // The bottom-right tab row now owns SELECT; the upper-right action stack is
     // reserved for undo/redo and contextual edit operations.
     private static readonly int[] EditorRightActionIds =
@@ -1027,6 +1111,8 @@ public sealed partial class Playfield
     private const int EditorActionConstantScroll = 18;
     private const int EditorActionSettings = 19;
     private const int EditorActionMetronome = 20;
+    private const int EditorActionEditorPreview = 21;
+    private const int EditorActionGameplayMode = 22;
     private enum EditorUnlinkMode
     {
         PreserveDuration,
@@ -1259,6 +1345,7 @@ public sealed partial class Playfield
 
     private bool IsEditorActionVisible(int actionId) => actionId switch
     {
+        EditorActionDelete => HasSelectedEditorNotes() || _editorSelectedTempoEvent is not null,
         EditorActionCopy or EditorActionCut => HasSelectedEditorNotes(),
         EditorActionPaste or EditorActionPasteFit => _editorClipboard.Count > 0,
         EditorActionDeselect => HasAnyEditorSelection() || _editorSelectedGridCells.Count > 0,
@@ -1271,36 +1358,38 @@ public sealed partial class Playfield
     private Rectangle GetEditorTopStripPanelBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(14f * unit);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
+        var bottomStrip = GetEditorBottomLeftStripBounds(virtualWidth, virtualHeight);
+        var stripGap = Math.Max(1, (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelGap * unit));
         if (_editorPanelsViewEnabled)
         {
-            var padding = Math.Max(1, (int)MathF.Round(6f * unit));
-            var desiredWidth = (int)MathF.Round(232f * unit);
+            var padding = Math.Max(1, (int)MathF.Round(5f * unit));
+            var desiredWidth = (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelsToolbarWidth * unit);
             var availableWidth = Math.Max(76, virtualWidth - margin * 2 - padding * 2);
             var responsiveWidthCap = Math.Max(76, (int)MathF.Round(availableWidth * 0.46f));
             var width = Math.Min(desiredWidth, Math.Min(availableWidth, responsiveWidthCap));
             var attributeGap = (int)MathF.Round(4f * unit);
-            // The fixed-height Panels toolbar contains its header, CONNECTOR,
-            // four rows of animation attributes, a DURATION tool button, and SELECT.
-            var contentHeight = (int)MathF.Round(44f * unit) + attributeGap +
-                                7 * ((int)MathF.Round(38f * unit) + attributeGap);
+            // The panels toolbar contains its header, CONNECTOR, four rows of
+            // attributes, DURATION, and SELECT. Dock it directly above the
+            // full-width bottom toolbar rather than against the window edge.
+            var contentHeight = (int)MathF.Round(38f * unit) + attributeGap +
+                                7 * ((int)MathF.Round(32f * unit) + attributeGap);
             var panelHeight = contentHeight + padding * 2;
             return new Rectangle(virtualWidth - margin - width - padding * 2,
-                Math.Max(margin, virtualHeight - margin - panelHeight), width + padding * 2, panelHeight);
+                Math.Max(margin, bottomStrip.Y - stripGap - panelHeight), width + padding * 2, panelHeight);
         }
 
-        // The four category buttons form a fixed-size strip. Expanded menus are
-        // laid out in their own panel above this strip, so selecting another menu
-        // never changes the strip's size or pushes its buttons around.
-        var paddingFixed = Math.Max(1, (int)MathF.Round(10f * unit));
-        var desiredContentWidth = (int)MathF.Round(450f * unit);
+        // Notes / Tools / BPM / Select form a fixed vertical strip immediately
+        // above the bottom toolbar. Their expanded menus open to the left.
+        var paddingFixed = Math.Max(1, (int)MathF.Round(8f * unit));
+        var desiredContentWidth = (int)MathF.Round(152f * unit);
         var availableContentWidth = Math.Max(76, virtualWidth - margin * 2 - paddingFixed * 2);
-        var responsiveCap = Math.Max(76, (int)MathF.Round(availableContentWidth * 0.46f));
-        var widthFixed = Math.Min(desiredContentWidth, Math.Min(availableContentWidth, responsiveCap));
-        var tabsHeight = (int)MathF.Round(38f * unit);
-        var panelHeightFixed = tabsHeight + paddingFixed * 2;
+        var widthFixed = Math.Min(desiredContentWidth, availableContentWidth);
+        var tabHeight = (int)MathF.Round(34f * unit);
+        var tabGap = Math.Max(1, (int)MathF.Round(4f * unit));
+        var panelHeightFixed = tabHeight * 4 + tabGap * 3 + paddingFixed * 2;
         return new Rectangle(virtualWidth - margin - widthFixed - paddingFixed * 2,
-            Math.Max(margin, virtualHeight - margin - panelHeightFixed),
+            Math.Max(margin, bottomStrip.Y - stripGap - panelHeightFixed),
             widthFixed + paddingFixed * 2, panelHeightFixed);
     }
 
@@ -1313,19 +1402,23 @@ public sealed partial class Playfield
             // Keep these locals distinct from the gameplay-menu layout variables
             // below; C# forbids redeclaring those names in this nested scope.
             var selectUnit = _projection.ScalePixels(1f);
-            var selectMargin = (int)MathF.Round(14f * selectUnit);
+            var selectMargin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * selectUnit);
             var selectPadding = GetEditorMenuPanelPadding(selectUnit);
             var selectHeaderGap = GetEditorMenuHeaderContentGap(selectUnit);
-            var selectHeaderHeight = (int)MathF.Round(38f * selectUnit);
+            var selectHeaderHeight = (int)MathF.Round(34f * selectUnit);
             var selectRows = GetEditorMenuRowCount();
             var selectContentHeight = selectHeaderHeight + selectHeaderGap +
                 GetEditorMenuRowsHeight(selectRows, selectUnit) + selectHeaderGap;
             var selectPanelHeight = selectContentHeight + selectPadding * 2;
             var selectStrip = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-            var selectStripGap = Math.Max(1, (int)MathF.Round(4f * selectUnit));
-            return new Rectangle(selectStrip.X,
-                Math.Max(selectMargin, selectStrip.Y - selectStripGap - selectPanelHeight),
-                selectStrip.Width, selectPanelHeight);
+            var selectStripGap = Math.Max(1, (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelGap * selectUnit));
+            var anchorButton = _editorMenuSection == EditorMenuSection.Duration
+                ? GetEditorPanelsDurationButtonBounds(virtualWidth, virtualHeight)
+                : GetEditorPanelsSelectButtonBounds(virtualWidth, virtualHeight);
+            var selectMaxY = Math.Max(selectMargin, selectStrip.Bottom - selectPanelHeight);
+            var selectY = Math.Clamp(anchorButton.Y, selectMargin, selectMaxY);
+            return new Rectangle(Math.Max(selectMargin, selectStrip.X - selectStripGap - selectStrip.Width),
+                selectY, selectStrip.Width, selectPanelHeight);
         }
 
         // Other menus use their own responsive width. The Panels attributes
@@ -1335,19 +1428,20 @@ public sealed partial class Playfield
             return Rectangle.Empty;
 
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(14f * unit);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
         var padding = GetEditorMenuPanelPadding(unit);
         var tickPicking = _editorMenuSection == EditorMenuSection.Stutter &&
                           (_editorStutterStartPlacementPending || _editorStutterEndPlacementPending);
-        var desiredWidth = (int)MathF.Round((tickPicking ? 300f :
+        var desiredWidthBase = tickPicking ? 300f :
             _editorMenuSection == EditorMenuSection.Stutter ? 640f :
-            _editorMenuSection == EditorMenuSection.Tools ? 520f : 450f) * unit);
+            _editorMenuSection == EditorMenuSection.Tools ? 520f : (float)_chartEditorInterfaceLayout.ToolbarWidth;
+        var desiredWidth = (int)MathF.Round(desiredWidthBase * unit);
         var availableWidth = Math.Max(76, virtualWidth - margin * 2 - padding * 2);
         var responsiveWidthCap = Math.Max(76, (int)MathF.Round(availableWidth * 0.46f));
         var width = Math.Min(desiredWidth, Math.Min(availableWidth, responsiveWidthCap));
 
         var headerGap = GetEditorMenuHeaderContentGap(unit);
-        var headerHeight = (int)MathF.Round(38f * unit);
+        var headerHeight = (int)MathF.Round(34f * unit);
         var rows = GetEditorMenuRowCount();
         var contentHeight = headerHeight;
         if (rows > 0)
@@ -1355,20 +1449,31 @@ public sealed partial class Playfield
         var panelHeight = contentHeight + padding * 2;
 
         var strip = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var stripGap = Math.Max(1, (int)MathF.Round(4f * unit));
+        var stripGap = Math.Max(1, (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelGap * unit));
+        var rootIndex = GetEditorMenuRootSection() switch
+        {
+            EditorMenuSection.Notes => 0,
+            EditorMenuSection.Tools => 1,
+            EditorMenuSection.Bpm => 2,
+            EditorMenuSection.Select => 3,
+            _ => 0
+        };
+        var anchor = GetEditorMenuParentBounds(rootIndex, virtualWidth, virtualHeight);
         var panelWidth = width + padding * 2;
-        return new Rectangle(strip.Right - panelWidth,
-            Math.Max(margin, strip.Y - stripGap - panelHeight), panelWidth, panelHeight);
+        var maxY = Math.Max(margin, strip.Bottom - panelHeight);
+        var y = Math.Clamp(anchor.Y, margin, maxY);
+        return new Rectangle(Math.Max(margin, strip.X - stripGap - panelWidth),
+            y, panelWidth, panelHeight);
     }
 
     private Rectangle GetEditorPanelsSelectButtonBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var padding = (int)MathF.Round(6f * unit);
-        var headerHeight = (int)MathF.Round(44f * unit);
+        var padding = (int)MathF.Round(5f * unit);
+        var headerHeight = (int)MathF.Round(38f * unit);
         var gap = (int)MathF.Round(4f * unit);
-        var buttonHeight = (int)MathF.Round(38f * unit);
+        var buttonHeight = (int)MathF.Round(32f * unit);
         // SELECT occupies the bottom row of the Panels toolbar, like the SELECT
         // category at the bottom-right of the gameplay editor. Its handler opens
         // the shared Y RANGE / X RANGE / APPLY SELECT menu, it is not a mode toggle.
@@ -1382,10 +1487,10 @@ public sealed partial class Playfield
     {
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var padding = (int)MathF.Round(6f * unit);
-        var headerHeight = (int)MathF.Round(44f * unit);
+        var padding = (int)MathF.Round(5f * unit);
+        var headerHeight = (int)MathF.Round(38f * unit);
         var gap = (int)MathF.Round(4f * unit);
-        var buttonHeight = (int)MathF.Round(38f * unit);
+        var buttonHeight = (int)MathF.Round(32f * unit);
         var firstRowY = panel.Y + padding + headerHeight + gap;
         var rowStride = buttonHeight + gap;
         return new Rectangle(panel.X + padding, firstRowY + 5 * rowStride,
@@ -1396,10 +1501,10 @@ public sealed partial class Playfield
     {
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var padding = (int)MathF.Round(6f * unit);
-        var headerHeight = (int)MathF.Round(44f * unit);
+        var padding = (int)MathF.Round(5f * unit);
+        var headerHeight = (int)MathF.Round(38f * unit);
         var gap = (int)MathF.Round(4f * unit);
-        var buttonHeight = (int)MathF.Round(38f * unit);
+        var buttonHeight = (int)MathF.Round(32f * unit);
         return new Rectangle(panel.X + padding, panel.Y + padding + headerHeight + gap,
             panel.Width - padding * 2, buttonHeight);
     }
@@ -1410,10 +1515,10 @@ public sealed partial class Playfield
             return Rectangle.Empty;
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var padding = (int)MathF.Round(6f * unit);
-        var headerHeight = (int)MathF.Round(44f * unit);
+        var padding = (int)MathF.Round(5f * unit);
+        var headerHeight = (int)MathF.Round(38f * unit);
         var gap = (int)MathF.Round(4f * unit);
-        var buttonHeight = (int)MathF.Round(38f * unit);
+        var buttonHeight = (int)MathF.Round(32f * unit);
         var contentX = panel.X + padding;
         var contentY = panel.Y + padding + headerHeight + gap;
         var contentWidth = panel.Width - padding * 2;
@@ -1470,40 +1575,39 @@ public sealed partial class Playfield
     }
 
     private int GetEditorMenuChildHeight(float unit)
-        => Math.Max(1, (int)MathF.Round(46f * unit));
+        => Math.Max(1, (int)MathF.Round(38f * unit));
 
     private int GetEditorMenuChildGap(float unit)
-        => Math.Max(1, (int)MathF.Round((_editorMenuSection == EditorMenuSection.Stutter ? 12f :
-            _editorMenuSection is EditorMenuSection.Bpm or EditorMenuSection.Duration or EditorMenuSection.Select ? 10f : 8f) * unit));
+        => Math.Max(1, (int)MathF.Round(5f * unit));
 
     private int GetEditorMenuPanelPadding(float unit)
     {
-        var padding = _editorPanelsViewEnabled && _editorMenuSection != EditorMenuSection.Select ? 6f :
-            _editorMenuSection == EditorMenuSection.Stutter ? 16f :
-            _editorMenuSection is EditorMenuSection.Bpm or EditorMenuSection.Duration or EditorMenuSection.Select ? 12f : 10f;
+        var padding = _editorPanelsViewEnabled && _editorMenuSection != EditorMenuSection.Select ? 5f :
+            _editorMenuSection == EditorMenuSection.Stutter ? 12f :
+            _editorMenuSection is EditorMenuSection.Bpm or EditorMenuSection.Duration or EditorMenuSection.Select ? 9f : 8f;
         return Math.Max(1, (int)MathF.Round(padding * unit));
     }
 
     private int GetEditorMenuHeaderContentGap(float unit)
     {
-        var gap = _editorMenuSection == EditorMenuSection.Stutter ? 14f :
-            _editorMenuSection is EditorMenuSection.Bpm or EditorMenuSection.Duration or EditorMenuSection.Select ? 12f : 9f;
+        var gap = _editorMenuSection == EditorMenuSection.Stutter ? 10f :
+            _editorMenuSection is EditorMenuSection.Bpm or EditorMenuSection.Duration or EditorMenuSection.Select ? 8f : 6f;
         return Math.Max(1, (int)MathF.Round(gap * unit));
     }
 
     private int GetEditorStutterCellHorizontalPadding(float unit)
-        => Math.Max(1, (int)MathF.Round(10f * unit));
+        => Math.Max(1, (int)MathF.Round(8f * unit));
 
     private int GetEditorStutterCellVerticalPadding(float unit)
-        => Math.Max(1, (int)MathF.Round(8f * unit));
+        => Math.Max(1, (int)MathF.Round(6f * unit));
 
     // Menu items reserve a caption row above the clickable control. Keeping the
     // captions outside the buttons gives field names room to breathe.
     private int GetEditorMenuLabelHeight(float unit)
-        => Math.Max(1, (int)MathF.Round(20f * unit));
+        => Math.Max(1, (int)MathF.Round(17f * unit));
 
     private int GetEditorMenuLabelGap(float unit)
-        => Math.Max(1, (int)MathF.Round(5f * unit));
+        => Math.Max(1, (int)MathF.Round(4f * unit));
 
     private bool EditorMenuRowHasExternalLabels(int row) => _editorMenuSection switch
     {
@@ -1524,7 +1628,10 @@ public sealed partial class Playfield
             ? GetEditorMenuLabelHeight(unit) + GetEditorMenuLabelGap(unit) + buttonHeight
             : buttonHeight;
         return _editorMenuSection == EditorMenuSection.Stutter
-            ? contentHeight + GetEditorStutterCellVerticalPadding(unit) * 2
+            // Keep the top inset for generator controls. The inter-row gap below
+            // the button is supplied by GetEditorMenuChildGap, matching the
+            // compact 8px stacking used by the bottom-left strip.
+            ? contentHeight + GetEditorStutterCellVerticalPadding(unit)
             : contentHeight;
     }
 
@@ -1610,7 +1717,7 @@ public sealed partial class Playfield
             : GetEditorMenuPanelBounds(virtualWidth, virtualHeight);
         var padding = GetEditorMenuPanelPadding(unit);
         var top = panel.Y + padding;
-        var headerHeight = (int)MathF.Round((_editorPanelsViewEnabled && !hasPanelSubmenu ? 44f : 38f) * unit);
+        var headerHeight = (int)MathF.Round((_editorPanelsViewEnabled && !hasPanelSubmenu ? 38f : 34f) * unit);
         return new Rectangle(panel.X + padding, top, panel.Width - padding * 2, headerHeight);
     }
 
@@ -1618,8 +1725,8 @@ public sealed partial class Playfield
     {
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var padding = Math.Max(1, (int)MathF.Round(6f * unit));
-        var headerHeight = (int)MathF.Round(44f * unit);
+        var padding = Math.Max(1, (int)MathF.Round(5f * unit));
+        var headerHeight = (int)MathF.Round(38f * unit);
         return new Rectangle(panel.X + padding, panel.Y + padding, panel.Width - padding * 2, headerHeight);
     }
 
@@ -1644,17 +1751,14 @@ public sealed partial class Playfield
             return Rectangle.Empty;
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var padding = Math.Max(1, (int)MathF.Round(10f * unit));
-        var gap = Math.Max(1, (int)MathF.Round(5f * unit));
-        var headerHeight = (int)MathF.Round(38f * unit);
+        var padding = Math.Max(1, (int)MathF.Round(8f * unit));
+        var gap = Math.Max(1, (int)MathF.Round(4f * unit));
+        var buttonHeight = (int)MathF.Round(34f * unit);
         var contentX = panel.X + padding;
         var contentY = panel.Y + padding;
         var contentWidth = panel.Width - padding * 2;
-        var buttonWidth = Math.Max(1, (contentWidth - gap * 3) / 4);
-        var x = contentX + parentIndex * (buttonWidth + gap);
-        if (parentIndex == 3)
-            buttonWidth = Math.Max(1, panel.Right - padding - x);
-        return new Rectangle(x, contentY, buttonWidth, headerHeight);
+        return new Rectangle(contentX, contentY + parentIndex * (buttonHeight + gap),
+            Math.Max(1, contentWidth), buttonHeight);
     }
 
     private Rectangle GetEditorMenuChildBounds(int childIndex, int virtualWidth, int virtualHeight)
@@ -1810,17 +1914,22 @@ public sealed partial class Playfield
     private int GetEditorNumericTextCaretIndex(Rectangle bounds, string value, Microsoft.Xna.Framework.Point pixel,
         float unit, string? fieldId = null)
     {
-        if (_font is null)
-            return value.Length;
-
+        var interfaceUi = _chartEditorInterfaceLayout;
+        var font = GetChartEditorFont(interfaceUi.LabelFont);
         fieldId ??= _editorTextActiveFieldId ?? "editor-numeric";
-        var spinnerWidth = Math.Min(Math.Max(26, (int)MathF.Round(34f * unit)), Math.Max(1, bounds.Width / 3));
+        var toolbarInput = fieldId is "bpm" or "duration" ||
+                           fieldId.StartsWith("stutter:", StringComparison.Ordinal);
+        var spinnerWidth = toolbarInput ? 0 :
+            Math.Min(Math.Max(26, (int)MathF.Round(34f * unit)), Math.Max(1, bounds.Width / 3));
         var textLeft = bounds.X + (int)MathF.Round(10f * unit);
         var availableWidth = Math.Max(1f, bounds.Width - spinnerWidth - 16f * unit);
-        var measured = UnicodeTextRenderer.MeasureString(_font, FontSafeText(_font, value));
+        var measured = UnicodeTextRenderer.MeasureString(font, FontSafeText(font, value));
         var scale = Math.Min(1f, Math.Max(0.55f,
             (bounds.Height - 8f * unit) / Math.Max(1f, measured.Y)));
-        return GetEditorTextCaretIndexFromMouse(fieldId, value, pixel.X, textLeft, availableWidth, scale);
+        font = GetChartEditorFont(interfaceUi.LabelFont, 24f * scale);
+        scale = Math.Min(1f, (bounds.Height - 8f * unit) /
+            Math.Max(1f, UnicodeTextRenderer.MeasureString(font, "Ag").Y));
+        return GetEditorTextCaretIndexFromMouse(fieldId, value, pixel.X, textLeft, availableWidth, scale, font);
     }
 
     private Rectangle[] GetEditorStutterPatternButtonBounds(Rectangle rowBounds)
@@ -1843,11 +1952,11 @@ public sealed partial class Playfield
     private Rectangle GetEditorBottomActionPanelBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(14f * unit);
-        var padding = (int)MathF.Round(6f * unit);
-        var width = Math.Min((int)MathF.Round(166f * unit), Math.Max(76, virtualWidth - margin * 2));
-        var buttonHeight = (int)MathF.Round(44f * unit);
-        var gap = (int)MathF.Round(4f * unit);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
+        var padding = (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelPadding * unit);
+        var width = Math.Min((int)MathF.Round((float)_chartEditorInterfaceLayout.ActionColumnWidth * unit), Math.Max(76, virtualWidth - margin * 2));
+        var buttonHeight = (int)MathF.Round((float)_chartEditorInterfaceLayout.ActionButtonHeight * unit);
+        var gap = (int)MathF.Round((float)_chartEditorInterfaceLayout.ActionButtonGap * unit);
         // The action rows are fixed even when COPY/CUT/PASTE/DESELECT are hidden.
         var contentHeight = EditorRightActionIds.Length * buttonHeight +
                             (EditorRightActionIds.Length - 1) * gap;
@@ -1866,9 +1975,9 @@ public sealed partial class Playfield
             return Rectangle.Empty;
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorBottomActionPanelBounds(virtualWidth, virtualHeight);
-        var padding = (int)MathF.Round(6f * unit);
-        var buttonHeight = (int)MathF.Round(44f * unit);
-        var gap = (int)MathF.Round(4f * unit);
+        var padding = (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelPadding * unit);
+        var buttonHeight = (int)MathF.Round((float)_chartEditorInterfaceLayout.ActionButtonHeight * unit);
+        var gap = (int)MathF.Round((float)_chartEditorInterfaceLayout.ActionButtonGap * unit);
         return new Rectangle(panel.X + padding,
             panel.Y + padding + index * (buttonHeight + gap),
             panel.Width - padding * 2, buttonHeight);
@@ -1877,45 +1986,47 @@ public sealed partial class Playfield
     private int GetEditorBottomLeftContentWidth(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(14f * unit);
-        var padding = (int)MathF.Round(6f * unit);
-        var desiredContentWidth = (int)MathF.Round(1160f * unit);
-        // The wider Notes/Tools/BPM workspace is the control that occupies the
-        // bottom-right now, so size this strip against it rather than the
-        // narrow action column at the top-right.
-        var rightPanel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
-        var submenuPanel = GetEditorMenuPanelBounds(virtualWidth, virtualHeight);
-        var rightEdge = submenuPanel.IsEmpty ? rightPanel.X : Math.Min(rightPanel.X, submenuPanel.X);
-        var availableContentWidth = Math.Max(1,
-            rightEdge - margin - margin - padding * 2);
-        return Math.Min(desiredContentWidth, availableContentWidth);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
+        var padding = (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelPadding * unit);
+        // This toolbar spans the entire bottom edge, independent of the right rail.
+        return Math.Max(1, virtualWidth - margin * 2 - padding * 2);
     }
 
     private int GetEditorBottomLeftColumnCount(int virtualWidth, int virtualHeight)
+        => _editorPreviewMode ? 3 : Math.Max(1, EditorBottomLeftActionIds.Length);
+
+    private (int Row, int Column) GetEditorBottomLeftActionSlot(int actionIndex, int columns)
     {
-        var unit = _projection.ScalePixels(1f);
-        // At narrow/portrait resolutions, wrap across rows so mobile buttons keep
-        // a usable touch width instead of shrinking to tiny labels.
-        var width = GetEditorBottomLeftContentWidth(virtualWidth, virtualHeight);
-        if (width < (int)MathF.Round(600f * unit)) return 3;
-        if (width < (int)MathF.Round(850f * unit)) return 5;
-        if (width < (int)MathF.Round(1020f * unit)) return 8;
-        return EditorBottomLeftActionIds.Length;
+        if (actionIndex < 0 || actionIndex >= EditorBottomLeftActionIds.Length)
+            return (-1, -1);
+        var id = EditorBottomLeftActionIds[actionIndex];
+        if (_editorPreviewMode)
+        {
+            if (id == EditorActionPlay) return (0, 0);
+            if (id == EditorActionEditorPreview) return (0, 1);
+            if (id == EditorActionGameplayMode) return (0, 2);
+            return (-1, -1);
+        }
+        return (0, actionIndex);
     }
 
     private Rectangle GetEditorBottomLeftStripBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(14f * unit);
-        var padding = (int)MathF.Round(6f * unit);
-        var buttonHeight = (int)MathF.Round(44f * unit);
-        var gap = (int)MathF.Round(5f * unit);
-        var columns = GetEditorBottomLeftColumnCount(virtualWidth, virtualHeight);
-        var rows = (EditorBottomLeftActionIds.Length + columns - 1) / columns;
-        var contentWidth = GetEditorBottomLeftContentWidth(virtualWidth, virtualHeight);
-        var height = rows * buttonHeight + Math.Max(0, rows - 1) * gap + padding * 2;
-        return new Rectangle(margin, virtualHeight - margin - height,
-            contentWidth + padding * 2, height);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
+        var padding = (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelPadding * unit);
+        var buttonHeight = (int)MathF.Round((float)_chartEditorInterfaceLayout.LeftToolbarButtonHeight * unit);
+        var height = buttonHeight + padding * 2;
+        var width = Math.Max(1, virtualWidth - margin * 2);
+        if (_editorPreviewMode)
+        {
+            var contentWidth = GetEditorBottomLeftContentWidth(virtualWidth, virtualHeight);
+            var gap = (int)MathF.Round((float)_chartEditorInterfaceLayout.LeftToolbarButtonGap * unit);
+            var normalButtonWidth = Math.Max(1,
+                (contentWidth - gap * (EditorBottomLeftActionIds.Length - 1)) / EditorBottomLeftActionIds.Length);
+            width = padding * 2 + normalButtonWidth * 3 + gap * 2;
+        }
+        return new Rectangle(margin, virtualHeight - margin - height, width, height);
     }
 
     private Rectangle GetEditorBottomLeftButtonBounds(int index, int virtualWidth, int virtualHeight)
@@ -1924,19 +2035,24 @@ public sealed partial class Playfield
             return Rectangle.Empty;
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorBottomLeftStripBounds(virtualWidth, virtualHeight);
-        var padding = (int)MathF.Round(6f * unit);
-        var gap = (int)MathF.Round(5f * unit);
+        var padding = (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelPadding * unit);
+        var gap = (int)MathF.Round((float)_chartEditorInterfaceLayout.LeftToolbarButtonGap * unit);
         var columns = GetEditorBottomLeftColumnCount(virtualWidth, virtualHeight);
-        var row = index / columns;
-        var column = index % columns;
-        var itemsInRow = Math.Min(columns, EditorBottomLeftActionIds.Length - row * columns);
-        var innerWidth = Math.Max(1, panel.Width - padding * 2 - gap * (columns - 1));
-        var buttonWidth = Math.Max(1, innerWidth / columns);
+        var id = EditorBottomLeftActionIds[index];
+        if (_editorPreviewMode && id is not (EditorActionPlay or EditorActionEditorPreview or EditorActionGameplayMode))
+            return Rectangle.Empty;
+        var (row, column) = GetEditorBottomLeftActionSlot(index, columns);
+        var fullContentWidth = GetEditorBottomLeftContentWidth(virtualWidth, virtualHeight);
+        // Preview keeps the same per-button width as the full editor toolbar;
+        // only the background/strip width contracts to fit its three controls.
+        var normalActionCount = Math.Max(1, EditorBottomLeftActionIds.Length);
+        var buttonWidth = Math.Max(1, (fullContentWidth - gap * (normalActionCount - 1)) / normalActionCount);
         var x = panel.X + padding + column * (buttonWidth + gap);
-        if (itemsInRow == columns && column == itemsInRow - 1)
-            buttonWidth = Math.Max(1, panel.Right - padding - x);
-        var buttonHeight = (int)MathF.Round(44f * unit);
-        return new Rectangle(x, panel.Y + padding + row * (buttonHeight + gap), buttonWidth, buttonHeight);
+        var buttonHeight = (int)MathF.Round((float)_chartEditorInterfaceLayout.LeftToolbarButtonHeight * unit);
+        var y = _editorPreviewMode
+            ? panel.Y + padding
+            : panel.Y + padding + row * (buttonHeight + gap);
+        return new Rectangle(x, y, buttonWidth, buttonHeight);
     }
 
     private int GetEditorSnapActionIndex() => Array.IndexOf(EditorBottomLeftActionIds, EditorActionSnap);
@@ -1999,8 +2115,8 @@ public sealed partial class Playfield
     private Rectangle GetEditorMetaPanelBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(10f * unit);
-        var desiredWidth = (int)MathF.Round(720f * unit);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.MetadataPanelMargin * unit);
+        var desiredWidth = (int)MathF.Round((float)_chartEditorInterfaceLayout.MetadataPanelWidth * unit);
         var width = Math.Min(virtualWidth - margin * 2,
             Math.Max((int)MathF.Round(420f * unit), Math.Min(desiredWidth, (int)MathF.Round(virtualWidth * 0.60f))));
         width = Math.Max(1, width);
@@ -2070,7 +2186,7 @@ public sealed partial class Playfield
         var unit = _projection.ScalePixels(1f);
         var padding = (int)MathF.Round(12f * unit);
         var contentTop = panel.Y + (int)MathF.Round(156f * unit);
-        var contentBottom = GetEditorMetaExportControlsTop(virtualWidth, virtualHeight) - padding;
+        var contentBottom = GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight).Y - padding;
         return new Rectangle(
             panel.X + padding,
             contentTop,
@@ -2078,13 +2194,23 @@ public sealed partial class Playfield
             Math.Max(0, contentBottom - contentTop));
     }
 
+    private int GetEditorMetaLabelHeight(float unit)
+        => Math.Max(1, (int)MathF.Round(20f * unit));
+
+    private int GetEditorMetaLabelGap(float unit)
+        => Math.Max(1, (int)MathF.Round(5f * unit));
+
+    private int GetEditorMetaFieldHeight(float unit)
+        => Math.Max(1, (int)MathF.Round(46f * unit));
+
     private int GetEditorMetaRowPitch(float unit)
     {
-        // Keep the info panel's label + value layout aligned with the external
-        // captions and controls used throughout the editor submenus.
-        var labelHeight = GetEditorMenuLabelHeight(unit);
-        var labelGap = GetEditorMenuLabelGap(unit);
-        var valueHeight = GetEditorMenuChildHeight(unit);
+        // Match chartEditorInterface.lua exactly: 20 label + 5 gap + 46 field + 8 row gap.
+        // If this estimate is smaller than the Lua layout, scrolling stops early and
+        // the final INFO rows cannot be reached.
+        var labelHeight = GetEditorMetaLabelHeight(unit);
+        var labelGap = GetEditorMetaLabelGap(unit);
+        var valueHeight = GetEditorMetaFieldHeight(unit);
         var rowGap = Math.Max(1, (int)MathF.Round(8f * unit));
         return Math.Max(1, labelHeight + labelGap + valueHeight + rowGap);
     }
@@ -2092,7 +2218,10 @@ public sealed partial class Playfield
     private int GetEditorMetaVisibleRowCount(int virtualWidth, int virtualHeight)
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
-        return Math.Max(1, content.Height / GetEditorMetaRowPitch(_projection.ScalePixels(1f)));
+        var unit = _projection.ScalePixels(1f);
+        // The Lua renderer lays out rows with floating-point scaled dimensions;
+        // use the same unrounded pitch for the scroll limit it receives in state.
+        return Math.Max(1, (int)MathF.Floor(content.Height / Math.Max(1f, 79f * unit)));
     }
 
     private void ClampEditorMetaScrollOffset(int rowCount, int virtualWidth, int virtualHeight)
@@ -2106,7 +2235,7 @@ public sealed partial class Playfield
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
         var pitch = GetEditorMetaRowPitch(unit);
-        var labelHeight = GetEditorMenuLabelHeight(unit);
+        var labelHeight = GetEditorMetaLabelHeight(unit);
         var rowTop = content.Y + (index - _editorMetaScrollOffset) * pitch;
         var scrollbarSpace = (int)MathF.Round(8f * unit);
         return new Rectangle(content.X, rowTop,
@@ -2117,9 +2246,9 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var labelHeight = GetEditorMenuLabelHeight(unit);
-        var labelGap = GetEditorMenuLabelGap(unit);
-        var valueHeight = GetEditorMenuChildHeight(unit);
+        var labelHeight = GetEditorMetaLabelHeight(unit);
+        var labelGap = GetEditorMetaLabelGap(unit);
+        var valueHeight = GetEditorMetaFieldHeight(unit);
         var rowTop = content.Y + (index - _editorMetaScrollOffset) * GetEditorMetaRowPitch(unit);
         var scrollbarSpace = (int)MathF.Round(8f * unit);
         return new Rectangle(content.X, rowTop + labelHeight + labelGap,
@@ -2141,53 +2270,64 @@ public sealed partial class Playfield
 
     private int GetEditorMetaExportOptionCount()
 #if TSC_PUBLISH
-        => _editorBundleTemplate == ChartBundleTemplate.Tsc ? 6 : 5;
+        => 5;
 #else
-        => _editorBundleTemplate == ChartBundleTemplate.Tsc ? 7 : 6;
+        => 6;
 #endif
 
-    private (string Label, Color Accent, EditorMetaExportAction Action) GetEditorMetaExportOption(int index)
+    private (string Label, string Description, Color Accent, EditorMetaExportAction Action) GetEditorMetaExportOption(int index)
     {
+        const string tstsDescription = "TSTS bundle containing ARES files. Compatible with ReSONANCE.";
         if (index == 0)
         {
             return _editorBundleTemplate switch
             {
-                ChartBundleTemplate.Bold => ("NATIVE: BOLD / ARES", Hold, EditorMetaExportAction.Native),
-                ChartBundleTemplate.Tsts => ("NATIVE: TSTS BUNDLE", new Color(196, 181, 253), EditorMetaExportAction.Native),
-                _ => ("NATIVE: TSC + JSON", Active, EditorMetaExportAction.Native)
+                ChartBundleTemplate.Bold => ("NATIVE: BOLD / ARES", "Export the current chart in BOLD's native ARES format.", Hold, EditorMetaExportAction.Native),
+                ChartBundleTemplate.Tsts => ("NATIVE: TSTS BUNDLE", tstsDescription, new Color(196, 181, 253), EditorMetaExportAction.Native),
+                _ => ("TSC ZIP", "Bundle all enabled difficulty charts with song metadata and shared assets.", Active, EditorMetaExportAction.TscZip)
             };
         }
 
-        if (index == 1) return ("EXPORT TSC ONLY", Active, EditorMetaExportAction.TscOnly);
-        if (index == 2) return ("EXPORT JSON ONLY", new Color(134, 239, 172), EditorMetaExportAction.JsonOnly);
-        if (index == 3) return ("EXPORT TSC ZIP", Active, EditorMetaExportAction.TscZip);
+        if (index == 1)
+            return ("EXPORT TSC ONLY", "Export only the current difficulty as a standalone .tsc chart.", Active, EditorMetaExportAction.TscOnly);
+        if (index == 2)
+            return ("EXPORT JSON META", "Export song metadata only; chart files and media are not included.", new Color(134, 239, 172), EditorMetaExportAction.JsonOnly);
+        if (index == 3)
+        {
+            return _editorBundleTemplate == ChartBundleTemplate.Tsc
+                ? ("EXPORT ARES", "Export the current difficulty as a raw ARES chart for tools that read .ares files.", Active, EditorMetaExportAction.Ares)
+                : ("EXPORT TSC ZIP", "Bundle all enabled TSC difficulty charts with song metadata and shared assets.", Active, EditorMetaExportAction.TscZip);
+        }
         if (index == 4)
         {
 #if TSC_PUBLISH
-            return _editorBundleTemplate == ChartBundleTemplate.Bold
-                ? ("EXPORT TSTS", new Color(196, 181, 253), EditorMetaExportAction.Tsts)
-                : ("EXPORT ARES", Active, EditorMetaExportAction.Ares);
+            return _editorBundleTemplate == ChartBundleTemplate.Tsts
+                ? ("EXPORT ARES", "Export the current difficulty as a raw ARES chart for tools that read .ares files.", Active, EditorMetaExportAction.Ares)
+                : ("EXPORT TSTS", tstsDescription, new Color(196, 181, 253), EditorMetaExportAction.Tsts);
 #else
-            return _editorBundleTemplate == ChartBundleTemplate.Bold
-                ? ("EXPORT FPK", Hold, EditorMetaExportAction.Fpk)
-                : ("EXPORT ARES", Active, EditorMetaExportAction.Ares);
+            return _editorBundleTemplate == ChartBundleTemplate.Tsts
+                ? ("EXPORT ARES", "Export the current difficulty as a raw ARES chart for tools that read .ares files.", Active, EditorMetaExportAction.Ares)
+                : ("EXPORT FPK", "Pack all enabled difficulties and shared assets into a BOLD/FPK bundle.", Hold, EditorMetaExportAction.Fpk);
 #endif
         }
-#if TSC_PUBLISH
-        if (index == 5 && _editorBundleTemplate == ChartBundleTemplate.Tsc)
-            return ("EXPORT TSTS", new Color(196, 181, 253), EditorMetaExportAction.Tsts);
-#else
+#if !TSC_PUBLISH
         if (index == 5)
         {
-            return _editorBundleTemplate == ChartBundleTemplate.Bold
-                ? ("EXPORT TSTS", new Color(196, 181, 253), EditorMetaExportAction.Tsts)
-                : ("EXPORT FPK", Hold, EditorMetaExportAction.Fpk);
+            return _editorBundleTemplate == ChartBundleTemplate.Tsts
+                ? ("EXPORT FPK", "Pack all enabled difficulties and shared assets into a BOLD/FPK bundle.", Hold, EditorMetaExportAction.Fpk)
+                : ("EXPORT TSTS", tstsDescription, new Color(196, 181, 253), EditorMetaExportAction.Tsts);
         }
-        if (index == 6 && _editorBundleTemplate == ChartBundleTemplate.Tsc)
-            return ("EXPORT TSTS", new Color(196, 181, 253), EditorMetaExportAction.Tsts);
 #endif
+        return (string.Empty, string.Empty, Active, EditorMetaExportAction.Native);
+    }
 
-        return (string.Empty, Active, EditorMetaExportAction.Native);
+    private Rectangle GetEditorMetaDifficultyToggleBounds(int virtualWidth, int virtualHeight)
+    {
+        var export = GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var gap = Math.Max(1, (int)MathF.Round(6f * unit));
+        var height = Math.Max(1, (int)MathF.Round(34f * unit));
+        return new Rectangle(export.X, export.Y - gap - height, export.Width, height);
     }
 
     private Rectangle GetEditorMetaExportToggleBounds(int virtualWidth, int virtualHeight)
@@ -2200,54 +2340,161 @@ public sealed partial class Playfield
             Math.Max(1, panel.Width - padding * 2), height);
     }
 
+    private List<string> WrapEditorTextToWidth(SpriteFont font, string text, float maxWidth)
+    {
+        var lines = new List<string>();
+        foreach (var sourceLine in (text ?? string.Empty).Split('\n'))
+        {
+            var line = string.Empty;
+            foreach (var word in sourceLine.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var candidate = line.Length == 0 ? word : line + " " + word;
+                var measured = UnicodeTextRenderer.MeasureString(font, FontSafeText(font, candidate)).X;
+                if (line.Length > 0 && measured > maxWidth)
+                {
+                    lines.Add(line);
+                    line = word;
+                }
+                else
+                {
+                    line = candidate;
+                }
+            }
+            lines.Add(line);
+        }
+        if (lines.Count == 0)
+            lines.Add(string.Empty);
+        return lines;
+    }
+
+    private int[] GetEditorMetaExportOptionRowHeights(int virtualWidth)
+    {
+        var count = GetEditorMetaExportOptionCount();
+        var unit = _projection.ScalePixels(1f);
+        var margin = Math.Max(1, (int)MathF.Round(16f * unit));
+        var modalWidth = Math.Min((int)MathF.Round(760f * unit), Math.Max(1, virtualWidth - margin * 2));
+        var sidePadding = Math.Max(1, (int)MathF.Round(18f * unit));
+        var optionWidth = Math.Max(1, modalWidth - sidePadding * 2);
+        var textWidth = Math.Max(1f, optionWidth - 32f * unit);
+        var interfaceUi = _chartEditorInterfaceLayout;
+        var titleFont = GetChartEditorFont(interfaceUi.ButtonFont, 20f * unit);
+        var descriptionFont = GetChartEditorFont(interfaceUi.LabelFont, 16f * unit);
+        var titleLineHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(titleFont, "Ag").Y);
+        var descriptionLineHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(descriptionFont, "Ag").Y);
+        var titleTop = (int)MathF.Round(8f * unit);
+        var descriptionGap = (int)MathF.Round(4f * unit);
+        var bottomPadding = (int)MathF.Round(9f * unit);
+        var result = new int[count];
+        for (var i = 0; i < count; i++)
+        {
+            var (_, description, _, _) = GetEditorMetaExportOption(i);
+            var lines = WrapEditorTextToWidth(descriptionFont, description, textWidth);
+            result[i] = Math.Max(1, (int)MathF.Ceiling(titleTop + titleLineHeight + descriptionGap +
+                lines.Count * descriptionLineHeight * 1.22f + bottomPadding));
+        }
+        return result;
+    }
+
     private Rectangle GetEditorMetaExportOptionBounds(int index, int virtualWidth, int virtualHeight)
     {
-        if (index < 0 || index >= GetEditorMetaExportOptionCount())
+        var count = GetEditorMetaExportOptionCount();
+        if (index < 0 || index >= count)
             return Rectangle.Empty;
-        var panel = GetEditorMetaPanelBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var padding = (int)MathF.Round(12f * unit);
-        var buttonHeight = Math.Max(1, (int)MathF.Round(32f * unit));
-        var gap = Math.Max(1, (int)MathF.Round(4f * unit));
-        var colGap = Math.Max(1, (int)MathF.Round(6f * unit));
-        var colWidth = Math.Max(1, (panel.Width - padding * 2 - colGap) / 2);
-        var rowCount = (GetEditorMetaExportOptionCount() + 1) / 2;
-        var toggle = GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight);
-        var gridHeight = rowCount * buttonHeight + (rowCount - 1) * gap;
-        var gridBottom = toggle.Y - gap;
-        var gridTop = gridBottom - gridHeight;
-        var row = index / 2;
-        var col = index % 2;
-        var x = panel.X + padding + col * (colWidth + colGap);
-        var y = gridTop + row * (buttonHeight + gap);
-        if ((GetEditorMetaExportOptionCount() % 2) == 1 && index == GetEditorMetaExportOptionCount() - 1)
-        {
-            x = panel.X + padding;
-            colWidth = Math.Max(1, panel.Width - padding * 2);
-        }
-        return new Rectangle(x, y, colWidth, buttonHeight);
+        var margin = Math.Max(1, (int)MathF.Round(16f * unit));
+        var modalWidth = Math.Min((int)MathF.Round(760f * unit), Math.Max(1, virtualWidth - margin * 2));
+        var sidePadding = Math.Max(1, (int)MathF.Round(18f * unit));
+        var headerHeight = (int)MathF.Round(94f * unit);
+        var headerContentGap = (int)MathF.Round(24f * unit);
+        var gap = (int)MathF.Round(6f * unit);
+        var bottomPadding = (int)MathF.Round(18f * unit);
+        var rowHeights = GetEditorMetaExportOptionRowHeights(virtualWidth);
+        var rowsHeight = rowHeights.Sum();
+        var modalHeight = headerHeight + headerContentGap + rowsHeight + gap * Math.Max(0, count - 1) + bottomPadding;
+        modalHeight = Math.Min(modalHeight, Math.Max(1, virtualHeight - margin * 2));
+        var modalX = (virtualWidth - modalWidth) / 2;
+        var modalY = (virtualHeight - modalHeight) / 2;
+        var x = modalX + sidePadding;
+        var width = Math.Max(1, modalWidth - sidePadding * 2);
+        var y = modalY + headerHeight + headerContentGap;
+        for (var i = 0; i < index; i++)
+            y += rowHeights[i] + gap;
+        return new Rectangle(x, y, width, rowHeights[index]);
     }
 
     private int GetEditorMetaExportControlsTop(int virtualWidth, int virtualHeight)
-        => _editorMetaExportExpanded
-            ? GetEditorMetaExportOptionBounds(0, virtualWidth, virtualHeight).Y
-            : GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight).Y;
+        => GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight).Y;
 
     private void PlaceEditorMetaCaretFromClick(Rectangle bounds, Microsoft.Xna.Framework.Point pixel, float unit)
     {
-        if (_font is null)
-        {
-            _editorMetaInputCaretIndex = _editorMetaInputText.Length;
-            return;
-        }
-
         var fieldId = _editorMetaEditingField is null ? (_editorTextActiveFieldId ?? "meta") : "meta:" + _editorMetaEditingField;
         var textLeft = bounds.X + 10f * unit;
         var textWidth = Math.Max(1f, bounds.Width - 20f * unit);
-        var size = UnicodeTextRenderer.MeasureString(_font, FontSafeText(_font, _editorMetaInputText));
+        if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+        {
+            const string fontPath = "Roboto-Medium.ttf";
+            var textSize = 24f * unit;
+            var clickOffset = Math.Max(0f, pixel.X - textLeft);
+            var previousWidth = 0f;
+            var caret = 0;
+            for (var index = 1; index <= _editorMetaInputText.Length; index++)
+            {
+                var nextWidth = _chartEditorInterfaceRuntime.MeasureTextWidthForUi(
+                    _editorMetaInputText[..index], fontPath, textSize);
+                if (nextWidth > textWidth)
+                    break;
+                if (clickOffset < (previousWidth + nextWidth) * 0.5f)
+                {
+                    caret = index - 1;
+                    break;
+                }
+                previousWidth = nextWidth;
+                caret = index;
+            }
+            if (clickOffset > previousWidth && caret == _editorMetaInputText.Length)
+                caret = _editorMetaInputText.Length;
+            _editorMetaInputCaretIndex = caret;
+            return;
+        }
+
+        var fontName = _chartEditorInterfaceLayout.LabelFont;
+        var font = GetChartEditorFont(fontName);
+        var size = UnicodeTextRenderer.MeasureString(font, FontSafeText(font, _editorMetaInputText));
         var scale = Math.Min(1f, Math.Max(0.55f, (bounds.Height - 8f * unit) / Math.Max(1f, size.Y)));
-        _editorMetaInputCaretIndex = GetEditorTextCaretIndexFromMouse(
-            fieldId, _editorMetaInputText, pixel.X, textLeft, textWidth, scale);
+        font = GetChartEditorFont(fontName, 24f * scale);
+        scale = Math.Min(1f, (bounds.Height - 8f * unit) /
+            Math.Max(1f, UnicodeTextRenderer.MeasureString(font, "Ag").Y));
+        _editorMetaInputCaretIndex = GetEditorTextCaretIndexFromMouse(fieldId, _editorMetaInputText,
+            pixel.X, textLeft, textWidth, scale, font);
+    }
+
+    private Rectangle GetEditorMetaInterfaceFieldBounds(int rowIndex, int virtualWidth, int virtualHeight)
+    {
+        if (_chartEditorInterfaceRuntime.TryGetUiButtonBounds($"editor_meta_row_{rowIndex}", out var bounds))
+            return bounds;
+        return GetEditorMetaFieldBounds(rowIndex, virtualWidth, virtualHeight);
+    }
+
+    private void HandleEditorMetaInterfaceFieldClick(int rowIndex, string fieldKey, string rowValue,
+        Microsoft.Xna.Framework.Point pixel, int virtualWidth, int virtualHeight)
+    {
+        var bounds = GetEditorMetaInterfaceFieldBounds(rowIndex, virtualWidth, virtualHeight);
+        if (bounds.IsEmpty)
+            return;
+
+        if (!string.Equals(_editorMetaEditingField, fieldKey, StringComparison.OrdinalIgnoreCase))
+        {
+            if (_editorMetaEditingField is not null)
+                CommitEditorMetaFieldOnBlur();
+            _editorMetaEditingField = fieldKey;
+            _editorMetaInputText = GetEditorMetaFieldValue(fieldKey, rowValue);
+            _editorMetaInputReplaceOnNextKey = false;
+        }
+
+        PlaceEditorMetaCaretFromClick(bounds, pixel, _projection.ScalePixels(1f));
+        _editorMetaSelectionAnchor = _editorMetaInputCaretIndex;
+        BeginEditorTextFieldMouseSelection("meta:" + fieldKey, bounds,
+            _editorMetaInputCaretIndex, ref _editorMetaSelectionAnchor);
     }
 
     private Rectangle GetEditorElementOptionBounds(int rowIndex, int optionIndex, int virtualWidth, int virtualHeight)
@@ -2285,6 +2532,33 @@ public sealed partial class Playfield
 
     private bool TryHandleEditorMetaPanelClick(Microsoft.Xna.Framework.Point pixel, int virtualWidth, int virtualHeight)
     {
+        if (_editorMetaDeleteConfirmOpen)
+        {
+            var unit = _projection.ScalePixels(1f);
+            var modalW = Math.Min((int)MathF.Round(520f * unit), virtualWidth - 48);
+            var modalH = Math.Max(1, (int)MathF.Round(220f * unit));
+            var modal = new Rectangle((virtualWidth - modalW) / 2, (virtualHeight - modalH) / 2, modalW, modalH);
+            var buttonY = modal.Bottom - (int)MathF.Round(62f * unit);
+            var buttonW = (modal.Width - (int)MathF.Round(68f * unit)) / 2;
+            var cancel = new Rectangle(modal.X + (int)MathF.Round(22f * unit), buttonY, buttonW, (int)MathF.Round(42f * unit));
+            var confirm = new Rectangle(cancel.Right + (int)MathF.Round(12f * unit), buttonY, buttonW, cancel.Height);
+            if (confirm.Contains(pixel)) DeleteEditorDifficultyFromSession();
+            else _editorMetaDeleteConfirmOpen = false;
+            return true;
+        }
+        if (_editorMetaExportExpanded)
+        {
+            for (var i = 0; i < GetEditorMetaExportOptionCount(); i++)
+            {
+                if (GetEditorMetaExportOptionBounds(i, virtualWidth, virtualHeight).Contains(pixel))
+                {
+                    HandleEditorMetaExportOption(i);
+                    return true;
+                }
+            }
+            _editorMetaExportExpanded = false;
+            return true;
+        }
         if (!_editorMetaPanelOpen)
             return false;
         var panel = GetEditorMetaPanelBounds(virtualWidth, virtualHeight);
@@ -2293,6 +2567,7 @@ public sealed partial class Playfield
         if (GetEditorMetaExitButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
         {
             CancelEditorMetaField();
+            _editorMetaExportExpanded = false;
             _editorMetaPanelOpen = false;
             EditorExitRequested?.Invoke();
             return true;
@@ -2300,6 +2575,7 @@ public sealed partial class Playfield
         if (GetEditorMetaCloseButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
         {
             CancelEditorMetaField();
+            _editorMetaExportExpanded = false;
             _editorMetaPanelOpen = false;
             return true;
         }
@@ -2309,6 +2585,8 @@ public sealed partial class Playfield
                 continue;
             _editorMetaScrollOffset = 0;
             _editorElementDropdownOpen = false;
+            // A missing chart is still a valid destination: switching to it
+            // opens a blank chart state so the user can create that difficulty.
             SwitchEditorDifficulty(EditorDifficultyCodes[i]);
             return true;
         }
@@ -2398,6 +2676,14 @@ public sealed partial class Playfield
                 _editorElementDropdownOpen = false;
         }
         ClampEditorMetaScrollOffset(metaRows.Count, virtualWidth, virtualHeight);
+        if (GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight).Contains(pixel))
+        {
+            var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+            if (!HasEditorDifficultyChart(code)) return true;
+            ToggleEditorDifficultyEnabled(code);
+            MarkEditorDirty();
+            return true;
+        }
         var metaContent = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var firstVisibleRow = _editorMetaScrollOffset;
         var visibleRowEnd = Math.Min(metaRows.Count,
@@ -2410,21 +2696,29 @@ public sealed partial class Playfield
                 if (!bounds.Contains(pixel))
                     continue;
                 var fieldLabel = metaRows[i].Label;
+                if (fieldLabel == "DELETE DIFFICULTY")
+                {
+                    if (HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)))
+                        _editorMetaDeleteConfirmOpen = true;
+                    return true;
+                }
                 if (fieldLabel == "ELEMENT")
                 {
                     CancelEditorMetaField();
                     _editorElementDropdownOpen = !_editorElementDropdownOpen;
                     return true;
                 }
-                if (fieldLabel == "EXTRA DIFFICULTY")
+                if (fieldLabel == "DIFFICULTY")
                 {
                     CancelEditorMetaField();
-                    _editorExtraDifficultyEnabled = !_editorExtraDifficultyEnabled;
+                    var difficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+                    if (!HasEditorDifficultyChart(difficultyCode)) return true;
+                    ToggleEditorDifficultyEnabled(difficultyCode);
                     MarkEditorDirty();
                     _editorElementDropdownOpen = false;
-                    _statusMessage = _editorExtraDifficultyEnabled
-                        ? "Extra difficulty enabled; existing charts will export with their normal filename."
-                        : "Extra difficulty disabled; existing Extra charts will export with a .disabled suffix.";
+                    _statusMessage = IsEditorDifficultyEnabled(difficultyCode)
+                        ? $"{GetEditorDifficultyName(difficultyCode)} difficulty enabled."
+                        : $"{GetEditorDifficultyName(difficultyCode)} difficulty disabled; this chart will be omitted from exports.";
                     return true;
                 }
                 if (fieldLabel == "MUSIC")
@@ -2502,49 +2796,8 @@ public sealed partial class Playfield
         if (GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight).Contains(pixel))
         {
             CancelEditorMetaField();
-            _editorMetaExportExpanded = !_editorMetaExportExpanded;
+            _editorMetaExportExpanded = true;
             return true;
-        }
-
-        if (_editorMetaExportExpanded)
-        {
-            for (var i = 0; i < GetEditorMetaExportOptionCount(); i++)
-            {
-                if (!GetEditorMetaExportOptionBounds(i, virtualWidth, virtualHeight).Contains(pixel))
-                    continue;
-                CancelEditorMetaField();
-                _editorMetaExportExpanded = false;
-                var action = GetEditorMetaExportOption(i).Action;
-                switch (action)
-                {
-                    case EditorMetaExportAction.Native:
-                        if (_editorBundleTemplate == ChartBundleTemplate.Tsts)
-                        {
-                            SaveTstsRequested?.Invoke();
-                            _statusMessage = "Native TSTS export requested.";
-                        }
-                        else if (_editorBundleTemplate == ChartBundleTemplate.Bold)
-                        {
-                            SaveAresRequested?.Invoke();
-                            _statusMessage = "Native BOLD ARES export requested.";
-                        }
-                        else
-                        {
-                            SaveTscRequested?.Invoke();
-                            _statusMessage = "Native TSC + JSON export requested.";
-                        }
-                        break;
-                    case EditorMetaExportAction.TscOnly: SaveTscOnlyRequested?.Invoke(); _statusMessage = "TSC-only export requested."; break;
-                    case EditorMetaExportAction.JsonOnly: SaveJsonRequested?.Invoke(); _statusMessage = "JSON-only export requested."; break;
-                    case EditorMetaExportAction.TscZip: SaveTscZipRequested?.Invoke(); _statusMessage = "TSC ZIP export requested."; break;
-                    case EditorMetaExportAction.Ares: SaveAresRequested?.Invoke(); _statusMessage = "ARES export requested."; break;
-#if !TSC_PUBLISH
-                    case EditorMetaExportAction.Fpk: SaveFpkRequested?.Invoke(); _statusMessage = "FPK export requested."; break;
-#endif
-                    case EditorMetaExportAction.Tsts: SaveTstsRequested?.Invoke(); _statusMessage = "TSTS export requested."; break;
-                }
-                return true;
-            }
         }
         // The panel blocks chart clicks while open, even in its unused space.
         return true;
@@ -2553,36 +2806,33 @@ public sealed partial class Playfield
     private Rectangle GetEditorScrollSpeedPanelBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(14f * unit);
-        var padding = (int)MathF.Round(6f * unit);
-        var button = (int)MathF.Round(42f * unit);
-        var gap = (int)MathF.Round(5f * unit);
-        var labelWidth = (int)MathF.Round(82f * unit);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
+        var button = (int)MathF.Round((float)_chartEditorInterfaceLayout.ScrollButtonSize * unit);
         var y = margin;
         var x = margin;
-        return new Rectangle(x, y, padding * 2 + button * 2 + gap * 2 + labelWidth, button + padding * 2);
+        var width = (int)MathF.Round((float)_chartEditorInterfaceLayout.ScrollSpeedWidth * unit);
+        return new Rectangle(x, y, width, button + (int)MathF.Round(16f * unit));
     }
 
     private Rectangle GetEditorScrollSpeedButtonBounds(bool increase, int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorScrollSpeedPanelBounds(virtualWidth, virtualHeight);
-        var padding = (int)MathF.Round(6f * unit);
-        var button = (int)MathF.Round(42f * unit);
-        var gap = (int)MathF.Round(5f * unit);
-        return new Rectangle(panel.X + padding + (increase ? button + gap : 0),
-            panel.Y + padding, button, button);
+        var button = (int)MathF.Round((float)_chartEditorInterfaceLayout.ScrollButtonSize * unit);
+        var buttonOffset = increase ? (float)_chartEditorInterfaceLayout.ScrollSpeedWidth - 40f : 6f;
+        return new Rectangle(panel.X + (int)MathF.Round(buttonOffset * unit),
+            panel.Y + (int)MathF.Round(8f * unit), button, button);
     }
 
     private Rectangle GetEditorTimelineScrubberBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
-        var margin = (int)MathF.Round(14f * unit);
+        var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
         var speedPanel = GetEditorScrollSpeedPanelBounds(virtualWidth, virtualHeight);
-        var top = speedPanel.Bottom + (int)MathF.Round(14f * unit);
+        var top = speedPanel.Bottom + (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelGap * unit);
         var bottomLeftStrip = GetEditorBottomLeftStripBounds(virtualWidth, virtualHeight);
         var bottom = bottomLeftStrip.Y - (int)MathF.Round(10f * unit);
-        var width = Math.Min((int)MathF.Round(124f * unit), Math.Max(64, virtualWidth / 3));
+        var width = Math.Min((int)MathF.Round((float)_chartEditorInterfaceLayout.TimelineWidth * unit), Math.Max(64, virtualWidth / 3));
         var height = Math.Max(1, bottom - top);
         return new Rectangle(margin, top, width, height);
     }
@@ -2882,6 +3132,13 @@ public sealed partial class Playfield
 
     private bool HandleEditorCommandKeybinds()
     {
+        // Preview mode is available as a keybind as well as a toolbar action.
+        if (KeybindSettings.IsPressed("editor_toggle_preview_mode"))
+        {
+            SetEditorPreviewMode(!_editorPreviewMode);
+            return true;
+        }
+
         // Editor playback, seeking, scroll speed, view, and bank routing are
         // configurable keybinds rather than hard-coded checks.
         if (KeybindSettings.IsPressed("editor_scroll_speed_decrease"))
@@ -2906,12 +3163,20 @@ public sealed partial class Playfield
 
         // File commands and selection editing. These intentionally run before
         // note/panel tool handling, and after focused text fields have consumed input.
+        if (KeybindSettings.IsPressed("editor_open_export_modal"))
+        {
+            CancelEditorMetaField();
+            _editorMetaPanelOpen = true;
+            _editorMetaExportExpanded = true;
+            _editorMetaDeleteConfirmOpen = false;
+            _editorElementDropdownOpen = false;
+            return true;
+        }
         if (KeybindSettings.IsPressed("editor_quick_save")) { QuickSaveRequested?.Invoke(); return true; }
 #if !TSC_PUBLISH
         if (KeybindSettings.IsPressed("editor_save_fpk")) { SaveFpkRequested?.Invoke(); return true; }
 #endif
         if (KeybindSettings.IsPressed("editor_save_ares")) { SaveAresRequested?.Invoke(); return true; }
-        if (KeybindSettings.IsPressed("editor_save_tsc")) { SaveTscRequested?.Invoke(); return true; }
         if (KeybindSettings.IsPressed("editor_save_tsts")) { SaveTstsRequested?.Invoke(); return true; }
         if (KeybindSettings.IsPressed("editor_save_json")) { SaveJsonRequested?.Invoke(); return true; }
         if (KeybindSettings.IsPressed("editor_save_tsc_zip")) { SaveTscZipRequested?.Invoke(); return true; }
@@ -3029,6 +3294,11 @@ public sealed partial class Playfield
     {
         if (_editorPanelsViewEnabled)
             return false;
+        if (KeybindSettings.IsPressed("editor_delete_family"))
+        {
+            DeleteSelectedEditorNoteFamily();
+            return true;
+        }
         if (KeybindSettings.IsPressed("editor_delete"))
         {
             if (_editorSelectedTempoEvent is not null) DeleteSelectedEditorTempoChanger();
@@ -3076,6 +3346,12 @@ public sealed partial class Playfield
             case EditorActionPlay:
                 _playing = !_playing;
                 _statusMessage = _playing ? "Preview playing." : "Preview paused.";
+                break;
+            case EditorActionEditorPreview:
+                SetEditorPreviewMode(!_editorPreviewMode);
+                break;
+            case EditorActionGameplayMode:
+                ToggleGameplayMode();
                 break;
             case EditorActionDelete:
                 if (_editorSelectedTempoEvent is not null)

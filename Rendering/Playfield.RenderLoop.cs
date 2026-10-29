@@ -133,7 +133,7 @@ public sealed partial class Playfield
         _graphics.Clear(Background);
         WarmFeedbackRenderingIfNeeded();
 
-        var editorGroupInactiveBanks = _chartEditorMode && !_compact &&
+        var editorGroupInactiveBanks = _chartEditorMode && !_editorPreviewMode && !_compact &&
             _chart is not null && _tempo is not null && _gear is not null &&
             Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f) > 0.001f &&
             Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f) < 0.999f;
@@ -156,6 +156,16 @@ public sealed partial class Playfield
         DrawSkinScriptUiLayers(_skinDrawCommands, true, _skinRuntime);
         _debugSkinDrawMs = ElapsedMilliseconds(skinDrawStartTimestamp);
         _debugAllocSkinDrawBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+
+        // The editor owns its background dimmer: dim background/skin layers by
+        // 50% in top-down 2D, but keep the lanes and notes at full brightness.
+        // 3D view (including preview mode) deliberately leaves the background undimmed.
+        if (_chartEditorMode && !_editorPreviewMode && _topDownViewEnabled && !_editorPanelsViewEnabled)
+        {
+            _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.NonPremultiplied);
+            _spriteBatch.Draw(_pixel, new Rectangle(0, 0, virtualWidth, virtualHeight), new Color(0, 0, 0, 128));
+            _spriteBatch.End();
+        }
 
         var laneDrawCallsStart = _debugTexturedDrawCalls;
         var laneVerticesStart = _debugTexturedVertices;
@@ -192,7 +202,7 @@ public sealed partial class Playfield
             // Beat subdivisions and tempo-change guide lines are editor-only.
             // Do not call their projection/drawing paths during normal gameplay:
             // the judgement line is the only timing line needed while playing.
-            if (_chartEditorMode)
+            if (_chartEditorMode && !_editorPreviewMode)
             {
                 allocStart = GC.GetAllocatedBytesForCurrentThread();
                 DrawEditorBankSeparators();
@@ -223,7 +233,7 @@ public sealed partial class Playfield
             _editorActiveBanksOnlyPass = editorGroupInactiveBanks;
             DrawNotes(currentTick, currentState);
             _editorActiveBanksOnlyPass = false;
-            if (_chartEditorMode)
+            if (_chartEditorMode && !_editorPreviewMode)
                 DrawEditorProblemNoteMarkers(currentTick, currentState);
             _debugAllocNotesBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
             _debugDrawNotesMs = ElapsedMilliseconds(drawNotesStartTimestamp);
@@ -237,12 +247,13 @@ public sealed partial class Playfield
             var feedbackVerticesStart = _debugTexturedVertices;
             allocStart = GC.GetAllocatedBytesForCurrentThread();
             DrawHitAnimations();
-            DrawSelectionOverlay(currentTick, currentState);
-            if (_chartEditorMode && _editorPanelsViewEnabled)
+            if (!_editorPreviewMode)
+                DrawSelectionOverlay(currentTick, currentState);
+            if (_chartEditorMode && !_editorPreviewMode && _editorPanelsViewEnabled)
                 DrawEditorPanelsView(currentTick, currentState);
-            if (!_hideDebugHud)
+            if (!_hideDebugHud && !_chartEditorMode)
                 DrawHud(currentState, currentTick);
-            if (_showAuxTrackDebug)
+            if (_showAuxTrackDebug && !_chartEditorMode)
                 DrawAuxTrackDebugOverlay(currentTick);
             _debugAllocFeedbackHudBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
             if (_performanceDebugInstrumentFrame)
@@ -292,9 +303,44 @@ public sealed partial class Playfield
         // the bottom-left controls and their SNAPS popup fully visible and usable.
         if (_chartEditorMode && _chart is not null && _tempo is not null)
         {
-            DrawEditorProblemsPanel(virtualWidth, virtualHeight);
-            DrawEditorBankIndicators();
-            DrawEditorToolbar();
+            var chartEditorLuaDrawn = false;
+            try
+            {
+                _chartEditorInterfaceRuntime.UpdateChartEditorInterfaceState(
+                    BuildChartEditorInterfaceState(virtualWidth, virtualHeight));
+                var editorCommands = _chartEditorInterfaceRuntime.BuildDrawCommands(virtualWidth, virtualHeight);
+                if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+                {
+                    DrawSkinScriptUiLayers(editorCommands, false, _chartEditorInterfaceRuntime);
+                    if (_editorMetaPanelOpen && string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase) &&
+                        !_editorPreviewEditorOpen && !_editorMetaExportExpanded && !_editorMetaDeleteConfirmOpen && !_editorElementDropdownOpen)
+                        DrawEditorMediaArtworkPreviewOverlay(virtualWidth, virtualHeight);
+                    chartEditorLuaDrawn = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.LogFatal("CHART_EDITOR_INTERFACE_LUA_DRAW", ex);
+            }
+
+            if (!chartEditorLuaDrawn)
+            {
+                if (!_hideDebugHud && !_editorPreviewMode)
+                {
+                    var fallbackTick = _tempo!.SecondsToTick(_playSeconds);
+                    DrawHud(RenderGearState(fallbackTick), fallbackTick);
+                }
+                if (_showAuxTrackDebug && !_editorPreviewMode)
+                    DrawAuxTrackDebugOverlay(_tempo!.SecondsToTick(_playSeconds));
+                if (_editorPreviewMode)
+                    DrawEditorPreviewToolbar();
+                else
+                {
+                    DrawEditorProblemsPanel(virtualWidth, virtualHeight);
+                    DrawEditorBankIndicators();
+                    DrawEditorToolbar();
+                }
+            }
         }
 
         if (_showPerformanceDebug)
@@ -480,9 +526,15 @@ public sealed partial class Playfield
 
     private void EnsureGameplayRenderTarget(int width, int height)
     {
+        // The connector preview renders to a transparent overlay before blending
+        // it back. Preserve the in-progress scene while that overlay target is bound;
+        // otherwise keep the faster discard-contents path used elsewhere.
+        var preserveContents = _chartEditorMode && !_editorPreviewMode &&
+                               _chart is not null && _editorConnectorMode;
         if (_gameplayRenderTarget is not null &&
             _gameplayRenderTarget.Width == width &&
-            _gameplayRenderTarget.Height == height)
+            _gameplayRenderTarget.Height == height &&
+            _gameplayRenderTargetPreservesContents == preserveContents)
             return;
 
         _gameplayRenderTarget?.Dispose();
@@ -494,7 +546,8 @@ public sealed partial class Playfield
             SurfaceFormat.Color,
             DepthFormat.None,
             0,
-            RenderTargetUsage.DiscardContents);
+            preserveContents ? RenderTargetUsage.PreserveContents : RenderTargetUsage.DiscardContents);
+        _gameplayRenderTargetPreservesContents = preserveContents;
     }
 
     private void WarmFeedbackRenderingIfNeeded()

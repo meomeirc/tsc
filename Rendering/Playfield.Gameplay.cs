@@ -1739,9 +1739,13 @@ public sealed partial class Playfield
         if (_chart is null || _gear is null)
             return new Dictionary<int, int>();
 
-        var key = _compact
-            ? (GearTimeline.ActiveBankForSide(currentState, "left"), GearTimeline.ActiveBankForSide(currentState, "right"))
-            : ("Expanded", "Expanded");
+        // Multi-note textures are based only on notes in the banks currently active
+        // on each side, even when the editor is showing all banks in expanded mode.
+        // Inactive-bank notes still render, but they must not make an active-bank
+        // note appear simultaneous.
+        var key = (
+            GearTimeline.ActiveBankForSide(currentState, "left"),
+            GearTimeline.ActiveBankForSide(currentState, "right"));
 
         if (_simultaneousCountsCache.TryGetValue(key, out var cached))
             return cached;
@@ -1751,7 +1755,7 @@ public sealed partial class Playfield
         {
             if ((_chart.PlayTick > 0 && ev.Tick > _chart.PlayTick) || ev.IsSuperFlick || ev.NoteType == NoteType.LinkTail)
                 continue;
-            if (_compact && !currentState.IsActive(ev.Track))
+            if (!currentState.IsActive(ev.Track))
                 continue;
             counts[ev.Tick] = counts.GetValueOrDefault(ev.Tick) + 1;
         }

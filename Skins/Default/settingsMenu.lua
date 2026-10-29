@@ -545,62 +545,26 @@ function render()
         draw_keybinds_page(width, height)
         return
     end
+
     local style = UI.settings_menu or {}
     local padding = tonumber(style.panel_padding or 24) or 24
     local page_padding = math.min(UI.spacing.page_padding, math.max(24, width * 0.05))
     local panel_width = math.min(tonumber(style.panel_width or 1080) or 1080, width - page_padding * 2)
     local panel_x = (width - panel_width) * 0.5
-    local panel_top = tonumber(style.panel_top or 142) or 142
+    local panel_top = math.max(176, tonumber(style.panel_top or 176) or 176)
     local row_height = tonumber(style.row_height or 66) or 66
     local row_gap = tonumber(style.row_gap or 7) or 7
-    local row_count = 13
-    local available_panel_height = math.max(1, height - panel_top - (tonumber(style.panel_bottom_padding or 115) or 115))
-    row_height = math.min(row_height, math.max(24, (available_panel_height - padding * 2 - row_gap * (row_count - 1)) / row_count))
-    local panel_height = math.min(padding * 2 + row_height * row_count + row_gap * (row_count - 1), available_panel_height)
+    local tab = tostring(menu.settings_tab or "general")
+    if tab ~= "audio" and tab ~= "display" then tab = "general" end
 
-    UI.layout_box({ id = "settings_viewport", width = width, height = height })
-    draw.text("SETTINGS", {
-        parent = "settings_viewport",
-        x = width * 0.5,
-        y = tonumber(style.heading_y or 64) or 64,
-        size = tonumber(style.heading_size or UI.sizes.heading) or UI.sizes.heading,
-        color = UI.colors.text,
-        font = UI.fonts.bold,
-        anchor = "center",
-        layer = 2,
-    })
-    draw.text("Changes are saved automatically", {
-        parent = "settings_viewport",
-        x = width * 0.5,
-        y = (tonumber(style.heading_y or 64) or 64) + 35,
-        size = UI.sizes.small,
-        color = UI.colors.muted,
-        font = UI.fonts.regular,
-        anchor = "center",
-        layer = 2,
-    })
-
-    UI.draw_panel({
-        id = "settings_panel",
-        parent = "settings_viewport",
-        x = panel_x,
-        y = panel_top,
-        width = panel_width,
-        height = panel_height,
-        color = UI.colors.background,
-        alpha = 0.96,
-        layer = 5,
-    })
-
-    local row_width = math.max(1, panel_width - padding * 2)
-    local row_x = padding
-    local row_y = padding
     local settings = game.settings
     local speed = tonumber(settings.scroll_speed or 1.0) or 1.0
     local scroll_mode = tostring(settings.scroll_mode or "xmod"):lower()
+    local music_volume = tonumber(settings.music_volume or 1.0) or 1.0
     local tap_volume = tonumber(settings.tap_volume or 1.0) or 1.0
     local link_volume = tonumber(settings.link_volume or 1.0) or 1.0
     local lane_volume = tonumber(settings.lane_switch_volume or 1.0) or 1.0
+    local metronome_volume = tonumber(settings.metronome_volume or 1.0) or 1.0
     local early_late = tonumber(settings.early_late_minimum_offset_ms or 25) or 25
     local timing_offset = tonumber(settings.timing_offset_minimum_offset_ms or 25) or 25
     local max_frame_rate = tonumber(settings.max_frame_rate or 0) or 0
@@ -609,125 +573,147 @@ function render()
     local display_mode_label = display_mode == "borderless" and "BORDERLESS WINDOW"
         or (display_mode == "fullscreen" and "FULLSCREEN" or "WINDOWED")
 
-    draw_slider_row({
-        parent = "settings_panel", id = "setting_scroll_speed_row", control_id = "setting_scroll_speed",
-        setting_key = "scroll_speed", x = row_x, y = row_y, width = row_width, height = row_height,
-        label = "SCROLL SPEED", current = speed, minimum = 0.25, maximum = 9.0, step = 0.05,
-        action = "set_scroll_speed", value_label = value_text("%.2fx", speed, "1.00x"),
-    })
-    row_y = row_y + row_height + row_gap
+    local row_count = tab == "general" and 6 or (tab == "display" and 4 or 5)
+    local available_panel_height = math.max(1, height - panel_top - (tonumber(style.panel_bottom_padding or 115) or 115))
+    row_height = math.min(row_height, math.max(24, (available_panel_height - padding * 2 - row_gap * (row_count - 1)) / row_count))
+    local panel_height = math.min(padding * 2 + row_height * row_count + row_gap * (row_count - 1), available_panel_height)
 
-    draw_plain_row({
-        parent = "settings_panel", id = "setting_scroll_mode_row", control_id = "setting_scroll_mode",
-        x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
-        label = "SCROLL MODE (XMOD / MMOD)", button_width = 260, button_height = math.min(48, row_height - 4),
-        button_label = string.upper(scroll_mode), action = "toggle_scroll_mode",
-        selected = scroll_mode == "mmod",
+    UI.layout_box({ id = "settings_viewport", width = width, height = height })
+    draw.text("SETTINGS", {
+        parent = "settings_viewport", x = width * 0.5,
+        y = tonumber(style.heading_y or 48) or 48,
+        size = tonumber(style.heading_size or UI.sizes.heading) or UI.sizes.heading,
+        color = UI.colors.text, font = UI.fonts.bold, anchor = "center", layer = 2,
     })
-    row_y = row_y + row_height + row_gap
+    draw.text("Changes are saved automatically", {
+        parent = "settings_viewport", x = width * 0.5,
+        y = (tonumber(style.heading_y or 48) or 48) + 35,
+        size = UI.sizes.small, color = UI.colors.muted, font = UI.fonts.regular,
+        anchor = "center", layer = 2,
+    })
 
-    draw_slider_row({
-        parent = "settings_panel", id = "setting_tap_volume_row", control_id = "setting_tap_volume",
-        setting_key = "tap_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-        label = "TAP VOLUME", current = tap_volume, minimum = 0, maximum = 1, step = 0.01,
-        action = "set_tap_volume", value_label = value_text("%.0f%%", tap_volume * 100, "100%"),
-    })
-    row_y = row_y + row_height + row_gap
-    draw_slider_row({
-        parent = "settings_panel", id = "setting_link_volume_row", control_id = "setting_link_volume",
-        setting_key = "link_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-        label = "LINK VOLUME", current = link_volume, minimum = 0, maximum = 1, step = 0.01,
-        action = "set_link_volume", value_label = value_text("%.0f%%", link_volume * 100, "100%"),
-    })
-    row_y = row_y + row_height + row_gap
-    draw_slider_row({
-        parent = "settings_panel", id = "setting_lane_switch_volume_row", control_id = "setting_lane_switch_volume",
-        setting_key = "lane_switch_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-        label = "LANE SWITCH VOLUME", current = lane_volume, minimum = 0, maximum = 1, step = 0.01,
-        action = "set_lane_switch_volume", value_label = value_text("%.0f%%", lane_volume * 100, "100%"),
-    })
-    row_y = row_y + row_height + row_gap
-    draw_slider_row({
-        parent = "settings_panel", id = "setting_early_late_row", control_id = "setting_early_late",
-        setting_key = "early_late_minimum_offset_ms", x = row_x, y = row_y, width = row_width, height = row_height,
-        label = "SKIN EARLY/LATE THRESHOLD", current = early_late, minimum = 0, maximum = 250, step = 5,
-        action = "set_early_late_minimum_offset_ms", value_label = value_text("%.0f ms", early_late, "25 ms"),
-    })
-    row_y = row_y + row_height + row_gap
-    draw_slider_row({
-        parent = "settings_panel", id = "setting_timing_offset_row", control_id = "setting_timing_offset",
-        setting_key = "timing_offset_minimum_offset_ms", x = row_x, y = row_y, width = row_width, height = row_height,
-        label = "SKIN TIMING OFFSET THRESHOLD", current = timing_offset, minimum = 0, maximum = 250, step = 5,
-        action = "set_timing_offset_minimum_offset_ms", value_label = value_text("%.0f ms", timing_offset, "25 ms"),
-    })
-    row_y = row_y + row_height + row_gap
-    draw_slider_row({
-        parent = "settings_panel", id = "setting_max_frame_rate_row", control_id = "setting_max_frame_rate",
-        setting_key = "max_frame_rate", x = row_x, y = row_y, width = row_width, height = row_height,
-        label = "MAX FRAME RATE", current = clamp(max_frame_rate, 0, 1000), minimum = 0, maximum = 1000, step = 1,
-        action = "set_max_frame_rate",
-        value_label = max_frame_rate <= 0 and "DEFAULT / 60 FPS" or value_text("%.0f FPS", max_frame_rate, "DEFAULT / 60 FPS"),
-    })
-    row_y = row_y + row_height + row_gap
+    local tabs = {
+        { id = "general", label = "GENERAL" },
+        { id = "audio", label = "AUDIO" },
+        { id = "display", label = "DISPLAY" },
+    }
+    local tab_gap = 10
+    local tab_width = math.min(220, (panel_width - tab_gap * 2) / 3)
+    local tabs_width = tab_width * 3 + tab_gap * 2
+    local tabs_x = (width - tabs_width) * 0.5
+    for index, item in ipairs(tabs) do
+        UI.draw_button({
+            id = "settings_tab_" .. item.id, parent = "settings_viewport",
+            x = tabs_x + (index - 1) * (tab_width + tab_gap), y = panel_top - 54,
+            width = tab_width, height = 42, label = item.label,
+            text_size = UI.sizes.body, font = UI.fonts.bold,
+            action = "set_settings_tab", value = item.id,
+            variant = tab == item.id and "primary" or "secondary",
+            selected = tab == item.id, layer = 5,
+        })
+    end
 
-    draw_plain_row({
-        parent = "settings_panel", id = "setting_vsync_row", control_id = "setting_vsync",
-        x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
-        label = "VERTICAL SYNC", button_width = 360, button_height = math.min(48, row_height - 4),
-        button_label = vsync and "V-SYNC: ON" or "V-SYNC: OFF",
-        action = "toggle_vsync", selected = vsync,
+    UI.draw_panel({
+        id = "settings_panel", parent = "settings_viewport",
+        x = panel_x, y = panel_top, width = panel_width, height = panel_height,
+        color = UI.colors.background, alpha = 0.96, layer = 5,
     })
-    row_y = row_y + row_height + row_gap
 
-    draw_plain_row({
-        parent = "settings_panel", id = "setting_display_mode_row", control_id = "setting_display_mode",
-        x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
-        label = "DISPLAY MODE", button_width = 360, button_height = math.min(48, row_height - 4),
-        button_label = display_mode_label, action = "toggle_display_mode",
-        selected = display_mode ~= "windowed",
-    })
-    row_y = row_y + row_height + row_gap
+    local row_width = math.max(1, panel_width - padding * 2)
+    local row_x, row_y = padding, padding
+    local function next_row() row_y = row_y + row_height + row_gap end
 
-    draw_plain_row({
-        parent = "settings_panel", id = "setting_gauge_row", control_id = "setting_gauge_toggle",
-        x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
-        label = "GAUGE TYPE", button_width = 260, button_height = math.min(48, row_height - 4),
-        button_label = tostring(settings.gauge or "hard"):upper() == "HARD" and "GAUGE: HARD" or "GAUGE: EASY",
-        action = "toggle_gauge", selected = tostring(settings.gauge or "hard"):upper() == "HARD",
-    })
-    row_y = row_y + row_height + row_gap
-
-    draw_plain_row({
-        parent = "settings_panel", id = "setting_skin_row", control_id = "setting_skin_dropdown",
-        x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
-        label = "SKIN", button_width = 360, button_height = math.min(48, row_height - 4),
-        button_label = tostring(menu.skin or settings.skin or "Default") .. "  ▼",
-        action = "toggle_skin_dropdown", selected = menu.skin_dropdown_open == true,
-    })
-    row_y = row_y + row_height + row_gap
-    draw_plain_row({
-        parent = "settings_panel", id = "setting_keybinds_row", control_id = "setting_keybinds_open",
-        x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
-        label = "KEYBOARD / GAMEPLAY KEYBINDS", button_width = 360, button_height = math.min(48, row_height - 4),
-        button_label = "CONFIGURE  →", action = "open_keybinds",
-    })
+    if tab == "general" then
+        draw_slider_row({ parent = "settings_panel", id = "setting_scroll_speed_row", control_id = "setting_scroll_speed",
+            setting_key = "scroll_speed", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "SCROLL SPEED", current = speed, minimum = 0.25, maximum = 9.0, step = 0.05,
+            action = "set_scroll_speed", value_label = value_text("%.2fx", speed, "1.00x") })
+        next_row()
+        draw_plain_row({ parent = "settings_panel", id = "setting_scroll_mode_row", control_id = "setting_scroll_mode",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "SCROLL MODE (XMOD / MMOD)", button_width = 260, button_height = math.min(48, row_height - 4),
+            button_label = string.upper(scroll_mode), action = "toggle_scroll_mode", selected = scroll_mode == "mmod" })
+        next_row()
+        draw_plain_row({ parent = "settings_panel", id = "setting_gauge_row", control_id = "setting_gauge_toggle",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "GAUGE TYPE", button_width = 260, button_height = math.min(48, row_height - 4),
+            button_label = tostring(settings.gauge or "hard"):upper() == "HARD" and "GAUGE: HARD" or "GAUGE: EASY",
+            action = "toggle_gauge", selected = tostring(settings.gauge or "hard"):upper() == "HARD" })
+        next_row()
+        draw_slider_row({ parent = "settings_panel", id = "setting_early_late_row", control_id = "setting_early_late",
+            setting_key = "early_late_minimum_offset_ms", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "SKIN EARLY/LATE THRESHOLD", current = early_late, minimum = 0, maximum = 250, step = 5,
+            action = "set_early_late_minimum_offset_ms", value_label = value_text("%.0f ms", early_late, "25 ms") })
+        next_row()
+        draw_slider_row({ parent = "settings_panel", id = "setting_timing_offset_row", control_id = "setting_timing_offset",
+            setting_key = "timing_offset_minimum_offset_ms", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "SKIN TIMING OFFSET THRESHOLD", current = timing_offset, minimum = 0, maximum = 250, step = 5,
+            action = "set_timing_offset_minimum_offset_ms", value_label = value_text("%.0f ms", timing_offset, "25 ms") })
+        next_row()
+        draw_plain_row({ parent = "settings_panel", id = "setting_keybinds_row", control_id = "setting_keybinds_open",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "KEYBOARD / GAMEPLAY KEYBINDS", button_width = 360, button_height = math.min(48, row_height - 4),
+            button_label = "CONFIGURE  →", action = "open_keybinds" })
+    elseif tab == "audio" then
+        draw_slider_row({ parent = "settings_panel", id = "setting_music_volume_row", control_id = "setting_music_volume",
+            setting_key = "music_volume", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "MUSIC VOLUME", current = music_volume, minimum = 0, maximum = 1, step = 0.01,
+            action = "set_music_volume", value_label = value_text("%.0f%%", music_volume * 100, "100%") })
+        next_row()
+        draw_slider_row({ parent = "settings_panel", id = "setting_tap_volume_row", control_id = "setting_tap_volume",
+            setting_key = "tap_volume", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "TAP VOLUME", current = tap_volume, minimum = 0, maximum = 1, step = 0.01,
+            action = "set_tap_volume", value_label = value_text("%.0f%%", tap_volume * 100, "100%") })
+        next_row()
+        draw_slider_row({ parent = "settings_panel", id = "setting_link_volume_row", control_id = "setting_link_volume",
+            setting_key = "link_volume", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "LINK VOLUME", current = link_volume, minimum = 0, maximum = 1, step = 0.01,
+            action = "set_link_volume", value_label = value_text("%.0f%%", link_volume * 100, "100%") })
+        next_row()
+        draw_slider_row({ parent = "settings_panel", id = "setting_lane_switch_volume_row", control_id = "setting_lane_switch_volume",
+            setting_key = "lane_switch_volume", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "LANE SWITCH VOLUME", current = lane_volume, minimum = 0, maximum = 1, step = 0.01,
+            action = "set_lane_switch_volume", value_label = value_text("%.0f%%", lane_volume * 100, "100%") })
+        next_row()
+        draw_slider_row({ parent = "settings_panel", id = "setting_metronome_volume_row", control_id = "setting_metronome_volume",
+            setting_key = "metronome_volume", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "METRONOME VOLUME", current = metronome_volume, minimum = 0, maximum = 1, step = 0.01,
+            action = "set_metronome_volume", value_label = value_text("%.0f%%", metronome_volume * 100, "100%") })
+    else
+        draw_slider_row({ parent = "settings_panel", id = "setting_max_frame_rate_row", control_id = "setting_max_frame_rate",
+            setting_key = "max_frame_rate", x = row_x, y = row_y, width = row_width, height = row_height,
+            label = "MAX FRAME RATE", current = clamp(max_frame_rate, 0, 1000), minimum = 0, maximum = 1000, step = 1,
+            action = "set_max_frame_rate", value_label = max_frame_rate <= 0 and "DEFAULT / 60 FPS" or value_text("%.0f FPS", max_frame_rate, "DEFAULT / 60 FPS") })
+        next_row()
+        draw_plain_row({ parent = "settings_panel", id = "setting_vsync_row", control_id = "setting_vsync",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "VERTICAL SYNC", button_width = 360, button_height = math.min(48, row_height - 4),
+            button_label = vsync and "V-SYNC: ON" or "V-SYNC: OFF", action = "toggle_vsync", selected = vsync })
+        next_row()
+        draw_plain_row({ parent = "settings_panel", id = "setting_display_mode_row", control_id = "setting_display_mode",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "DISPLAY MODE", button_width = 360, button_height = math.min(48, row_height - 4),
+            button_label = display_mode_label, action = "toggle_display_mode", selected = display_mode ~= "windowed" })
+        next_row()
+        draw_plain_row({ parent = "settings_panel", id = "setting_skin_row", control_id = "setting_skin_dropdown",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "SKIN", button_width = 360, button_height = math.min(48, row_height - 4),
+            button_label = tostring(menu.skin or settings.skin or "Default") .. "  ▼",
+            action = "toggle_skin_dropdown", selected = menu.skin_dropdown_open == true })
+        next_row()
+    end
 
     UI.draw_button({
-        id = "settings_back",
-        parent = "settings_viewport",
+        id = "settings_back", parent = "settings_viewport",
         x = (width - (tonumber(style.back_width or 260) or 260)) * 0.5,
         y = height - (tonumber(style.back_bottom or 30) or 30) - (tonumber(style.back_height or 64) or 64),
         width = tonumber(style.back_width or 260) or 260,
         height = tonumber(style.back_height or 64) or 64,
-        label = "BACK",
-        text_size = UI.sizes.button,
-        font = UI.fonts.bold,
-        action = "back_main_menu",
-        variant = "secondary",
-        layer = 30,
+        label = "BACK", text_size = UI.sizes.button, font = UI.fonts.bold,
+        action = "back_main_menu", variant = "secondary", layer = 30,
     })
 
-    if menu.skin_dropdown_open then
+    if menu.skin_dropdown_open and tab == "display" then
         draw_skin_dropdown(width, height, screen.ref_scale or 1)
     end
 end

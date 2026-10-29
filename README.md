@@ -20,7 +20,7 @@ dotnet run --project .\TSC.csproj
 To publish using the included Windows x64 profile:
 
 ```powershell
-dotnet publish .\TSC.csproj -p:PublishProfile=Properties\PublishProfiles\TSC-Publish.pubxml
+dotnet publish TSC.csproj -c Publish -p:PublishProfile=TSC-Publish
 ```
 
 The profile writes to `bin/Publish/win-x64/`.

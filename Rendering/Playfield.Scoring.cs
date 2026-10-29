@@ -458,7 +458,7 @@ public sealed partial class Playfield
         return lo;
     }
 
-    private void ProcessAutomaticJudgements(double fromSeconds, double toSeconds)
+    private void ProcessAutomaticJudgements(double fromSeconds, double toSeconds, bool scoreOnly = false)
     {
         if (_scoreEntries.Count == 0 || toSeconds <= fromSeconds)
             return;
@@ -507,7 +507,7 @@ public sealed partial class Playfield
                 if (_scoredEntryIds.Contains(entry.Id) || !IsAutomaticScoreEntryActive(entry, tickState))
                     continue;
 
-                AwardAutomaticScoreEntry(entry, applyEditorPreviewRouteChange: false);
+                AwardAutomaticScoreEntry(entry, applyEditorPreviewRouteChange: false, scoreOnly: scoreOnly);
                 if (entry.Kind == ScoreEntryKind.SuperFlick && entry.SuperFlickKey.HasValue &&
                     _scoredEntryIds.Contains(entry.Id))
                 {
@@ -520,10 +520,48 @@ public sealed partial class Playfield
 
             foreach (var hit in successfulSuperFlicks)
                 ApplyEditorPreviewSuperFlickHit(hit);
-            if (successfulSuperFlicks.Count > 0)
+            if (!scoreOnly && successfulSuperFlicks.Count > 0)
                 RefreshSkinGameState();
             index = next;
         }
+    }
+
+    private void RebuildEditorAutoplayResultsToCurrentTime()
+    {
+        if (!_chartEditorMode || _chart is null || _tempo is null)
+            return;
+
+        // Preserve the route actually reached during gameplay, even though the
+        // scoring pass itself is replayed from the selected preview start banks.
+        var livePreviewState = EnsureEditorPreviewGearState().Copy();
+        var liveGameplayState = _gameplayState.Copy();
+        var liveRouteHistory = _editorTimelineRouteHistory
+            .Select(entry => (Seconds: entry.Seconds, State: entry.State.Copy()))
+            .ToList();
+
+        _editorPreviewGearState = CreateEditorPreviewInitialState();
+        _gameplayState = _editorPreviewGearState.Copy();
+        SyncEditorPreviewBankIndicators(_editorPreviewGearState);
+        ResetEditorTimelineRouteHistory(_editorPreviewGearState);
+        ResetGameplayResults();
+        ResetBankSwitchTransitions();
+
+        if (_playSeconds > 0.0)
+            ProcessAutomaticJudgements(0.0, _playSeconds, scoreOnly: true);
+
+        // Only the result values come from the replay. Keep gameplay's actual gear
+        // state and route history so subsequent autoplay continues from where the
+        // user left it, rather than snapping to the simulated route.
+        _editorPreviewGearState = livePreviewState;
+        _gameplayState = liveGameplayState;
+        SyncEditorPreviewBankIndicators(livePreviewState);
+        _editorTimelineRouteHistory.Clear();
+        _editorTimelineRouteHistory.AddRange(liveRouteHistory);
+        ResetBankSwitchTransitions();
+        _autoJudgementSeconds = _playSeconds;
+        _autoSoundSeconds = _playSeconds;
+        RefreshSkinGameState();
+        _skinRuntime.OnComboChanged(_combo);
     }
 
     private bool IsAutomaticScoreEntryActive(ScoreEntry entry, GearState? stateOverride = null)
@@ -583,7 +621,10 @@ public sealed partial class Playfield
         return lo;
     }
 
-    private void AwardAutomaticScoreEntry(ScoreEntry entry, bool applyEditorPreviewRouteChange = true)
+    private void AwardAutomaticScoreEntry(
+        ScoreEntry entry,
+        bool applyEditorPreviewRouteChange = true,
+        bool scoreOnly = false)
     {
         if (_scoredEntryIds.Contains(entry.Id))
             return;
@@ -591,6 +632,27 @@ public sealed partial class Playfield
         AwardScorePoints(entry, JudgementTier.PerfectPlus);
         if (entry.Kind is ScoreEntryKind.Event or ScoreEntryKind.SuperFlick or ScoreEntryKind.HoldTick)
             RecordAccuracy(JudgementTier.PerfectPlus, 0.0, entry);
+
+        if (scoreOnly)
+        {
+            // Rebuilding the editor's all-Perfect+ score must update result values
+            // without replaying hit animations, skin callbacks, or other effects
+            // for every note that has already passed the playhead.
+            if (entry.Kind == ScoreEntryKind.Event)
+            {
+                if (entry.CountsCombo)
+                    _combo++;
+            }
+            else
+            {
+                _combo++;
+            }
+
+            _maxCombo = Math.Max(_maxCombo, _combo);
+            _lastJudgement = "PERFECT+";
+            _lastJudgementColor = Color.White;
+            return;
+        }
 
         if (entry.Kind == ScoreEntryKind.Event && entry.EventKey.HasValue)
         {

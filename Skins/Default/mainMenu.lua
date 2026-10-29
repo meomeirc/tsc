@@ -93,6 +93,21 @@ function render()
         layer = 4,
     })
 
+    local update_status = tostring(menu.update_status or "")
+    if update_status ~= "" then
+        local version_width = (#version + 1) * UI.sizes.small * 0.58
+        draw.text(update_status, {
+            parent = "main_viewport",
+            x = page_padding + version_width + 18,
+            y = height - 18,
+            size = UI.sizes.small,
+            color = update_status == "Update available" and UI.colors.accent or UI.colors.muted,
+            font = UI.fonts.regular,
+            anchor = "left",
+            layer = 4,
+        })
+    end
+
     local error = menu.error
     if error ~= nil and error ~= "" then
         draw.text(error, {

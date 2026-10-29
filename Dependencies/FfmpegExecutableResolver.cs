@@ -31,9 +31,10 @@ internal static class FfmpegExecutableResolver
 
         foreach (var candidate in new[]
         {
-            Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe"),
-            Path.Combine(AppContext.BaseDirectory, "tools", "ffmpeg.exe"),
-            Path.Combine(AppContext.BaseDirectory, "Tools", "ffmpeg.exe")
+            Path.Combine(UserDataPaths.GameRootDirectory, "ffmpeg.exe"),
+            Path.Combine(UserDataPaths.GameRootDirectory, "tools", "ffmpeg.exe"),
+            Path.Combine(UserDataPaths.GameRootDirectory, "Tools", "ffmpeg.exe"),
+            Path.Combine(AppContext.BaseDirectory, "tools", "ffmpeg.exe")
         })
         {
             if (File.Exists(candidate))
@@ -48,7 +49,7 @@ internal static class FfmpegExecutableResolver
 
 #if !TSC_PUBLISH
         // Developer builds may run from bin/Debug/... while tools/ sits at the
-        // project root. Publish builds intentionally search only beside the app.
+        // project root. Published builds resolve user tools through GameRootDirectory.
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
         {
             foreach (var candidate in new[]
@@ -92,8 +93,8 @@ internal static class FfmpegExecutableResolver
     {
         foreach (var archivePath in new[]
         {
-            Path.Combine(AppContext.BaseDirectory, "tools", "ffmpeg.7z"),
-            Path.Combine(AppContext.BaseDirectory, "Tools", "ffmpeg.7z")
+            Path.Combine(UserDataPaths.GameRootDirectory, "tools", "ffmpeg.7z"),
+            Path.Combine(UserDataPaths.GameRootDirectory, "Tools", "ffmpeg.7z")
         })
         {
             if (!File.Exists(archivePath))

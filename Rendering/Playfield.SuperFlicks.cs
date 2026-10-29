@@ -1031,6 +1031,14 @@ public sealed partial class Playfield
         {
             foreach (var bank in VisibleBanks(state))
             {
+                // Expanded gameplay shows every bank's lane geometry, but input
+                // highlights must follow only the active bank on each side.
+                if (!string.Equals(
+                        GearTimeline.ActiveBankForSide(state, bank.Side),
+                        bank.Bank,
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+
                 foreach (var column in HighlightColumns(bank.Side, bank.Bank))
                 {
                     if (!TryGetTrackForBankColumn(bank.Side, bank.Bank, column, out var track))
@@ -1151,6 +1159,14 @@ public sealed partial class Playfield
 
         foreach (var bank in VisibleBanks(state))
         {
+            // In expanded gameplay, all banks remain visible, but a held or
+            // rising lane highlight belongs only to the active bank for its side.
+            if (_gameplayMode && !string.Equals(
+                    GearTimeline.ActiveBankForSide(state, bank.Side),
+                    bank.Bank,
+                    StringComparison.OrdinalIgnoreCase))
+                continue;
+
             if (!ShouldRenderBankInCurrentEditorPass(bank.Side, bank.Bank, state))
                 continue;
 

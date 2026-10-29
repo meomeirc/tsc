@@ -57,7 +57,7 @@ public sealed partial class Playfield
     private void PlayEditorMetronomeTick()
     {
         EnsureEditorMetronomeSoundLoaded();
-        _editorMetronomeSound?.Play(0.75f);
+        _editorMetronomeSound?.Play(Math.Clamp(_skin.GameConfig.MetronomeVolume, 0f, 1f));
     }
 
     private void UpdateEditorMetronome(

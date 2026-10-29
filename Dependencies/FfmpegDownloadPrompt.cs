@@ -11,7 +11,7 @@ internal readonly record struct FfmpegDownloadPromptResult(bool Installed, strin
 
 /// <summary>
 /// Offers an optional, one-click install of the compact FFmpeg Essentials build.
-/// Only ffmpeg.exe is extracted into the app-local tools folder.
+/// Only ffmpeg.exe is extracted into the install-root tools folder.
 /// </summary>
 internal static class FfmpegDownloadPrompt
 {
@@ -23,7 +23,7 @@ internal static class FfmpegDownloadPrompt
         if (!OperatingSystem.IsWindows())
             return new FfmpegDownloadPromptResult(false);
 
-        var destination = Path.Combine(AppContext.BaseDirectory, "tools", "ffmpeg.exe");
+        var destination = UserDataPaths.GetPath("tools", "ffmpeg.exe");
         using var prompt = new Form
         {
             Text = "FFmpeg not found",
@@ -207,11 +207,7 @@ internal static class FfmpegDownloadPrompt
 
         private static string? WriteDownloadFailureLog(Exception exception, string failedStage)
         {
-            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-            if (string.IsNullOrWhiteSpace(localAppData))
-                return null;
-
-            var logPath = Path.Combine(localAppData, "TSC", "Logs", "ffmpeg-download.log");
+            var logPath = UserDataPaths.GetPath("Logs", "ffmpeg-download.log");
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
@@ -284,7 +280,7 @@ internal static class FfmpegDownloadPrompt
     {
         const long maximumArchiveBytes = 128L * 1024 * 1024;
         var archivePath = Path.Combine(Path.GetTempPath(), $"tsc-ffmpeg-{Guid.NewGuid():N}.7z");
-        var toolsDirectory = Path.Combine(AppContext.BaseDirectory, "tools");
+        var toolsDirectory = UserDataPaths.GetPath("tools");
         var temporaryExecutable = Path.Combine(toolsDirectory, $"ffmpeg-{Guid.NewGuid():N}.tmp");
         var destination = Path.Combine(toolsDirectory, "ffmpeg.exe");
 
