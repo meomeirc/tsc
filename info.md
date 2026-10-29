@@ -1,6 +1,6 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
-# 0.0.2
+# 0.0.13
 
 i think im gonna use this menu for changelog so uhh
 
