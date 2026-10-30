@@ -879,7 +879,7 @@ end
 
 local function drawBottomActionButton(item, x, y, width, height, layer)
     if item == nil then return end
-    -- Fourteen actions share this row, so fit labels to each button rather than
+    -- The editor actions share this row, so fit labels to each button rather than
     -- letting long names spill into neighboring controls at narrow resolutions.
     local textSize = math.min(fontSize("body"), math.max(fontSize("small") * 0.9, width * 0.12))
     local fittedLabel = fittedMeasuredText(item.label or "", math.max(1, width - 18 * ACTIVE_SCALE), textSize, F.medium)

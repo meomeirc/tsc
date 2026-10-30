@@ -58,6 +58,8 @@ public sealed partial class Playfield
 
         ClearNoteGeometryCache();
         var counts = SimultaneousCounts(currentState);
+        var showEditorAttributes = _chartEditorMode && !_editorPreviewMode && _editorShowAttributes;
+        _editorNoteAttributeLabels.Clear();
         // Use the same spatial coordinate as the cached event positions. In
         // constant-scroll mode this is chart time (seconds); otherwise it is ticks.
         var currentScrollUnits = _projection.ScrollCoordinateAtTick(currentTick);
@@ -221,6 +223,26 @@ public sealed partial class Playfield
 
             if (_projection.BeyondLaneStart(startTravel, endTravel))
                 continue;
+
+            if (showEditorAttributes && ev.Track is >= 0 and <= 15 && renderInBank &&
+                (_chart.PlayTick <= 0 || ev.Tick <= _chart.PlayTick) &&
+                (!_gameplayMode || !_hitEvents.Contains(eventKey)) &&
+                (_gameplayMode || isLongOrLinkBody || startTravel > 0f))
+            {
+                var isLinkedChainNode = ev.NoteType == NoteType.LinkHead
+                    ? _linkHeadKeys.Contains(eventKey)
+                    : ev.NoteType == NoteType.LinkTail && _linkHeadByTailKey.ContainsKey(eventKey);
+                // Linked heads/tails disappear when they pass the judge line. Keep
+                // standalone holds labelled at the judge line while their body remains.
+                if (!isLinkedChainNode || startTravel > 0f)
+                {
+                    var labelTick = startTravel < -1f && isLongOrLinkBody && !isLinkedChainNode
+                        ? currentTick
+                        : ev.Tick;
+                    var point = _projection.ProjectAtTicks(ev.Track, labelTick, currentTick, currentState);
+                    _editorNoteAttributeLabels.Add((point, ev.Attr));
+                }
+            }
 
             if (_gameplayMode && ev.NoteType is NoteType.SingleLong or NoteType.Vibrato)
             {
@@ -696,6 +718,65 @@ public sealed partial class Playfield
         // set. These retain the previous geometry instead of silently hiding a
         // chart element.
         DrawFallbackHeadShapes(currentState, counts);
+        if (showEditorAttributes)
+            DrawEditorNoteAttributeLabels();
+    }
+
+    private void DrawEditorNoteAttributeLabels()
+    {
+        if (_editorNoteAttributeLabels.Count == 0)
+            return;
+
+        _editorNoteAttributeLabels.Sort(static (left, right) => right.Point.Depth.CompareTo(left.Point.Depth));
+        var textColor = Color.White;
+        var outline = Color.Black;
+        const float outlineThickness = 1.25f;
+        _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        foreach (var (point, attribute) in _editorNoteAttributeLabels)
+        {
+            if (!float.IsFinite(point.Position.X) || !float.IsFinite(point.Position.Y) ||
+                point.Position.X < -64f || point.Position.Y < -64f ||
+                point.Position.X > _graphics.Viewport.Width + 64f ||
+                point.Position.Y > _graphics.Viewport.Height + 64f)
+                continue;
+
+            var label = attribute.ToString(CultureInfo.InvariantCulture);
+            var measured = UnicodeTextRenderer.MeasureString(_font, label);
+            var targetWidth = Math.Max(12f, _projection.NoteWidth * Math.Max(0.25f, point.Scale) * 0.82f);
+            var scale = Math.Clamp(targetWidth / Math.Max(1f, measured.X), 0.45f, 1.35f);
+            var size = measured * scale;
+            var position = point.Position - size * 0.5f;
+
+            // Draw a black stroke around the white number so it remains
+            // readable on both bright and dark note textures.
+            var left = new Vector2(-outlineThickness, 0f);
+            var right = new Vector2(outlineThickness, 0f);
+            var up = new Vector2(0f, -outlineThickness);
+            var down = new Vector2(0f, outlineThickness);
+            var upperLeft = new Vector2(-outlineThickness, -outlineThickness);
+            var upperRight = new Vector2(outlineThickness, -outlineThickness);
+            var lowerLeft = new Vector2(-outlineThickness, outlineThickness);
+            var lowerRight = new Vector2(outlineThickness, outlineThickness);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + left,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + right,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + up,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + down,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + upperLeft,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + upperRight,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + lowerLeft,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position + lowerRight,
+                outline, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, position,
+                textColor, 0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
+        }
+        _spriteBatch.End();
     }
 
     // A connector preview replaces the existing duration body of a selected

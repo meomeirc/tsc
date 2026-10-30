@@ -1415,7 +1415,7 @@ public sealed partial class Playfield
                 _spriteBatch.Draw(_pixel, headClip, new Color(hue.R, hue.G, hue.B, selected ? (byte)190 : (byte)76));
             DrawEditorPanelRectOutline(headClip, outline, thickness);
 
-            if (!preview)
+            if (!preview && _editorShowAttributes)
             {
                 var label = ev.Attr.ToString(CultureInfo.InvariantCulture);
                 var measured = UnicodeTextRenderer.MeasureString(_font, label);
@@ -1424,7 +1424,7 @@ public sealed partial class Playfield
                 textY = Math.Clamp(textY, headClip.Top, Math.Max(headClip.Top, headClip.Bottom - (int)MathF.Ceiling(measured.Y * scale)));
                 var textX = (int)MathF.Round(headClip.Center.X - measured.X * scale * 0.5f);
                 UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, new Vector2(textX, textY),
-                    new Color((byte)255, (byte)255, (byte)255, selected ? (byte)245 : (byte)185),
+                    new Color((byte)0, (byte)255, (byte)96, selected ? (byte)255 : (byte)225),
                     0f, Vector2.Zero, scale, SpriteEffects.None, 0f);
             }
         }

@@ -299,6 +299,7 @@ public sealed partial class Playfield
     // (17-20) beside the normal collapsed playfield.
     private bool _editorPanelsViewEnabled;
     private int _editorPanelsSelectedAttr = 101;
+    private bool _editorShowAttributes;
     private bool _beatLines = false;
     private bool _tempoLines = true;
     private bool _constantScroll;
@@ -616,6 +617,7 @@ public sealed partial class Playfield
     // Render/gameplay caches. The chart never changes after LoadChart, so keep
     // expensive ordering/tempo conversion out of the frame loop.
     private readonly List<ChartEvent> _orderedRenderableEvents = new();
+    private readonly List<(ProjectedPoint Point, int Attribute)> _editorNoteAttributeLabels = new();
     private readonly List<double> _eventSeconds = new();
     private readonly List<double> _eventScrollUnits = new();
     // Effective end time/scroll for render lifetime. This differs from EndTick for

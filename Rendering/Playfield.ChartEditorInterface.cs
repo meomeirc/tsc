@@ -267,6 +267,7 @@ public sealed partial class Playfield
                 EditorActionGameplayMode => "AUTOPLAY",
                 EditorActionExpand => _compact ? "COLLAPSED" : "EXPANDED",
                 EditorActionBeatLines => "GRIDS",
+                EditorActionAttributes => "ATTR",
                 EditorActionTempoLines => "TEMPO LINES",
                 EditorActionConstantScroll => "CONSTANT",
                 EditorActionSnap => "SNAPS",
@@ -285,6 +286,7 @@ public sealed partial class Playfield
                 EditorActionGameplayMode => !_gameplayMode,
                 EditorActionExpand => _compact,
                 EditorActionBeatLines => _beatLines,
+                EditorActionAttributes => _editorShowAttributes,
                 EditorActionTempoLines => _tempoLines,
                 EditorActionConstantScroll => _constantScroll,
                 EditorActionSnap => _editorMenuSection == EditorMenuSection.Snap,
@@ -294,7 +296,7 @@ public sealed partial class Playfield
                 _ => false
             };
             var toggle = id is EditorActionPlay or EditorActionViewMode or EditorActionExpand or EditorActionBeatLines or
-                EditorActionPanels or EditorActionSnap or EditorActionTempoLines or EditorActionConstantScroll or
+                EditorActionAttributes or EditorActionPanels or EditorActionSnap or EditorActionTempoLines or EditorActionConstantScroll or
                 EditorActionMetronome or EditorActionMeta or EditorActionEditorPreview or EditorActionGameplayMode;
             var leftAction = EditorUiItem($"left_{id}", label, "editor.action", id, selected,
                 enabled: !(id == EditorActionExpand && !_topDownViewEnabled && _editorPanelsViewEnabled), toggle: toggle);

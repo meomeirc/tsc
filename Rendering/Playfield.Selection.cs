@@ -1077,11 +1077,11 @@ public sealed partial class Playfield
         "PLAY", "DELETE", "UNDO", "REDO", "COPY", "CUT", "PASTE", "DESELECT",
         "INFO", "VIEW 2D/3D", "EXPAND/COLLAPSE", "GRIDS", "SAVE", "PANELS",
         "PASTE FIT", "SELECT", "SNAPS", "TEMPO LINES", "CONSTANT", "SETTINGS", "METRONOME",
-        "EDITOR/PREVIEW", "AUTOPLAY"
+        "EDITOR/PREVIEW", "AUTOPLAY", "ATTR"
     };
     private static readonly int[] EditorBottomLeftActionIds =
         { EditorActionPlay, EditorActionEditorPreview, EditorActionGameplayMode,
-          EditorActionViewMode, EditorActionExpand, EditorActionBeatLines,
+          EditorActionViewMode, EditorActionExpand, EditorActionBeatLines, EditorActionAttributes,
           EditorActionTempoLines, EditorActionConstantScroll, EditorActionPanels,
           EditorActionMetronome, EditorActionSnap, EditorActionMeta,
           EditorActionQuickSave, EditorActionSettings };
@@ -1113,6 +1113,7 @@ public sealed partial class Playfield
     private const int EditorActionMetronome = 20;
     private const int EditorActionEditorPreview = 21;
     private const int EditorActionGameplayMode = 22;
+    private const int EditorActionAttributes = 23;
     private enum EditorUnlinkMode
     {
         PreserveDuration,
@@ -3727,6 +3728,10 @@ public sealed partial class Playfield
             case EditorActionBeatLines:
                 _beatLines = !_beatLines;
                 _statusMessage = _beatLines ? "Grids and beat numbers ON." : "Grids and beat numbers OFF.";
+                break;
+            case EditorActionAttributes:
+                _editorShowAttributes = !_editorShowAttributes;
+                _statusMessage = _editorShowAttributes ? "Note attributes ON." : "Note attributes OFF.";
                 break;
             case EditorActionTempoLines:
                 _tempoLines = !_tempoLines;

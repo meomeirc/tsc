@@ -958,6 +958,7 @@ public sealed partial class Playfield
                 EditorActionGameplayMode => "AUTOPLAY",
                 EditorActionExpand => _compact ? "COLLAPSED" : "EXPANDED",
                 EditorActionBeatLines => "GRIDS",
+                EditorActionAttributes => "ATTR",
                 EditorActionTempoLines => "TEMPO LINES",
                 EditorActionConstantScroll => "CONSTANT",
                 EditorActionSnap => "SNAPS",
@@ -969,7 +970,7 @@ public sealed partial class Playfield
                 _ => EditorActionLabels[id]
             };
             var actionLabelKey = id == EditorActionPlay && _playing ? "action_pause" : GetEditorActionLabelKey(id);
-            if (id is not (EditorActionGameplayMode or EditorActionPanels))
+            if (id is not (EditorActionGameplayMode or EditorActionPanels or EditorActionAttributes))
                 label = interfaceUi.Label(actionLabelKey, label);
             var active = id switch
             {
@@ -979,6 +980,7 @@ public sealed partial class Playfield
                 EditorActionGameplayMode => !_gameplayMode,
                 EditorActionExpand => _compact,
                 EditorActionBeatLines => _beatLines,
+                EditorActionAttributes => _editorShowAttributes,
                 EditorActionTempoLines => _tempoLines,
                 EditorActionConstantScroll => _constantScroll,
                 EditorActionSnap => _editorMenuSection == EditorMenuSection.Snap,
@@ -1009,6 +1011,8 @@ public sealed partial class Playfield
                 EditorActionMetronome when _editorMenuSection == EditorMenuSection.Metronome => new Color(52, 211, 153),
                 EditorActionPanels when _editorPanelsViewEnabled => new Color(129, 140, 248),
                 EditorActionBeatLines when !_beatLines => new Color(125, 125, 127),
+                EditorActionAttributes when _editorShowAttributes => new Color(52, 211, 153),
+                EditorActionAttributes => new Color(125, 125, 127),
                 EditorActionTempoLines when !_tempoLines => new Color(125, 125, 127),
                 EditorActionConstantScroll when !_constantScroll => new Color(125, 125, 127),
                 _ => active ? new Color(52, 211, 153) : Active
@@ -1210,6 +1214,7 @@ public sealed partial class Playfield
         EditorActionViewMode => "action_view_mode",
         EditorActionExpand => "action_expand",
         EditorActionBeatLines => "action_grids",
+        EditorActionAttributes => "action_attributes",
         EditorActionQuickSave => "action_save",
         EditorActionPanels => "action_panels",
         EditorActionPasteFit => "action_paste_fit",
