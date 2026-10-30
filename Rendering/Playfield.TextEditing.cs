@@ -32,6 +32,9 @@ public sealed partial class Playfield
     private readonly HashSet<XnaKeys> _editorTextRepeatPulses = new();
     private readonly HashSet<XnaKeys> _editorTextRepeatInitialPulses = new();
     private double _editorTextInputDeltaSeconds = 1.0 / 60.0;
+    // Set at the start of the update while an editor text field/modal owns the keyboard.
+    // Gameplay lane and editor hotkeys must not also consume the same keystrokes.
+    private bool _editorTextInputOwnsKeyboardThisFrame;
     private const double EditorTextRepeatDelaySeconds = 0.32;
     private const double EditorTextRepeatIntervalSeconds = 0.095;
 
@@ -215,7 +218,7 @@ public sealed partial class Playfield
     /// Returning from the caller still owns Enter/Escape so each field can validate/commit
     /// or cancel according to its own data rules.
     /// </summary>
-    private void HandleEditorTextFieldKeyboard(
+    private bool HandleEditorTextFieldKeyboard(
         string fieldId,
         ref string text,
         ref int caret,
@@ -239,20 +242,20 @@ public sealed partial class Playfield
         {
             _editorTextOverwriteMode = !_editorTextOverwriteMode;
             replaceOnNextKey = false;
-            return;
+            return true;
         }
         if (shift && !alt && Pressed(XnaKeys.Insert))
         {
             if (TryReadEditorClipboard(out var shiftedPasted) && shiftedPasted.Length > 0)
                 InsertEditorText(fieldId, ref text, ref caret, ref anchor, ref replaceOnNextKey, shiftedPasted, allowCharacter);
-            return;
+            return true;
         }
         if (control && !alt && Pressed(XnaKeys.Insert))
         {
             var copyRange = GetEditorTextSelection(text, caret, anchor);
             if (copyRange.End > copyRange.Start)
                 TryWriteEditorClipboard(text[copyRange.Start..copyRange.End]);
-            return;
+            return true;
         }
         if (shift && !control && !alt && Pressed(XnaKeys.Delete))
         {
@@ -266,7 +269,7 @@ public sealed partial class Playfield
                 RecordEditorTextChange(fieldId, beforeCut, text);
             }
             replaceOnNextKey = false;
-            return;
+            return true;
         }
 
         if (control && !alt)
@@ -276,13 +279,13 @@ public sealed partial class Playfield
                 anchor = 0;
                 caret = text.Length;
                 replaceOnNextKey = false;
-                return;
+                return true;
             }
             if (Pressed(XnaKeys.C) || (shift && Pressed(XnaKeys.Insert)))
             {
                 if (selection.End > selection.Start)
                     TryWriteEditorClipboard(text[selection.Start..selection.End]);
-                return;
+                return true;
             }
             if (Pressed(XnaKeys.X) || (shift && Pressed(XnaKeys.Delete)))
             {
@@ -295,25 +298,25 @@ public sealed partial class Playfield
                     RecordEditorTextChange(fieldId, oldText, text);
                 }
                 replaceOnNextKey = false;
-                return;
+                return true;
             }
             if (Pressed(XnaKeys.V) || (shift && Pressed(XnaKeys.Insert)))
             {
                 if (TryReadEditorClipboard(out var pasted) && pasted.Length > 0)
                     InsertEditorText(fieldId, ref text, ref caret, ref anchor, ref replaceOnNextKey, pasted, allowCharacter);
-                return;
+                return true;
             }
             if (Pressed(XnaKeys.Z) && !shift)
             {
                 UndoEditorTextChange(fieldId, ref text, ref caret, ref anchor);
                 replaceOnNextKey = false;
-                return;
+                return true;
             }
             if (Pressed(XnaKeys.Y) || (Pressed(XnaKeys.Z) && shift))
             {
                 RedoEditorTextChange(fieldId, ref text, ref caret, ref anchor);
                 replaceOnNextKey = false;
-                return;
+                return true;
             }
         }
 
@@ -328,7 +331,7 @@ public sealed partial class Playfield
                     : Math.Clamp(caret + (left ? -1 : 1), 0, text.Length);
             if (!shift) anchor = caret;
             replaceOnNextKey = false;
-            return;
+            return true;
         }
         if (Pressed(XnaKeys.Home) || Pressed(XnaKeys.End))
         {
@@ -336,7 +339,7 @@ public sealed partial class Playfield
             caret = target;
             if (!shift) anchor = caret;
             replaceOnNextKey = false;
-            return;
+            return true;
         }
         if (Pressed(XnaKeys.Back) || Pressed(XnaKeys.Delete))
         {
@@ -361,18 +364,22 @@ public sealed partial class Playfield
             }
             RecordEditorTextChange(fieldId, oldText, text);
             replaceOnNextKey = false;
-            return;
+            return true;
         }
 
-        if (control || alt) return;
-        if (TryGetEditorMetaInputCharacter(keyboard, previousKeyboard, out var typedCharacter) &&
-            allowCharacter(selection.End > selection.Start
-                ? text.Remove(selection.Start, selection.End - selection.Start)
-                : text, typedCharacter))
+        if (control || alt) return false;
+        if (TryGetEditorMetaInputCharacter(keyboard, previousKeyboard, out var typedCharacter))
         {
-            InsertEditorText(fieldId, ref text, ref caret, ref anchor, ref replaceOnNextKey,
-                typedCharacter.ToString(), allowCharacter);
+            if (allowCharacter(selection.End > selection.Start
+                    ? text.Remove(selection.Start, selection.End - selection.Start)
+                    : text, typedCharacter))
+            {
+                InsertEditorText(fieldId, ref text, ref caret, ref anchor, ref replaceOnNextKey,
+                    typedCharacter.ToString(), allowCharacter);
+            }
+            return true;
         }
+        return false;
     }
 
     private void BeginEditorTextFieldMouseSelection(string fieldId, Rectangle bounds, int caret, ref int anchor)

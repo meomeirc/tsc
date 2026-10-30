@@ -30,6 +30,8 @@ public sealed partial class Playfield
     {
         var dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         _editorTextInputDeltaSeconds = Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
+        _editorTextInputOwnsKeyboardThisFrame = _chartEditorMode &&
+            (_editorPreviewEditorOpen || EditorTextInputActive);
 
         // Skin reload is a global recovery shortcut. Handle it before modal and
         // text-field early returns so F10 remains available throughout the editor.
@@ -52,6 +54,18 @@ public sealed partial class Playfield
 
         UpdateEditorWheelScrollPause(dt);
         UpdateEditorSeekPauseState();
+
+        // A focused field gets first refusal on the keyboard before preview or
+        // gameplay shortcuts. Its text-edit keys must never also hit mapped lanes
+        // or trigger editor actions in the same frame.
+        if (_editorTextInputOwnsKeyboardThisFrame)
+        {
+            if (_chartEditorMode)
+                HandleChartEditorInput(keyboard, _previousKeyboard);
+            HandleMouseSelection();
+            UpdateLaneHighlights(keyboard, dt);
+            return;
+        }
 
         // Preview mode does not run the regular chart-editor command handler,
         // so dispatch its three playback actions from the configured keybinds.
@@ -114,31 +128,14 @@ public sealed partial class Playfield
         if (_chartEditorMode && !_editorPreviewMode)
             HandleChartEditorInput(keyboard, _previousKeyboard);
 
-        // While an inline Meta input has focus, swallow all editor/gameplay keybinds.
-        // Mouse handling still runs so an outside click can confirm the edit.
-        if (_chartEditorMode && !_editorPreviewMode && _editorMetaEditingField is not null)
+        // A field may have received focus from a mouse click during this frame.
+        // Swallow mapped keys now as well, while still allowing pointer selection.
+        if (_chartEditorMode && !_editorPreviewMode && EditorTextInputActive)
         {
-            HandleMouseSelection();
-            UpdateLaneHighlights(keyboard, dt);
-            return;
-        }
-
-        // While the BPM field is being edited, numeric shortcuts and editor hotkeys
-        // must not leak through to gameplay (for example, B toggling the grid).
-        // Mouse selection still runs so clicking a lane can place a tempo change.
-        if (_chartEditorMode && !_editorPreviewMode && _editorBpmInputFocused)
-        {
-            HandleMouseSelection();
-            UpdateLaneHighlights(keyboard, dt);
-            return;
-        }
-
-        // Numeric generator/duration fields also own Left/Right while editing.
-        // Mouse selection still runs so an outside click confirms or discards the
-        // draft, but do not let those same arrows seek the chart on this frame.
-        if (_chartEditorMode && !_editorPreviewMode &&
-            (_editorDurationInputFocused || _editorStutterInputField != EditorStutterInputField.None))
-        {
+            // A field may have gained focus from this frame's mouse click, after
+            // the initial keyboard-ownership snapshot. Claim it before the rest
+            // of the frame captures gameplay or editor keybind edges.
+            _editorTextInputOwnsKeyboardThisFrame = true;
             HandleMouseSelection();
             UpdateLaneHighlights(keyboard, dt);
             return;
@@ -193,9 +190,9 @@ public sealed partial class Playfield
 
         // Text fields and the preview modal own their input; their keys must not
         // pause playback as if they were seek gestures.
-        var textFieldOwnsInput = _editorPreviewEditorOpen || _editorMetaEditingField is not null ||
-                                 _editorDurationInputFocused || _editorStutterInputField != EditorStutterInputField.None ||
-                                 _editorBpmInputFocused;
+        var textFieldOwnsInput = _editorPreviewEditorOpen || _editorPreviewFocusedField >= 0 ||
+                                 _editorMetaEditingField is not null || _editorDurationInputFocused ||
+                                 _editorStutterInputField != EditorStutterInputField.None || _editorBpmInputFocused;
         var physicalSeekHeld = IsEditorSeekKeyDown();
         // Once a seek gesture has paused playback, keep it paused until the key is
         // physically released even if focus changes while the key is still held.
@@ -556,11 +553,11 @@ public sealed partial class Playfield
         _statusMessage = _gameplayMode ? "GAMEPLAY ON" : "GAMEPLAY OFF";
     }
 
-    private bool IsTrackKeyDown(int track) => KeybindSettings.IsTrackDown(track);
+    private bool IsTrackKeyDown(int track) => !_editorTextInputOwnsKeyboardThisFrame && KeybindSettings.IsTrackDown(track);
 
-    private bool IsTrackKeyPressed(int track) => KeybindSettings.IsTrackPressed(track);
+    private bool IsTrackKeyPressed(int track) => !_editorTextInputOwnsKeyboardThisFrame && KeybindSettings.IsTrackPressed(track);
 
-    private bool IsSuperFlickInputPressed(ChartEvent ev) => KeybindSettings.IsSuperFlickPressed(ev);
+    private bool IsSuperFlickInputPressed(ChartEvent ev) => !_editorTextInputOwnsKeyboardThisFrame && KeybindSettings.IsSuperFlickPressed(ev);
 
     private SuperFlickVisualKey SuperFlickKeyOf(ChartEvent ev)
     {

@@ -803,6 +803,12 @@ public sealed partial class Playfield
 
     private void CaptureGameplayLaneInputEdges(double currentSeconds)
     {
+        if (_editorTextInputOwnsKeyboardThisFrame)
+        {
+            _gameplayLaneInputEdges.Clear();
+            return;
+        }
+
         foreach (var action in GameplayLaneInputActions)
         {
             if (KeybindSettings.IsPressed(action))
@@ -1445,7 +1451,7 @@ public sealed partial class Playfield
 
     private void ProcessEarlyPressMisses(IReadOnlyList<ChartEvent> ordered, double currentSeconds, HashSet<string> consumedPressedKeys, GearState frameGameplayState)
     {
-        if (_tempo is null)
+        if (_editorTextInputOwnsKeyboardThisFrame || _tempo is null)
             return;
 
         const double earlyWindow = 0.150;

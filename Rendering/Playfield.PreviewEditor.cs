@@ -662,38 +662,30 @@ public sealed partial class Playfield
     private void HandleEditorPreviewEditorInput(KeyboardState keyboard, KeyboardState previousKeyboard)
     {
         UpdateEditorTextFieldMouseDrag();
-        if (KeybindSettings.IsPressed("editor_cancel"))
-        {
-            if (_editorPreviewFocusedField == 0)
-            {
-                _editorPreviewStartText = FormatEditorPreviewSeconds(_editorPreviewStartSeconds);
-                _editorPreviewStartCaret = _editorPreviewStartText.Length;
-                _editorPreviewStartSelectionAnchor = _editorPreviewStartCaret;
-                _editorPreviewFocusedField = -1;
-                _editorPreviewInputReplaceOnNextKey = false;
-                EndEditorTextFieldMouseSelection();
-                _editorPreviewDialogMessage = null;
-                return;
-            }
-            if (_editorPreviewFocusedField == 1)
-            {
-                _editorPreviewEndText = FormatEditorPreviewSeconds(_editorPreviewEndSeconds);
-                _editorPreviewEndCaret = _editorPreviewEndText.Length;
-                _editorPreviewEndSelectionAnchor = _editorPreviewEndCaret;
-                _editorPreviewFocusedField = -1;
-                _editorPreviewInputReplaceOnNextKey = false;
-                EndEditorTextFieldMouseSelection();
-                _editorPreviewDialogMessage = null;
-                return;
-            }
-            CloseEditorPreviewEditor();
-            return;
-        }
 
         if (_editorPreviewFocusedField >= 0)
         {
             var isStart = _editorPreviewFocusedField == 0;
-            if (KeybindSettings.IsTextFieldCommitPressed())
+            var textHandled = isStart
+                ? HandleEditorTextFieldKeyboard("preview-start", ref _editorPreviewStartText,
+                    ref _editorPreviewStartCaret, ref _editorPreviewStartSelectionAnchor,
+                    ref _editorPreviewInputReplaceOnNextKey, keyboard, previousKeyboard,
+                    static (current, c) => char.IsDigit(c) || (c == '.' && !current.Contains('.')))
+                : HandleEditorTextFieldKeyboard("preview-end", ref _editorPreviewEndText,
+                    ref _editorPreviewEndCaret, ref _editorPreviewEndSelectionAnchor,
+                    ref _editorPreviewInputReplaceOnNextKey, keyboard, previousKeyboard,
+                    static (current, c) => char.IsDigit(c) || (c == '.' && !current.Contains('.')));
+            if (textHandled)
+            {
+                _editorPreviewDialogMessage = null;
+            }
+            else if (KeybindSettings.IsPressed("editor_cancel"))
+            {
+                DiscardEditorPreviewFocusedTimeInput();
+                _editorPreviewDialogMessage = null;
+                return;
+            }
+            else if (KeybindSettings.IsTextFieldCommitPressed())
             {
                 CommitEditorPreviewFocusedTime();
             }
@@ -712,22 +704,11 @@ public sealed partial class Playfield
                 _editorTextMouseSelecting = false;
                 _editorPreviewInputReplaceOnNextKey = false;
             }
-            else if (isStart)
-            {
-                HandleEditorTextFieldKeyboard("preview-start", ref _editorPreviewStartText,
-                    ref _editorPreviewStartCaret, ref _editorPreviewStartSelectionAnchor,
-                    ref _editorPreviewInputReplaceOnNextKey, keyboard, previousKeyboard,
-                    static (current, c) => char.IsDigit(c) || (c == '.' && !current.Contains('.')));
-                _editorPreviewDialogMessage = null;
-            }
-            else
-            {
-                HandleEditorTextFieldKeyboard("preview-end", ref _editorPreviewEndText,
-                    ref _editorPreviewEndCaret, ref _editorPreviewEndSelectionAnchor,
-                    ref _editorPreviewInputReplaceOnNextKey, keyboard, previousKeyboard,
-                    static (current, c) => char.IsDigit(c) || (c == '.' && !current.Contains('.')));
-                _editorPreviewDialogMessage = null;
-            }
+        }
+        else if (KeybindSettings.IsPressed("editor_cancel"))
+        {
+            CloseEditorPreviewEditor();
+            return;
         }
 
         var mouse = GlobalInput.Mouse;

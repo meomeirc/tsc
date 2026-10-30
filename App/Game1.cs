@@ -316,19 +316,16 @@ public sealed class Game1 : Game
         // Escape remains a text-edit cancel key, but ordinary menu/gameplay Back
         // navigation is controlled by the configurable scancode binding.
         var physicalEscapeForExternalTextField = physicalEscapePressed && (_settingsEditingKey is not null || searchTyping);
-        var editorCancelPressed = _startupScreen == StartupScreen.Gameplay &&
-            _playfield?.ChartEditorMode == true &&
-            (KeybindSettings.IsPressed("editor_cancel") ||
-             (_playfield?.HandlesDifficultyConfirmationInput == true && KeybindSettings.IsPressed("menu_back")));
-        // In the chart editor, the editor's configurable Cancel action gets first
-        // chance to handle the same key as global Back (Escape by default). Active
-        // difficulty confirmation dialogs also reserve the menu Back binding so it
-        // closes the dialog instead of leaving the editor or toggling INFO.
+        var chartEditorOwnsBack = _startupScreen == StartupScreen.Gameplay &&
+            _playfield?.ChartEditorMode == true;
+        // The chart editor handles its own Back binding. Do not intercept it here:
+        // menu_back can share a key with editor_delete, and the delete action must
+        // reach the editor before any global screen navigation.
         var resultActionPressed = (_startupScreen is StartupScreen.Gameplay or StartupScreen.GameplayResult) &&
             _playfield?.HandlesResultActionInput == true &&
             (KeybindSettings.IsPressed("gameplay_result_continue") || KeybindSettings.IsPressed("gameplay_result_retry"));
-        var configurableBackPressed = isStartupMenuScreen && !textTyping && !resultActionPressed &&
-            !editorCancelPressed && KeybindSettings.IsPressed("menu_back");
+        var configurableBackPressed = isStartupMenuScreen && !chartEditorOwnsBack &&
+            !textTyping && !resultActionPressed && KeybindSettings.IsPressed("menu_back");
         if (inputActive && (physicalEscapeForExternalTextField || configurableBackPressed))
         {
             if (_startupScreen == StartupScreen.SettingsMenu)
@@ -395,11 +392,7 @@ public sealed class Game1 : Game
             }
             else if ((_startupScreen == StartupScreen.Gameplay || _startupScreen == StartupScreen.GameplayResult) && _playfield is not null)
             {
-                if (_playfield.ChartEditorMode)
-                {
-                    _playfield.ToggleEditorInfoMenu();
-                }
-                else if (_playfield.MainMenuPlayMode)
+                if (_playfield.MainMenuPlayMode)
                     _playfield.ToggleGameplayPause();
                 else
                     Exit();
@@ -413,7 +406,7 @@ public sealed class Game1 : Game
             return;
         }
 
-        if (inputActive && keyboard.IsKeyDown(Keys.F11) && !_previousKeyboard.IsKeyDown(Keys.F11))
+        if (inputActive && !textTyping && keyboard.IsKeyDown(Keys.F11) && !_previousKeyboard.IsKeyDown(Keys.F11))
             ToggleWindowMode();
 
         if (_startupScreen == StartupScreen.Gameplay)

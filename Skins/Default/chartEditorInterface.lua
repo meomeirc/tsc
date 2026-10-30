@@ -1225,19 +1225,18 @@ local function drawMeta(state, w, h, layer)
     if state.meta_category == "TEST" then
         local textWidth = math.max(1, panelW - padding * 2)
         local textX = x + padding
-        local textY = contentTop + 2 * scale
         local bodySize = fontSize("body")
         local smallSize = fontSize("small")
         local bodyLineHeight = math.max(18 * scale, bodySize * 1.35)
         local smallLineHeight = math.max(16 * scale, smallSize * 1.4)
         local bodyLayer = (layer or 100) + 5
         local labelLayer = (layer or 100) + 4
+        local testButtonY = contentBottom - 38 * scale - 8 * scale
+        local adbEnabled = state.meta_test_adb_enabled == true
+        local textY = contentTop + 2 * scale
 
         local function drawWrappedValue(value, size, color, font, lineHeight, drawLayer)
             local wrapped = wrapMeasuredText(value, textWidth, size, font)
-            -- Match editorChartMenu's description renderer: draw each line separately.
-            -- A single draw.text call containing many lines can be scaled against the
-            -- full block height by legacy UI sizing, making the text look tiny.
             for lineIndex, line in ipairs(wrapped) do
                 draw.text(line, {
                     x = textX, y = textY + (lineIndex - 1) * lineHeight,
@@ -1253,16 +1252,56 @@ local function drawMeta(state, w, h, layer)
             drawWrappedValue(value, bodySize, color, font or F.regular, bodyLineHeight, bodyLayer)
         end
 
+        label("LOCAL TEST", textX, contentTop + 2 * scale, fontSize("body"), C.text, nil, labelLayer + 1)
+        local adbControlY = contentTop + 28 * scale
+        UI.draw_button({ id = "editor_lan_adb_toggle", x = textX, y = adbControlY,
+            width = math.max(1, panelW - padding * 2), height = 34 * scale,
+            label = adbEnabled and "USE ADB: ON" or "USE ADB: OFF",
+            action = "editor.lan_test.adb.toggle", enabled = state.meta_test_busy ~= true,
+            variant = adbEnabled and "primary" or "secondary",
+            font = F.medium, text_size = fontSize("small"), layer = bodyLayer + 2 })
+        textY = adbControlY + 44 * scale
+
         drawTestField("STATUS", state.meta_test_status or "Not running",
             state.meta_test_running and C.accent or C.text, F.medium)
         local musicStatus = state.meta_test_music_available and "Ready" or "Missing — import music in MEDIA first"
         drawTestField("MUSIC", musicStatus,
             state.meta_test_music_available and C.text or C.error, F.regular)
         drawTestField("AVAILABLE CHARTS", state.meta_test_chart_summary or "No charts exported", C.text, F.regular)
-        drawTestField("LAN ADDRESS",
-            (state.meta_test_address and state.meta_test_address ~= "" and state.meta_test_address) or "Shown after the server starts",
+        drawTestField(adbEnabled and "ADB ENDPOINT" or "LAN ADDRESS",
+            (state.meta_test_address and state.meta_test_address ~= "" and state.meta_test_address) or (adbEnabled and "ADB forwarding is set up when a device connects" or "Shown after the server starts"),
             C.text, F.regular)
-
+        if adbEnabled then
+            drawTestField("ADB", state.meta_test_adb_status or "Starting", C.accent, F.medium)
+            -- Local beatmap testing must be enabled in ReSONANCE for both ADB and LAN.
+            -- Keep this notice in the ADB section of the actual Lua menu skin.
+            drawWrappedValue("Enable Local beatmap testing in your ReSONANCE account settings.",
+                smallSize, C.text, F.medium, smallLineHeight, bodyLayer)
+            if state.meta_test_adb_details and state.meta_test_adb_details ~= "" then
+                drawWrappedValue(state.meta_test_adb_details, smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
+            end
+            drawWrappedValue("USB: Enable Developer Options and USB debugging, connect your phone with a data-capable cable, then accept the debugging prompt.",
+                smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
+            local devices = state.meta_test_adb_devices or {}
+            for i = 1, math.min(#devices, 2) do
+                local entry = tostring(devices[i])
+                local serial = string.match(entry, "^([^ ]+)") or ""
+                local wireless = string.find(serial, ":", 1, true) ~= nil or
+                    string.find(serial, "_adb-tls-connect._tcp", 1, true) ~= nil
+                local rowY = textY
+                draw.text(fittedMeasuredText(entry, textWidth - (wireless and 112 * scale or 8 * scale),
+                    smallSize, F.regular), { x = textX, y = rowY + 16 * scale, size = smallSize,
+                    color = C.text, font = F.regular, anchor = "left", layer = bodyLayer + 1 })
+                if wireless then
+                    UI.draw_button({ id = "editor_lan_adb_disconnect_" .. tostring(i),
+                        x = textX + textWidth - 104 * scale, y = rowY + 2 * scale,
+                        width = 104 * scale, height = 30 * scale, label = "DISCONNECT",
+                        action = "editor.lan_test.adb.disconnect", value = serial,
+                        variant = "danger", font = F.medium, text_size = fontSize("small"), layer = bodyLayer + 3 })
+                end
+                textY = textY + 34 * scale
+            end
+        end
         if state.meta_test_details and state.meta_test_details ~= "" then
             drawWrappedValue(state.meta_test_details, smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
         end
@@ -1270,14 +1309,14 @@ local function drawMeta(state, w, h, layer)
             drawWrappedValue("TEST DATA CHANGED — refresh before the next play.", smallSize,
                 C.warning or C.accent, F.medium, smallLineHeight, (layer or 100) + 6)
         end
-        drawWrappedValue("Enable Local beatmap testing in your ReSONANCE account settings.",
-            smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
-        drawWrappedValue("Keep the phone and PC on the same private Wi-Fi; allow TCP/UDP 8765 in Windows Firewall.",
-            smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
+        if not adbEnabled then
+            drawWrappedValue("Enable Local beatmap testing in your ReSONANCE account settings.",
+                smallSize, C.text, F.medium, smallLineHeight, bodyLayer)
+            drawWrappedValue("Keep the phone and PC on the same private Wi-Fi; allow TCP/UDP 8765 in Windows Firewall.",
+                smallSize, C.muted, F.regular, smallLineHeight, bodyLayer)
+        end
 
-        -- Keep actions docked to the bottom of the panel; the text above them can
-        -- now take as many wrapped lines as necessary without being ellipsized.
-        local testButtonY = contentBottom - 38 * scale - 8 * scale
+        -- Keep actions docked to the bottom of the panel; text above can wrap freely.
         if state.meta_test_running == true then
             local gap = 8 * scale
             local half = (panelW - padding * 2 - gap) / 2
@@ -1293,7 +1332,7 @@ local function drawMeta(state, w, h, layer)
         else
             UI.draw_button({ id = "editor_lan_test_start", x = x + padding, y = testButtonY,
                 width = math.max(1, panelW - padding * 2), height = 38 * scale,
-                label = state.meta_test_busy and "PREPARING..." or "START LAN TEST",
+                label = state.meta_test_busy and "PREPARING..." or "START LOCAL TEST",
                 action = "editor.lan_test.start", enabled = state.meta_test_start_enabled == true,
                 variant = "success", font = F.medium, text_size = fontSize("body"), layer = (layer or 100) + 7 })
         end

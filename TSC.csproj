@@ -110,6 +110,18 @@
     <RemoveDir Directories="$(TSCInstallRoot)runtimes;$(TSCInstallRoot)Content;$(TSCInstallRoot)Samples;$(TSCInstallRoot)textures" />
   </Target>
 
+  <!-- Bundle a reproducible, checksum-verified copy of Google's Windows Platform-Tools
+       in the install-root tools/adb folder. The archive is cached under obj/, not checked in. -->
+  <Target Name="BundleTscAdbForPublish" AfterTargets="FinalizeTscPublishLayout"
+          Condition="'$(Configuration)' == 'Publish' and '$(PublishDir)' != ''">
+    <PropertyGroup>
+      <TSCAdbArchivePath>$(MSBuildProjectDirectory)\obj\android-platform-tools\platform-tools_r37.0.1-win.zip</TSCAdbArchivePath>
+      <TSCAdbDestination>$(TSCInstallRoot)tools\adb</TSCAdbDestination>
+    </PropertyGroup>
+    <Exec Command="powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\build\Prepare-Adb.ps1&quot; -ArchivePath &quot;$(TSCAdbArchivePath)&quot; -DestinationPath &quot;$(TSCAdbDestination)&quot;" />
+    <Error Condition="!Exists('$(TSCAdbDestination)\adb.exe')" Text="Android Debug Bridge was not bundled. Check the Platform-Tools download and checksum in build/Prepare-Adb.ps1." />
+  </Target>
+
   <Target Name="RemoveLegacyLanEditorHelperOutput" AfterTargets="Build"
           Condition="'$(Configuration)' != 'Publish'">
     <RemoveDir Directories="$(OutDir)LanEditorServer" />

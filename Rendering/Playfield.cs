@@ -967,6 +967,8 @@ public sealed partial class Playfield
                 return true;
             if (_editorMetaEditingField is not null)
             {
+                if (IsEditorLanTestAdbTextField(_editorMetaEditingField))
+                    return false;
                 var currentValue = GetEditorMetaFieldValue(_editorMetaEditingField, string.Empty);
                 return !string.Equals(_editorMetaInputText.Trim(), currentValue.Trim(), StringComparison.Ordinal);
             }
@@ -5973,6 +5975,13 @@ public sealed partial class Playfield
 
     private string GetEditorMetaFieldValue(string field, string fallback)
     {
+        if (IsEditorLanTestAdbTextField(field))
+            return field switch
+            {
+                "adb_pair_address" => _editorLanTestAdbPairAddress,
+                "adb_pair_code" => _editorLanTestAdbPairCode,
+                _ => string.Empty
+            };
         if (_chart is null) return string.Empty;
         return field switch
         {
@@ -6005,9 +6014,24 @@ public sealed partial class Playfield
 
     private void CommitEditorMetaField()
     {
-        if (_chart is null || string.IsNullOrWhiteSpace(_editorMetaEditingField)) return;
+        if (string.IsNullOrWhiteSpace(_editorMetaEditingField)) return;
         var field = _editorMetaEditingField;
         var value = _editorMetaInputText.Trim();
+        if (IsEditorLanTestAdbTextField(field))
+        {
+            switch (field)
+            {
+                case "adb_pair_address": _editorLanTestAdbPairAddress = value; break;
+                case "adb_pair_code": _editorLanTestAdbPairCode = new string(value.Where(char.IsDigit).Take(6).ToArray()); break;
+            }
+            _editorMetaEditingField = null;
+            _editorMetaInputCaretIndex = 0;
+            _editorMetaInputText = string.Empty;
+            _editorMetaInputReplaceOnNextKey = false;
+            EndEditorTextFieldMouseSelection();
+            return;
+        }
+        if (_chart is null) return;
         bool TryInt(out int parsed) => int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed);
         bool TryDouble(out double parsed) => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) && double.IsFinite(parsed);
         switch (field)
@@ -6216,7 +6240,23 @@ public sealed partial class Playfield
     {
         if (_editorMetaEditingField is null) return;
 
-        if (KeybindSettings.IsPressed("editor_cancel")) { CancelEditorMetaField(); return; }
+        var id = "meta:" + _editorMetaEditingField;
+        // Let text editing own Backspace/Delete/arrows/printable keys before checking
+        // configurable field actions. Otherwise a key assigned to Cancel/Commit/Tab
+        // can also cancel or commit while the user is trying to edit the same key.
+        if (HandleEditorTextFieldKeyboard(id, ref _editorMetaInputText, ref _editorMetaInputCaretIndex,
+                ref _editorMetaSelectionAnchor, ref _editorMetaInputReplaceOnNextKey,
+                keyboard, previousKeyboard, _editorMetaEditingField == "adb_pair_code"
+                    ? static (current, c) => char.IsDigit(c) && current.Length < 6
+                    : static (_, c) => !char.IsControl(c)))
+            return;
+
+        if (KeybindSettings.IsPressed("editor_cancel") ||
+            (_editorLanTestAdbWizardOpen && KeybindSettings.IsPressed("menu_back")))
+        {
+            CancelEditorMetaField();
+            return;
+        }
         if (KeybindSettings.IsTextFieldCommitPressed())
         {
             CommitEditorMetaField();
@@ -6235,17 +6275,28 @@ public sealed partial class Playfield
                 EndEditorTextFieldMouseSelection();
                 FocusNextEditorMetaTextField(oldField, previousField);
             }
-            return;
         }
-
-        var id = "meta:" + _editorMetaEditingField;
-        HandleEditorTextFieldKeyboard(id, ref _editorMetaInputText, ref _editorMetaInputCaretIndex,
-            ref _editorMetaSelectionAnchor, ref _editorMetaInputReplaceOnNextKey,
-            keyboard, previousKeyboard, static (_, c) => !char.IsControl(c));
     }
 
     private void FocusNextEditorMetaTextField(string? oldField, bool backwards)
     {
+        if (IsEditorLanTestAdbTextField(oldField))
+        {
+            var adbFields = new[] { "adb_pair_address", "adb_pair_code" };
+            var adbIndex = Array.IndexOf(adbFields, oldField);
+            var nextAdb = adbFields[(adbIndex + (backwards ? -1 : 1) + adbFields.Length) % adbFields.Length];
+            _editorMetaEditingField = nextAdb;
+            _editorMetaInputText = GetEditorMetaFieldValue(nextAdb, string.Empty);
+            _editorMetaInputCaretIndex = _editorMetaInputText.Length;
+            _editorMetaSelectionAnchor = _editorMetaInputCaretIndex;
+            _editorMetaInputReplaceOnNextKey = false;
+            _editorTextActiveFieldId = "meta:" + nextAdb;
+            var adbButtonId = "editor_lan_" + nextAdb;
+            _editorTextActiveBounds = _chartEditorInterfaceRuntime.TryGetUiButtonBounds(adbButtonId, out var adbBounds)
+                ? adbBounds : Rectangle.Empty;
+            _editorTextMouseSelecting = false;
+            return;
+        }
         var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
         var fields = rows.Select(row => GetEditorMetaFieldKey(row.Label))
             .Where(key => key is not null).Cast<string>().Distinct(StringComparer.OrdinalIgnoreCase).ToList();
@@ -6310,8 +6361,19 @@ public sealed partial class Playfield
             HandleEditorMetaKeyboard(keyboard, previousKeyboard);
             return;
         }
+        if (_editorLanTestAdbWizardOpen &&
+            (KeybindSettings.IsPressed("editor_cancel") || KeybindSettings.IsPressed("menu_back")))
+        {
+            CloseEditorLanTestAdbWizard();
+            return;
+        }
         if (_editorDurationInputFocused)
         {
+            if (HandleEditorTextFieldKeyboard("duration", ref _editorDurationInputText,
+                    ref _editorDurationInputCaretIndex, ref _editorDurationSelectionAnchor,
+                    ref _editorDurationInputReplaceOnNextKey, keyboard, previousKeyboard,
+                    static (_, c) => char.IsDigit(c)))
+                return;
             if (KeybindSettings.IsPressed("editor_cancel"))
             {
                 _editorDurationInputFocused = false;
@@ -6330,16 +6392,22 @@ public sealed partial class Playfield
                     _editorDurationInputText = string.Empty;
                     EndEditorTextFieldMouseSelection();
                 }
-                return;
             }
-            HandleEditorTextFieldKeyboard("duration", ref _editorDurationInputText,
-                ref _editorDurationInputCaretIndex, ref _editorDurationSelectionAnchor,
-                ref _editorDurationInputReplaceOnNextKey, keyboard, previousKeyboard,
-                static (_, c) => char.IsDigit(c));
             return;
         }
         if (_editorStutterInputField != EditorStutterInputField.None)
         {
+            var allowBeatFraction = IsEditorBeatValueField(_editorStutterInputField);
+            if (HandleEditorTextFieldKeyboard("stutter:" + _editorStutterInputField,
+                    ref _editorStutterInputText, ref _editorStutterInputCaretIndex,
+                    ref _editorStutterSelectionAnchor, ref _editorStutterInputReplaceOnNextKey,
+                    keyboard, previousKeyboard, (current, c) =>
+                    {
+                        if (char.IsDigit(c)) return true;
+                        if (c == '.' && !current.Contains('.') && !current.Contains('/')) return true;
+                        return c == '/' && allowBeatFraction && !current.Contains('/') && !current.Contains('.');
+                    }))
+                return;
             if (KeybindSettings.IsPressed("editor_cancel"))
             {
                 _editorStutterInputField = EditorStutterInputField.None;
@@ -6358,22 +6426,16 @@ public sealed partial class Playfield
                     _editorStutterInputText = string.Empty;
                     EndEditorTextFieldMouseSelection();
                 }
-                return;
             }
-            var allowBeatFraction = IsEditorBeatValueField(_editorStutterInputField);
-            HandleEditorTextFieldKeyboard("stutter:" + _editorStutterInputField,
-                ref _editorStutterInputText, ref _editorStutterInputCaretIndex,
-                ref _editorStutterSelectionAnchor, ref _editorStutterInputReplaceOnNextKey,
-                keyboard, previousKeyboard, (current, c) =>
-                {
-                    if (char.IsDigit(c)) return true;
-                    if (c == '.' && !current.Contains('.') && !current.Contains('/')) return true;
-                    return c == '/' && allowBeatFraction && !current.Contains('/') && !current.Contains('.');
-                });
             return;
         }
         if (_editorBpmInputFocused)
         {
+            if (HandleEditorTextFieldKeyboard("bpm", ref _editorBpmInputText,
+                    ref _editorBpmInputCaretIndex, ref _editorBpmSelectionAnchor,
+                    ref _editorBpmInputReplaceOnNextKey, keyboard, previousKeyboard,
+                    static (current, c) => char.IsDigit(c) || (c == '.' && !current.Contains('.'))))
+                return;
             if (KeybindSettings.IsPressed("editor_cancel"))
             {
                 _editorBpmInputFocused = false;
@@ -6414,12 +6476,7 @@ public sealed partial class Playfield
                 {
                     _statusMessage = "Enter a BPM of at least 1 that fits the chart's numeric format.";
                 }
-                return;
             }
-            HandleEditorTextFieldKeyboard("bpm", ref _editorBpmInputText,
-                ref _editorBpmInputCaretIndex, ref _editorBpmSelectionAnchor,
-                ref _editorBpmInputReplaceOnNextKey, keyboard, previousKeyboard,
-                static (current, c) => char.IsDigit(c) || (c == '.' && !current.Contains('.')));
             return;
         }
 
@@ -6479,20 +6536,31 @@ public sealed partial class Playfield
             _statusMessage = "Editor submenu closed.";
             return;
         }
-        // Cancel panel-specific tools before command dispatch so a shared CANCEL / INFO
-        // key cancels the active operation first. INFO is reached on the next press,
-        // once nothing remains to cancel.
+        // Delete selection before command dispatch. In particular, menu_back and
+        // editor_delete may share Backspace; the chart editor must delete the note
+        // rather than allowing global Back navigation to consume that key first.
         if (_editorPanelsViewEnabled)
         {
-            if (HandleEditorCommandKeybinds())
-                return;
             if (KeybindSettings.IsPressed("editor_delete_family"))
                 DeleteSelectedEditorNoteFamily();
             else if (KeybindSettings.IsPressed("editor_delete"))
                 DeleteSelectedEditorNote();
+            else if (HandleEditorCommandKeybinds())
+                return;
             return; // Ordinary gameplay note tools must not leak into panel tracks.
         }
 
+        if (KeybindSettings.IsPressed("editor_delete_family"))
+        {
+            DeleteSelectedEditorNoteFamily();
+            return;
+        }
+        if (KeybindSettings.IsPressed("editor_delete"))
+        {
+            if (_editorSelectedTempoEvent is not null) DeleteSelectedEditorTempoChanger();
+            else DeleteSelectedEditorNote();
+            return;
+        }
         if (HandleEditorCommandKeybinds())
             return;
 
@@ -10679,9 +10747,7 @@ public sealed partial class Playfield
         var keyboard = Keyboard.GetState();
         var wasPlaying = _playing;
         var timeBeforeInput = _playSeconds;
-        var editorRestartPressed = _chartEditorMode &&
-            _editorMetaEditingField is null && !_editorBpmInputFocused &&
-            !_editorDurationInputFocused && _editorStutterInputField == EditorStutterInputField.None &&
+        var editorRestartPressed = _chartEditorMode && !EditorTextInputActive && !_editorPreviewEditorOpen &&
             KeybindSettings.IsPressed("editor_restart_preview");
         HandleInput(keyboard, gameTime);
         if (_gameplayResultActive || _gameplayResultTransitionPending)

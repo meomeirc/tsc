@@ -17,6 +17,9 @@ public sealed class GameConfig
     public string Gauge { get; set; } = "hard";
     public bool Autoplay { get; set; } = false;
 
+    // Optional Android Debug Bridge reverse forwarding for the chart editor's Local Test.
+    public bool UseAdb { get; set; } = true;
+
     // Windowed keeps a normal resizable window, borderless fills the current display
     // without entering fullscreen, and fullscreen requests a hardware display switch.
     public string DisplayMode { get; set; } = "borderless";

@@ -1114,6 +1114,10 @@ public sealed partial class Playfield
             case "editor.lan_test.start": StartEditorLanTest(); return true;
             case "editor.lan_test.refresh": RefreshEditorLanTest(); return true;
             case "editor.lan_test.stop": StopEditorLanTest(); return true;
+            case "editor.lan_test.adb.toggle": ToggleEditorLanTestAdb(); return true;
+            case "editor.lan_test.adb.disconnect":
+                if (value is string serial) DisconnectEditorLanTestWirelessDevice(serial);
+                return true;
             default:
                 return true;
         }

@@ -1027,7 +1027,7 @@ public sealed partial class Playfield
         // Physical keyboard presses are gameplay-only. Autoplay drives the same
         // visual state from automatic judgements instead of treating any key that
         // happens to be down as a lane press.
-        if (_gameplayMode)
+        if (_gameplayMode && !_editorTextInputOwnsKeyboardThisFrame)
         {
             foreach (var bank in VisibleBanks(state))
             {

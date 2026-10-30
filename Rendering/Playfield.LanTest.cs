@@ -1,3 +1,5 @@
+using Microsoft.Xna.Framework;
+using Rectangle = Microsoft.Xna.Framework.Rectangle;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -15,11 +17,22 @@ public sealed partial class Playfield
     private volatile bool _editorLanTestBusy;
     private volatile bool _editorLanTestRunning;
     private string _editorLanTestStatus = "Not running";
-    private string _editorLanTestDetails = "Start a local test to share this song with ReSONANCE on the same Wi-Fi.";
+    private string _editorLanTestDetails = "Start Local Test to prepare this song for ReSONANCE.";
     private string _editorLanTestAddress = string.Empty;
     private string _editorLanTestChartSummary = "No charts exported";
     private bool _editorLanTestDataStale;
     private long _editorLanTestChangeRevision;
+    private AdbReverseBridge? _editorLanTestAdbBridge;
+    private string _editorLanTestAdbStatus = "Enabled — server stopped";
+    private string _editorLanTestAdbDetails = "Start Local Test to connect an Android device through ADB.";
+    private bool _editorLanTestAdbAvailable;
+    private bool _editorLanTestTransportChangePending;
+    private string[] _editorLanTestAdbDevices = [];
+    private readonly HashSet<string> _editorLanTestAdbWirelessSerials = new(StringComparer.Ordinal);
+    private bool _editorLanTestAdbWizardOpen;
+    private string _editorLanTestAdbWizardMode = "USB";
+    private string _editorLanTestAdbPairAddress = string.Empty;
+    private string _editorLanTestAdbPairCode = string.Empty;
 
     private sealed record EditorLanTestSnapshot(
         byte[] MusicBytes,
@@ -104,7 +117,7 @@ public sealed partial class Playfield
     private EditorLanTestSnapshot CaptureEditorLanTestSnapshot()
     {
         if (!_chartEditorMode || _chart is null)
-            throw new InvalidOperationException("Open a chart in the editor before starting a LAN test.");
+            throw new InvalidOperationException("Open a chart in the editor before starting Local Test.");
 
         if (!_editorDifficultySessionActive)
             InitializeEditorDifficultySession();
@@ -224,12 +237,12 @@ public sealed partial class Playfield
         {
             if (_editorLanTestBusy)
             {
-                _statusMessage = "LAN test is already preparing or refreshing.";
+                _statusMessage = "Local Test is already preparing or refreshing.";
                 return;
             }
             if (_editorLanTestRunning)
             {
-                _statusMessage = "LAN test is already running. Use Refresh Test Data or Stop in INFO → TEST.";
+                _statusMessage = "Local Test is already running. Use Refresh Test Data or Stop in INFO → TEST.";
                 return;
             }
         }
@@ -257,7 +270,7 @@ public sealed partial class Playfield
             _editorLanTestRunning = false;
             _editorLanTestStatus = "Preparing";
             _editorLanTestDetails = "Converting music to resource-OPUS and exporting enabled ARES difficulties…";
-            _editorLanTestAddress = BuildEditorLanTestAddressList();
+            _editorLanTestAddress = _skin.GameConfig.UseAdb ? "localhost:8765 (ADB reverse)" : BuildEditorLanTestAddressList();
             _editorLanTestChartSummary = snapshot.ChartSummary;
             _editorLanTestDataStale = false;
         }
@@ -265,13 +278,315 @@ public sealed partial class Playfield
         _ = Task.Run(() => StartEditorLanTestWorker(snapshot, workspace, generation));
     }
 
+    private void FocusEditorLanTestAdbTextField(string field, string buttonId, Rectangle fallbackBounds = default)
+    {
+        if (!IsEditorLanTestAdbTextField(field) || !_editorLanTestAdbWizardOpen)
+            return;
+        if (!_chartEditorInterfaceRuntime.TryGetUiButtonBounds(buttonId, out var bounds) || bounds.IsEmpty)
+            bounds = fallbackBounds;
+        if (bounds.IsEmpty) return;
+        var alreadyEditingField = string.Equals(_editorMetaEditingField, field, StringComparison.OrdinalIgnoreCase);
+        if (!alreadyEditingField && _editorMetaEditingField is not null)
+            CommitEditorMetaFieldOnBlur();
+        if (!alreadyEditingField)
+        {
+            _editorMetaEditingField = field;
+            _editorMetaInputText = GetEditorMetaFieldValue(field, string.Empty);
+            _editorMetaInputCaretIndex = _editorMetaInputText.Length;
+            _editorMetaSelectionAnchor = _editorMetaInputCaretIndex;
+            _editorMetaInputReplaceOnNextKey = false;
+        }
+        _editorTextActiveFieldId = "meta:" + field;
+        _editorTextActiveBounds = bounds;
+        var pointer = new Microsoft.Xna.Framework.Point(
+            (int)MathF.Round(_chartEditorInterfaceRuntime.UiPointerX),
+            (int)MathF.Round(_chartEditorInterfaceRuntime.UiPointerY));
+        PlaceEditorMetaCaretFromClick(bounds, pointer, _projection.ScalePixels(1f));
+        _editorMetaSelectionAnchor = _editorMetaInputCaretIndex;
+        BeginEditorTextFieldMouseSelection("meta:" + field, bounds,
+            _editorMetaInputCaretIndex, ref _editorMetaSelectionAnchor);
+    }
+
+    private void ToggleEditorLanTestAdb()
+    {
+        bool enabled;
+        bool running;
+        lock (_editorLanTestSync)
+        {
+            if (_editorLanTestBusy)
+            {
+                _statusMessage = "Wait for Local Test to finish before changing ADB mode.";
+                return;
+            }
+            enabled = !_skin.GameConfig.UseAdb;
+            _skin.GameConfig.UseAdb = enabled;
+            try
+            {
+                SkinConfigStore.SaveGameConfig(UserDataPaths.GameConfigPath, _skin.GameConfig);
+            }
+            catch (Exception ex)
+            {
+                _skin.GameConfig.UseAdb = !enabled;
+                _statusMessage = $"Could not save USE ADB setting: {ex.Message}";
+                return;
+            }
+            running = _editorLanTestRunning;
+        }
+
+        if (running)
+        {
+            RestartEditorLanTestTransport();
+            return;
+        }
+        if (enabled)
+        {
+            _editorLanTestAdbStatus = "Enabled — server stopped";
+            _editorLanTestAdbDetails = "Start Local Test to connect an Android device through ADB.";
+        }
+        else
+        {
+            _editorLanTestAdbWizardOpen = false;
+            StopEditorLanTestAdbBridge();
+            _editorLanTestAdbStatus = "Disabled";
+            _editorLanTestAdbDetails = "ADB is disabled. Local Test will be available over LAN.";
+            _editorLanTestAdbAvailable = false;
+            _editorLanTestAdbDevices = [];
+        }
+    }
+
+    private void RestartEditorLanTestTransport()
+    {
+        LanEditorTestService? previousService;
+        string workspace;
+        int generation;
+        bool adbOnly;
+        lock (_editorLanTestSync)
+        {
+            if (!_editorLanTestRunning || string.IsNullOrWhiteSpace(_editorLanTestWorkspace))
+                return;
+            if (_editorLanTestBusy)
+            {
+                _editorLanTestTransportChangePending = true;
+                return;
+            }
+
+            adbOnly = _skin.GameConfig.UseAdb;
+            _editorLanTestTransportChangePending = false;
+            workspace = _editorLanTestWorkspace;
+            generation = _editorLanTestGeneration;
+            previousService = _editorLanTestService;
+            _editorLanTestService = null;
+            _editorLanTestBusy = true;
+            _editorLanTestRunning = false;
+            _editorLanTestStatus = "Switching transport";
+            _editorLanTestAddress = string.Empty;
+            _editorLanTestDetails = adbOnly
+                ? "Switching Local Test to ADB-only mode…"
+                : "Switching Local Test to LAN mode…";
+        }
+
+        _ = Task.Run(async () =>
+        {
+            LanEditorTestService? nextService = null;
+            try
+            {
+                await StopEditorLanTestAdbBridgeAsync().ConfigureAwait(false);
+                try { previousService?.Dispose(); } catch (Exception ex)
+                {
+                    TSC.Program.LogRuntime($"LOCAL_TEST_TRANSPORT_STOP_FAILED error={ex.Message}");
+                }
+                EnsureEditorLanTestGeneration(generation);
+
+                var audioDirectory = Path.Combine(workspace, "audio");
+                var chartDirectory = Path.Combine(workspace, "charts");
+                nextService = new LanEditorTestService(audioDirectory, chartDirectory, EditorLanTestPort,
+                    adbOnly, line => HandleEditorLanTestServerOutput(line, generation));
+
+                lock (_editorLanTestSync)
+                {
+                    EnsureEditorLanTestGeneration(generation);
+                    if (!_editorLanTestBusy || !string.Equals(_editorLanTestWorkspace, workspace, StringComparison.Ordinal))
+                        throw new OperationCanceledException("Local Test transport switch was canceled.");
+
+                    _editorLanTestService = nextService;
+                    nextService.Start();
+                    _editorLanTestRunning = true;
+                    _editorLanTestBusy = false;
+                    if (adbOnly)
+                    {
+                        _editorLanTestAdbStatus = "Starting";
+                        _editorLanTestAdbDetails = "Looking for Android devices…";
+                        _editorLanTestAdbAvailable = false;
+                        _editorLanTestAdbDevices = [];
+                    }
+                    else
+                    {
+                        _editorLanTestAdbStatus = "Disabled";
+                        _editorLanTestAdbDetails = "ADB is disabled. Local Test is available over LAN.";
+                        _editorLanTestAdbAvailable = false;
+                        _editorLanTestAdbDevices = [];
+                    }
+                    _editorLanTestStatus = "Running";
+                    _editorLanTestAddress = adbOnly ? "localhost:8765 (ADB reverse)" : BuildEditorLanTestAddressList();
+                    _editorLanTestDetails = adbOnly
+                        ? "ADB-only service listening on localhost TCP 8765. LAN access and discovery are disabled."
+                        : "LAN service listening on TCP/UDP 8765. Select an available difficulty in ReSONANCE.";
+                }
+
+                if (adbOnly)
+                    StartEditorLanTestAdbBridge();
+            }
+            catch (OperationCanceledException)
+            {
+                try { nextService?.Dispose(); } catch { }
+            }
+            catch (Exception ex)
+            {
+                try { nextService?.Dispose(); } catch { }
+                SetEditorLanTestFailure(ex.Message, generation: generation);
+            }
+        });
+    }
+
+    private void OpenEditorLanTestAdbWizard()
+    {
+        if (!_editorLanTestRunning)
+        {
+            _statusMessage = "Start Local Test before connecting a device.";
+            return;
+        }
+        if (!_skin.GameConfig.UseAdb)
+        {
+            _statusMessage = "Turn on USE ADB before connecting a device.";
+            return;
+        }
+        _editorLanTestAdbWizardOpen = true;
+        _editorLanTestAdbWizardMode = "USB";
+        CancelEditorMetaField();
+    }
+
+    private void CloseEditorLanTestAdbWizard()
+    {
+        CommitEditorMetaFieldOnBlur();
+        _editorLanTestAdbWizardOpen = false;
+        _editorLanTestAdbPairCode = string.Empty;
+    }
+
+    private void StartEditorLanTestAdbBridge()
+    {
+        AdbReverseBridge bridge;
+        lock (_editorLanTestSync)
+        {
+            if (!_editorLanTestRunning || !_skin.GameConfig.UseAdb || _editorLanTestAdbBridge is not null)
+                return;
+            bridge = new AdbReverseBridge(EditorLanTestPort, UpdateEditorLanTestAdbSnapshot, _editorLanTestAdbWirelessSerials);
+            _editorLanTestAdbBridge = bridge;
+            _editorLanTestAdbStatus = "Starting";
+            _editorLanTestAdbDetails = "Looking for Android devices…";
+            _editorLanTestAdbAvailable = false;
+        }
+        try { bridge.Start(); }
+        catch (Exception ex)
+        {
+            SetEditorLanTestAdbActionStatus("ADB ERROR", ex.Message + " Connect an Android device through ADB to continue.");
+            TSC.Program.LogRuntime($"ADB_BRIDGE_START_FAILED error={ex.Message}");
+        }
+    }
+
+    private void StopEditorLanTestAdbBridge()
+    {
+        _ = Task.Run(StopEditorLanTestAdbBridgeAsync);
+    }
+
+    private async Task StopEditorLanTestAdbBridgeAsync()
+    {
+        AdbReverseBridge? bridge;
+        lock (_editorLanTestSync) bridge = _editorLanTestAdbBridge;
+        if (bridge is null) return;
+
+        try { await bridge.StopAsync().ConfigureAwait(false); }
+        catch (Exception ex) { TSC.Program.LogRuntime($"ADB_BRIDGE_STOP_FAILED error={ex.Message}"); }
+        finally
+        {
+            lock (_editorLanTestSync)
+            {
+                if (ReferenceEquals(_editorLanTestAdbBridge, bridge))
+                    _editorLanTestAdbBridge = null;
+            }
+        }
+    }
+
+    private void UpdateEditorLanTestAdbSnapshot(AdbBridgeSnapshot snapshot)
+    {
+        lock (_editorLanTestSync)
+        {
+            if (_editorLanTestAdbBridge is null || !_skin.GameConfig.UseAdb || !_editorLanTestRunning)
+                return;
+            _editorLanTestAdbStatus = snapshot.Status;
+            _editorLanTestAdbDetails = snapshot.Details;
+            _editorLanTestAdbAvailable = snapshot.Available;
+            _editorLanTestAdbDevices = snapshot.Devices.ToArray();
+        }
+    }
+
+    private void SetEditorLanTestAdbActionStatus(string status, string details)
+    {
+        lock (_editorLanTestSync)
+        {
+            if (!_skin.GameConfig.UseAdb || !_editorLanTestRunning) return;
+            _editorLanTestAdbStatus = status;
+            _editorLanTestAdbDetails = details;
+        }
+    }
+
+    private void PairEditorLanTestWirelessDevice()
+    {
+        var address = _editorLanTestAdbPairAddress.Trim();
+        var code = _editorLanTestAdbPairCode.Trim();
+        AdbReverseBridge? bridge;
+        lock (_editorLanTestSync) bridge = _editorLanTestAdbBridge;
+        if (bridge is null)
+        {
+            SetEditorLanTestAdbActionStatus("ADB NOT READY", "Turn on USE ADB and start Local Test before pairing.");
+            return;
+        }
+        SetEditorLanTestAdbActionStatus("PAIRING…", "Pairing with the Android device. Check your phone for the pairing prompt.");
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await bridge.PairWirelessAsync(address, code).ConfigureAwait(false);
+                _editorLanTestAdbPairCode = string.Empty;
+            }
+            catch (Exception ex)
+            {
+                SetEditorLanTestAdbActionStatus("PAIRING FAILED", ex.Message);
+            }
+        });
+    }
+
+    private void DisconnectEditorLanTestWirelessDevice(string serial)
+    {
+        AdbReverseBridge? bridge;
+        lock (_editorLanTestSync) bridge = _editorLanTestAdbBridge;
+        if (bridge is null) return;
+        _ = Task.Run(async () =>
+        {
+            try { await bridge.DisconnectWirelessAsync(serial).ConfigureAwait(false); }
+            catch (Exception ex) { SetEditorLanTestAdbActionStatus("DISCONNECT FAILED", ex.Message); }
+        });
+    }
+
+    private static bool IsEditorLanTestAdbTextField(string? field)
+        => field is "adb_pair_address" or "adb_pair_code";
+
     private void RefreshEditorLanTest()
     {
         lock (_editorLanTestSync)
         {
             if (!_editorLanTestRunning || _editorLanTestBusy || string.IsNullOrWhiteSpace(_editorLanTestWorkspace))
             {
-                _statusMessage = "Start the LAN test before refreshing its data.";
+                _statusMessage = "Start Local Test before refreshing its data.";
                 return;
             }
         }
@@ -316,6 +631,7 @@ public sealed partial class Playfield
             _editorLanTestWorkspace = null;
             _editorLanTestBusy = false;
             _editorLanTestRunning = false;
+            _editorLanTestTransportChangePending = false;
             _editorLanTestStatus = "Stopped";
             _editorLanTestDetails = "The local server is stopped.";
             _editorLanTestAddress = string.Empty;
@@ -323,6 +639,17 @@ public sealed partial class Playfield
         }
 
         try { service?.Dispose(); } catch (Exception ex) { TSC.Program.LogRuntime($"LAN_TEST_STOP_FAILED error={ex.Message}"); }
+        StopEditorLanTestAdbBridge();
+        _editorLanTestAdbWizardOpen = false;
+        lock (_editorLanTestSync)
+        {
+            _editorLanTestAdbStatus = _skin.GameConfig.UseAdb ? "Waiting for Local Test" : "Disabled";
+            _editorLanTestAdbDetails = _skin.GameConfig.UseAdb
+                ? "Start Local Test to reconnect an Android device."
+                : "ADB is disabled. Local Test will be available over LAN.";
+            _editorLanTestAdbAvailable = false;
+            _editorLanTestAdbDevices = [];
+        }
         DeleteEditorLanTestWorkspace(workspace);
     }
 
@@ -337,22 +664,28 @@ public sealed partial class Playfield
 
             var audioDirectory = Path.Combine(workspace, "audio");
             var chartDirectory = Path.Combine(workspace, "charts");
-            service = new LanEditorTestService(audioDirectory, chartDirectory, EditorLanTestPort,
-                line => HandleEditorLanTestServerOutput(line, generation));
+            bool adbOnly;
             lock (_editorLanTestSync)
             {
                 EnsureEditorLanTestGeneration(generation);
+                adbOnly = _skin.GameConfig.UseAdb;
+                service = new LanEditorTestService(audioDirectory, chartDirectory, EditorLanTestPort,
+                    adbOnly, line => HandleEditorLanTestServerOutput(line, generation));
                 _editorLanTestService = service;
                 service.Start();
                 _editorLanTestRunning = true;
                 _editorLanTestBusy = false;
                 _editorLanTestStatus = "Running";
-                _editorLanTestAddress = BuildEditorLanTestAddressList();
+                _editorLanTestAddress = adbOnly ? "localhost:8765 (ADB reverse)" : BuildEditorLanTestAddressList();
                 _editorLanTestDetails = _editorLanTestDataStale
-                    ? "LAN service is running, but the chart changed while it was starting. Refresh Test Data before playing."
-                    : "LAN service listening on TCP/UDP 8765. Select an available difficulty in ReSONANCE.";
+                    ? "The chart changed while Local Test was starting. Refresh Test Data before playing."
+                    : adbOnly
+                        ? "ADB-only service listening on localhost TCP 8765. LAN access and discovery are disabled."
+                        : "LAN service listening on TCP/UDP 8765. Select an available difficulty in ReSONANCE.";
             }
             TSC.Program.LogRuntime($"LAN_TEST_STARTED port={EditorLanTestPort} workspace={workspace}");
+            if (adbOnly)
+                StartEditorLanTestAdbBridge();
         }
         catch (OperationCanceledException)
         {
@@ -396,6 +729,7 @@ public sealed partial class Playfield
                     : "Test data refreshed. The next test play will use the updated chart and music.";
             }
             TSC.Program.LogRuntime($"LAN_TEST_REFRESHED workspace={workspace} charts={snapshot.ChartSummary}");
+            RestartEditorLanTestTransportIfPending();
         }
         catch (OperationCanceledException)
         {
@@ -404,7 +738,21 @@ public sealed partial class Playfield
         catch (Exception ex)
         {
             SetEditorLanTestFailure(ex.Message, preserveRunningService: true, generation: generation);
+            RestartEditorLanTestTransportIfPending();
         }
+    }
+
+    private void RestartEditorLanTestTransportIfPending()
+    {
+        bool pending;
+        lock (_editorLanTestSync)
+        {
+            pending = _editorLanTestTransportChangePending && _editorLanTestRunning && !_editorLanTestBusy;
+            if (pending)
+                _editorLanTestTransportChangePending = false;
+        }
+        if (pending)
+            RestartEditorLanTestTransport();
     }
 
     private void WriteEditorLanTestFiles(EditorLanTestSnapshot snapshot, string workspace, int generation)
@@ -513,10 +861,12 @@ public sealed partial class Playfield
                 _editorLanTestRunning = true;
                 _editorLanTestBusy = false;
                 _editorLanTestStatus = "Running";
-                _editorLanTestAddress = BuildEditorLanTestAddressList();
+                _editorLanTestAddress = _skin.GameConfig.UseAdb ? "localhost:8765 (ADB reverse)" : BuildEditorLanTestAddressList();
                 _editorLanTestDetails = _editorLanTestDataStale
-                    ? "LAN service is running, but the chart changed while it was starting. Refresh Test Data before playing."
-                    : "LAN service listening on TCP/UDP 8765. Select an available difficulty in ReSONANCE.";
+                    ? "The chart changed while Local Test was starting. Refresh Test Data before playing."
+                    : _skin.GameConfig.UseAdb
+                        ? "ADB-only service listening on localhost TCP 8765. LAN access and discovery are disabled."
+                        : "LAN service listening on TCP/UDP 8765. Select an available difficulty in ReSONANCE.";
             }
             else if (line.Contains("Address already in use", StringComparison.OrdinalIgnoreCase) ||
                      line.Contains("Only one usage of each socket address", StringComparison.OrdinalIgnoreCase))
@@ -528,6 +878,7 @@ public sealed partial class Playfield
             {
                 _editorLanTestRunning = false;
                 _editorLanTestBusy = false;
+                _editorLanTestTransportChangePending = false;
                 _editorLanTestStatus = "Server stopped unexpectedly";
                 _editorLanTestDetails = line;
                 cleanupService = _editorLanTestService;
@@ -535,6 +886,12 @@ public sealed partial class Playfield
                 cleanupWorkspace = _editorLanTestWorkspace;
                 _editorLanTestWorkspace = null;
                 _editorLanTestAddress = string.Empty;
+                _editorLanTestAdbStatus = _skin.GameConfig.UseAdb ? "Waiting for Local Test" : "Disabled";
+                _editorLanTestAdbDetails = _skin.GameConfig.UseAdb
+                    ? "Start Local Test to reconnect an Android device."
+                    : "ADB is disabled. Local Test will be available over LAN.";
+                _editorLanTestAdbAvailable = false;
+                _editorLanTestAdbDevices = [];
             }
             else if (line.Equals("LAN editor service stopped", StringComparison.OrdinalIgnoreCase) &&
                      _editorLanTestStatus == "Server stopped unexpectedly")
@@ -549,6 +906,7 @@ public sealed partial class Playfield
 
         if (cleanupService is not null || cleanupWorkspace is not null)
         {
+            StopEditorLanTestAdbBridge();
             _ = Task.Run(() =>
             {
                 try { cleanupService?.Dispose(); } catch (Exception ex) { TSC.Program.LogRuntime($"LAN_TEST_STOP_FAILED error={ex.Message}"); }
@@ -568,12 +926,14 @@ public sealed partial class Playfield
                 return;
 
             _editorLanTestBusy = false;
+            if (!preserveRunningService)
+                _editorLanTestTransportChangePending = false;
             var portBusy = message.Contains("Address already in use", StringComparison.OrdinalIgnoreCase) ||
                            message.Contains("Only one usage of each socket address", StringComparison.OrdinalIgnoreCase) ||
                            message.Contains("address is already in use", StringComparison.OrdinalIgnoreCase);
             _editorLanTestStatus = portBusy ? "Port 8765 is busy" : "Error";
             _editorLanTestDetails = string.IsNullOrWhiteSpace(message) ? "Unknown LAN-test error." : message;
-            _statusMessage = "LAN test: " + _editorLanTestDetails;
+            _statusMessage = "Local Test: " + _editorLanTestDetails;
             if (!preserveRunningService)
             {
                 _editorLanTestRunning = false;
@@ -582,12 +942,22 @@ public sealed partial class Playfield
                 cleanupWorkspace ??= _editorLanTestWorkspace;
                 _editorLanTestWorkspace = null;
                 _editorLanTestAddress = string.Empty;
+                _editorLanTestAdbStatus = _skin.GameConfig.UseAdb ? "Waiting for Local Test" : "Disabled";
+                _editorLanTestAdbDetails = _skin.GameConfig.UseAdb
+                    ? "Start Local Test to reconnect an Android device."
+                    : "ADB is disabled. Local Test will be available over LAN.";
+                _editorLanTestAdbAvailable = false;
+                _editorLanTestAdbDevices = [];
+                _editorLanTestAdbWizardOpen = false;
             }
         }
 
         try { service?.Dispose(); } catch { }
         if (!preserveRunningService)
+        {
+            StopEditorLanTestAdbBridge();
             DeleteEditorLanTestWorkspace(cleanupWorkspace);
+        }
         TSC.Program.LogRuntime($"LAN_TEST_FAILED error={message}");
     }
 
@@ -650,6 +1020,9 @@ public sealed partial class Playfield
         bool running;
         bool busy;
         bool stale;
+        string adbStatus;
+        string adbDetails;
+        string[] adbDevices;
         lock (_editorLanTestSync)
         {
             status = _editorLanTestStatus;
@@ -658,6 +1031,9 @@ public sealed partial class Playfield
             running = _editorLanTestRunning;
             busy = _editorLanTestBusy;
             stale = _editorLanTestDataStale;
+            adbStatus = _editorLanTestAdbStatus;
+            adbDetails = _editorLanTestAdbDetails;
+            adbDevices = _editorLanTestAdbDevices.ToArray();
         }
 
         var musicAvailable = IsEditorLanTestMusicAvailable();
@@ -674,5 +1050,30 @@ public sealed partial class Playfield
             musicAvailable && chartSummary is not ("No enabled charts" or "Open a chart first");
         state["meta_test_refresh_enabled"] = running && !busy;
         state["meta_test_stop_enabled"] = running;
+        state["meta_test_adb_enabled"] = _skin.GameConfig.UseAdb;
+        state["meta_test_adb_status"] = _skin.GameConfig.UseAdb ? adbStatus : "Disabled";
+        state["meta_test_adb_details"] = adbDetails;
+        state["meta_test_adb_devices"] = adbDevices;
+        state["meta_test_adb_wizard_open"] = _editorLanTestAdbWizardOpen;
+        state["meta_test_adb_wizard_mode"] = _editorLanTestAdbWizardMode;
+        state["meta_test_adb_pair_address"] = _editorLanTestAdbPairAddress;
+        state["meta_test_adb_pair_code"] = _editorLanTestAdbPairCode;
+        state["meta_test_adb_edit_field"] = IsEditorLanTestAdbTextField(_editorMetaEditingField) ? _editorMetaEditingField : string.Empty;
+        state["meta_test_adb_edit_value"] = IsEditorLanTestAdbTextField(_editorMetaEditingField) ? _editorMetaInputText : string.Empty;
+        if (IsEditorLanTestAdbTextField(_editorMetaEditingField))
+        {
+            var adbMetrics = GetEditorTextFieldMetrics(_editorMetaInputText, _editorMetaInputCaretIndex, _editorMetaSelectionAnchor);
+            state["meta_test_adb_caret_offset"] = adbMetrics.CaretOffset;
+            state["meta_test_adb_selection_offset"] = adbMetrics.SelectionOffset;
+            state["meta_test_adb_selection_width"] = adbMetrics.SelectionWidth;
+            state["meta_test_adb_text_width"] = adbMetrics.TextWidth;
+        }
+        else
+        {
+            state["meta_test_adb_caret_offset"] = 0;
+            state["meta_test_adb_selection_offset"] = 0;
+            state["meta_test_adb_selection_width"] = 0;
+            state["meta_test_adb_text_width"] = 0;
+        }
     }
 }

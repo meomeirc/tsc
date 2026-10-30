@@ -207,6 +207,7 @@ internal sealed class LanEditorTestService : IDisposable
     private readonly string _audioDirectory;
     private readonly string _chartDirectory;
     private readonly int _port;
+    private readonly bool _adbOnly;
     private readonly Action<string> _log;
     private readonly Dictionary<(string Peer, string PlayId), PlaySnapshot> _snapshots = new();
     private readonly Dictionary<(string Peer, string PlayId), long> _retired = new();
@@ -226,11 +227,12 @@ internal sealed class LanEditorTestService : IDisposable
     private Task? _udpTask;
     private Task? _monitorTask;
 
-    public LanEditorTestService(string audioDirectory, string chartDirectory, int port, Action<string> log)
+    public LanEditorTestService(string audioDirectory, string chartDirectory, int port, bool adbOnly, Action<string> log)
     {
         _audioDirectory = Path.GetFullPath(audioDirectory);
         _chartDirectory = Path.GetFullPath(chartDirectory);
         _port = port > 0 ? port : DefaultPort;
+        _adbOnly = adbOnly;
         _log = log ?? (_ => { });
     }
 
@@ -248,30 +250,37 @@ internal sealed class LanEditorTestService : IDisposable
         UdpClient? udp = null;
         try
         {
-            var startedTcp = new TcpListener(IPAddress.Any, _port);
+            var listenAddress = _adbOnly ? IPAddress.Loopback : IPAddress.Any;
+            var startedTcp = new TcpListener(listenAddress, _port);
             tcp = startedTcp;
             startedTcp.Server.ExclusiveAddressUse = true;
             startedTcp.Start(64);
 
-            var startedUdp = new UdpClient(AddressFamily.InterNetwork);
-            udp = startedUdp;
-            startedUdp.Client.ExclusiveAddressUse = true;
-            startedUdp.Client.Bind(new IPEndPoint(IPAddress.Any, _port));
+            if (!_adbOnly)
+            {
+                var startedUdp = new UdpClient(AddressFamily.InterNetwork);
+                udp = startedUdp;
+                startedUdp.Client.ExclusiveAddressUse = true;
+                startedUdp.Client.Bind(new IPEndPoint(IPAddress.Any, _port));
+            }
 
             lock (_sync)
             {
                 if (_shutdown is not null)
-                    throw new InvalidOperationException("The LAN editor service is already running.");
+                    throw new InvalidOperationException("The Local Test service is already running.");
                 _shutdown = shutdown;
                 _tcpListener = startedTcp;
-                _udpServer = startedUdp;
+                _udpServer = udp;
                 _acceptTask = Task.Run(() => AcceptLoopAsync(startedTcp, shutdown.Token));
-                _udpTask = Task.Run(() => DiscoveryLoopAsync(startedUdp, shutdown.Token));
+                var startedUdp = udp;
+                _udpTask = startedUdp is null ? null : Task.Run(() => DiscoveryLoopAsync(startedUdp, shutdown.Token));
                 _monitorTask = Task.Run(() => MonitorLoopAsync(shutdown.Token));
             }
 
             _log("Chart fallback: OFF (exact difficulty only)");
-            _log($"Editor service listening on TCP {_port} + LAN discovery");
+            _log(_adbOnly
+                ? $"Editor service listening on loopback TCP {_port} (ADB only; LAN disabled)"
+                : $"Editor service listening on TCP {_port} + LAN discovery");
         }
         catch
         {

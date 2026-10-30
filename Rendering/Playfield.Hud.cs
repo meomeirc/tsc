@@ -2100,6 +2100,9 @@ public sealed partial class Playfield
         bool running;
         bool busy;
         bool stale;
+        string adbStatus;
+        string adbDetails;
+        string[] adbDevices;
         lock (_editorLanTestSync)
         {
             status = _editorLanTestStatus;
@@ -2108,11 +2111,14 @@ public sealed partial class Playfield
             running = _editorLanTestRunning;
             busy = _editorLanTestBusy;
             stale = _editorLanTestDataStale;
+            adbStatus = _editorLanTestAdbStatus;
+            adbDetails = _editorLanTestAdbDetails;
+            adbDevices = _editorLanTestAdbDevices.ToArray();
         }
         var chartSummary = GetEditorLanTestChartSummary();
         var musicAvailable = IsEditorLanTestMusicAvailable();
         var textFont = GetChartEditorFont(font, 24f);
-        float cursorY = content.Y + (int)MathF.Round(8f * unit);
+        float cursorY = content.Y + 44f * unit;
         var textLineHeight = Math.Max(16f * unit,
             UnicodeTextRenderer.GetLogicalLineSpacing(textFont) * unit);
         var textWidth = Math.Max(1f, content.Width);
@@ -2129,17 +2135,33 @@ public sealed partial class Playfield
             cursorY += 4f * unit;
         }
 
+        DrawEditorMetaButton(GetEditorMetaLanTestAdbToggleBounds(virtualWidth, virtualHeight),
+            _skin.GameConfig.UseAdb ? "USE ADB: ON" : "USE ADB: OFF",
+            _skin.GameConfig.UseAdb ? new Color(38, 58, 64, 250) : new Color(28, 28, 30, 250),
+            _skin.GameConfig.UseAdb ? Active : new Color(100, 100, 102));
+
         Line("STATUS: " + status, running ? new Color(52, 211, 153) : normal);
         Line("MUSIC: " + (musicAvailable ? "Ready" : "Missing — import music under MEDIA first"),
             musicAvailable ? normal : _chartEditorInterfaceLayout.DangerColor);
         Line("CHARTS: " + chartSummary, normal);
         if (!string.IsNullOrWhiteSpace(address))
-            Line("ADDRESS: " + address, normal);
+            Line((_skin.GameConfig.UseAdb ? "ADB ENDPOINT: " : "LAN ADDRESS: ") + address, normal);
+        if (_skin.GameConfig.UseAdb)
+        {
+            Line("ADB: " + adbStatus, Active);
+            Line("Enable Local beatmap testing in your ReSONANCE account settings.", normal);
+            Line(adbDetails, muted);
+            Line("USB: Enable Developer Options and USB debugging, connect your phone with a data cable, then accept the debugging prompt.", muted);
+            foreach (var device in adbDevices.Take(2)) Line(device, normal);
+        }
         Line(details, muted);
         if (stale && running)
             Line("TEST DATA IS OUT OF DATE — refresh before the next play.", new Color(251, 191, 36));
-        Line("Enable Local beatmap testing in your ReSONANCE account settings.", muted);
-        Line("Keep the PC and phone on the same private Wi-Fi. Allow TCP/UDP 8765 through Windows Firewall.", muted);
+        if (!_skin.GameConfig.UseAdb)
+        {
+            Line("Enable Local beatmap testing in your ReSONANCE account settings.", normal);
+            Line("Keep the PC and phone on the same private Wi-Fi. Allow TCP/UDP 8765 through Windows Firewall.", muted);
+        }
 
         if (running)
         {
@@ -2155,7 +2177,7 @@ public sealed partial class Playfield
             var enabled = !busy && _chart is not null && musicAvailable &&
                 chartSummary is not ("No enabled charts" or "Open a chart first");
             DrawEditorMetaButton(GetEditorMetaLanTestButtonBounds(0, virtualWidth, virtualHeight),
-                busy ? "PREPARING…" : "START LAN TEST",
+                busy ? "PREPARING…" : "START LOCAL TEST",
                 enabled ? new Color(22, 52, 42, 250) : new Color(38, 38, 40, 245),
                 enabled ? Active : new Color(100, 100, 102));
         }

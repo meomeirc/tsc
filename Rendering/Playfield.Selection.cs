@@ -2225,6 +2225,54 @@ public sealed partial class Playfield
             Math.Max(0, contentBottom - contentTop));
     }
 
+    private Rectangle GetEditorMetaLanTestAdbToggleBounds(int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var y = content.Y + (int)MathF.Round(2f * unit);
+        return new Rectangle(content.X, y, content.Width, Math.Max(1, (int)MathF.Round(34f * unit)));
+    }
+
+    private Rectangle GetEditorMetaLanTestAdbModeBounds(bool wifi, int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var gap = Math.Max(1, (int)MathF.Round(8f * unit));
+        var half = Math.Max(1, (content.Width - gap) / 2);
+        var y = content.Y + (int)MathF.Round(29f * unit);
+        return wifi
+            ? new Rectangle(content.X + half + gap, y, Math.Max(1, content.Width - half - gap), Math.Max(1, (int)MathF.Round(34f * unit)))
+            : new Rectangle(content.X, y, half, Math.Max(1, (int)MathF.Round(34f * unit)));
+    }
+
+    private Rectangle GetEditorMetaLanTestAdbInputBounds(string field, int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var y = content.Y + (int)MathF.Round((field == "adb_pair_code" ? 240f : 182f) * unit);
+        var width = field == "adb_pair_code"
+            ? Math.Max(1, content.Width - (int)MathF.Round(146f * unit))
+            : content.Width;
+        return new Rectangle(content.X, y, width, Math.Max(1, (int)MathF.Round(36f * unit)));
+    }
+
+    private Rectangle GetEditorMetaLanTestAdbPairActionBounds(int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var width = Math.Min((int)MathF.Round(138f * unit), content.Width);
+        var y = content.Y + (int)MathF.Round(240f * unit);
+        return new Rectangle(content.Right - width, y, width, Math.Max(1, (int)MathF.Round(36f * unit)));
+    }
+
+    private Rectangle GetEditorMetaLanTestAdbBackBounds(int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var height = Math.Max(1, (int)MathF.Round(38f * unit));
+        return new Rectangle(content.X, content.Bottom - height - (int)MathF.Round(8f * unit), content.Width, height);
+    }
+
     private Rectangle GetEditorMetaLanTestButtonBounds(int action, int virtualWidth, int virtualHeight)
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
@@ -2784,6 +2832,11 @@ public sealed partial class Playfield
         }
         if (string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase))
         {
+            if (GetEditorMetaLanTestAdbToggleBounds(virtualWidth, virtualHeight).Contains(pixel))
+            {
+                ToggleEditorLanTestAdb();
+                return true;
+            }
             if (GetEditorMetaLanTestButtonBounds(0, virtualWidth, virtualHeight).Contains(pixel))
             {
                 StartEditorLanTest();
@@ -3500,17 +3553,6 @@ public sealed partial class Playfield
     {
         if (_editorPanelsViewEnabled)
             return false;
-        if (KeybindSettings.IsPressed("editor_delete_family"))
-        {
-            DeleteSelectedEditorNoteFamily();
-            return true;
-        }
-        if (KeybindSettings.IsPressed("editor_delete"))
-        {
-            if (_editorSelectedTempoEvent is not null) DeleteSelectedEditorTempoChanger();
-            else DeleteSelectedEditorNote();
-            return true;
-        }
         if (KeybindSettings.IsPressed("editor_tool_tap")) { SelectEditorTool(0); return true; }
         if (KeybindSettings.IsPressed("editor_tool_connector")) { SelectEditorTool(1); return true; }
         if (KeybindSettings.IsPressed("editor_tool_flick_left")) { SelectEditorTool(2); return true; }
