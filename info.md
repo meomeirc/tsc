@@ -1,5 +1,11 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.21
+
+- fixed duplicate extension when saving a difficulty that doesnt already exist
+- added a confirmation popup to create a new difficulty file immediately to make it extra obvious
+- other bug fixes
+
 # 0.0.20
 
 - added LAN testing
