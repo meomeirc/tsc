@@ -5818,7 +5818,8 @@ public sealed class Game1 : Game
     }
 
     private bool Pressed(KeyboardState keyboard, Keys key)
-        => keyboard.IsKeyDown(key) && !_previousKeyboard.IsKeyDown(key);
+        => (keyboard.IsKeyDown(key) && !_previousKeyboard.IsKeyDown(key)) ||
+           (key == Keys.Enter && PhysicalKeyboard.IsPressed(PhysicalKeyboard.NumpadEnterScancode));
 
     private Rectangle MainMenuButtonBounds(int index)
     {

@@ -4721,7 +4721,8 @@ public sealed class SongSelectMenu : IDisposable
     }
 
     private static bool Pressed(KeyboardState keyboard, KeyboardState previousKeyboard, XnaKeys key)
-        => keyboard.IsKeyDown(key) && !previousKeyboard.IsKeyDown(key);
+        => (keyboard.IsKeyDown(key) && !previousKeyboard.IsKeyDown(key)) ||
+           (key == XnaKeys.Enter && PhysicalKeyboard.IsPressed(PhysicalKeyboard.NumpadEnterScancode));
 
     private static string FindSongsRoot()
     {

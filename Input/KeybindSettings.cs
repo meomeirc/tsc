@@ -599,6 +599,13 @@ internal static class KeybindSettings
            IsDown(action, previous: true) &&
            !IsDown(action);
 
+    /// <summary>
+    /// Text fields accept the keypad Enter key as an additional commit key,
+    /// without making it a global alias for menu confirmation or other actions.
+    /// </summary>
+    public static bool IsTextFieldCommitPressed()
+        => IsPressed("editor_field_commit") || PhysicalKeyboard.IsPressed(PhysicalKeyboard.NumpadEnterScancode);
+
     public static bool IsPressed(string action)
     {
         if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;

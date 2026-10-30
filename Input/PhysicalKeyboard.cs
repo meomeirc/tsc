@@ -13,6 +13,7 @@ internal static class PhysicalKeyboard
     public const int MouseRightScancode = 514;
     public const int MouseX1Scancode = 515;
     public const int MouseX2Scancode = 516;
+    public const int NumpadEnterScancode = 88;
     public const int ScancodeCount = 517;
     private static byte[] _current = new byte[ScancodeCount];
     private static byte[] _previous = new byte[ScancodeCount];
@@ -170,7 +171,7 @@ internal static class PhysicalKeyboard
         65 => "F8", 66 => "F9", 67 => "F10", 68 => "F11", 69 => "F12", 73 => "INSERT", 74 => "HOME",
         75 => "PAGE UP", 76 => "DELETE", 77 => "END", 78 => "PAGE DOWN", 79 => "RIGHT", 80 => "LEFT",
         81 => "DOWN", 82 => "UP", 84 => "NUM /", 85 => "NUM *", 86 => "NUM -", 87 => "NUM +",
-        88 => "NUM ENTER", 89 => "NUM 1", 90 => "NUM 2", 91 => "NUM 3", 92 => "NUM 4", 93 => "NUM 5", 94 => "NUM 6", 95 => "NUM 7", 96 => "NUM 8", 97 => "NUM 9", 98 => "NUM 0", 99 => "NUM .", 224 => "CTRL", 225 => "SHIFT", 226 => "ALT", 227 => "WIN",
+        NumpadEnterScancode => "NUM ENTER", 89 => "NUM 1", 90 => "NUM 2", 91 => "NUM 3", 92 => "NUM 4", 93 => "NUM 5", 94 => "NUM 6", 95 => "NUM 7", 96 => "NUM 8", 97 => "NUM 9", 98 => "NUM 0", 99 => "NUM .", 224 => "CTRL", 225 => "SHIFT", 226 => "ALT", 227 => "WIN",
         228 => "CTRL", 229 => "SHIFT", 230 => "ALT", 231 => "WIN",
         MouseLeftScancode => "MOUSE LEFT", MouseMiddleScancode => "MOUSE MIDDLE",
         MouseRightScancode => "MOUSE RIGHT", MouseX1Scancode => "MOUSE X1", MouseX2Scancode => "MOUSE X2",
@@ -184,7 +185,7 @@ internal static class PhysicalKeyboard
         "Q" => 20, "R" => 21, "S" => 22, "T" => 23, "U" => 24, "V" => 25, "W" => 26, "X" => 27,
         "Y" => 28, "Z" => 29, "D1" => 30, "D2" => 31, "D3" => 32, "D4" => 33, "D5" => 34,
         "D6" => 35, "D7" => 36, "D8" => 37, "D9" => 38, "D0" => 39, "Enter" => 40, "Escape" => 41,
-        "Back" => 42, "Tab" => 43, "Space" => 44, "OemMinus" => 45, "OemPlus" => 46,
+        "Back" => 42, "Tab" => 43, "Space" => 44, "Separator" => NumpadEnterScancode, "OemMinus" => 45, "OemPlus" => 46,
         "OemOpenBrackets" => 47, "OemCloseBrackets" => 48, "OemPipe" => 49, "OemSemicolon" => 51,
         "OemQuotes" => 52, "OemTilde" => 53, "OemComma" => 54, "OemPeriod" => 55, "OemQuestion" => 56,
         "CapsLock" => 57, "Insert" => 73, "Home" => 74, "PageUp" => 75, "Delete" => 76, "End" => 77,

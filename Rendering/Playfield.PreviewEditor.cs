@@ -693,7 +693,7 @@ public sealed partial class Playfield
         if (_editorPreviewFocusedField >= 0)
         {
             var isStart = _editorPreviewFocusedField == 0;
-            if (KeybindSettings.IsPressed("editor_field_commit"))
+            if (KeybindSettings.IsTextFieldCommitPressed())
             {
                 CommitEditorPreviewFocusedTime();
             }

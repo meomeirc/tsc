@@ -6217,7 +6217,7 @@ public sealed partial class Playfield
         if (_editorMetaEditingField is null) return;
 
         if (KeybindSettings.IsPressed("editor_cancel")) { CancelEditorMetaField(); return; }
-        if (KeybindSettings.IsPressed("editor_field_commit"))
+        if (KeybindSettings.IsTextFieldCommitPressed())
         {
             CommitEditorMetaField();
             if (_editorMetaEditingField is null) EndEditorTextFieldMouseSelection();
@@ -6321,7 +6321,7 @@ public sealed partial class Playfield
                 _statusMessage = "Duration edit cancelled; the previous value was kept.";
                 return;
             }
-            if (KeybindSettings.IsPressed("editor_field_commit") || KeybindSettings.IsPressed("editor_field_next") || KeybindSettings.IsPressed("editor_field_previous"))
+            if (KeybindSettings.IsTextFieldCommitPressed() || KeybindSettings.IsPressed("editor_field_next") || KeybindSettings.IsPressed("editor_field_previous"))
             {
                 if (TryCommitEditorDurationInput())
                 {
@@ -6349,7 +6349,7 @@ public sealed partial class Playfield
                 _statusMessage = "Generator value edit cancelled.";
                 return;
             }
-            if (KeybindSettings.IsPressed("editor_field_commit") || KeybindSettings.IsPressed("editor_field_next") || KeybindSettings.IsPressed("editor_field_previous"))
+            if (KeybindSettings.IsTextFieldCommitPressed() || KeybindSettings.IsPressed("editor_field_next") || KeybindSettings.IsPressed("editor_field_previous"))
             {
                 if (TryCommitEditorStutterInput())
                 {
@@ -6387,7 +6387,7 @@ public sealed partial class Playfield
                 EndEditorTextFieldMouseSelection();
                 return;
             }
-            if (KeybindSettings.IsPressed("editor_field_commit") || KeybindSettings.IsPressed("editor_field_next") || KeybindSettings.IsPressed("editor_field_previous"))
+            if (KeybindSettings.IsTextFieldCommitPressed() || KeybindSettings.IsPressed("editor_field_next") || KeybindSettings.IsPressed("editor_field_previous"))
             {
                 if (TryParseEditorBpmInput(out var enteredBpm))
                 {
