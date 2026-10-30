@@ -1,5 +1,11 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.22
+
+- added adb option for local testing
+- prevent text inputs from triggering other keybinds
+- delete note keybind takes priority over cancel actions if bound to the same key
+ 
 # 0.0.21
 
 - fixed duplicate extension when saving a difficulty that doesnt already exist
