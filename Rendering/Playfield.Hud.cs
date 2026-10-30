@@ -2335,6 +2335,35 @@ public sealed partial class Playfield
             if (_editorMetaExportExpanded)
                 DrawEditorMetaExportPopup(virtualWidth, virtualHeight);
         }
+        if (_editorCreateDifficultyConfirmOpen)
+            DrawEditorCreateDifficultyConfirmation(virtualWidth, virtualHeight);
+    }
+
+    private void DrawEditorCreateDifficultyConfirmation(int virtualWidth, int virtualHeight)
+    {
+        var unit = _projection.ScalePixels(1f);
+        _spriteBatch.Draw(_pixel, new Rectangle(0, 0, virtualWidth, virtualHeight), new Color(0, 0, 0, 190));
+        var width = Math.Min((int)MathF.Round(460f * unit), virtualWidth - 24);
+        var height = Math.Max(1, (int)MathF.Round(190f * unit));
+        var panel = new Rectangle((virtualWidth - width) / 2, (virtualHeight - height) / 2, width, height);
+        _spriteBatch.Draw(_pixel, panel, _chartEditorInterfaceLayout.PanelColor);
+        var font = GetChartEditorFont(_chartEditorInterfaceLayout.HeaderFont);
+        var title = FontSafeText(font, "CREATE DIFFICULTY?");
+        UnicodeTextRenderer.DrawString(_spriteBatch, font, title,
+            new Vector2(panel.Center.X, panel.Y + 24f * unit), _chartEditorInterfaceLayout.ButtonTextColor,
+            0f, new Vector2(font.MeasureString(title).X / 2f, 0f), unit, SpriteEffects.None, 0f);
+        var difficulty = GetEditorDifficultyName(_editorPendingCreateDifficultyCode);
+        var body = FontSafeText(GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont),
+            $"Create an empty {difficulty} chart file now? You can add notes afterward.");
+        var bodyFit = FitChartEditorText(body, _chartEditorInterfaceLayout.LabelFont, 16f, panel.Width - 28f * unit, 48f * unit);
+        UnicodeTextRenderer.DrawString(_spriteBatch, bodyFit.Font, bodyFit.Text,
+            new Vector2(panel.Center.X, panel.Y + 66f * unit), _chartEditorInterfaceLayout.MutedTextColor,
+            0f, new Vector2(bodyFit.Measured.X / 2f, 0f), bodyFit.Scale, SpriteEffects.None, 0f);
+        var cancel = new Rectangle(panel.X + (int)MathF.Round(12f * unit), panel.Bottom - (int)MathF.Round(48f * unit),
+            (panel.Width - (int)MathF.Round(36f * unit)) / 2, (int)MathF.Round(34f * unit));
+        var confirm = new Rectangle(cancel.Right + (int)MathF.Round(12f * unit), cancel.Y, cancel.Width, cancel.Height);
+        DrawEditorMetaButton(cancel, "CANCEL", new Color(28, 28, 30, 250), Active);
+        DrawEditorMetaButton(confirm, "CREATE", new Color(22, 52, 42, 250), new Color(52, 211, 153));
     }
 
     private void DrawEditorMetaDeleteConfirmation(int virtualWidth, int virtualHeight)

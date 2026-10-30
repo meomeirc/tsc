@@ -718,6 +718,9 @@ public sealed partial class Playfield
             ["meta_difficulty_label"] = GetEditorDifficultyName(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)).ToUpperInvariant() + " DIFFICULTY",
             ["meta_delete_enabled"] = HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)),
             ["meta_delete_confirm_open"] = _editorMetaDeleteConfirmOpen,
+            ["meta_create_confirm_open"] = _editorCreateDifficultyConfirmOpen,
+            ["meta_create_difficulty_label"] = string.IsNullOrWhiteSpace(_editorPendingCreateDifficultyCode)
+                ? "difficulty" : GetEditorDifficultyName(_editorPendingCreateDifficultyCode).ToLowerInvariant(),
             ["meta_template"] = _editorBundleTemplate.ToString().ToUpperInvariant(),
             ["meta_element_open"] = _editorElementDropdownOpen,
             ["meta_preview_playing"] = _editorPreviewPlayer?.IsPlaying == true,
@@ -1040,6 +1043,12 @@ public sealed partial class Playfield
                 return true;
             case "editor.meta.delete_yes":
                 if (_editorMetaDeleteConfirmOpen) DeleteEditorDifficultyFromSession();
+                return true;
+            case "editor.meta.create_cancel":
+                CancelCreateEditorDifficulty();
+                return true;
+            case "editor.meta.create_yes":
+                if (_editorCreateDifficultyConfirmOpen) ConfirmCreateEditorDifficulty();
                 return true;
             case "editor.meta.export_toggle":
                 CancelEditorMetaField();

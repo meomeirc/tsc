@@ -75,6 +75,8 @@ public sealed partial class Playfield
     private int _editorMetaScrollOffset;
     private bool _editorMetaExportExpanded;
     private bool _editorMetaDeleteConfirmOpen;
+    private bool _editorCreateDifficultyConfirmOpen;
+    private string? _editorPendingCreateDifficultyCode;
     private bool _editorExtraDifficultyEnabled = true;
     private bool _editorElementDropdownOpen;
     private bool _editorProblemsExpanded;
@@ -943,6 +945,8 @@ public sealed partial class Playfield
     public bool GameplayResultActive => _gameplayResultActive;
     public bool HardGaugeGameOverActive => _hardGaugeGameOverActive;
     public bool HandlesResultActionInput => _gameplayResultActive || _hardGaugeGameOverActive;
+    public bool HandlesDifficultyConfirmationInput =>
+        _editorCreateDifficultyConfirmOpen || _editorMetaDeleteConfirmOpen;
     // The destination can leave the opaque PREPARING transition as soon as the
     // hidden renderer/audio warm-up is done. Playback remains pending until the
     // transition has fully faded away and the skin intro has finished.
@@ -1107,9 +1111,9 @@ public sealed partial class Playfield
         if (!IsEditorDifficultyEnabled(code))
             return false;
 
-        // A missing difficulty tab is represented by a generated blank chart in
-        // memory. Keep supplied charts even if they are intentionally empty, but
-        // omit unsupplied placeholders until the user authors actual chart data.
+        // A confirmed new difficulty has a real, valid empty chart file, so it is
+        // retained even before notes are authored. Omit only unsaved placeholders
+        // with neither a backing file nor authored chart content.
         // Re-check loose chart paths in case a save or external file change made
         // the cached HasSourceChart flag stale; an FPK path alone is not a chart.
         var hasSourceChart = state.HasSourceChart;
@@ -2322,6 +2326,20 @@ public sealed partial class Playfield
             return true;
         }
 
+        // Missing difficulties need explicit approval before a file is created.
+        // HasEditorDifficultyChart also discovers and caches sibling charts that
+        // were not loaded when the editor session started.
+        if (!HasEditorDifficultyChart(nextCode))
+        {
+            _editorPendingCreateDifficultyCode = nextCode;
+            _editorCreateDifficultyConfirmOpen = true;
+            _editorMetaPanelOpen = true;
+            _editorMetaExportExpanded = false;
+            _editorElementDropdownOpen = false;
+            _editorMetaScrollOffset = 0;
+            return true;
+        }
+
         // Selecting a committed-deleted difficulty again starts a fresh chart.
         // Simply remaining on the deleted tab does not silently recreate its file.
         if (_editorCommittedDeletedDifficultyCodes.Remove(nextCode))
@@ -2425,11 +2443,171 @@ public sealed partial class Playfield
         }
     }
 
+    private void CancelCreateEditorDifficulty()
+    {
+        _editorCreateDifficultyConfirmOpen = false;
+        _editorPendingCreateDifficultyCode = null;
+    }
+
+    private void ConfirmCreateEditorDifficulty()
+    {
+        var code = _editorPendingCreateDifficultyCode;
+        CancelCreateEditorDifficulty();
+        if (_chart is null || string.IsNullOrWhiteSpace(code))
+            return;
+
+        code = GetEditorDifficultyCode(code);
+        try
+        {
+            var sharedMusic = _editorSharedMusicBytes ?? _loadedMusicBytes;
+
+            // The file may have been created by another tool while the popup was
+            // open. Reuse it rather than overwrite it. This also restores a
+            // difficulty whose deletion was only staged in the current session.
+            EditorDifficultyState? existing = null;
+            try
+            {
+                existing = TryLoadSiblingEditorDifficulty(code, sharedMusic);
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or JsonException or UnauthorizedAccessException)
+            {
+                _statusMessage = $"Could not load {GetEditorDifficultyName(code)} difficulty: {ex.Message}";
+                return;
+            }
+
+            if (existing is not null)
+            {
+                _editorDeletedDifficultyCodes.Remove(code);
+                _editorCommittedDeletedDifficultyCodes.Remove(code);
+                existing.HasSourceChart = true;
+                _editorDifficultyStates[code] = existing;
+                SwitchEditorDifficulty(code);
+                return;
+            }
+
+            if (!_editorDifficultySessionActive)
+            {
+                _editorDifficultyStates.Clear();
+                _editorDeletedDifficultyCodes.Clear();
+                _editorCommittedDeletedDifficultyCodes.Clear();
+                _editorDifficultySessionActive = true;
+                _editorActiveDifficultyCode = GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+                _editorSharedMusicBytes = _loadedMusicBytes?.ToArray();
+                _editorSharedSongImportedAudio = _editorImportedSongAudio;
+                _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
+                StoreActiveEditorDifficulty();
+                sharedMusic = _editorSharedMusicBytes ?? _loadedMusicBytes;
+            }
+
+            SyncSharedEditorMetadataToDifficultyStates();
+            StoreActiveEditorDifficulty();
+            var newState = CreateBlankEditorDifficultyState(code, _chart, sharedMusic);
+            CopySharedEditorMetadata(_chart, newState.Chart);
+            newState.Chart.Difficulty = GetEditorDifficultyName(code);
+            if (sharedMusic is { Length: > 0 })
+                newState.MusicBytes = sharedMusic.ToArray();
+            if (_editorSharedSongImportedAudio)
+                newState.ImportedSongAudio = true;
+
+            var target = newState.SourcePath;
+            if (string.IsNullOrWhiteSpace(target))
+                throw new InvalidOperationException("The new difficulty file path could not be determined. Save or export this chart first.");
+
+            target = Path.GetFullPath(target);
+            var sourceExtension = Path.GetExtension(StripEditorDisabledSuffix(_editorDifficultyDiscoverySourcePath ?? _loadedSourcePath ?? string.Empty));
+            if (sourceExtension.Equals(".fpk", StringComparison.OrdinalIgnoreCase))
+            {
+                CreateBlankEditorDifficultyInFpk(target, code, newState);
+            }
+            else
+            {
+                // Do not replace a file that appeared after the initial existence
+                // check. The sibling-load attempt above handles normal valid files;
+                // this protects an unexpected/unreadable file from being lost.
+                if (File.Exists(target) || File.Exists(target + ".disabled"))
+                    throw new IOException($"A file for {GetEditorDifficultyName(code)} difficulty already exists.");
+
+                var explicitlyDisabled = code == "xt"
+                    ? !_editorExtraDifficultyEnabled
+                    : _editorDisabledDifficultyCodes.Contains(code);
+                var outputPath = explicitlyDisabled ? target + ".disabled" : target;
+                Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? Directory.GetCurrentDirectory());
+                if (Path.GetExtension(target).Equals(".tsc", StringComparison.OrdinalIgnoreCase))
+                {
+                    TscLoader.Save(outputPath, newState.Chart, newState.Chart.MusicPath,
+                        includeJudgementWindows: _editorCustomJudgementWindowsEnabled,
+                        writeSongJsonSidecar: false);
+                }
+                else if (Path.GetExtension(target).Equals(".ares", StringComparison.OrdinalIgnoreCase))
+                {
+                    AresWriter.Save(outputPath, newState.Chart, newState.AresHeaderTemplate);
+                }
+                else
+                {
+                    throw new InvalidOperationException($"Cannot create a chart file with extension '{Path.GetExtension(target)}'.");
+                }
+
+                newState.SourcePath = outputPath;
+                newState.SourceName = Path.GetFileName(outputPath);
+                newState.FpkChartName = null;
+                newState.HasSourceChart = true;
+            }
+
+            _editorDeletedDifficultyCodes.Remove(code);
+            _editorCommittedDeletedDifficultyCodes.Remove(code);
+            _editorDifficultyStates[code] = newState;
+            _statusMessage = $"Created empty {GetEditorDifficultyName(code)} difficulty file.";
+            SwitchEditorDifficulty(code);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException or ArgumentException)
+        {
+            _statusMessage = $"Could not create {GetEditorDifficultyName(code)} difficulty: {ex.Message}";
+        }
+    }
+
+    private void CreateBlankEditorDifficultyInFpk(string packagePath, string code, EditorDifficultyState state)
+    {
+        var fullPackagePath = Path.GetFullPath(packagePath);
+        if (!File.Exists(fullPackagePath))
+            throw new FileNotFoundException("The source FPK bundle could not be found.", fullPackagePath);
+
+        var package = FpkPackage.Load(fullPackagePath);
+        var explicitlyDisabled = code == "xt"
+            ? !_editorExtraDifficultyEnabled
+            : _editorDisabledDifficultyCodes.Contains(code);
+        var logicalName = $"pattern_{code}.ares" + (explicitlyDisabled ? ".disabled" : string.Empty);
+        var existingNames = package.Entries.Select(entry => entry.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (existingNames.Contains(logicalName) || existingNames.Contains(StripEditorDisabledSuffix(logicalName)) ||
+            existingNames.Contains(StripEditorDisabledSuffix(logicalName) + ".disabled"))
+            throw new IOException($"A file for {GetEditorDifficultyName(code)} difficulty already exists in the FPK.");
+
+        var entries = package.Entries
+            .Select(entry => new FpkWriteEntry(entry.Name, package.Extract(entry)))
+            .ToList();
+        entries.Add(new FpkWriteEntry(logicalName, AresWriter.BuildBytes(state.Chart, state.AresHeaderTemplate)));
+
+        var directory = Path.GetDirectoryName(fullPackagePath) ?? Directory.GetCurrentDirectory();
+        var temporaryPath = Path.Combine(directory, $".{Path.GetFileName(fullPackagePath)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            FpkWriter.Save(temporaryPath, entries, package);
+            File.Move(temporaryPath, fullPackagePath, overwrite: true);
+            state.SourcePath = fullPackagePath;
+            state.SourceName = logicalName;
+            state.FpkChartName = logicalName;
+            state.HasSourceChart = true;
+        }
+        finally
+        {
+            try { if (File.Exists(temporaryPath)) File.Delete(temporaryPath); }
+            catch { /* best-effort cleanup of the temporary package */ }
+        }
+    }
+
     private EditorDifficultyState CaptureEditorDifficultyState(string code)
     {
-        // Do not turn a blank difficulty into an existing chart merely because
-        // it is now the active editor tab. New difficulties have an in-memory
-        // chart state, but no source file until their first save.
+        // Do not infer a source file from an in-memory chart alone; the state is
+        // considered supplied only when it already knows it has a backing file.
         var hasSourceChart = !_editorDeletedDifficultyCodes.Contains(code) &&
             !_editorCommittedDeletedDifficultyCodes.Contains(code) &&
             (_editorDifficultyStates.TryGetValue(code, out var existing)
@@ -3946,6 +4124,8 @@ public sealed partial class Playfield
 
     private void LoadChartObject(AresChart chart, string sourceName, byte[]? musicBytes, byte[]? chartBytes = null, bool preservePlayback = false)
     {
+        if (!_switchingEditorDifficulty)
+            CancelCreateEditorDifficulty();
         var preservedPlaySeconds = _playSeconds;
         var preservedPlaying = _playing;
         var preservedPlaybackStartPending = _playbackStartPending;
@@ -6090,6 +6270,32 @@ public sealed partial class Playfield
     {
         if (!_chartEditorMode || _chart is null || _tempo is null)
             return;
+
+        // Modal confirmation dialogs own editor keyboard input until dismissed.
+        // Support the global menu Back/Confirm bindings as well as the editor's
+        // Cancel and text-field Commit bindings. Cancel wins if bindings overlap.
+        if (_editorCreateDifficultyConfirmOpen || _editorMetaDeleteConfirmOpen)
+        {
+            if (KeybindSettings.IsPressed("editor_cancel") || KeybindSettings.IsPressed("menu_back"))
+            {
+                if (_editorCreateDifficultyConfirmOpen)
+                    CancelCreateEditorDifficulty();
+                else
+                    _editorMetaDeleteConfirmOpen = false;
+                return;
+            }
+
+            if (KeybindSettings.IsPressed("menu_confirm") || KeybindSettings.IsPressed("editor_field_commit"))
+            {
+                if (_editorCreateDifficultyConfirmOpen)
+                    ConfirmCreateEditorDifficulty();
+                else
+                    DeleteEditorDifficultyFromSession();
+                return;
+            }
+
+            return;
+        }
 
         if (_editorMetaExportExpanded && KeybindSettings.IsPressed("editor_cancel"))
         {

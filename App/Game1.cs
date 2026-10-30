@@ -317,10 +317,13 @@ public sealed class Game1 : Game
         // navigation is controlled by the configurable scancode binding.
         var physicalEscapeForExternalTextField = physicalEscapePressed && (_settingsEditingKey is not null || searchTyping);
         var editorCancelPressed = _startupScreen == StartupScreen.Gameplay &&
-            _playfield?.ChartEditorMode == true && KeybindSettings.IsPressed("editor_cancel");
+            _playfield?.ChartEditorMode == true &&
+            (KeybindSettings.IsPressed("editor_cancel") ||
+             (_playfield?.HandlesDifficultyConfirmationInput == true && KeybindSettings.IsPressed("menu_back")));
         // In the chart editor, the editor's configurable Cancel action gets first
-        // chance to handle the same key as global Back (Escape by default). When no
-        // tool needs cancelling, the editor falls back to toggling its INFO panel.
+        // chance to handle the same key as global Back (Escape by default). Active
+        // difficulty confirmation dialogs also reserve the menu Back binding so it
+        // closes the dialog instead of leaving the editor or toggling INFO.
         var resultActionPressed = (_startupScreen is StartupScreen.Gameplay or StartupScreen.GameplayResult) &&
             _playfield?.HandlesResultActionInput == true &&
             (KeybindSettings.IsPressed("gameplay_result_continue") || KeybindSettings.IsPressed("gameplay_result_retry"));

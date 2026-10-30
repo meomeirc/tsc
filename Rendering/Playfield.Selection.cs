@@ -2700,6 +2700,21 @@ public sealed partial class Playfield
 
     private bool TryHandleEditorMetaPanelClick(Microsoft.Xna.Framework.Point pixel, int virtualWidth, int virtualHeight)
     {
+        if (_editorCreateDifficultyConfirmOpen)
+        {
+            var unit = _projection.ScalePixels(1f);
+            var modalWidth = Math.Min((int)MathF.Round(460f * unit), virtualWidth - 24);
+            var modalHeight = Math.Max(1, (int)MathF.Round(190f * unit));
+            var modal = new Rectangle((virtualWidth - modalWidth) / 2, (virtualHeight - modalHeight) / 2, modalWidth, modalHeight);
+            var buttonHeight = (int)MathF.Round(34f * unit);
+            var buttonY = modal.Bottom - (int)MathF.Round(48f * unit);
+            var buttonWidth = (modal.Width - (int)MathF.Round(36f * unit)) / 2;
+            var cancel = new Rectangle(modal.X + (int)MathF.Round(12f * unit), buttonY, buttonWidth, buttonHeight);
+            var confirm = new Rectangle(cancel.Right + (int)MathF.Round(12f * unit), buttonY, buttonWidth, buttonHeight);
+            if (confirm.Contains(pixel)) ConfirmCreateEditorDifficulty();
+            else if (cancel.Contains(pixel)) CancelCreateEditorDifficulty();
+            return true;
+        }
         if (_editorMetaDeleteConfirmOpen)
         {
             var unit = _projection.ScalePixels(1f);
@@ -2753,8 +2768,7 @@ public sealed partial class Playfield
                 continue;
             _editorMetaScrollOffset = 0;
             _editorElementDropdownOpen = false;
-            // A missing chart is still a valid destination: switching to it
-            // opens a blank chart state so the user can create that difficulty.
+            // Switching to an absent chart asks before creating its file.
             SwitchEditorDifficulty(EditorDifficultyCodes[i]);
             return true;
         }

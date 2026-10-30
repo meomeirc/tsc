@@ -1454,9 +1454,13 @@ local function drawDeleteDifficultyPopup(state, w, h, layer)
     draw.text("DELETE DIFFICULTY?", { parent = "editor_delete_difficulty_panel", x = panelW * 0.5,
         y = 28 * scale, size = fontSize("heading"), color = C.text, font = F.medium,
         anchor = "center", layer = base + 3 })
-    draw.text("This marks the chart for deletion. Its file will be removed when you save.",
-        { parent = "editor_delete_difficulty_panel", x = panelW * 0.5, y = 72 * scale,
-          size = fontSize("description"), color = C.muted, font = F.regular, anchor = "center", layer = base + 3 })
+    local bodyLines = wrapMeasuredText("This marks the chart for deletion. Its file will be removed when you save.",
+        panelW - 36 * scale, fontSize("description"), F.regular)
+    for index, line in ipairs(bodyLines) do
+        draw.text(line, { parent = "editor_delete_difficulty_panel", x = panelW * 0.5,
+            y = (69 + (index - 1) * 21) * scale, size = fontSize("description"), color = C.muted,
+            font = F.regular, anchor = "center", layer = base + 3 })
+    end
     local gap = 12 * scale
     local bw = (panelW - 56 * scale - gap) / 2
     local buttonH = 42 * scale
@@ -1464,6 +1468,40 @@ local function drawDeleteDifficultyPopup(state, w, h, layer)
     button({ id = "editor_delete_difficulty_cancel", label = "CANCEL", action = "editor.meta.delete_cancel" },
         x + 22 * scale, by, bw, buttonH, { layer = base + 4, hit_test_priority = 190 })
     button({ id = "editor_delete_difficulty_yes", label = "DELETE", action = "editor.meta.delete_yes", variant = "danger" },
+        x + 22 * scale + bw + gap, by, bw, buttonH, { layer = base + 4, hit_test_priority = 190 })
+end
+
+local function drawCreateDifficultyPopup(state, w, h, layer)
+    if state.meta_create_confirm_open ~= true then return end
+    local scale = ACTIVE_SCALE
+    local panelW = math.min(520 * scale, w - 48 * scale)
+    local panelH = 220 * scale
+    local x, y = (w - panelW) * 0.5, (h - panelH) * 0.5
+    local base = layer or 180
+    local difficulty = tostring(state.meta_create_difficulty_label or "difficulty")
+    ui.button({ id = "editor_create_difficulty_backdrop", x = 0, y = 0, width = w, height = h,
+        action = "editor.meta.create_cancel", hit_test_priority = 180 })
+    draw.rect({ x = 0, y = 0, width = w, height = h,
+        color = { r = 0, g = 0, b = 0, a = 190 }, layer = base })
+    UI.draw_panel({ id = "editor_create_difficulty_panel", x = x, y = y, width = panelW, height = panelH,
+        color = C.panel, alpha = 0.99, layer = base + 1 })
+    draw.text("CREATE DIFFICULTY?", { parent = "editor_create_difficulty_panel", x = panelW * 0.5,
+        y = 28 * scale, size = fontSize("heading"), color = C.text, font = F.medium,
+        anchor = "center", layer = base + 3 })
+    local bodyLines = wrapMeasuredText("Create an empty " .. difficulty .. " chart file now? You can add notes afterward.",
+        panelW - 36 * scale, fontSize("description"), F.regular)
+    for index, line in ipairs(bodyLines) do
+        draw.text(line, { parent = "editor_create_difficulty_panel", x = panelW * 0.5,
+            y = (69 + (index - 1) * 21) * scale, size = fontSize("description"), color = C.muted,
+            font = F.regular, anchor = "center", layer = base + 3 })
+    end
+    local gap = 12 * scale
+    local bw = (panelW - 56 * scale - gap) / 2
+    local buttonH = 42 * scale
+    local by = y + panelH - 62 * scale
+    button({ id = "editor_create_difficulty_cancel", label = "CANCEL", action = "editor.meta.create_cancel" },
+        x + 22 * scale, by, bw, buttonH, { layer = base + 4, hit_test_priority = 190 })
+    button({ id = "editor_create_difficulty_yes", label = "CREATE", action = "editor.meta.create_yes", variant = "success" },
         x + 22 * scale + bw + gap, by, bw, buttonH, { layer = base + 4, hit_test_priority = 190 })
 end
 
@@ -1893,6 +1931,7 @@ function render()
 
     drawExportPopup(s, w, h, 150)
     drawDeleteDifficultyPopup(s, w, h, 170)
+    drawCreateDifficultyPopup(s, w, h, 180)
 end
 
 -- Retained only for the built-in C# emergency renderer. Normal chart editor

@@ -313,7 +313,8 @@ public sealed partial class Playfield
                 {
                     DrawSkinScriptUiLayers(editorCommands, false, _chartEditorInterfaceRuntime);
                     if (_editorMetaPanelOpen && string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase) &&
-                        !_editorPreviewEditorOpen && !_editorMetaExportExpanded && !_editorMetaDeleteConfirmOpen && !_editorElementDropdownOpen)
+                        !_editorPreviewEditorOpen && !_editorMetaExportExpanded && !_editorMetaDeleteConfirmOpen &&
+                        !_editorCreateDifficultyConfirmOpen && !_editorElementDropdownOpen)
                         DrawEditorMediaArtworkPreviewOverlay(virtualWidth, virtualHeight);
                     chartEditorLuaDrawn = true;
                 }
