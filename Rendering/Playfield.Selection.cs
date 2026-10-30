@@ -8118,6 +8118,22 @@ public sealed partial class Playfield
             if (!_projection.RenderIntervalIntersects((float)startTravel, (float)endTravel))
                 continue;
 
+            // SuperFlicks are rendered across their complete source bank, not at
+            // the single physical track stored on the event. Hit-test that same
+            // bank-wide strip so users can click anywhere along the visible path.
+            if (ev.IsSuperFlick)
+            {
+                if (!TryGetEditorSuperFlickHitDistance(point, ev, currentTick, out var superFlickDistance))
+                    continue;
+
+                if (superFlickDistance < bestDistance)
+                {
+                    best = ev;
+                    bestDistance = superFlickDistance;
+                }
+                continue;
+            }
+
             var start = _projection.ProjectAtTicks(ev.Track, ev.Tick, currentTick, currentState);
             var end = _projection.ProjectAtTicks(ev.Track, endTick, currentTick, currentState);
             if (OutsideNoteView(start, end))
@@ -8178,6 +8194,72 @@ public sealed partial class Playfield
         }
 
         return best;
+    }
+
+    private bool TryGetEditorSuperFlickHitDistance(
+        Vector2 point,
+        ChartEvent ev,
+        double currentTick,
+        out float hitDistance)
+    {
+        hitDistance = float.MaxValue;
+        var physicalPosition = GearState.Position(ev.Track);
+        if (physicalPosition is null)
+            return false;
+
+        var routeBeforeEvent = _gear?.AtTick(ev.Tick, includeTickChanges: false);
+        var side = ev.GetSuperFlickRenderSide() ?? physicalPosition.Value.Side;
+        var bank = ev.GetSuperFlickSourceBank(routeBeforeEvent) ?? physicalPosition.Value.Bank;
+        if (string.IsNullOrWhiteSpace(side) || string.IsNullOrWhiteSpace(bank))
+            return false;
+
+        var (bankLeft, bankRight) = SuperFlickSpanEdges(side, bank);
+        var surface = _projection.BuildBankSurface(side, bank);
+        var travel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, currentTick);
+
+        // Sample across the bank instead of relying on the event's physical track.
+        // The projected strip can curve slightly with the bank surface, so use a
+        // short polyline rather than a single straight line between its endpoints.
+        const int segmentCount = 6;
+        var previousPoint = Vector2.Zero;
+        var closestDistance = float.MaxValue;
+        var maxHitRadius = 0f;
+
+        for (var i = 0; i <= segmentCount; i++)
+        {
+            var amount = i / (float)segmentCount;
+            var normalizedX = MathHelper.Lerp(bankLeft, bankRight, amount);
+            var context = _projection.BuildStandingNoteTravelContext(
+                surface, normalizedX, side, bank);
+            var basis = _projection.BuildStandingNoteBasis(context, travel);
+            var screenPoint = _projection.ScreenPositionFromCameraSpace(basis.Center);
+
+            var judgeBasis = _projection.BuildStandingNoteBasis(context, 0f);
+            var currentPixelsPerWorld = Math.Max(0.0001f,
+                _projection.ScreenPixelsPerWorldUnit(basis.Center, basis.Across));
+            var referencePixelsPerWorld = Math.Max(0.0001f,
+                _projection.ScreenPixelsPerWorldUnit(judgeBasis.Center, judgeBasis.Across));
+            var localScale = currentPixelsPerWorld / referencePixelsPerWorld;
+            var stripHeight = Math.Max(3f, _projection.SuperFlickTextureWidth * localScale);
+
+            // Keep the hit area comfortably larger than the thin animated strip.
+            // The added padding makes it much easier to select without requiring
+            // pixel-perfect clicks, especially at the edges of a bank.
+            maxHitRadius = Math.Max(maxHitRadius, Math.Max(12f, stripHeight * 0.5f + 8f));
+
+            if (i > 0)
+                closestDistance = Math.Min(
+                    closestDistance,
+                    PointToSegmentDistance(point, previousPoint, screenPoint));
+
+            previousPoint = screenPoint;
+        }
+
+        if (closestDistance > maxHitRadius)
+            return false;
+
+        hitDistance = closestDistance;
+        return true;
     }
 
     private int? FindClickedQuarterBeat(Vector2 point, double currentTick, GearState currentState, out int track)
