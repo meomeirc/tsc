@@ -330,10 +330,16 @@ local function button(item, x, y, width, height, options)
             id = item.id .. "_disabled", x = x, y = y, width = width, height = height,
             color = C.button, alpha = 0.75, layer = options.layer or 4,
         })
-        draw.text(tostring(item.label or ""), {
+        local label = tostring(item.label or "")
+        local font = F.regular
+        local paddingX = math.min(18, math.max(8, width * 0.06))
+        local paddingY = math.min(8, math.max(3, height * 0.12))
+        local textSize = UI.fit_button_text_size(label, font,
+            options.text_size or fontSize("body"), width - paddingX * 2, height - paddingY * 2)
+        draw.text(label, {
             x = x + width * 0.5, y = y + height * 0.5,
-            size = options.text_size or fontSize("body"), color = C.muted,
-            font = F.regular, anchor = "center", layer = (options.layer or 4) + 1,
+            size = textSize, color = C.muted,
+            font = font, anchor = "center", layer = (options.layer or 4) + 1,
         })
         return
     end
@@ -879,17 +885,10 @@ end
 
 local function drawBottomActionButton(item, x, y, width, height, layer)
     if item == nil then return end
-    -- The editor actions share this row, so fit labels to each button rather than
-    -- letting long names spill into neighboring controls at narrow resolutions.
+    -- Keep the complete label. The shared UI.draw_button helper measures it and
+    -- shrinks its font only when the button does not have enough room.
     local textSize = math.min(fontSize("body"), math.max(fontSize("small") * 0.9, width * 0.12))
-    local fittedLabel = fittedMeasuredText(item.label or "", math.max(1, width - 18 * ACTIVE_SCALE), textSize, F.medium)
-    local drawItem = item
-    if fittedLabel ~= tostring(item.label or "") then
-        drawItem = {}
-        for key, value in pairs(item) do drawItem[key] = value end
-        drawItem.label = fittedLabel
-    end
-    button(drawItem, x, y, width, height, { layer = layer or 5, text_size = textSize })
+    button(item, x, y, width, height, { layer = layer or 5, text_size = textSize })
 end
 
 local function drawBottomActions(items, x, y, width, layer, cols)

@@ -243,6 +243,71 @@ function UI.button_color(state, selected, variant)
     return UI.colors.button
 end
 
+local button_text_fit_cache = {}
+local button_text_fit_cache_count = 0
+
+-- Shared by every button renderer, including disabled editor buttons. Keep the
+-- original label and reduce only its font size when the available space is tight.
+function UI.fit_button_text_size(text, font, requested_size, max_width, max_height)
+    text = tostring(text or "")
+    local requested = math.max(1, tonumber(requested_size) or UI.sizes.button)
+    max_width = math.max(1, tonumber(max_width) or 1)
+    max_height = math.max(1, tonumber(max_height) or 1)
+    local upper = math.min(requested, max_height)
+
+    if text == "" then return upper end
+    local cache_key = (font or "") .. "\0" .. text .. "\0" ..
+        string.format("%.2f:%.2f:%.2f", upper, max_width, max_height)
+    local cached = button_text_fit_cache[cache_key]
+    if cached then return cached end
+
+    local function measured_width(candidate_size)
+        if draw.measure_text then
+            local measured = tonumber(draw.measure_text(text, { font = font, size = candidate_size })) or 0
+            if measured > 0 then
+                return measured
+            end
+        end
+
+        -- Fallback for runtimes without text measurement; count UTF-8 code points
+        -- rather than bytes so non-ASCII labels do not shrink too aggressively.
+        local characters = 0
+        local index = 1
+        while index <= #text do
+            local first = string.byte(text, index)
+            index = index + (first < 128 and 1 or first < 224 and 2 or first < 240 and 3 or 4)
+            characters = characters + 1
+        end
+        return characters * candidate_size * 0.55
+    end
+
+    local size = upper
+    if measured_width(size) > max_width then
+        size = 1
+        if measured_width(size) <= max_width then
+            local low, high = 1, upper
+            for _ = 1, 14 do
+                local candidate = (low + high) * 0.5
+                if measured_width(candidate) <= max_width then
+                    size = candidate
+                    low = candidate
+                else
+                    high = candidate
+                end
+            end
+            size = math.max(1, size * 0.985)
+        end
+    end
+
+    if button_text_fit_cache_count >= 768 then
+        button_text_fit_cache = {}
+        button_text_fit_cache_count = 0
+    end
+    button_text_fit_cache[cache_key] = size
+    button_text_fit_cache_count = button_text_fit_cache_count + 1
+    return size
+end
+
 function UI.draw_button(options)
     local id = assert(options.id, "UI.draw_button requires id")
     local parent = options.parent
@@ -250,6 +315,15 @@ function UI.draw_button(options)
     local width, height = options.width, options.height
     local layer = options.layer or 1
     local frame_id = id .. "_frame"
+    local label = tostring(options.label or "")
+    local font = options.font or UI.fonts.medium
+    local button_width = math.max(1, tonumber(width) or 1)
+    local button_height = math.max(1, tonumber(height) or 1)
+    local padding_x = tonumber(options.text_padding_x) or math.min(18, math.max(8, button_width * 0.06))
+    local padding_y = tonumber(options.text_padding_y) or math.min(8, math.max(3, button_height * 0.12))
+    local text_size = UI.fit_button_text_size(
+        label, font, options.text_size or UI.sizes.button,
+        button_width - padding_x * 2, button_height - padding_y * 2)
 
     ui.button({
         id = id,
@@ -287,15 +361,15 @@ function UI.draw_button(options)
         })
     end
 
-    draw.text(options.label or "", {
+    draw.text(label, {
         parent = frame_id,
         x = width * 0.5,
         y = height * 0.5,
-        size = options.text_size or UI.sizes.button,
+        size = text_size,
         color = options.text_color or
             ((variant == "primary") and UI.colors.primary_text or
              ((variant == "success" or variant == "warning" or variant == "danger" or variant == "info") and UI.colors.status_text or UI.colors.text)),
-        font = options.font or UI.fonts.medium,
+        font = font,
         anchor = "center",
         shadow = options.shadow,
         layer = layer + 2,
@@ -450,12 +524,17 @@ function UI.draw_row(options)
     })
 
     if options.description ~= nil and options.description ~= "" then
-        draw.text(options.label or "", {
+        local label = tostring(options.label or "")
+        local label_font = UI.fonts.medium
+        local label_size = UI.fit_button_text_size(label, label_font,
+            options.text_size or UI.sizes.button,
+            width - pad_x * 2, height - pad_y * 2)
+        draw.text(label, {
             parent = frame_id,
             x = pad_x, y = pad_y,
-            size = options.text_size or UI.sizes.button,
+            size = label_size,
             color = UI.colors.text,
-            font = UI.fonts.medium,
+            font = label_font,
             anchor = "top-left",
             layer = layer + 2,
         })
@@ -485,13 +564,18 @@ function UI.draw_row(options)
             description_start = newline + 1
         end
     else
-        draw.text(options.label or "", {
+        local label = tostring(options.label or "")
+        local label_font = UI.fonts.medium
+        local label_size = UI.fit_button_text_size(label, label_font,
+            options.text_size or UI.sizes.body,
+            width - pad_x * 2, height - pad_y * 2)
+        draw.text(label, {
             parent = frame_id,
             x = pad_x,
             y = height * 0.5,
-            size = options.text_size or UI.sizes.body,
+            size = label_size,
             color = UI.colors.text,
-            font = UI.fonts.medium,
+            font = label_font,
             anchor = "left",
             layer = layer + 2,
         })

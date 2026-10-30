@@ -403,7 +403,6 @@ public sealed partial class Playfield
         RefreshEditorDiagnostics();
         var interfaceUi = _chartEditorInterfaceLayout;
         var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
-        var buttonFont = GetChartEditorFont(interfaceUi.ButtonFont);
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorProblemsPanelBounds(virtualWidth, virtualHeight);
         var header = GetEditorProblemsHeaderBounds(virtualWidth, virtualHeight);
@@ -449,14 +448,16 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.X, quickFixButton.Bottom - edge, quickFixButton.Width, edge), quickFixBorder);
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.X, quickFixButton.Y, edge, quickFixButton.Height), quickFixBorder);
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.Right - edge, quickFixButton.Y, edge, quickFixButton.Height), quickFixBorder);
-        var quickFixLabel = FontSafeText(buttonFont, interfaceUi.Label("button:QUICK FIX", "QUICK FIX"));
-        var quickFixText = UnicodeTextRenderer.MeasureString(buttonFont, quickFixLabel).X <= quickFixButton.Width - 12f * unit
-            ? quickFixLabel
-            : FitHudText(buttonFont, quickFixLabel, Math.Max(1f, quickFixButton.Width - 12f * unit));
-        var quickFixTextSize = UnicodeTextRenderer.MeasureString(buttonFont, quickFixText);
-        UnicodeTextRenderer.DrawString(_spriteBatch, buttonFont, quickFixText,
+        var quickFixFit = FitChartEditorText(
+            interfaceUi.Label("button:QUICK FIX", "QUICK FIX"), interfaceUi.ButtonFont,
+            24f * (float)interfaceUi.ButtonTextScale,
+            Math.Max(1f, quickFixButton.Width - 12f * unit),
+            Math.Max(1f, quickFixButton.Height - 8f * unit));
+        var quickFixTextSize = quickFixFit.Measured * quickFixFit.Scale;
+        UnicodeTextRenderer.DrawString(_spriteBatch, quickFixFit.Font, quickFixFit.Text,
             new Vector2(quickFixButton.X + (quickFixButton.Width - quickFixTextSize.X) * 0.5f,
-                quickFixButton.Y + (quickFixButton.Height - quickFixTextSize.Y) * 0.5f), interfaceUi.ButtonTextColor);
+                quickFixButton.Y + (quickFixButton.Height - quickFixTextSize.Y) * 0.5f),
+            interfaceUi.ButtonTextColor, 0f, Vector2.Zero, quickFixFit.Scale, SpriteEffects.None, 0f);
 
         var chevron = _editorProblemsExpanded ? "−" : "+";
         var chevronSize = UnicodeTextRenderer.MeasureString(labelFont, chevron);
