@@ -6034,6 +6034,7 @@ public sealed partial class Playfield
         if (_chart is null) return;
         bool TryInt(out int parsed) => int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed);
         bool TryDouble(out double parsed) => double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) && double.IsFinite(parsed);
+        var initialGearChanged = false;
         switch (field)
         {
             case "name": _chart.Name = NormalizeEditorMetaValue(value) ?? "Untitled Song"; break;
@@ -6110,10 +6111,17 @@ public sealed partial class Playfield
                 else { _statusMessage = "Ticks per measure must be from 1 to 3840."; return; }
                 break;
             case "start_gear":
-                if (value.Equals("1K", StringComparison.OrdinalIgnoreCase) || value == "0" || value == "2") _chart.InitialGearAttr = value == "2" ? 2 : 0;
-                else if (value.Equals("2K", StringComparison.OrdinalIgnoreCase) || value == "4") _chart.InitialGearAttr = 4;
-                else if (value.Equals("3K", StringComparison.OrdinalIgnoreCase) || value == "6") _chart.InitialGearAttr = 6;
+                int nextInitialGearAttr;
+                if (value.Equals("1K", StringComparison.OrdinalIgnoreCase) || value == "0" || value == "2")
+                    nextInitialGearAttr = value == "2" ? 2 : 0;
+                else if (value.Equals("2K", StringComparison.OrdinalIgnoreCase) || value == "4")
+                    nextInitialGearAttr = 4;
+                else if (value.Equals("3K", StringComparison.OrdinalIgnoreCase) || value == "6")
+                    nextInitialGearAttr = 6;
                 else { _statusMessage = "Start gear must be 1K, 2K, or 3K."; return; }
+
+                initialGearChanged = _chart.InitialGearAttr != nextInitialGearAttr;
+                _chart.InitialGearAttr = nextInitialGearAttr;
                 break;
             case "play_time":
                 var audioLength = _loadedMusicBytes is { Length: > 0 } && double.IsFinite(_audio.DurationSeconds)
@@ -6151,6 +6159,9 @@ public sealed partial class Playfield
             _projection.SetTempo(_tempo);
             _projection.RebuildPrecomputedNoteMotionPaths();
         }
+        if (initialGearChanged)
+            RefreshEditorPreviewAfterInitialGearChange();
+
         ReconcilePlayTickAndPlayTime();
         // Keep the native track-16 Play End marker aligned whenever an edited
         // metadata field recalculates the Play Tick endpoint.
@@ -8976,30 +8987,26 @@ public sealed partial class Playfield
         _statusMessage = $"Added {_editorNoteType} note: tick {tick}, track {_editorTrack}, attr {placementAttr}";
     }
 
-    private static bool IsLinkPairOccupied(AresChart chart, int pair, int startTick, int targetTick,
-        HashSet<ChartEvent>? ignoredEvents = null, bool hasLinkTailAtStart = false)
+    private static bool IsLinkPairOccupied(AresChart chart, string candidateFamily, int pair,
+        int startTick, int targetTick, HashSet<ChartEvent>? ignoredEvents = null,
+        bool hasLinkTailAtStart = false)
     {
         if (targetTick < startTick)
             return false;
 
-        // Link IDs are shared globally. A pair is occupied only while an existing
-        // point's stored duration reaches the requested interval. In particular,
-        // a LinkHead without a connected tail expires at its own EndTick instead
-        // of reserving that ID forever; LinkBuilder uses the same endpoint rule.
+        // A pair is global across the two physical sides, because a left and a
+        // right route can be active together. Alternate banks on the same side
+        // are mutually exclusive, though, so they may reuse the same pair.
         var families = chart.Events
             .Where(ev => ignoredEvents is null || !ignoredEvents.Contains(ev))
             .Select(ev => LinkBuilder.Family(ev.Track))
             .OfType<string>()
             .Distinct(StringComparer.Ordinal);
-        return families.Any(candidateFamily =>
-            IsLinkPairOccupiedInFamily(chart, candidateFamily, pair, startTick, targetTick,
+        return families.Any(existingFamily =>
+            EditorLinkFamiliesCanSharePair(candidateFamily, existingFamily) &&
+            IsLinkPairOccupiedInFamily(chart, existingFamily, pair, startTick, targetTick,
                 ignoredEvents, hasLinkTailAtStart));
     }
-
-    // Compatibility overload for editor-history code from versions that passed
-    // the track family explicitly. Pair IDs are global, not per-family.
-    private static bool IsLinkPairOccupied(AresChart chart, string family, int pair, int startTick, int targetTick)
-        => IsLinkPairOccupied(chart, pair, startTick, targetTick);
 
     private static bool IsLinkPairOccupiedInFamily(AresChart chart, string family, int pair,
         int startTick, int targetTick, HashSet<ChartEvent>? ignoredEvents = null,
@@ -9376,20 +9383,21 @@ public sealed partial class Playfield
         int pair;
         if (source.NoteType == NoteType.Single && source.Attr == 0)
         {
-            // Each native track family has four line-pair IDs. Ignore the target
-            // chain because it will be merged into this chain below; otherwise its
-            // current pair can incorrectly look occupied by an unrelated chain.
+            // Pair IDs are shared across routes that can be active together. The
+            // allocator ignores alternate banks on this same side, but still checks
+            // the opposite side for a possible simultaneous route. Ignore the target
+            // chain because it will be merged into this chain below.
             var usedPairs = new HashSet<int>();
             foreach (var candidatePair in new[] { 1, 3, 5, 7 })
             {
-                if (IsLinkPairOccupied(_chart, candidatePair, pairAllocationStartTick, targetTick,
+                if (IsLinkPairOccupied(_chart, sourceFamily, candidatePair, pairAllocationStartTick, targetTick,
                         ignoredChainEventsForPair, candidateHasLinkTailAtStart))
                     usedPairs.Add(candidatePair);
             }
             pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !usedPairs.Contains(candidate));
             if (pair == 0)
             {
-                _statusMessage = "No free link line pair across that time range. Choose another interval or remove an existing chain.";
+                _statusMessage = "No safe link line pair is available across that time range. Choose another interval or remove an existing chain.";
                 return;
             }
 
@@ -9416,14 +9424,14 @@ public sealed partial class Playfield
             var usedPairs = new HashSet<int>();
             foreach (var candidatePair in new[] { 1, 3, 5, 7 })
             {
-                if (IsLinkPairOccupied(_chart, candidatePair, pairAllocationStartTick, targetTick,
+                if (IsLinkPairOccupied(_chart, sourceFamily, candidatePair, pairAllocationStartTick, targetTick,
                         ignoredChainEventsForPair, candidateHasLinkTailAtStart))
                     usedPairs.Add(candidatePair);
             }
             pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !usedPairs.Contains(candidate));
             if (pair == 0)
             {
-                _statusMessage = "No free link line pair across that time range. Choose another interval or remove an existing chain.";
+                _statusMessage = "No safe link line pair is available across that time range. Choose another interval or remove an existing chain.";
                 return;
             }
 
@@ -9452,11 +9460,11 @@ public sealed partial class Playfield
                 // ended or been damaged. Give it the first genuinely free pair
                 // for this interval instead of blindly reusing that stale ID.
                 pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                    !IsLinkPairOccupied(_chart, candidate, pairAllocationStartTick, targetTick,
+                    !IsLinkPairOccupied(_chart, sourceFamily, candidate, pairAllocationStartTick, targetTick,
                         ignoredChainEventsForPair, candidateHasLinkTailAtStart));
                 if (pair == 0)
                 {
-                    _statusMessage = "No free link line pair across that time range. Choose another interval or remove an existing chain.";
+                    _statusMessage = "No safe link line pair is available across that time range. Choose another interval or remove an existing chain.";
                     return;
                 }
                 source.LinePair = pair;
@@ -9477,18 +9485,19 @@ public sealed partial class Playfield
                     return;
                 }
 
-                // Pair IDs are global. An existing chain may have had its ID reused
-                // later in the chart, so extending it must avoid colliding with that
-                // unrelated chain. Reassign every point in the source chain together.
-                if (IsLinkPairOccupied(_chart, pair, pairAllocationStartTick, targetTick,
+                // Pair IDs are shared across simultaneously reachable routes. An
+                // existing chain may have reused its ID in an alternate bank on the
+                // same side, so extending this chain only needs to avoid real route
+                // conflicts. Reassign every point in the source chain together.
+                if (IsLinkPairOccupied(_chart, sourceFamily, pair, pairAllocationStartTick, targetTick,
                         ignoredChainEventsForPair, candidateHasLinkTailAtStart))
                 {
                     var replacementPair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                        !IsLinkPairOccupied(_chart, candidate, pairAllocationStartTick, targetTick,
+                        !IsLinkPairOccupied(_chart, sourceFamily, candidate, pairAllocationStartTick, targetTick,
                             ignoredChainEventsForPair, candidateHasLinkTailAtStart));
                     if (replacementPair == 0)
                     {
-                        _statusMessage = "No free link line pair across that time range. Choose another interval or remove an existing chain.";
+                        _statusMessage = "No safe link line pair is available across that time range. Choose another interval or remove an existing chain.";
                         return;
                     }
                     pair = replacementPair;

@@ -82,6 +82,32 @@ public sealed partial class Playfield
         _editorPreviewRightBank = GearTimeline.ActiveBankForSide(state, "right");
     }
 
+    private void RefreshEditorPreviewAfterInitialGearChange()
+    {
+        if (!_chartEditorMode || _chart is null || _tempo is null)
+            return;
+
+        // A metadata edit changes the route seed, not just the label. Rebuild
+        // the authored timeline and immediately move the current preview to the
+        // route that the new start gear produces at the existing playhead.
+        _editorPreviewStartLeftBank = null;
+        _editorPreviewStartRightBank = null;
+        _gear = new GearTimeline(_chart);
+
+        var initialState = _gear.Initial.Copy();
+        _editorPreviewGearState = initialState.Copy();
+        _gameplayState = initialState.Copy();
+        SyncEditorPreviewBankIndicators(initialState);
+
+        // Rebuild the full route history up to the current playhead, rather than
+        // recording only a single jump at the playhead. This keeps both the lane
+        // preview and the timeline trace in sync with the newly selected start gear.
+        ResetEditorTimelineRouteHistory(initialState);
+        RebuildEditorPreviewRouteBetweenSeconds(0.0, _playSeconds, initialState);
+        _editorHoverCacheValid = false;
+        InvalidateLaneMeshCache();
+    }
+
     private void ResetEditorTimelineRouteHistory(GearState? initialState)
     {
         _editorTimelineRouteHistory.Clear();

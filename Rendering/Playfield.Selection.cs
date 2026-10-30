@@ -1143,6 +1143,36 @@ public sealed partial class Playfield
 
     private sealed record EditorLinkPathIssue(int Tick, int Track, string Message, ChartEvent? Event);
 
+    // A side can display only one bank at a time. Different banks on the same
+    // side can therefore reuse an ID even when their chart-time ranges overlap.
+    // The two sides are independent, however, and valid mixed gear routes can
+    // display any left bank alongside any right bank. Those combinations must
+    // continue to use different IDs to avoid a cross-side link crossover.
+    private static (string Side, string Bank)? GetEditorLinkFamilyRoute(string? family) => family switch
+    {
+        "ForwardLeft" => ("left", "Forward"),
+        "BackwardLeft" => ("left", "Backward"),
+        "CenterLeft" => ("left", "Center"),
+        "ForwardRight" => ("right", "Forward"),
+        "BackwardRight" => ("right", "Backward"),
+        "CenterRight" => ("right", "Center"),
+        _ => null
+    };
+
+    private static bool EditorLinkFamiliesCanSharePair(string? familyA, string? familyB)
+    {
+        var routeA = GetEditorLinkFamilyRoute(familyA);
+        var routeB = GetEditorLinkFamilyRoute(familyB);
+        if (routeA is null || routeB is null)
+            return true; // Unknown families are handled conservatively.
+
+        // Same family means the chains can be active together. Different banks
+        // on the same side cannot. Opposite sides can be active together in a
+        // mixed route, so their IDs remain mutually exclusive.
+        return !string.Equals(routeA.Value.Side, routeB.Value.Side, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(routeA.Value.Bank, routeB.Value.Bank, StringComparison.OrdinalIgnoreCase);
+    }
+
     // Link IDs can be handed off at an exact duration boundary when the new
     // chain starts with a LinkHead and its next LinkTail is later. A LinkTail
     // at that same boundary is different: it can be mistaken for the ending
@@ -1160,12 +1190,28 @@ public sealed partial class Playfield
             .FirstOrDefault();
     }
 
+    private static bool EditorLinkIntervalsConflict(
+        string? familyA, int startA, long endA, bool hasTailAtStartA,
+        string? familyB, int startB, long endB, bool hasTailAtStartB)
+    {
+        if (!EditorLinkFamiliesCanSharePair(familyA, familyB))
+            return false;
+
+        var rangesOverlap = startA < endB && startB < endA;
+        if (rangesOverlap)
+            return true;
+
+        return (endA == startB && hasTailAtStartB) ||
+               (endB == startA && hasTailAtStartA);
+    }
+
     private static bool EditorLinkChainsConflictInTime(EditorLinkChainInfo a, EditorLinkChainInfo b)
     {
-        var rangesOverlap = a.StartTick < b.EndTick && b.StartTick < a.EndTick;
-        return rangesOverlap ||
-               GetEditorLinkBoundaryTailConflict(a, b) is not null ||
-               GetEditorLinkBoundaryTailConflict(b, a) is not null;
+        var aHasTailAtStart = a.Nodes.Any(node => node.NoteType == NoteType.LinkTail && node.Tick == a.StartTick);
+        var bHasTailAtStart = b.Nodes.Any(node => node.NoteType == NoteType.LinkTail && node.Tick == b.StartTick);
+        return EditorLinkIntervalsConflict(
+            a.Family, a.StartTick, a.EndTick, aHasTailAtStart,
+            b.Family, b.StartTick, b.EndTick, bHasTailAtStart);
     }
 
     private bool HasSelectedEditorNotes()
@@ -5205,21 +5251,23 @@ public sealed partial class Playfield
                 if (a.Pair != b.Pair)
                     continue;
 
-                // Normal pair ownership is half-open: a chain ending at T can
-                // hand its ID to a new LinkHead at T. But if that new chain also
-                // has a LinkTail at T, the old and new tails become ambiguous.
-                if (a.StartTick < b.EndTick && b.StartTick < a.EndTick)
+                // Same-side alternate banks cannot be active together, so they
+                // may safely reuse a pair. Same-bank and cross-side overlaps still
+                // conflict because a valid route can display both chains at once.
+                if (EditorLinkChainsConflictInTime(a, b) &&
+                    a.StartTick < b.EndTick && b.StartTick < a.EndTick)
                 {
-                    Add(b.Root, $"global pair {a.Pair}/{a.Pair + 1} overlaps between ticks {a.StartTick} and {b.StartTick}");
+                    Add(b.Root, $"pair {a.Pair}/{a.Pair + 1} is reused by simultaneously reachable routes ({a.Family} and {b.Family}) between ticks {a.StartTick} and {b.StartTick}");
                     continue;
                 }
 
-                var boundaryTail = GetEditorLinkBoundaryTailConflict(a, b) ??
-                                   GetEditorLinkBoundaryTailConflict(b, a);
+                var boundaryTail = EditorLinkFamiliesCanSharePair(a.Family, b.Family)
+                    ? GetEditorLinkBoundaryTailConflict(a, b) ?? GetEditorLinkBoundaryTailConflict(b, a)
+                    : null;
                 if (boundaryTail is not null)
                 {
                     Add(boundaryTail,
-                        $"global pair {a.Pair}/{a.Pair + 1} cannot be reused at tick {boundaryTail.Tick}: a LinkTail at the hand-off tick is ambiguous; use a different ID");
+                        $"pair {a.Pair}/{a.Pair + 1} cannot be reused at tick {boundaryTail.Tick}: a LinkTail at the hand-off tick is ambiguous; use a different ID");
                 }
             }
         }
@@ -5422,7 +5470,7 @@ public sealed partial class Playfield
             RebuildEditorLinkGraph();
 
         // Step 4: with straight chains and orphan points cleaned up, reassign
-        // the global pair IDs. If the remaining paths are structurally unsafe,
+        // the route-aware pair IDs. If the remaining paths are structurally unsafe,
         // keep the cleanup as one undoable change and explain why ID repair stopped.
         var claimed = new HashSet<ChartEvent>();
         var chains = GetEditorLinkChainInfos(claimed)
@@ -5536,11 +5584,11 @@ public sealed partial class Playfield
         => ev.Kind == "Note" && ev.RawType == 1 && ev.NoteType != NoteType.End &&
            !ev.IsFlick && !ev.IsSuperFlick && ev.NoteType != NoteType.Vibrato;
 
-    private bool IsEditorLinkPairAvailable(int pair, int startTick, int endTick,
+    private bool IsEditorLinkPairAvailable(string family, int pair, int startTick, int endTick,
         HashSet<ChartEvent> movingEvents, bool hasLinkTailAtStart = false)
     {
         return _chart is not null &&
-               !IsLinkPairOccupied(_chart, pair, startTick, endTick, movingEvents, hasLinkTailAtStart);
+               !IsLinkPairOccupied(_chart, family, pair, startTick, endTick, movingEvents, hasLinkTailAtStart);
     }
 
     private ChartTrack GetOrCreateEditorTrack(int trackIndex)
@@ -5723,15 +5771,15 @@ public sealed partial class Playfield
             var endTickForPath = Math.Max(terminalEnd, points[^1].Tick);
             var hasLinkTailAtStart = points.Count > 1 && points[1].Tick == startTick;
             var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                IsEditorLinkPairAvailable(candidate, startTick, endTickForPath, selectedSet, hasLinkTailAtStart) &&
+                IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, endTickForPath, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
-                    (plan.StartTick < endTickForPath && plan.EndTick > startTick ||
-                     (hasLinkTailAtStart && plan.EndTick == startTick) ||
-                     (endTickForPath == plan.StartTick && plan.Points.Count > 1 &&
-                      plan.Points[1].Tick == plan.StartTick))));
+                    EditorLinkIntervalsConflict(
+                        plan.Family, plan.StartTick, plan.EndTick,
+                        plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick,
+                        grouping.Key, startTick, endTickForPath, hasLinkTailAtStart)));
             if (pair == 0)
             {
-                _statusMessage = "No free link pair is available across all banks for this time range.";
+                _statusMessage = "No safe link pair is available for a route that can be active at the same time.";
                 return;
             }
             plans.Add((grouping.Key, points, absorbed, pair, startTick, endTickForPath, false));
@@ -5953,17 +6001,17 @@ public sealed partial class Playfield
                 TryGetEditorSameTickTapHoldPair(notes, out var sameTickTap, out var sameTickHold))
             {
                 var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                    IsEditorLinkPairAvailable(candidate, sameTickTap.Tick, sameTickHold.EndTick, selectedSet,
+                    IsEditorLinkPairAvailable(grouping.Key, candidate, sameTickTap.Tick, sameTickHold.EndTick, selectedSet,
                         hasLinkTailAtStart: true) &&
                     !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
-                        (plan.StartTick < sameTickHold.EndTick && plan.EndTick > sameTickTap.Tick ||
-                         plan.EndTick == sameTickTap.Tick ||
-                         (sameTickHold.EndTick == plan.StartTick &&
-                          (plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
-                           (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick))))));
+                        EditorLinkIntervalsConflict(
+                            plan.Family, plan.StartTick, plan.EndTick,
+                            plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
+                            (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick),
+                            grouping.Key, sameTickTap.Tick, sameTickHold.EndTick, true)));
                 if (pair == 0)
                 {
-                    _statusMessage = "No free link pair is available across all banks for this time range.";
+                    _statusMessage = "No safe link pair is available for a route that can be active at the same time.";
                     return;
                 }
 
@@ -6083,16 +6131,16 @@ public sealed partial class Playfield
             var hasLinkTailAtStart = generated.Any(ev => ev.Tick == startTick) ||
                                      (points.Count > 1 && points[1].Tick == startTick);
             var pairId = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                IsEditorLinkPairAvailable(candidate, startTick, terminalEnd, selectedSet, hasLinkTailAtStart) &&
+                IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, terminalEnd, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
-                    (plan.StartTick < terminalEnd && plan.EndTick > startTick ||
-                     (hasLinkTailAtStart && plan.EndTick == startTick) ||
-                     (terminalEnd == plan.StartTick &&
-                      (plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
-                       (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick))))));
+                    EditorLinkIntervalsConflict(
+                        plan.Family, plan.StartTick, plan.EndTick,
+                        plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
+                        (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick),
+                        grouping.Key, startTick, terminalEnd, hasLinkTailAtStart)));
             if (pairId == 0)
             {
-                _statusMessage = "No free link pair is available across all banks for this time range.";
+                _statusMessage = "No safe link pair is available for a route that can be active at the same time.";
                 return;
             }
 
