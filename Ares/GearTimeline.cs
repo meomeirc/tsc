@@ -38,6 +38,18 @@ public sealed class GearTimeline
 
     public GearState Initial => _initial.Copy();
 
+    public IEnumerable<int> ChangeTicksBetween(int startInclusive, int endExclusive)
+    {
+        foreach (var change in _changes)
+        {
+            if (change.Tick < startInclusive)
+                continue;
+            if (change.Tick >= endExclusive)
+                yield break;
+            yield return change.Tick;
+        }
+    }
+
     public GearState AtTick(int tick, bool includeTickChanges = true)
     {
         var lo = 0;

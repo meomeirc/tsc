@@ -1144,34 +1144,50 @@ public sealed partial class Playfield
 
     private sealed record EditorLinkPathIssue(int Tick, int Track, string Message, ChartEvent? Event);
 
-    // A side can display only one bank at a time. Different banks on the same
-    // side can therefore reuse an ID even when their chart-time ranges overlap.
-    // The two sides are independent, however, and valid mixed gear routes can
-    // display any left bank alongside any right bank. Those combinations must
-    // continue to use different IDs to avoid a cross-side link crossover.
-    private static (string Side, string Bank)? GetEditorLinkFamilyRoute(string? family) => family switch
+    // Resolve a link family to one representative gameplay track. GearState
+    // knows which of these banks is actually active at any point in the chart.
+    private static int? GetEditorLinkFamilyRepresentativeTrack(string? family) => family switch
     {
-        "ForwardLeft" => ("left", "Forward"),
-        "BackwardLeft" => ("left", "Backward"),
-        "CenterLeft" => ("left", "Center"),
-        "ForwardRight" => ("right", "Forward"),
-        "BackwardRight" => ("right", "Backward"),
-        "CenterRight" => ("right", "Center"),
+        "ForwardLeft" => 0,
+        "ForwardRight" => 3,
+        "BackwardLeft" => 6,
+        "BackwardRight" => 9,
+        "CenterLeft" => 12,
+        "CenterRight" => 14,
         _ => null
     };
 
-    private static bool EditorLinkFamiliesCanSharePair(string? familyA, string? familyB)
+    // Check the chart's real gear route, including its starting gear and every
+    // valid SuperFlick transition. Merely being on opposite physical sides does
+    // not mean two banks can be active together: without a route transition,
+    // an inactive bank must not create a false Link ID collision.
+    private static bool EditorLinkFamiliesCanSharePair(
+        GearTimeline timeline, string? familyA, string? familyB,
+        int startTick, int endTickExclusive)
     {
-        var routeA = GetEditorLinkFamilyRoute(familyA);
-        var routeB = GetEditorLinkFamilyRoute(familyB);
-        if (routeA is null || routeB is null)
+        var trackA = GetEditorLinkFamilyRepresentativeTrack(familyA);
+        var trackB = GetEditorLinkFamilyRepresentativeTrack(familyB);
+        if (trackA is null || trackB is null)
             return true; // Unknown families are handled conservatively.
 
-        // Same family means the chains can be active together. Different banks
-        // on the same side cannot. Opposite sides can be active together in a
-        // mixed route, so their IDs remain mutually exclusive.
-        return !string.Equals(routeA.Value.Side, routeB.Value.Side, StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(routeA.Value.Bank, routeB.Value.Bank, StringComparison.OrdinalIgnoreCase);
+        var sampleEnd = endTickExclusive > startTick
+            ? endTickExclusive
+            : startTick < int.MaxValue ? startTick + 1 : int.MaxValue;
+        bool AreActiveTogetherAt(int tick)
+        {
+            var route = timeline.AtTick(tick);
+            return route.IsActive(trackA.Value) && route.IsActive(trackB.Value);
+        }
+
+        if (AreActiveTogetherAt(startTick))
+            return true;
+        foreach (var tick in timeline.ChangeTicksBetween(startTick, sampleEnd))
+        {
+            if (tick != startTick && AreActiveTogetherAt(tick))
+                return true;
+        }
+
+        return false;
     }
 
     // Link IDs can be handed off at an exact duration boundary when the new
@@ -1192,25 +1208,36 @@ public sealed partial class Playfield
     }
 
     private static bool EditorLinkIntervalsConflict(
+        GearTimeline timeline,
         string? familyA, int startA, long endA, bool hasTailAtStartA,
         string? familyB, int startB, long endB, bool hasTailAtStartB)
     {
-        if (!EditorLinkFamiliesCanSharePair(familyA, familyB))
-            return false;
-
-        var rangesOverlap = startA < endB && startB < endA;
-        if (rangesOverlap)
+        var overlapStart = Math.Max(startA, startB);
+        var overlapEnd = Math.Min(endA, endB);
+        if (overlapStart < overlapEnd &&
+            EditorLinkFamiliesCanSharePair(timeline, familyA, familyB, overlapStart,
+                (int)Math.Min(int.MaxValue, overlapEnd)))
+        {
             return true;
+        }
 
-        return (endA == startB && hasTailAtStartB) ||
-               (endB == startA && hasTailAtStartA);
+        if (endA == startB && hasTailAtStartB && startB < int.MaxValue &&
+            EditorLinkFamiliesCanSharePair(timeline, familyA, familyB, startB, startB + 1))
+        {
+            return true;
+        }
+
+        return endB == startA && hasTailAtStartA && startA < int.MaxValue &&
+               EditorLinkFamiliesCanSharePair(timeline, familyA, familyB, startA, startA + 1);
     }
 
-    private static bool EditorLinkChainsConflictInTime(EditorLinkChainInfo a, EditorLinkChainInfo b)
+    private static bool EditorLinkChainsConflictInTime(
+        GearTimeline timeline, EditorLinkChainInfo a, EditorLinkChainInfo b)
     {
         var aHasTailAtStart = a.Nodes.Any(node => node.NoteType == NoteType.LinkTail && node.Tick == a.StartTick);
         var bHasTailAtStart = b.Nodes.Any(node => node.NoteType == NoteType.LinkTail && node.Tick == b.StartTick);
         return EditorLinkIntervalsConflict(
+            timeline,
             a.Family, a.StartTick, a.EndTick, aHasTailAtStart,
             b.Family, b.StartTick, b.EndTick, bHasTailAtStart);
     }
@@ -5201,6 +5228,7 @@ public sealed partial class Playfield
         void Add(ChartEvent ev, string message)
             => issues.Add(new EditorLinkPathIssue(ev.Tick, ev.Track, message, ev));
 
+        var routeTimeline = new GearTimeline(_chart);
         var claimed = new HashSet<ChartEvent>();
         foreach (var chain in chains)
         {
@@ -5256,19 +5284,23 @@ public sealed partial class Playfield
                 if (a.Pair != b.Pair)
                     continue;
 
-                // Same-side alternate banks cannot be active together, so they
-                // may safely reuse a pair. Same-bank and cross-side overlaps still
-                // conflict because a valid route can display both chains at once.
-                if (EditorLinkChainsConflictInTime(a, b) &&
+                // Reuse is allowed only when the actual gear timeline keeps the
+                // two chain families from being active together during overlap.
+                if (EditorLinkChainsConflictInTime(routeTimeline, a, b) &&
                     a.StartTick < b.EndTick && b.StartTick < a.EndTick)
                 {
                     Add(b.Root, $"pair {a.Pair}/{a.Pair + 1} is reused by simultaneously reachable routes ({a.Family} and {b.Family}) between ticks {a.StartTick} and {b.StartTick}");
                     continue;
                 }
 
-                var boundaryTail = EditorLinkFamiliesCanSharePair(a.Family, b.Family)
-                    ? GetEditorLinkBoundaryTailConflict(a, b) ?? GetEditorLinkBoundaryTailConflict(b, a)
-                    : null;
+                var boundaryTail = GetEditorLinkBoundaryTailConflict(a, b) ??
+                                   GetEditorLinkBoundaryTailConflict(b, a);
+                if (boundaryTail is not null &&
+                    !EditorLinkFamiliesCanSharePair(routeTimeline, a.Family, b.Family,
+                        boundaryTail.Tick, boundaryTail.Tick < int.MaxValue ? boundaryTail.Tick + 1 : boundaryTail.Tick))
+                {
+                    boundaryTail = null;
+                }
                 if (boundaryTail is not null)
                 {
                     Add(boundaryTail,
@@ -5507,12 +5539,13 @@ public sealed partial class Playfield
         }
 
         var assignments = new List<(EditorLinkChainInfo Chain, int Pair)>();
+        var routeTimeline = new GearTimeline(_chart);
         if (idFixFailure is null)
         {
             foreach (var chain in chains)
             {
                 var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !assignments.Any(existing =>
-                    existing.Pair == candidate && EditorLinkChainsConflictInTime(existing.Chain, chain)));
+                    existing.Pair == candidate && EditorLinkChainsConflictInTime(routeTimeline, existing.Chain, chain)));
                 if (pair == 0)
                 {
                     idFixFailure = $"more than four chains overlap near tick {chain.StartTick}";
@@ -5616,6 +5649,7 @@ public sealed partial class Playfield
             return;
         }
 
+        var routeTimeline = new GearTimeline(_chart);
         var selected = GetSelectedEditorNotes(expandLinkFamilies: true, orderByTrack: false)
             .Where(IsEditorLinkableNote)
             .Distinct()
@@ -5779,6 +5813,7 @@ public sealed partial class Playfield
                 IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, endTickForPath, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
                     EditorLinkIntervalsConflict(
+                        routeTimeline,
                         plan.Family, plan.StartTick, plan.EndTick,
                         plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick,
                         grouping.Key, startTick, endTickForPath, hasLinkTailAtStart)));
@@ -5968,6 +6003,7 @@ public sealed partial class Playfield
             return;
         }
 
+        var routeTimeline = new GearTimeline(_chart);
         var selected = GetSelectedEditorNotes(expandLinkFamilies: true, orderByTrack: false)
             .Where(IsEditorLinkableNote)
             .Distinct()
@@ -6010,6 +6046,7 @@ public sealed partial class Playfield
                         hasLinkTailAtStart: true) &&
                     !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
                         EditorLinkIntervalsConflict(
+                            routeTimeline,
                             plan.Family, plan.StartTick, plan.EndTick,
                             plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
                             (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick),
@@ -6139,6 +6176,7 @@ public sealed partial class Playfield
                 IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, terminalEnd, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
                     EditorLinkIntervalsConflict(
+                        routeTimeline,
                         plan.Family, plan.StartTick, plan.EndTick,
                         plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
                         (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick),

@@ -8990,16 +8990,19 @@ public sealed partial class Playfield
         if (targetTick < startTick)
             return false;
 
-        // A pair is global across the two physical sides, because a left and a
-        // right route can be active together. Alternate banks on the same side
-        // are mutually exclusive, though, so they may reuse the same pair.
+        // A pair can be shared only when the chart's actual gear timeline never
+        // makes these two families active together during the requested range.
         var families = chart.Events
             .Where(ev => ignoredEvents is null || !ignoredEvents.Contains(ev))
             .Select(ev => LinkBuilder.Family(ev.Track))
             .OfType<string>()
             .Distinct(StringComparer.Ordinal);
+        var routeCheckEnd = targetTick > startTick
+            ? targetTick
+            : startTick < int.MaxValue ? startTick + 1 : startTick;
+        var routeTimeline = new GearTimeline(chart);
         return families.Any(existingFamily =>
-            EditorLinkFamiliesCanSharePair(candidateFamily, existingFamily) &&
+            EditorLinkFamiliesCanSharePair(routeTimeline, candidateFamily, existingFamily, startTick, routeCheckEnd) &&
             IsLinkPairOccupiedInFamily(chart, existingFamily, pair, startTick, targetTick,
                 ignoredEvents, hasLinkTailAtStart));
     }

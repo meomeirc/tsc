@@ -506,6 +506,7 @@ public sealed partial class Playfield
             return;
         }
 
+        var routeTimeline = new GearTimeline(_chart);
         var clipboardEntries = _editorClipboard.ToList();
         var clipboardContainsPanelEvents = clipboardEntries.Any(entry => entry.Attr is >= 101 and <= 108);
         var clipboardIsPanelOnly = clipboardEntries.All(entry =>
@@ -801,6 +802,7 @@ public sealed partial class Playfield
                     !groupPairs.Any(existing => existing.Value == candidate &&
                         groupRanges.TryGetValue(existing.Key, out var range) &&
                         EditorLinkIntervalsConflict(
+                            routeTimeline,
                             range.Family, range.StartTick, range.EndTick, range.HasLinkTailAtStart,
                             family, startTick, endTick, hasLinkTailAtStart)));
                 if (pair != 0)
