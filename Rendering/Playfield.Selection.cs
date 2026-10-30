@@ -7867,9 +7867,11 @@ public sealed partial class Playfield
                      nextPoint.Track != previousPoint.Track)
                 previousPoint.Duration = 6;
             else
-                // The merged endpoint's own duration is authoritative. Do not
-                // invent a long-note duration when the tail had none.
-                previousPoint.Duration = Math.Max(1, ev.Duration);
+                // Preserve the removed tail's actual end tick, not just its
+                // local duration. The merged hold begins at previousPoint.Tick,
+                // so its duration must include the entire link span plus any
+                // authored duration on the terminal LinkTail.
+                previousPoint.Duration = Math.Max(1, ev.EndTick - previousPoint.Tick);
 
             finalSelection = previousPoint;
             mergedSameLane = true;
