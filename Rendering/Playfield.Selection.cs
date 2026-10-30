@@ -8010,25 +8010,47 @@ public sealed partial class Playfield
         // RefreshAfterEditorMutation has just rebuilt _chart.Links, so this list
         // describes only the surviving chain nodes.
         var nodes = GetEditorLinkChainNodes(root);
-        if (nodes.Count == 0 || nodes.Any(node => node.Track != root.Track))
+        if (nodes.Count < 2)
             return preferredSelection;
 
-        var terminal = nodes[^1];
-        var endTick = Math.Max(terminal.Tick, terminal.EndTick);
-        // Flatten the same-lane chain using its actual remaining extent. In
-        // particular, do not force a minimum long-note duration for a point that
-        // did not carry one before the merge.
-        root.Duration = Math.Max(1, endTick - root.Tick);
-        ConvertEditorLinkPointToStandaloneNote(root);
+        // Collapse each consecutive same-track run independently. A chain may
+        // still leave that lane later (for example 7 -> 7 -> 8); in that case
+        // the same-lane run becomes one hold ending at the next surviving point,
+        // while the later cross-track LinkTail must remain in the chain.
+        var removed = new HashSet<ChartEvent>();
+        var runStart = 0;
+        while (runStart < nodes.Count)
+        {
+            var runTrack = nodes[runStart].Track;
+            var runEnd = runStart + 1;
+            while (runEnd < nodes.Count && nodes[runEnd].Track == runTrack)
+                runEnd++;
 
-        foreach (var tail in nodes.Skip(1))
+            if (runEnd - runStart > 1)
+            {
+                var runHead = nodes[runStart];
+                var runEndTick = runEnd < nodes.Count
+                    ? nodes[runEnd].Tick
+                    : Math.Max(nodes[^1].Tick, nodes[^1].EndTick);
+                runHead.Duration = Math.Max(1, runEndTick - runHead.Tick);
+                for (var i = runStart + 1; i < runEnd; i++)
+                    removed.Add(nodes[i]);
+            }
+
+            runStart = runEnd;
+        }
+
+        if (removed.Count == 0)
+            return preferredSelection;
+
+        foreach (var redundant in removed)
         {
             foreach (var track in _chart.Tracks)
-                track.Events.RemoveAll(candidate => ReferenceEquals(candidate, tail));
+                track.Events.RemoveAll(candidate => ReferenceEquals(candidate, redundant));
         }
 
         changed = true;
-        return root;
+        return removed.Contains(preferredSelection) ? root : preferredSelection;
     }
 
     private ChartEvent? FindClickedNote(Vector2 point, double currentTick, GearState currentState, out float bestDistance)
