@@ -616,18 +616,46 @@ public sealed partial class Playfield
         }
     }
 
-    private void PlayHitSound(ChartEvent ev)
+    private float GetHitSoundVolume(ChartEvent ev)
     {
         var config = _skin.GameConfig;
-        if (ev.IsSuperFlick)
-        {
-            _hitSounds.PlayChange(config.LaneSwitchVolume);
-            return;
-        }
+        var volume = ev.IsSuperFlick
+            ? config.LaneSwitchVolume
+            : ev.NoteType == NoteType.LinkTail
+                ? config.LinkVolume
+                : config.TapVolume;
+        return float.IsFinite(volume) ? Math.Clamp(volume, 0f, 1f) : 0f;
+    }
 
-        var volume = ev.NoteType == NoteType.LinkTail
-            ? config.LinkVolume
-            : config.TapVolume;
-        _hitSounds.PlayNote(volume);
+    private void PlayHitSound(ChartEvent ev)
+    {
+        var volume = GetHitSoundVolume(ev);
+        if (volume <= 0f)
+            return;
+
+        if (ev.IsSuperFlick)
+            _hitSounds.PlayChange(volume);
+        else
+            _hitSounds.PlayNote(volume);
+    }
+
+    private void AccumulateAutomaticHitSound(ChartEvent ev, ref float noteVolume, ref float changeVolume)
+    {
+        var volume = GetHitSoundVolume(ev);
+        if (volume <= 0f)
+            return;
+
+        if (ev.IsSuperFlick)
+            changeVolume = Math.Max(changeVolume, volume);
+        else
+            noteVolume = Math.Max(noteVolume, volume);
+    }
+
+    private void PlayAutomaticHitSounds(float noteVolume, float changeVolume)
+    {
+        if (noteVolume > 0f)
+            _hitSounds.PlayNote(noteVolume);
+        if (changeVolume > 0f)
+            _hitSounds.PlayChange(changeVolume);
     }
 }

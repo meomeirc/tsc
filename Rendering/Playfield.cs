@@ -91,12 +91,6 @@ public sealed partial class Playfield
     private readonly record struct ChartEventKey(int Tick, int Track, int EventIndex);
     private readonly record struct SuperFlickVisualKey(int Tick, string Side, string Bank, SuperFlickFamily Family, string TrackSide, int Direction);
 
-    private enum HitSoundKind
-    {
-        Note,
-        Change
-    }
-
     private readonly record struct TexturedBodyCommand(
         Texture2D Texture,
         VertexPositionColorTexture[] Vertices,

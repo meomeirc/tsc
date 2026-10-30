@@ -439,8 +439,6 @@ public sealed partial class Playfield
         var toTick = _tempo.SecondsToTick(toSeconds);
         var first = UpperBound(_eventSeconds, fromSeconds);
         var last = UpperBound(_eventSeconds, toSeconds);
-        var lastTick = -1;
-        var lastKind = HitSoundKind.Note;
 
         if (_chartEditorMode)
         {
@@ -456,6 +454,8 @@ public sealed partial class Playfield
                 var stateChanges = new List<ChartEvent>();
                 var seenSuperFlicks = new HashSet<SuperFlickVisualKey>();
                 var seenSuperFlickSides = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var noteVolume = 0f;
+                var changeVolume = 0f;
                 var next = i;
                 while (next < last && _orderedRenderableEvents[next].Tick == tick)
                 {
@@ -474,17 +474,16 @@ public sealed partial class Playfield
                         seenSuperFlickSides.Add(side);
                     }
 
-                    var kind = ev.IsSuperFlick ? HitSoundKind.Change : HitSoundKind.Note;
-                    if (ev.Tick != lastTick || kind != lastKind)
-                    {
-                        lastTick = ev.Tick;
-                        lastKind = kind;
-                        PlayHitSound(ev);
-                    }
+                    // Tap and LinkTail use the same note.wav. Keep just one
+                    // instance per tick, using the loudest enabled volume. The
+                    // separate change.wav can still play alongside it.
+                    AccumulateAutomaticHitSound(ev, ref noteVolume, ref changeVolume);
 
                     if (ev.IsSuperFlick && seenSuperFlicks.Add(SuperFlickKeyOf(ev)))
                         stateChanges.Add(ev);
                 }
+
+                PlayAutomaticHitSounds(noteVolume, changeVolume);
 
                 // As with manual play, all notes at one tick use the state that
                 // was active at the start of that tick.
@@ -495,17 +494,24 @@ public sealed partial class Playfield
             return;
         }
 
-        for (var i = first; i < last; i++)
+        var eventIndex = first;
+        while (eventIndex < last)
         {
-            var ev = _orderedRenderableEvents[i];
-            if (ev.Tick <= fromTick || ev.Tick > toTick || !IsActiveEvent(ev))
-                continue;
-            var kind = ev.IsSuperFlick ? HitSoundKind.Change : HitSoundKind.Note;
-            if (ev.Tick == lastTick && kind == lastKind)
-                continue;
-            lastTick = ev.Tick;
-            lastKind = kind;
-            PlayHitSound(ev);
+            var tick = _orderedRenderableEvents[eventIndex].Tick;
+            var noteVolume = 0f;
+            var changeVolume = 0f;
+            var next = eventIndex;
+            while (next < last && _orderedRenderableEvents[next].Tick == tick)
+            {
+                var ev = _orderedRenderableEvents[next++];
+                if (ev.Tick <= fromTick || ev.Tick > toTick || !IsActiveEvent(ev))
+                    continue;
+
+                AccumulateAutomaticHitSound(ev, ref noteVolume, ref changeVolume);
+            }
+
+            PlayAutomaticHitSounds(noteVolume, changeVolume);
+            eventIndex = next;
         }
     }
 
