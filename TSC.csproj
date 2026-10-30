@@ -19,7 +19,6 @@
   </PropertyGroup>
   <ItemGroup Condition="'$(Configuration)' == 'Publish'">
     <Compile Remove="Skins\SkinDebugConsole.cs" />
-    <Compile Remove="Ares/FpkWriter.cs" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="SharpCompress" Version="0.50.4" />
@@ -48,11 +47,6 @@
     <!-- Tool payloads are staged beside the root launcher after publish. Never publish a
          locally downloaded FFmpeg executable; users can install that one themselves. -->
     <None Update="tools\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
-    <!-- The LAN test helper is part of the game runtime, not a root-level tool. -->
-    <None Update="tools\LanEditorServer\**\*"
-          TargetPath="LanEditorServer\%(RecursiveDir)%(Filename)%(Extension)"
-          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="Never"
-          Condition="'$(Configuration)' != 'Publish'" />
   </ItemGroup>
   <!-- Final install layout: the game and its self-contained .NET 8 runtime live in data/;
        the tiny Native AOT launcher, user files, Default skin, and tools stay at the install root. -->
@@ -68,15 +62,17 @@
     <!-- Runtime/user state belongs beside the launcher, never inside data/. Remove stale
          generated State/Logs folders from older publishes; root user data is preserved. -->
     <RemoveDir Directories="$(PublishDir)State;$(PublishDir)Logs" />
+    <!-- LAN testing is implemented in TSC now; remove helper scripts left by older publishes. -->
+    <RemoveDir Directories="$(TSCInstallRoot)data\LanEditorServer;$(PublishDir)LanEditorServer" />
     <!-- Never ship a second copy of the skin under data/. -->
     <RemoveDir Directories="$(PublishDir)Skins\Default;$(PublishDir)Skins;$(PublishDir)updater;$(PublishDir)updater.next;$(PublishDir)updater.old;$(TSCInstallRoot)updater;$(TSCInstallRoot)updater.next;$(TSCInstallRoot)updater.old" />
 
-    <!-- Include all project tools beside the launcher, preserving nested folders but
-         excluding ffmpeg.exe (a user-installed dependency that must not ship). -->
+    <!-- Include project tools beside the launcher, preserving nested folders but
+         excluding FFmpeg and the legacy Python LAN helper sources. The in-process LAN
+         test service is compiled into TSC and has no Python/runtime-script payload. -->
     <ItemGroup>
       <_TscRootToolFiles Include="$(MSBuildProjectDirectory)\tools\**\*"
                          Exclude="$(MSBuildProjectDirectory)\tools\**\ffmpeg.exe;$(MSBuildProjectDirectory)\tools\LanEditorServer\**\*" />
-      <_TscLanEditorServerFiles Include="$(MSBuildProjectDirectory)\tools\LanEditorServer\**\*" />
       <_TscPublishedToolFiles Include="$(PublishDir)tools\**\*" />
     </ItemGroup>
     <MakeDir Directories="$(TSCInstallRoot)tools" />
@@ -88,14 +84,6 @@
           Condition="'@(_TscRootToolFiles)' != ''" />
     <Delete Files="@(_TscPublishedToolFiles)" />
     <RemoveDir Directories="$(PublishDir)tools" />
-
-    <!-- Ship the LAN editor test service beside the game runtime under data/, not root/tools/. -->
-    <RemoveDir Directories="$(TSCInstallRoot)data\LanEditorServer" />
-    <MakeDir Directories="$(TSCInstallRoot)data\LanEditorServer" />
-    <Copy SourceFiles="@(_TscLanEditorServerFiles)"
-          DestinationFiles="@(_TscLanEditorServerFiles->'$(TSCInstallRoot)data\LanEditorServer\%(RecursiveDir)%(Filename)%(Extension)')"
-          SkipUnchangedFiles="true"
-          Condition="'@(_TscLanEditorServerFiles)' != ''" />
 
     <!-- Refresh only the shipped Default skin folder; custom skins stay separate. -->
     <RemoveDir Directories="$(TSCInstallRoot)Skins\Default" />
@@ -122,6 +110,10 @@
     <RemoveDir Directories="$(TSCInstallRoot)runtimes;$(TSCInstallRoot)Content;$(TSCInstallRoot)Samples;$(TSCInstallRoot)textures" />
   </Target>
 
+  <Target Name="RemoveLegacyLanEditorHelperOutput" AfterTargets="Build"
+          Condition="'$(Configuration)' != 'Publish'">
+    <RemoveDir Directories="$(OutDir)LanEditorServer" />
+  </Target>
   <ItemGroup>
     <!-- Song bundles are runtime data, not C# source. -->
     <Compile Remove="songs\**\*.cs" />
