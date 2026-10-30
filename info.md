@@ -1,5 +1,12 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.23
+
+- fixed merging midpoint linkTail to also merge the next tail
+- made link id pairs route-aware and can be reused by mutually exclusive banks on the same side
+- changing initial gear now immediately refreshes the route
+- fix autoplay hitsound mixing
+
 # 0.0.22
 
 - added adb option for local testing
