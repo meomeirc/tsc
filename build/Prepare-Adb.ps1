@@ -23,7 +23,22 @@ if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
     Invoke-WebRequest -Uri $archiveUrl -OutFile $ArchivePath -UseBasicParsing
 }
 
-$actualSha256 = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+# Use .NET directly instead of Get-FileHash so this also works in older
+# Windows PowerShell environments where that cmdlet is unavailable.
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $archiveStream = [System.IO.File]::OpenRead($ArchivePath)
+    try {
+        $hashBytes = $sha256.ComputeHash($archiveStream)
+        $actualSha256 = ([System.BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $archiveStream.Dispose()
+    }
+}
+finally {
+    $sha256.Dispose()
+}
 if ($actualSha256 -ne $expectedSha256) {
     Remove-Item -LiteralPath $ArchivePath -Force -ErrorAction SilentlyContinue
     throw "Platform-Tools archive SHA-256 mismatch. Expected $expectedSha256, received $actualSha256."
