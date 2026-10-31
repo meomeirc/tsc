@@ -9,12 +9,13 @@ namespace TSC.Rendering;
 
 public sealed partial class Playfield
 {
-    private sealed record EditorChartProblem(int Tick, int Track, string Message, ChartEvent? Event)
+    private sealed record EditorChartProblem(
+        int Tick, int Track, string Message, ChartEvent? Event, bool ForceWarning = false)
     {
         // Panel tracks contain background-animation cues only. Keep their issues
         // visible in the same report, but present them as warnings rather than
-        // gameplay errors.
-        public bool IsWarning => Track is >= 17 and <= 20;
+        // gameplay errors. Some bundle compatibility notices are also warnings.
+        public bool IsWarning => ForceWarning || Track is >= 17 and <= 20;
     }
 
     private void RefreshEditorDiagnostics()
@@ -70,6 +71,21 @@ public sealed partial class Playfield
             _editorProblems.Add(new EditorChartProblem(first.Tick, first.Track, message, first));
             foreach (var ev in members)
                 _editorProblemEventKeys.Add(KeyOf(ev));
+        }
+
+        // TSTS bundles may not support the distinct outer 2K->3K SuperFlick
+        // paths (attrs 80/90) in ReSONANCE. Keep these as compatibility warnings:
+        // the chart remains editable/exportable, but the mapper should be aware.
+        if (_editorBundleTemplate == ChartBundleTemplate.Tsts)
+        {
+            foreach (var ev in playableNotes.Where(ev => ev.Track is >= 0 and <= 15 &&
+                         ev.IsSuperFlick && (ev.Attr is 80 or 90)))
+            {
+                var side = ev.Attr == 80 ? "left" : "right";
+                var message = $"2K-to-3K {side} SuperFlick may not work in ReSONANCE with a TSTS bundle.";
+                // Keep compatibility warnings out of the red gameplay-note marker overlay.
+                _editorProblems.Add(new EditorChartProblem(ev.Tick, ev.Track, message, ev, ForceWarning: true));
+            }
         }
 
         // Build link adjacency before hold-overlap checks so a link's actual next
@@ -427,12 +443,12 @@ public sealed partial class Playfield
         var summary = (errorCount, warningCount) switch
         {
             (0, 0) => interfaceUi.Label("problems_none", "No problems found in this chart."),
-            (0, 1) => "1 panel warning.",
-            (0, _) => $"{warningCount} panel warnings.",
+            (0, 1) => "1 warning.",
+            (0, _) => $"{warningCount} warnings.",
             (1, 0) => "1 gameplay error needs to be fixed.",
             (_, 0) => $"{errorCount} gameplay errors need to be fixed.",
-            (1, _) => $"1 gameplay error · {warningCount} panel warning(s)",
-            _ => $"{errorCount} gameplay errors · {warningCount} panel warning(s)"
+            (1, _) => $"1 gameplay error · {warningCount} warning(s)",
+            _ => $"{errorCount} gameplay errors · {warningCount} warning(s)"
         };
         var quickFixButton = GetEditorProblemsQuickFixButtonBounds(virtualWidth, virtualHeight);
         var summaryMax = Math.Max(1f, quickFixButton.X - header.X - 20f * unit);

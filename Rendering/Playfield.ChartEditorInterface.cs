@@ -565,12 +565,12 @@ public sealed partial class Playfield
         var summary = (errorCount, warningCount) switch
         {
             (0, 0) => "No problems found in this chart.",
-            (0, 1) => "1 panel warning.",
-            (0, _) => $"{warningCount} panel warnings.",
+            (0, 1) => "1 warning.",
+            (0, _) => $"{warningCount} warnings.",
             (1, 0) => "1 gameplay error needs to be fixed.",
             (_, 0) => $"{errorCount} gameplay errors need to be fixed.",
-            (1, _) => $"1 gameplay error · {warningCount} panel warning(s)",
-            _ => $"{errorCount} gameplay errors · {warningCount} panel warning(s)"
+            (1, _) => $"1 gameplay error · {warningCount} warning(s)",
+            _ => $"{errorCount} gameplay errors · {warningCount} warning(s)"
         };
         var hudTick = _tempo?.SecondsToTick(_playSeconds) ?? 0.0;
         var hudGear = _gear?.AtTick((int)Math.Floor(hudTick), includeTickChanges: true) ?? new GearState();
