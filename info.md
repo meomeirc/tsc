@@ -1,5 +1,12 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.24
+
+- added note attr overlay toggle
+- link ids now check for possible gear combinations
+- expanded superflick editor hit area across bank width
+- other fixes
+
 # 0.0.23
 
 - fixed merging midpoint linkTail to also merge the next tail
