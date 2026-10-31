@@ -100,6 +100,7 @@ internal static class KeybindSettings
         ("editor_toggle_view_mode", "TOGGLE 2D / 3D VIEW", "editor_view", new[] { 43 }, Array.Empty<int>()),
         ("editor_toggle_expand", "EXPAND / COLLAPSE VIEW", "editor_view", new[] { 6 }, Array.Empty<int>()),
         ("editor_toggle_beat_lines", "TOGGLE GRIDS", "editor_view", new[] { 5 }, Array.Empty<int>()),
+        ("editor_toggle_attributes", "TOGGLE ATTR OVERLAY", "editor_view", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_toggle_tempo_lines", "TOGGLE TEMPO LINES", "editor_view", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_toggle_constant_scroll", "TOGGLE CONSTANT SCROLL", "editor_view", Array.Empty<int>(), Array.Empty<int>()),
         ("editor_toggle_snap_menu", "OPEN SNAP MENU", "editor_view", Array.Empty<int>(), Array.Empty<int>()),

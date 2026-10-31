@@ -3532,6 +3532,7 @@ public sealed partial class Playfield
         if (KeybindSettings.IsPressed("editor_toggle_view_mode")) { HandleEditorActionClick(EditorActionViewMode); return true; }
         if (KeybindSettings.IsPressed("editor_toggle_expand")) { HandleEditorActionClick(EditorActionExpand); return true; }
         if (KeybindSettings.IsPressed("editor_toggle_beat_lines")) { HandleEditorActionClick(EditorActionBeatLines); return true; }
+        if (KeybindSettings.IsPressed("editor_toggle_attributes")) { HandleEditorActionClick(EditorActionAttributes); return true; }
         if (KeybindSettings.IsPressed("editor_toggle_tempo_lines")) { HandleEditorActionClick(EditorActionTempoLines); return true; }
         if (KeybindSettings.IsPressed("editor_toggle_constant_scroll")) { HandleEditorActionClick(EditorActionConstantScroll); return true; }
         if (KeybindSettings.IsPressed("editor_toggle_snap_menu")) { HandleEditorActionClick(EditorActionSnap); return true; }
