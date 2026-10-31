@@ -116,4 +116,15 @@ public static class LinkBuilder
         14 or 15 => "CenterRight",
         _ => null
     };
+
+    public static string FamilyLabel(string? family) => family switch
+    {
+        "ForwardLeft" => "Left 1K",
+        "ForwardRight" => "Right 1K",
+        "BackwardLeft" => "Left 3K",
+        "BackwardRight" => "Right 3K",
+        "CenterLeft" => "Left 2K",
+        "CenterRight" => "Right 2K",
+        _ => "Unknown bank"
+    };
 }

@@ -1144,50 +1144,19 @@ public sealed partial class Playfield
 
     private sealed record EditorLinkPathIssue(int Tick, int Track, string Message, ChartEvent? Event);
 
-    // Resolve a link family to one representative gameplay track. GearState
-    // knows which of these banks is actually active at any point in the chart.
-    private static int? GetEditorLinkFamilyRepresentativeTrack(string? family) => family switch
-    {
-        "ForwardLeft" => 0,
-        "ForwardRight" => 3,
-        "BackwardLeft" => 6,
-        "BackwardRight" => 9,
-        "CenterLeft" => 12,
-        "CenterRight" => 14,
-        _ => null
-    };
-
-    // Check the chart's real gear route, including its starting gear and every
-    // valid SuperFlick transition. Merely being on opposite physical sides does
-    // not mean two banks can be active together: without a route transition,
-    // an inactive bank must not create a false Link ID collision.
+    // Route combinations start with the active banks in the initial gear.
+    // Each valid SuperFlick then registers its source/destination bank pair,
+    // plus any pair of banks active in the resulting gear state. Those route
+    // combinations persist for the rest of the chart instead of being limited
+    // to the exact tick range in which a particular gear state is active.
     private static bool EditorLinkFamiliesCanSharePair(
         GearTimeline timeline, string? familyA, string? familyB,
         int startTick, int endTickExclusive)
     {
-        var trackA = GetEditorLinkFamilyRepresentativeTrack(familyA);
-        var trackB = GetEditorLinkFamilyRepresentativeTrack(familyB);
-        if (trackA is null || trackB is null)
-            return true; // Unknown families are handled conservatively.
-
         var sampleEnd = endTickExclusive > startTick
             ? endTickExclusive
             : startTick < int.MaxValue ? startTick + 1 : int.MaxValue;
-        bool AreActiveTogetherAt(int tick)
-        {
-            var route = timeline.AtTick(tick);
-            return route.IsActive(trackA.Value) && route.IsActive(trackB.Value);
-        }
-
-        if (AreActiveTogetherAt(startTick))
-            return true;
-        foreach (var tick in timeline.ChangeTicksBetween(startTick, sampleEnd))
-        {
-            if (tick != startTick && AreActiveTogetherAt(tick))
-                return true;
-        }
-
-        return false;
+        return timeline.FamiliesCanSharePair(familyA, familyB, sampleEnd);
     }
 
     // Link IDs can be handed off at an exact duration boundary when the new
@@ -5285,12 +5254,13 @@ public sealed partial class Playfield
                 if (a.Pair != b.Pair)
                     continue;
 
-                // Reuse is allowed only when the actual gear timeline keeps the
-                // two chain families from being active together during overlap.
+                // Reuse is allowed only until the two families have become a
+                // possible route combination by the end of their overlap. A valid
+                // SuperFlick registers its source/destination banks persistently.
                 if (EditorLinkChainsConflictInTime(routeTimeline, a, b) &&
                     a.StartTick < b.EndTick && b.StartTick < a.EndTick)
                 {
-                    Add(b.Root, $"pair {a.Pair}/{a.Pair + 1} is reused by simultaneously reachable routes ({a.Family} and {b.Family}) between ticks {a.StartTick} and {b.StartTick}");
+                    Add(b.Root, $"pair {a.Pair}/{a.Pair + 1} is reused by a possible route combination ({LinkBuilder.FamilyLabel(a.Family)} and {LinkBuilder.FamilyLabel(b.Family)}) between ticks {a.StartTick} and {b.StartTick}");
                     continue;
                 }
 
@@ -5820,7 +5790,7 @@ public sealed partial class Playfield
                         grouping.Key, startTick, endTickForPath, hasLinkTailAtStart)));
             if (pair == 0)
             {
-                _statusMessage = "No safe link pair is available for a route that can be active at the same time.";
+                _statusMessage = "No safe link pair is available for the route combinations reached by this chart.";
                 return;
             }
             plans.Add((grouping.Key, points, absorbed, pair, startTick, endTickForPath, false));
@@ -6054,7 +6024,7 @@ public sealed partial class Playfield
                             grouping.Key, sameTickTap.Tick, sameTickHold.EndTick, true)));
                 if (pair == 0)
                 {
-                    _statusMessage = "No safe link pair is available for a route that can be active at the same time.";
+                    _statusMessage = "No safe link pair is available for the route combinations reached by this chart.";
                     return;
                 }
 
@@ -6184,7 +6154,7 @@ public sealed partial class Playfield
                         grouping.Key, startTick, terminalEnd, hasLinkTailAtStart)));
             if (pairId == 0)
             {
-                _statusMessage = "No safe link pair is available for a route that can be active at the same time.";
+                _statusMessage = "No safe link pair is available for the route combinations reached by this chart.";
                 return;
             }
 

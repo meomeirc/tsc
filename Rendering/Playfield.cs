@@ -8990,8 +8990,10 @@ public sealed partial class Playfield
         if (targetTick < startTick)
             return false;
 
-        // A pair can be shared only when the chart's actual gear timeline never
-        // makes these two families active together during the requested range.
+        // A pair can be shared only while the candidate and existing families
+        // have not yet become a possible route combination. The starting gear,
+        // valid SuperFlick transitions, and reached route states register those
+        // combinations, which remain possible for the rest of the chart.
         var families = chart.Events
             .Where(ev => ignoredEvents is null || !ignoredEvents.Contains(ev))
             .Select(ev => LinkBuilder.Family(ev.Track))
@@ -9382,10 +9384,10 @@ public sealed partial class Playfield
         int pair;
         if (source.NoteType == NoteType.Single && source.Attr == 0)
         {
-            // Pair IDs are shared across routes that can be active together. The
-            // allocator ignores alternate banks on this same side, but still checks
-            // the opposite side for a possible simultaneous route. Ignore the target
-            // chain because it will be merged into this chain below.
+            // Pair IDs are shared across route combinations reached by the chart.
+            // Alternate banks remain separate until the starting gear or a valid
+            // SuperFlick transition makes their combination possible. Ignore the
+            // target chain because it will be merged into this chain below.
             var usedPairs = new HashSet<int>();
             foreach (var candidatePair in new[] { 1, 3, 5, 7 })
             {
@@ -9484,10 +9486,10 @@ public sealed partial class Playfield
                     return;
                 }
 
-                // Pair IDs are shared across simultaneously reachable routes. An
-                // existing chain may have reused its ID in an alternate bank on the
-                // same side, so extending this chain only needs to avoid real route
-                // conflicts. Reassign every point in the source chain together.
+                // Pair IDs are shared across route combinations reached by the chart.
+                // An existing chain may have reused its ID in a bank that is still
+                // route-incompatible, so only reassign when the accumulated route
+                // combinations now make the pair unsafe. Reassign the full chain.
                 if (IsLinkPairOccupied(_chart, sourceFamily, pair, pairAllocationStartTick, targetTick,
                         ignoredChainEventsForPair, candidateHasLinkTailAtStart))
                 {
