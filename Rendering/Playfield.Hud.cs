@@ -631,13 +631,14 @@ public sealed partial class Playfield
         else
         {
             var activeRoot = GetEditorMenuRootSection();
-            for (var tabIndex = 0; tabIndex < 4; tabIndex++)
+            for (var tabIndex = 0; tabIndex < 5; tabIndex++)
             {
                 var tabSection = tabIndex switch
                 {
                     0 => EditorMenuSection.Notes,
                     1 => EditorMenuSection.Tools,
                     2 => EditorMenuSection.Bpm,
+                    3 => EditorMenuSection.NoteGroups,
                     _ => EditorMenuSection.Select
                 };
                 var tabLabel = tabIndex switch
@@ -645,9 +646,10 @@ public sealed partial class Playfield
                     0 => interfaceUi.Label("tab_notes", "NOTES"),
                     1 => interfaceUi.Label("tab_tools", "TOOLS"),
                     2 => interfaceUi.Label("tab_bpm", "BPM"),
+                    3 => interfaceUi.Label("tab_note_groups", "NOTE GROUPS"),
                     _ => interfaceUi.Label("tab_select", "SELECT")
                 };
-                var tabAccent = tabIndex switch { 0 => Active, 1 => Hold, 2 => new Color(129, 140, 248), _ => new Color(196, 181, 253) };
+                var tabAccent = tabIndex switch { 0 => Active, 1 => Hold, 2 => new Color(129, 140, 248), 3 => new Color(174, 255, 0), _ => new Color(196, 181, 253) };
                 var activeTab = activeRoot == tabSection;
                 DrawControlButton(GetEditorMenuParentBounds(tabIndex, virtualWidth, virtualHeight), tabLabel,
                     activeTab ? new Color(62, 62, 65, 245) : new Color(25, 25, 27, 242),
@@ -669,10 +671,96 @@ public sealed partial class Playfield
                             ? "TEMPO GENERATOR  ·  ALTERNATE"
                             : "TEMPO GENERATOR  ·  PULSE",
                     EditorMenuSection.Select => "SELECT OPTIONS",
+                    EditorMenuSection.NoteGroups => "NOTE GROUPS",
                     EditorMenuSection.Duration => "DURATION",
                     _ => "TEMPO CONTROLS"
                 };
                 DrawSubmenuHeader(GetEditorMenuHeaderBounds(virtualWidth, virtualHeight), headerLabel);
+
+                if (_editorMenuSection == EditorMenuSection.NoteGroups)
+                {
+                    var groupItems = BuildEditorNoteGroupMenuItems();
+                    for (var row = 0; row < 5; row++)
+                    {
+                        var bounds = GetEditorNoteGroupEntryBounds(row, virtualWidth, virtualHeight);
+                        if (bounds.IsEmpty) continue;
+                        if (row < groupItems.Count && groupItems[row] is Dictionary<string, object?> item)
+                        {
+                            var selected = item.TryGetValue("selected", out var selectedValue) && selectedValue is true;
+                            var primaryActive = item.TryGetValue("primary_active", out var primaryValue) && primaryValue is true;
+                            DrawControlButton(bounds, string.Empty,
+                                primaryActive ? interfaceUi.AccentColor : selected
+                                    ? new Color(52, 52, 52, 245) : new Color(25, 25, 27, 238),
+                                primaryActive ? interfaceUi.AccentColor : selected
+                                    ? GetEditorElementColor("SESSION") : new Color(83, 83, 85));
+                            var heading = item.TryGetValue("header", out var headingValue)
+                                ? headingValue?.ToString() ?? string.Empty : string.Empty;
+                            var description = item.TryGetValue("description", out var descriptionValue)
+                                ? descriptionValue?.ToString() ?? string.Empty : string.Empty;
+                            var titleFit = FitChartEditorText(heading, interfaceUi.ButtonFont,
+                                20f * (float)interfaceUi.ButtonTextScale, bounds.Width - 14f * unit, 23f * unit);
+                            var groupTextColor = primaryActive
+                                ? interfaceUi.PrimaryButtonTextColor
+                                : interfaceUi.ButtonTextColor;
+                            UnicodeTextRenderer.DrawString(_spriteBatch, titleFit.Font, titleFit.Text,
+                                new Vector2(bounds.X + 10f * unit, bounds.Y + 7f * unit), groupTextColor,
+                                0f, Vector2.Zero, titleFit.Scale, SpriteEffects.None, 0f);
+                            var descriptionFit = FitChartEditorText(description, interfaceUi.LabelFont,
+                                17f * (float)interfaceUi.LabelTextScale, bounds.Width - 14f * unit, 18f * unit);
+                            UnicodeTextRenderer.DrawString(_spriteBatch, descriptionFit.Font, descriptionFit.Text,
+                                new Vector2(bounds.X + 10f * unit, bounds.Y + 30f * unit), groupTextColor,
+                                0f, Vector2.Zero, descriptionFit.Scale, SpriteEffects.None, 0f);
+                        }
+                        else
+                        {
+                            _spriteBatch.Draw(_pixel, bounds, new Color(25, 25, 27, 150));
+                            if (row == 0 && groupItems.Count == 0)
+                            {
+                                var emptyFit = FitChartEditorText("NO GROUPS YET", interfaceUi.LabelFont,
+                                    18f * (float)interfaceUi.LabelTextScale, bounds.Width - 12f * unit, bounds.Height - 8f * unit);
+                                var emptySize = emptyFit.Measured * emptyFit.Scale;
+                                UnicodeTextRenderer.DrawString(_spriteBatch, emptyFit.Font, emptyFit.Text,
+                                    new Vector2(bounds.Center.X - emptySize.X * 0.5f, bounds.Center.Y - emptySize.Y * 0.5f),
+                                    interfaceUi.MutedTextColor, 0f, Vector2.Zero, emptyFit.Scale, SpriteEffects.None, 0f);
+                            }
+                        }
+                    }
+
+                    var maxScroll = GetEditorNoteGroupScrollMaximum();
+                    if (maxScroll > 0)
+                    {
+                        var first = GetEditorNoteGroupEntryBounds(0, virtualWidth, virtualHeight);
+                        var last = GetEditorNoteGroupEntryBounds(4, virtualWidth, virtualHeight);
+                        var bar = new Rectangle(first.Right + (int)MathF.Round(9f * unit), first.Y,
+                            Math.Max(2, (int)MathF.Round(6f * unit)), last.Bottom - first.Y);
+                        _spriteBatch.Draw(_pixel, bar, new Color(48, 48, 51, 240));
+                        var thumbHeight = Math.Max((int)MathF.Round(24f * unit),
+                            (int)MathF.Round(bar.Height * 5f / (5f + maxScroll)));
+                        thumbHeight = Math.Min(bar.Height, thumbHeight);
+                        var travel = Math.Max(0, bar.Height - thumbHeight);
+                        var thumbY = bar.Y + (int)MathF.Round(travel * _editorNoteGroupsScrollOffset / (float)maxScroll);
+                        _spriteBatch.Draw(_pixel, new Rectangle(bar.X, thumbY, bar.Width, thumbHeight), new Color(174, 255, 0));
+                    }
+
+                    DrawControlButton(GetEditorNoteGroupActionBounds(0, 0, 3, virtualWidth, virtualHeight), "CREATE",
+                        CanCreateEditorNoteGroupFromSelection() ? new Color(35, 67, 47, 245) : new Color(25, 25, 27, 238),
+                        CanCreateEditorNoteGroupFromSelection() ? new Color(52, 211, 153) : new Color(83, 83, 85));
+                    DrawControlButton(GetEditorNoteGroupActionBounds(0, 1, 3, virtualWidth, virtualHeight), "EDIT GROUP",
+                        _editorNoteGroupEditMode ? new Color(58, 58, 60, 245) : new Color(28, 28, 30, 242),
+                        _editorNoteGroupEditMode ? new Color(174, 255, 0) : new Color(129, 140, 248));
+                    DrawControlButton(GetEditorNoteGroupActionBounds(0, 2, 3, virtualWidth, virtualHeight), "UNGROUP",
+                        CanUngroupSelectedEditorNoteGroupInstance() ? new Color(28, 28, 30, 242) : new Color(25, 25, 27, 238),
+                        CanUngroupSelectedEditorNoteGroupInstance() ? new Color(196, 181, 253) : new Color(83, 83, 85));
+                    DrawControlButton(GetEditorNoteGroupActionBounds(1, 0, 2, virtualWidth, virtualHeight), "REMOVE GROUP",
+                        _editorSelectedNoteGroupId.HasValue ? new Color(74, 47, 35, 245) : new Color(25, 25, 27, 238),
+                        _editorSelectedNoteGroupId.HasValue ? new Color(251, 146, 60) : new Color(83, 83, 85));
+                    DrawControlButton(GetEditorNoteGroupActionBounds(1, 1, 2, virtualWidth, virtualHeight), "DELETE ALL",
+                        _chart?.NoteGroups.Count > 0 ? new Color(83, 35, 40, 238) : new Color(25, 25, 27, 238),
+                        _chart?.NoteGroups.Count > 0 ? new Color(230, 93, 104) : new Color(83, 83, 85));
+                    DrawControlButton(GetEditorNoteGroupActionBounds(2, 0, 1, virtualWidth, virtualHeight), "CONSOLIDATE GROUPS",
+                        _chart?.NoteGroups.Count > 0 ? new Color(37, 48, 61, 245) : new Color(25, 25, 27, 238),
+                        _chart?.NoteGroups.Count > 0 ? new Color(148, 163, 184) : new Color(83, 83, 85));
+                }
 
                 // Controls remain individually styled. Leave the spaces between rows
                 // neutral rather than tinting the entire section or adding color stripes.
@@ -699,10 +787,7 @@ public sealed partial class Playfield
                             };
                             if (i == 6)
                             {
-                                var selection = GetSelectedEditorNotes(expandLinkFamilies: true)
-                                    .Where(ev => IsPlayableEditorTrack(ev.Track) && ev.NoteType != NoteType.End)
-                                    .Distinct().ToList();
-                                var available = selection.Count > 0 && !_editorConnectorMode &&
+                                var available = HasPlayableEditorSelection() && !_editorConnectorMode &&
                                                 _editorSuperFlickTool != EditorSuperFlickTool.Place;
                                 DrawControlButton(bounds, EditorToolLabels[i],
                                     available ? new Color(74, 47, 35, 245) : new Color(25, 25, 27, 238),
@@ -3093,7 +3178,7 @@ public sealed partial class Playfield
                             Vector2 drawScale,
                             Vector2 drawOrigin)
                         {
-                            UnicodeTextRenderer.DrawString(_spriteBatch, 
+                            UnicodeTextRenderer.DrawString(_spriteBatch,
                                 drawFont,
                                 text,
                                 position,

@@ -307,7 +307,7 @@ public sealed partial class Playfield
 
         var tabs = new List<object?>();
         var activeRoot = GetEditorMenuRootSection();
-        var tabLabels = new[] { "NOTES", "TOOLS", "BPM", "SELECT" };
+        var tabLabels = new[] { "NOTES", "TOOLS", "BPM", "NOTE GROUPS", "SELECT" };
         for (var index = 0; index < tabLabels.Length; index++)
         {
             var target = index switch
@@ -315,6 +315,7 @@ public sealed partial class Playfield
                 0 => EditorMenuSection.Notes,
                 1 => EditorMenuSection.Tools,
                 2 => EditorMenuSection.Bpm,
+                3 => EditorMenuSection.NoteGroups,
                 _ => EditorMenuSection.Select
             };
             tabs.Add(EditorUiItem($"tab_{index}", tabLabels[index], "editor.tab", index,
@@ -643,11 +644,17 @@ public sealed partial class Playfield
             ["children"] = children,
             ["control_labels"] = childLabels,
             ["stutter_patterns"] = stutterPatterns,
+            ["note_groups"] = BuildEditorNoteGroupMenuItems(),
+            ["note_group_actions"] = BuildEditorNoteGroupActions(),
+            ["note_groups_scroll"] = _editorNoteGroupsScrollOffset,
+            ["note_groups_scroll_max"] = GetEditorNoteGroupScrollMaximum(),
+            ["note_group_edit_mode"] = _editorNoteGroupEditMode,
             ["menu_width"] = _editorMenuSection switch
             {
                 EditorMenuSection.Stutter when _editorStutterStartPlacementPending || _editorStutterEndPlacementPending => 300f,
                 EditorMenuSection.Stutter => 540f,
                 EditorMenuSection.Tools => 440f,
+                EditorMenuSection.NoteGroups => 520f,
                 _ => (float)_chartEditorInterfaceLayout.ToolbarWidth
             },
             ["panels_view"] = _editorPanelsViewEnabled,
@@ -783,6 +790,7 @@ public sealed partial class Playfield
         EditorMenuSection.Stutter when _editorStutterEndPlacementPending => "PICK END",
         EditorMenuSection.Stutter => _editorStutterRamp ? "TEMPO GENERATOR · RAMP" : _editorStutterAlternate ? "TEMPO GENERATOR · ALTERNATE" : "TEMPO GENERATOR · PULSE",
         EditorMenuSection.Select => "SELECT OPTIONS",
+        EditorMenuSection.NoteGroups => "NOTE GROUPS",
         EditorMenuSection.Duration => "DURATION",
         _ => string.Empty
     };
@@ -863,7 +871,7 @@ public sealed partial class Playfield
             case "editor.panel_attr":
                 SelectEditorPanelAttribute(Number()); return true;
             case "editor.panel_select":
-                HandleEditorMenuCategoryClick(3); return true;
+                HandleEditorMenuCategoryClick(4); return true;
             case "editor.panel_duration":
                 if (_editorMenuSection == EditorMenuSection.Duration) CloseEditorInterfaceMenu();
                 else OpenEditorDurationTool();
@@ -881,6 +889,23 @@ public sealed partial class Playfield
                     var split = bankValue.Split('|', 2);
                     if (split.Length == 2) SelectEditorPreviewBank(split[0], split[1]);
                 }
+                return true;
+            case "editor.note_groups.select":
+                SelectEditorNoteGroup(Number()); return true;
+            case "editor.note_groups.create":
+                HandleEditorNoteGroupUiAction("create", 0); return true;
+            case "editor.note_groups.ungroup":
+                HandleEditorNoteGroupUiAction("ungroup", 0); return true;
+            case "editor.note_groups.remove":
+                HandleEditorNoteGroupUiAction("remove", 0); return true;
+            case "editor.note_groups.delete_all":
+                HandleEditorNoteGroupUiAction("delete_all", 0); return true;
+            case "editor.note_groups.consolidate":
+                HandleEditorNoteGroupUiAction("consolidate", 0); return true;
+            case "editor.note_groups.edit":
+                HandleEditorNoteGroupUiAction("edit", 0); return true;
+            case "editor.note_groups.scroll_to":
+                _editorNoteGroupsScrollOffset = Math.Clamp(Number(), 0, GetEditorNoteGroupScrollMaximum());
                 return true;
             case "editor.problems.toggle":
                 _editorProblemsExpanded = !_editorProblemsExpanded; ClampEditorProblemsScroll(width, height); return true;

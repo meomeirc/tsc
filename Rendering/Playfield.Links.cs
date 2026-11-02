@@ -26,6 +26,7 @@ public sealed partial class Playfield
             return;
 
         var interactive = _gameplayMode;
+        var placementPreview = _editorNoteGroupPlacementPreviewRendering;
         HoldRuntime? runtime = interactive ? GetOrCreateHoldRuntime(root) : null;
         if (interactive && runtime!.Completed)
             return;
@@ -61,7 +62,8 @@ public sealed partial class Playfield
         // A LinkHead hit early must remain visible until its authored judgement
         // time. Only a successfully judged head is removed at/after the judge;
         // missed or dropped heads remain visible with the miss texture.
-        var showLinkHead = !rootHasReachedJudge && !IsEditorConnectorPreviewReplacingTargetHead(root);
+        var showLinkHead = placementPreview ||
+            (!rootHasReachedJudge && !IsEditorConnectorPreviewReplacingTargetHead(root));
         if (interactive)
             showLinkHead = runtime!.StartMissed || runtime.Dropped || !runtime.Started || !rootHasReachedJudge;
 
@@ -123,7 +125,7 @@ public sealed partial class Playfield
                 if (runtime.Dropped && runtime.DropSeconds >= tailSeconds)
                     continue;
             }
-            else if (tailPassed)
+            else if (!placementPreview && tailPassed)
             {
                 continue;
             }
@@ -135,7 +137,7 @@ public sealed partial class Playfield
             // endpoints can be outside the render window while the segment itself
             // still crosses the visible/judgement area. Regular long notes already
             // use this same interval-based lifetime rule.
-            if (!_projection.RenderIntervalIntersects(headTravel, tailTravel))
+            if (!placementPreview && !_projection.RenderIntervalIntersects(headTravel, tailTravel))
                 continue;
 
 
@@ -154,7 +156,7 @@ public sealed partial class Playfield
                 // starts at the current play time instead of continuing behind the
                 // judge. Gameplay keeps the older authored-start behavior until the
                 // source node is actually hit/misses.
-                if (!interactive && headPassed)
+                if (!interactive && !placementPreview && headPassed)
                     bodyStartSeconds = _playSeconds;
 
                 if (interactive && runtime!.Dropped && runtime.DropSeconds > headSeconds && runtime.DropSeconds < tailSeconds)
@@ -188,7 +190,7 @@ public sealed partial class Playfield
                 // note-body size used by the link body itself.
                 var connectorThicknessPixels = Math.Max(0.5f,
                     _projection.BodyTextureWidth);
-                var connectorOpacity = _chartEditorMode
+                var connectorOpacity = _chartEditorMode && !_editorNoteGroupPlacementPreviewRendering
                     ? (GetEditorBankOpacity(headPosition.Value.Side, headPosition.Value.Bank, currentState) +
                        GetEditorBankOpacity(tailPosition.Value.Side, tailPosition.Value.Bank, currentState)) * 0.5f
                     : 1f;
@@ -240,7 +242,7 @@ public sealed partial class Playfield
                 if (runtime.Dropped && runtime.DropSeconds >= nodeEndSeconds)
                     continue;
             }
-            else if (nodePassed)
+            else if (!placementPreview && nodePassed)
             {
                 continue;
             }
@@ -308,13 +310,13 @@ public sealed partial class Playfield
             // Reaching the authored LinkTail tick does not make it disappear by
             // itself; if the player has not actually judged that LinkTail yet,
             // keep the marker visible at the judge position.
-            if (currentTick >= connectedTailEndTick &&
+            if (!placementPreview && currentTick >= connectedTailEndTick &&
                 (!interactive || runtime!.CurrentNodeIndex >= i + 1))
                 continue;
 
             var connectedTailSeconds = _tempo.TickToSeconds(connectedTail.Tick);
             var connectedTailTravel = (float)_projection.ScrollPixels(connectedTailSeconds, _playSeconds);
-            if (!_projection.WithinRenderDistance(connectedTailTravel))
+            if (!placementPreview && !_projection.WithinRenderDistance(connectedTailTravel))
                 continue;
 
             // This is the same source-lane projected frame used by the connector
@@ -373,7 +375,7 @@ public sealed partial class Playfield
                         continue;
                 }
             }
-            else if (currentTick >= bodyEndTick)
+            else if (!placementPreview && currentTick >= bodyEndTick)
             {
                 continue;
             }
@@ -390,7 +392,7 @@ public sealed partial class Playfield
         var dim = _textures.Get(simultaneous ? "dim-multi" : "dim");
         var light = _textures.Get(simultaneous ? "light-multi" : "light-long");
 
-        var terminalPassed = currentTick >= terminalEndTick;
+        var terminalPassed = !placementPreview && currentTick >= terminalEndTick;
         if (!terminalPassed && tailTexture is not null && !missVisual)
         {
             AddNoteOverlayCommands(
@@ -431,18 +433,20 @@ public sealed partial class Playfield
     private bool ShouldIncludeRenderableEvent(ChartEvent ev, GearState state)
     {
         return IsRenderableNoteEvent(ev) &&
-               !(_chart?.PlayTick > 0 && ev.Tick > _chart.PlayTick) &&
+               (_editorNoteGroupPlacementPreviewRendering || !(_chart?.PlayTick > 0 && ev.Tick > _chart.PlayTick)) &&
                (!_gameplayMode || !IsHit(ev)) &&
-               ShouldRenderInCurrentBank(ev, state);
+               (_editorNoteGroupPlacementPreviewRendering || ShouldRenderInCurrentBank(ev, state));
     }
 
     private bool ShouldIncludeLink(LinkSegment link, GearState state)
     {
         if (_chart is null)
             return false;
-        if (_chart.PlayTick > 0 && (link.Head.Tick > _chart.PlayTick || link.Tail.Tick > _chart.PlayTick))
+        if (!_editorNoteGroupPlacementPreviewRendering && _chart.PlayTick > 0 &&
+            (link.Head.Tick > _chart.PlayTick || link.Tail.Tick > _chart.PlayTick))
             return false;
-        return ShouldRenderInCurrentBank(link.Head, state) || ShouldRenderInCurrentBank(link.Tail, state);
+        return _editorNoteGroupPlacementPreviewRendering ||
+               ShouldRenderInCurrentBank(link.Head, state) || ShouldRenderInCurrentBank(link.Tail, state);
     }
 
     private bool OutsideNoteView(ProjectedPoint a, ProjectedPoint b)
@@ -531,7 +535,8 @@ public sealed partial class Playfield
     {
         var bodyEndPoint = _projection.ProjectAtTicks(node.Track, bodyEndTick, currentTick, currentState);
         var bodyEndTravel = _projection.ScrollPixelsAtTicks(bodyEndTick, currentTick);
-        if (bodyEndTravel < -_projection.GetRenderDistanceBehind())
+        if (!_editorNoteGroupPlacementPreviewRendering &&
+            bodyEndTravel < -_projection.GetRenderDistanceBehind())
             return;
 
         AddLanePlaneTailCommand(
@@ -585,12 +590,13 @@ public sealed partial class Playfield
             return;
 
         var position = GearState.Position(track);
-        var state = _chartEditorMode
-            ? RenderGearState(_tempo?.SecondsToTick(_playSeconds) ?? 0.0)
-            : new GearState();
-        var opacity = position is { } bankPosition && _chartEditorMode
-            ? GetEditorBankOpacity(bankPosition.Side, bankPosition.Bank, state)
-            : 1f;
+        var opacity = 1f;
+        if (position is { } bankPosition && _chartEditorMode &&
+            !_editorNoteGroupPlacementPreviewRendering)
+        {
+            var state = RenderGearState(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+            opacity = GetEditorBankOpacity(bankPosition.Side, bankPosition.Bank, state);
+        }
         Color? effectiveTint = tint;
         if (opacity < 0.999f)
             effectiveTint = (tint ?? Color.White) * opacity;

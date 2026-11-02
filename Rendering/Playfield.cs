@@ -255,6 +255,10 @@ public sealed partial class Playfield
     private bool _gameplayRenderTargetPreservesContents;
     private RenderTarget2D? _editorInactiveBankRenderTarget;
     private RenderTarget2D? _editorConnectorPreviewRenderTarget;
+    private RenderTarget2D? _editorNoteGroupPlacementPreviewRenderTarget;
+    private bool _editorNoteGroupPlacementPreviewRendering;
+    private bool _editorNoteGroupPlacementPreviewCacheValid;
+    private int _editorNoteGroupPlacementPreviewCacheKey;
     private readonly List<Textured3DQuadCommand> _editorConnectorPreviewBody3DCommands = new();
     private readonly List<TexturedQuadCommand> _editorConnectorPreviewHeadCommands = new();
     // During editor rendering, the inactive banks and their notes are rendered
@@ -285,7 +289,7 @@ public sealed partial class Playfield
     private GearTimeline? _editorTimelineTraceGear;
     private TempoMap? _editorTimelineTraceTempo;
     private AresChart? _editorTimelineTraceChart;
-    private readonly List<ChartEvent> _editorTimelineTraceSuperFlicks = new();
+    private List<ChartEvent> _editorTimelineTraceSuperFlicks = new();
     private readonly List<(double Seconds, GearState State)> _editorTimelineRouteHistory = new();
     private readonly List<(double Seconds, GearState State)> _editorTimelineForecastRoute = new();
     private double _playSeconds;
@@ -492,7 +496,8 @@ public sealed partial class Playfield
         Stutter = 5,
         Select = 6,
         Duration = 7,
-        Metronome = 8
+        Metronome = 8,
+        NoteGroups = 9
     }
 
     private enum EditorSelectYMode
@@ -607,40 +612,41 @@ public sealed partial class Playfield
     private int _editorDragLastTick;
     private int _editorDragLastTrack;
     private int _editorDragLastDuration;
-    private readonly Dictionary<(int Tick, int Track, int EventIndex), ChartEvent> _linkRootByKey = new();
+    private Dictionary<(int Tick, int Track, int EventIndex), ChartEvent> _linkRootByKey = new();
     // Link adjacency caches. These are built once when a chart is loaded so the
     // frame loop never scans the full link list for every LinkHead/LinkTail.
-    private readonly Dictionary<ChartEventKey, LinkSegment> _nextLinkByHeadKey = new();
-    private readonly Dictionary<ChartEventKey, ChartEvent> _linkHeadByTailKey = new();
-    private readonly HashSet<ChartEventKey> _linkHeadKeys = new();
+    private Dictionary<ChartEventKey, LinkSegment> _nextLinkByHeadKey = new();
+    private Dictionary<ChartEventKey, ChartEvent> _linkHeadByTailKey = new();
+    private HashSet<ChartEventKey> _ambiguousNextLinkHeadKeys = new();
+    private HashSet<ChartEventKey> _linkHeadKeys = new();
 
     // Render/gameplay caches. The chart never changes after LoadChart, so keep
     // expensive ordering/tempo conversion out of the frame loop.
-    private readonly List<ChartEvent> _orderedRenderableEvents = new();
+    private List<ChartEvent> _orderedRenderableEvents = new();
     private readonly List<(ProjectedPoint Point, int Attribute)> _editorNoteAttributeLabels = new();
-    private readonly List<double> _eventSeconds = new();
-    private readonly List<double> _eventScrollUnits = new();
+    private List<double> _eventSeconds = new();
+    private List<double> _eventScrollUnits = new();
     // Effective end time/scroll for render lifetime. This differs from EndTick for
     // short holds and link-chain heads, where the visible lifetime belongs to the
     // actual chain endpoint.
-    private readonly List<double> _eventEffectiveEndSeconds = new();
-    private readonly List<double> _eventEffectiveEndScrollUnits = new();
+    private List<double> _eventEffectiveEndSeconds = new();
+    private List<double> _eventEffectiveEndScrollUnits = new();
     // Long-lived renderables are indexed by effective end distance so old heads do not
     // force DrawNotes to scan every earlier chart event.
-    private readonly List<double> _longEventEndScrollUnits = new();
-    private readonly List<int> _longRenderableEventIndicesByEnd = new();
-    private readonly List<int> _renderEventIndexScratch = new(256);
+    private List<double> _longEventEndScrollUnits = new();
+    private List<int> _longRenderableEventIndicesByEnd = new();
+    private List<int> _renderEventIndexScratch = new(256);
     private int[] _renderEventMarks = Array.Empty<int>();
     private int _renderEventMarkStamp;
-    private readonly Dictionary<ChartEventKey, List<ChartEvent>> _linkChainCache = new();
-    private readonly Dictionary<ChartEventKey, int> _linkChainEffectiveEndTickCache = new();
-    private readonly Dictionary<ChartEventKey, double> _eventSecondsByKey = new();
-    private readonly Dictionary<ChartEventKey, ChartEvent> _eventsByKey = new();
+    private Dictionary<ChartEventKey, List<ChartEvent>> _linkChainCache = new();
+    private Dictionary<ChartEventKey, int> _linkChainEffectiveEndTickCache = new();
+    private Dictionary<ChartEventKey, double> _eventSecondsByKey = new();
+    private Dictionary<ChartEventKey, ChartEvent> _eventsByKey = new();
     private readonly List<HitAnimationState> _hitAnimations = new();
     private bool _feedbackRenderWarmupDone;
-    private readonly Dictionary<(string Left, string Right), Dictionary<int, int>> _simultaneousCountsCache = new();
-    private readonly List<(int Tick, string Side, ChartEvent Event)> _bankChangingSuperFlicks = new();
-    private readonly HashSet<(int Tick, string Side)> _bankChangingSuperFlickTicks = new();
+    private Dictionary<(string Left, string Right), Dictionary<int, int>> _simultaneousCountsCache = new();
+    private List<(int Tick, string Side, ChartEvent Event)> _bankChangingSuperFlicks = new();
+    private HashSet<(int Tick, string Side)> _bankChangingSuperFlickTicks = new();
     private readonly HashSet<string> _gameplayConsumedPressedKeys = new(StringComparer.OrdinalIgnoreCase);
     private sealed class GameplayLaneInputEdge
     {
@@ -4184,6 +4190,9 @@ public sealed partial class Playfield
         if (!_switchingEditorDifficulty)
         {
             _editorClipboard.Clear();
+            _editorClipboardGroupSources.Clear();
+            _editorClipboardGroupSourceInstance = null;
+            _editorClipboardIsNoteGroupInstance = false;
             _editorClipboardAnchorTickOffset = 0;
             _editorClipboardAnchorTrackOffset = 0;
         }
@@ -4191,9 +4200,9 @@ public sealed partial class Playfield
         _editorMetaEditingField = null;
         _editorMetaInputText = string.Empty;
         _editorMetaInputCaretIndex = 0;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorDragUndoSnapshot = null;
-        _editorPendingRectangleUndoSnapshot = null;
+        ClearEditorPendingRectangleUndoSnapshot();
         _editorSelectionPendingUndoSnapshot = null;
         _editorRectSelectionArmed = false;
         _editorRectSelecting = false;
@@ -6487,6 +6496,20 @@ public sealed partial class Playfield
             return;
         }
 
+        if (KeybindSettings.IsPressed("editor_cancel") &&
+            (_editorNoteGroupPlacementArmed || _editorNoteGroupEditMode))
+        {
+            if (_editorNoteGroupEditMode)
+            {
+                ExitEditorNoteGroupEditMode("EDIT GROUP cancelled. Selecting one note selects its whole instance again.");
+            }
+            else
+            {
+                _editorNoteGroupPlacementArmed = false;
+                _statusMessage = "Group instance placement cancelled.";
+            }
+            return;
+        }
         if (HandleEditorDebugKeybinds())
             return;
 
@@ -7329,7 +7352,7 @@ public sealed partial class Playfield
         _selectedBeatTrack = null;
         _editorSelectedLinkRoot = null;
         _editorSelectedHoldEnd = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _statusMessage = group.Attr == 3
             ? $"Selected ramp group at tick {group.Tick}. Edit its settings, apply, delete the group, or ungroup it."
             : $"Selected stutter group at tick {group.Tick}. Edit its settings, apply, delete the group, or ungroup it.";
@@ -8306,7 +8329,7 @@ public sealed partial class Playfield
         _selectedBeatTrack = null;
         _editorSelectedLinkRoot = null;
         _editorSelectedHoldEnd = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         RefreshAfterEditorMutation();
         _editorHoverCacheValid = false;
 
@@ -8600,7 +8623,7 @@ public sealed partial class Playfield
         _selectedBeatTrack = null;
         _editorSelectedLinkRoot = null;
         _editorSelectedHoldEnd = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         RefreshAfterEditorMutation();
         _editorHoverCacheValid = false;
         _statusMessage = $"Flattened BPM: removed {tempoChanges.Count} tempo change(s) and {stutterGroups.Count} generator group(s); notes and chart markers were time-adjusted to {baseBpm:0.##} BPM.";
@@ -8686,7 +8709,7 @@ public sealed partial class Playfield
             _selectedBeatTrack = null;
             _editorSelectedHoldEnd = false;
             _editorSelectedLinkRoot = null;
-            _editorMultiSelectedEvents.Clear();
+            ClearEditorMultiSelection();
             _editorBpmPlacementPending = false;
             _editorBpmInputFocused = false;
             _editorBpmInputReplaceOnNextKey = false;
@@ -8835,7 +8858,7 @@ public sealed partial class Playfield
             _selectedBeatTrack = null;
             _editorSelectedHoldEnd = false;
             _editorSelectedLinkRoot = null;
-            _editorMultiSelectedEvents.Clear();
+            ClearEditorMultiSelection();
             _editorBpmPlacementPending = false;
             _editorBpmInputText = clickedTempo.Value.ToString("0.##", CultureInfo.InvariantCulture);
             _editorBpmInputFocused = false;
@@ -8975,6 +8998,11 @@ public sealed partial class Playfield
         };
         track.Events.Add(ev);
         CommitEditorUndoSnapshot(undoSnapshot);
+        if (!_chart.Events.Any(candidate => ReferenceEquals(candidate, ev)))
+        {
+            RefreshAfterEditorMutation();
+            return;
+        }
         RefreshAfterEditorMutation();
         _selectedEventKey = KeyOf(ev);
         _selectedBeatTick = null;
@@ -8985,7 +9013,9 @@ public sealed partial class Playfield
 
     private static bool IsLinkPairOccupied(AresChart chart, string candidateFamily, int pair,
         int startTick, int targetTick, HashSet<ChartEvent>? ignoredEvents = null,
-        bool hasLinkTailAtStart = false)
+        bool hasLinkTailAtStart = false, GearTimeline? routeTimelineOverride = null,
+        IReadOnlyCollection<string>? linkFamiliesOverride = null,
+        IReadOnlyDictionary<(string Family, int Pair), List<ChartEvent>>? linkPairNodesOverride = null)
     {
         if (targetTick < startTick)
             return false;
@@ -8994,35 +9024,50 @@ public sealed partial class Playfield
         // have not yet become a possible route combination. The starting gear,
         // valid SuperFlick transitions, and reached route states register those
         // combinations, which remain possible for the rest of the chart.
-        var families = chart.Events
+        var families = linkFamiliesOverride ?? chart.Events
             .Where(ev => ignoredEvents is null || !ignoredEvents.Contains(ev))
             .Select(ev => LinkBuilder.Family(ev.Track))
             .OfType<string>()
-            .Distinct(StringComparer.Ordinal);
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
         var routeCheckEnd = targetTick > startTick
             ? targetTick
             : startTick < int.MaxValue ? startTick + 1 : startTick;
-        var routeTimeline = new GearTimeline(chart);
-        return families.Any(existingFamily =>
-            EditorLinkFamiliesCanSharePair(routeTimeline, candidateFamily, existingFamily, startTick, routeCheckEnd) &&
-            IsLinkPairOccupiedInFamily(chart, existingFamily, pair, startTick, targetTick,
-                ignoredEvents, hasLinkTailAtStart));
+        var routeTimeline = routeTimelineOverride ?? new GearTimeline(chart);
+        foreach (var existingFamily in families)
+        {
+            if (!EditorLinkFamiliesCanSharePair(routeTimeline, candidateFamily, existingFamily, startTick, routeCheckEnd))
+                continue;
+
+            IReadOnlyList<ChartEvent>? cachedNodes = null;
+            if (linkPairNodesOverride is not null)
+                cachedNodes = linkPairNodesOverride.TryGetValue((existingFamily, pair), out var indexedNodes)
+                    ? indexedNodes
+                    : Array.Empty<ChartEvent>();
+            if (IsLinkPairOccupiedInFamily(chart, existingFamily, pair, startTick, targetTick,
+                    ignoredEvents, hasLinkTailAtStart, cachedNodes))
+                return true;
+        }
+        return false;
     }
 
     private static bool IsLinkPairOccupiedInFamily(AresChart chart, string family, int pair,
         int startTick, int targetTick, HashSet<ChartEvent>? ignoredEvents = null,
-        bool hasLinkTailAtStart = false)
+        bool hasLinkTailAtStart = false, IReadOnlyList<ChartEvent>? preorderedNodes = null)
     {
-        var nodes = chart.Events
-            .Where(ev => ev.Kind == "Note" &&
-                         (ignoredEvents is null || !ignoredEvents.Contains(ev)) &&
-                         (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
-                         ev.LinePair == pair &&
-                         string.Equals(LinkBuilder.Family(ev.Track), family, StringComparison.Ordinal))
-            .OrderBy(ev => ev.Tick)
-            .ThenBy(ev => ev.Track)
-            .ThenBy(ev => ev.EventIndex)
-            .ToList();
+        IReadOnlyList<ChartEvent> nodes = preorderedNodes is not null &&
+            (ignoredEvents is null || ignoredEvents.Count == 0)
+                ? preorderedNodes
+                : chart.Events
+                    .Where(ev => ev.Kind == "Note" &&
+                                 (ignoredEvents is null || !ignoredEvents.Contains(ev)) &&
+                                 (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
+                                 ev.LinePair == pair &&
+                                 string.Equals(LinkBuilder.Family(ev.Track), family, StringComparison.Ordinal))
+                    .OrderBy(ev => ev.Tick)
+                    .ThenBy(ev => ev.Track)
+                    .ThenBy(ev => ev.EventIndex)
+                    .ToList();
 
         var active = false;
         long expiry = long.MinValue;
@@ -9156,6 +9201,21 @@ public sealed partial class Playfield
             _editorSelectedLinkRoot = selectedRoot;
         }
 
+        var activeEditGroupId = _editorNoteGroupEditMode &&
+            _editorEditingNoteGroupId is int editingGroupId &&
+            _editorEditingNoteGroupInstanceId is int editingInstanceId &&
+            source.NoteGroupId == editingGroupId && source.NoteGroupInstanceId == editingInstanceId
+                ? editingGroupId : (int?)null;
+        var activeEditInstanceId = activeEditGroupId.HasValue ? _editorEditingNoteGroupInstanceId : null;
+        var existingTargetChainNodes = new List<ChartEvent>();
+        var sourceHasGroupIdentity = source.NoteGroupId.HasValue ||
+            source.NoteGroupInstanceId.HasValue || source.NoteGroupMemberId.HasValue;
+        if (sourceHasGroupIdentity && !activeEditGroupId.HasValue)
+        {
+            _statusMessage = "Enter EDIT GROUP for this instance before editing a grouped link.";
+            return;
+        }
+
         targetTick = Math.Max(0, targetTick);
         targetTrack = Math.Clamp(targetTrack, 0, 15);
         if (existingTarget is not null)
@@ -9182,6 +9242,36 @@ public sealed partial class Playfield
                     existingTarget = targetRootForValidation;
                     targetTick = existingTarget.Tick;
                     targetTrack = existingTarget.Track;
+                }
+                if (targetRootForValidation.NoteType == NoteType.LinkHead)
+                    existingTargetChainNodes = GetEditorLinkChainNodes(targetRootForValidation)
+                        .Where(node => !ReferenceEquals(node, source)).ToList();
+            }
+
+            var targetParticipants = existingTargetChainNodes.Append(existingTarget).Distinct().ToList();
+            var hasGroupedTarget = targetParticipants.Any(candidate => candidate.NoteGroupId.HasValue ||
+                candidate.NoteGroupInstanceId.HasValue || candidate.NoteGroupMemberId.HasValue);
+            if (hasGroupedTarget && !activeEditGroupId.HasValue)
+            {
+                _statusMessage = "Enter EDIT GROUP for the target's group instance before editing a grouped link.";
+                return;
+            }
+
+            if (activeEditGroupId.HasValue)
+            {
+                foreach (var candidate in targetParticipants)
+                {
+                    var isCompletelyUngrouped = candidate.NoteGroupId is null &&
+                        candidate.NoteGroupInstanceId is null && candidate.NoteGroupMemberId is null;
+                    var isSameInstanceMember = candidate.NoteGroupId == activeEditGroupId &&
+                        candidate.NoteGroupInstanceId == activeEditInstanceId && candidate.NoteGroupMemberId.HasValue;
+                    var isPendingMember = candidate.NoteGroupId == activeEditGroupId &&
+                        candidate.NoteGroupInstanceId == activeEditInstanceId && candidate.NoteGroupMemberId is null;
+                    if (!isCompletelyUngrouped && !isSameInstanceMember && !isPendingMember)
+                    {
+                        _statusMessage = "Cannot connect to a note from another group or group instance while EDIT GROUP is active. Finish that group's edit first.";
+                        return;
+                    }
                 }
             }
 
@@ -9270,7 +9360,7 @@ public sealed partial class Playfield
             }
 
             if ((source.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
-                _chart.Links.Any(link => ReferenceEquals(link.Head, source)))
+                GetEditorNextLinkPoint(source) is not null)
             {
                 _statusMessage = "Select the last link tail to add a same-track hold end.";
                 return;
@@ -9295,7 +9385,8 @@ public sealed partial class Playfield
                 foreach (var track in _chart.Tracks)
                     track.Events.RemoveAll(candidate => ReferenceEquals(candidate, existingTarget));
             }
-            CommitEditorUndoSnapshot(undoSnapshot);
+            if (!CommitEditorUndoSnapshot(undoSnapshot))
+                return;
             RefreshAfterEditorMutation();
             _selectedEventKey = KeyOf(source);
             _selectedBeatTick = null;
@@ -9327,12 +9418,16 @@ public sealed partial class Playfield
             source.EventIndex = destinationTrack.Events.Select(candidate => candidate.EventIndex).DefaultIfEmpty(-1).Max() + 1;
             destinationTrack.Events.Add(source);
             AresLoader.FinalizeEvents(_chart);
-            LinkBuilder.Build(_chart);
-            RebuildLinkRootMap();
+            if (!activeEditGroupId.HasValue)
+            {
+                LinkBuilder.Build(_chart);
+                RebuildLinkRootMap();
+            }
             var movedRoot = selectedRoot ?? GetEditorLinkRoot(source);
             if (movedRoot is not null)
                 SyncEditorLinkChainDurations(movedRoot);
-            CommitEditorUndoSnapshot(moveUndoSnapshot);
+            if (!CommitEditorUndoSnapshot(moveUndoSnapshot))
+                return;
             RefreshAfterEditorMutation();
             _selectedEventKey = KeyOf(source);
             _selectedBeatTick = null;
@@ -9347,6 +9442,16 @@ public sealed partial class Playfield
             ? GetEditorLinkChainNodes(selectedRoot).ToHashSet()
             : new HashSet<ChartEvent> { source };
         var ignoredChainEventsForPair = new HashSet<ChartEvent>(sourceChainNodesForPair);
+        if (activeEditGroupId is int pairAllocationGroupId)
+        {
+            // The final group synchronization assigns pair IDs to every logical
+            // chain in every instance as one batch. Existing physical IDs on those
+            // chains must not block the source edit from being created, because
+            // they are all candidates for reassignment in that same transaction.
+            ignoredChainEventsForPair.UnionWith(_chart.Events.Where(candidate =>
+                candidate.NoteGroupId == pairAllocationGroupId &&
+                candidate.NoteType is NoteType.LinkHead or NoteType.LinkTail));
+        }
         var pairAllocationStartTick = sourceChainNodesForPair.Min(node => node.Tick);
         var candidateHasLinkTailAtStart = targetTick == pairAllocationStartTick ||
             sourceChainNodesForPair.Any(node => node.NoteType == NoteType.LinkTail &&
@@ -9447,14 +9552,14 @@ public sealed partial class Playfield
             // This format stores a chain as an ordered sequence, not a branching
             // graph. Continue from the terminal point rather than branching from an
             // intermediate point.
-            if (_chart.Links.Any(link => ReferenceEquals(link.Head, source)))
+            if (GetEditorNextLinkPoint(source) is not null)
             {
                 _statusMessage = "Select the last link tail to continue the chain.";
                 return;
             }
 
             var orphanHead = source.NoteType == NoteType.LinkHead &&
-                             !_chart.Links.Any(link => ReferenceEquals(link.Head, source));
+                             GetEditorNextLinkPoint(source) is null;
             if (orphanHead)
             {
                 // An orphan head may retain an ID from a chain that has since
@@ -9531,6 +9636,7 @@ public sealed partial class Playfield
         }
 
         ChartEvent newTail;
+        ChartEvent? horizontalTailForGroup = null;
         var absorbedTargetIntoHorizontalDuration = false;
         if (existingTarget is not null)
         {
@@ -9541,7 +9647,6 @@ public sealed partial class Playfield
             }
 
             var targetRoot = GetEditorLinkRoot(existingTarget);
-            List<ChartEvent> targetChainNodes = new();
             if (targetRoot is not null && targetRoot.NoteType == NoteType.LinkHead)
             {
                 if (!ReferenceEquals(targetRoot, existingTarget))
@@ -9549,9 +9654,9 @@ public sealed partial class Playfield
                     _statusMessage = "Choose the head of the other link chain as the connector target.";
                     return;
                 }
-                targetChainNodes = GetEditorLinkChainNodes(targetRoot)
+                existingTargetChainNodes = GetEditorLinkChainNodes(targetRoot)
                     .Where(node => !ReferenceEquals(node, source)).ToList();
-                if (targetChainNodes.Any(node => node.Tick < targetTick))
+                if (existingTargetChainNodes.Any(node => node.Tick < targetTick))
                 {
                     _statusMessage = "The target chain has a point before its head and cannot be joined safely.";
                     return;
@@ -9601,7 +9706,7 @@ public sealed partial class Playfield
             // If the target was the head of another chain, fold its remaining
             // points into this chain by assigning them the source pair and making
             // them continuation tails.
-            foreach (var continuation in targetChainNodes.Where(node => !ReferenceEquals(node, newTail)))
+            foreach (var continuation in existingTargetChainNodes.Where(node => !ReferenceEquals(node, newTail)))
             {
                 continuation.NoteType = NoteType.LinkTail;
                 continuation.Attr = pair + 1;
@@ -9658,6 +9763,40 @@ public sealed partial class Playfield
                 Pan = source.Pan
             };
             destination.Events.Add(horizontalTail);
+            horizontalTailForGroup = horizontalTail;
+        }
+
+        // An existing note is already part of the pre-edit snapshot, so the normal
+        // "new event" scan cannot discover it after it becomes a LinkTail. Adopt
+        // the complete absorbed chain into the active source instance; group sync
+        // will assign member IDs and create its counterparts in every other copy.
+        if (activeEditGroupId is int activeGroupId && activeEditInstanceId is int activeInstanceId)
+        {
+            if (existingTarget is not null)
+            {
+                foreach (var candidate in existingTargetChainNodes.Append(existingTarget).Distinct())
+                {
+                    if (candidate.NoteGroupId is null && candidate.NoteGroupInstanceId is null &&
+                        candidate.NoteGroupMemberId is null)
+                    {
+                        candidate.NoteGroupId = activeGroupId;
+                        candidate.NoteGroupInstanceId = activeInstanceId;
+                    }
+                }
+            }
+
+            var connectorPoints = new List<ChartEvent> { newTail };
+            if (horizontalTailForGroup is not null)
+                connectorPoints.Add(horizontalTailForGroup);
+            foreach (var connectorPoint in connectorPoints)
+            {
+                if (connectorPoint.NoteGroupId is null && connectorPoint.NoteGroupInstanceId is null &&
+                    connectorPoint.NoteGroupMemberId is null)
+                {
+                    connectorPoint.NoteGroupId = activeGroupId;
+                    connectorPoint.NoteGroupInstanceId = activeInstanceId;
+                }
+            }
         }
 
         // Normalize immediately when a just-placed point would create a second
@@ -9666,22 +9805,31 @@ public sealed partial class Playfield
         // its duration end at tick 20. Existing malformed charts remain visible to
         // diagnostics and can be repaired with QUICK FIX.
         AresLoader.FinalizeEvents(_chart);
-        LinkBuilder.Build(_chart);
-        RebuildLinkRootMap();
+        if (!activeEditGroupId.HasValue)
+        {
+            LinkBuilder.Build(_chart);
+            RebuildLinkRootMap();
+        }
         var chainRootForNormalization = selectedRoot ?? GetEditorLinkRoot(newTail) ??
             (source.NoteType == NoteType.LinkHead ? source : null);
         var normalizedRepeatedPoints = 0;
         var finalSelectedLinkPoint = newTail;
         if (chainRootForNormalization is not null)
         {
-            var activeChain = GetEditorLinkChainInfos()
-                .Where(chain => ReferenceEquals(chain.Root, chainRootForNormalization))
-                .ToList();
+            var activeChain = activeEditGroupId is int normalizeGroupId && activeEditInstanceId is int normalizeInstanceId
+                ? GetEditorNoteGroupLinkChainInfos(normalizeGroupId, normalizeInstanceId)
+                    .Where(chain => ReferenceEquals(chain.Root, chainRootForNormalization)).ToList()
+                : GetEditorLinkChainInfos()
+                    .Where(chain => ReferenceEquals(chain.Root, chainRootForNormalization)).ToList();
             normalizedRepeatedPoints = NormalizeEditorRepeatedHorizontalLinkPoints(activeChain);
             if (normalizedRepeatedPoints > 0)
             {
                 AresLoader.FinalizeEvents(_chart);
-                LinkBuilder.Build(_chart);
+                if (!activeEditGroupId.HasValue)
+                {
+                    LinkBuilder.Build(_chart);
+                    RebuildLinkRootMap();
+                }
                 SyncEditorLinkChainDurations(chainRootForNormalization);
                 finalSelectedLinkPoint = GetEditorLinkChainNodes(chainRootForNormalization).LastOrDefault() ?? newTail;
             }
@@ -9695,7 +9843,8 @@ public sealed partial class Playfield
             SyncEditorLinkChainDurations(source.NoteType == NoteType.LinkHead ? source : GetEditorLinkRoot(source));
         }
 
-        CommitEditorUndoSnapshot(connectorUndoSnapshot);
+        if (!CommitEditorUndoSnapshot(connectorUndoSnapshot))
+            return;
         RefreshAfterEditorMutation();
         _selectedEventKey = KeyOf(finalSelectedLinkPoint);
         _selectedBeatTick = null;
@@ -9783,7 +9932,7 @@ public sealed partial class Playfield
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
         _editorSelectedHoldEnd = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedLinkRoot = replacement is not null ? GetEditorLinkRoot(replacement) : null;
         RefreshAfterEditorMutation();
         if (replacement is not null && _chart.Events.Any(candidate => ReferenceEquals(candidate, replacement)))
@@ -9804,7 +9953,7 @@ public sealed partial class Playfield
 
     private void DeleteEditorNoteAtPointer(ChartEvent note, bool deleteFamily)
     {
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _selectedEventKey = KeyOf(note);
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -9813,7 +9962,7 @@ public sealed partial class Playfield
         _editorSelectedLinkRoot = GetEditorLinkRoot(note);
         _editorRectSelectionArmed = false;
         _editorRectSelecting = false;
-        _editorPendingRectangleUndoSnapshot = null;
+        ClearEditorPendingRectangleUndoSnapshot();
         _editorSelectedGridCells.Clear();
         _editorPanelsSelectedEmptyCell = null;
         _editorSelectReferenceLineTick = null;
@@ -9865,7 +10014,7 @@ public sealed partial class Playfield
                     _selectedEventKey = KeyOf(endpointNote);
                     _selectedBeatTick = null;
                     _selectedBeatTrack = null;
-                    _editorMultiSelectedEvents.Clear();
+                    ClearEditorMultiSelection();
                     _editorSelectedLinkRoot = null;
                     RefreshAfterEditorMutation();
                     _selectedEventKey = KeyOf(endpointNote);
@@ -9883,7 +10032,7 @@ public sealed partial class Playfield
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
         _editorSelectedHoldEnd = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedLinkRoot = replacement is not null ? GetEditorLinkRoot(replacement) : null;
         RefreshAfterEditorMutation();
         if (replacement is not null && _chart.Events.Any(candidate => ReferenceEquals(candidate, replacement)))
@@ -9905,6 +10054,8 @@ public sealed partial class Playfield
         if (_chart is null)
             return;
 
+        InvalidateEditorNoteGroupMarkerCache();
+        InvalidateEditorSelectionRenderCache();
         _editorDiagnosticsDirty = true;
         RebuildChartTempoEventsFromTracks();
 
@@ -11477,6 +11628,7 @@ public sealed partial class Playfield
         _gameplayRenderTarget?.Dispose();
         _editorInactiveBankRenderTarget?.Dispose();
         _editorConnectorPreviewRenderTarget?.Dispose();
+        _editorNoteGroupPlacementPreviewRenderTarget?.Dispose();
         _skinRuntime.Dispose();
         _pauseSkinRuntime.Dispose();
         _resultSkinRuntime.Dispose();

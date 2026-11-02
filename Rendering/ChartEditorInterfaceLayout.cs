@@ -40,6 +40,7 @@ internal sealed record ChartEditorInterfaceLayout
     public Color PressedButtonColor { get; init; } = new(74, 74, 74);
     public Color SelectedButtonColor { get; init; } = new(52, 52, 52);
     public Color ButtonTextColor { get; init; } = new(245, 245, 245);
+    public Color PrimaryButtonTextColor { get; init; } = new(17, 17, 17);
     public Color MutedTextColor { get; init; } = new(167, 167, 167);
     public Color AccentColor { get; init; } = new(244, 197, 27);
     public Color DangerColor { get; init; } = new(255, 119, 119);
@@ -127,6 +128,7 @@ internal sealed record ChartEditorInterfaceLayout
                 PressedButtonColor = ReadColor(style, "pressed", defaults.PressedButtonColor),
                 SelectedButtonColor = ReadColor(style, "selected_button", defaults.SelectedButtonColor),
                 ButtonTextColor = ReadColor(style, "text", defaults.ButtonTextColor),
+                PrimaryButtonTextColor = ReadColor(style, "primary_text", defaults.PrimaryButtonTextColor),
                 MutedTextColor = ReadColor(style, "muted_text", defaults.MutedTextColor),
                 AccentColor = ReadColor(style, "accent", defaults.AccentColor),
                 DangerColor = ReadColor(style, "danger", defaults.DangerColor),

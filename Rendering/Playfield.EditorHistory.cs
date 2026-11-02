@@ -20,27 +20,38 @@ public sealed partial class Playfield
         int EventIndex,
         int LinePair,
         float Value,
+        int Instrument,
+        int Velocity,
+        int Pan,
         int? TwinPairId,
         bool LoopReconstructed,
-        string? LoopPhase);
+        string? LoopPhase,
+        int? NoteGroupId,
+        int? NoteGroupInstanceId,
+        int? NoteGroupMemberId);
 
     private sealed class EditorChartSnapshot
     {
-        public required List<EditorTrackSnapshot> Tracks { get; init; }
-        public required List<EditorEventSnapshot> Events { get; init; }
-        public required double MetadataBpm { get; init; }
-        public required double InitialTempo { get; init; }
-        public required int PlayTick { get; init; }
-        public required double PlayTime { get; init; }
-        public required int AudioOriginTick { get; init; }
-        public required uint RawMagic { get; init; }
-        public required int AresTrackCount { get; init; }
-        public required byte[]? AresHeaderTemplate { get; init; }
-        public required byte[]? LoadedAresHeaderTemplate { get; init; }
-        public required List<string> InstrumentNames { get; init; }
-        public required List<uint> InstrumentNameHuffmanFrequencies { get; init; }
-        public required List<int> InstrumentNameReferences { get; init; }
-        public required List<AresInstrumentDefinition> Instruments { get; init; }
+        // Selection-only history entries deliberately leave chart data empty. They
+        // are frequent (mouse selection and filtering) and must not copy the chart.
+        public AresChart? SourceChart { get; init; }
+        public List<EditorTrackSnapshot> Tracks { get; init; } = new();
+        public List<EditorEventSnapshot> Events { get; init; } = new();
+        public double MetadataBpm { get; init; }
+        public double InitialTempo { get; init; }
+        public int PlayTick { get; init; }
+        public double PlayTime { get; init; }
+        public int AudioOriginTick { get; init; }
+        public uint RawMagic { get; init; }
+        public int AresTrackCount { get; init; }
+        public byte[]? AresHeaderTemplate { get; init; }
+        public byte[]? LoadedAresHeaderTemplate { get; init; }
+        public List<string> InstrumentNames { get; init; } = new();
+        public List<uint> InstrumentNameHuffmanFrequencies { get; init; } = new();
+        public List<int> InstrumentNameReferences { get; init; } = new();
+        public List<AresInstrumentDefinition> Instruments { get; init; } = new();
+        public List<NoteGroupDefinition> NoteGroups { get; init; } = new();
+        public List<NoteGroupInstance> NoteGroupInstances { get; init; } = new();
         public bool SelectionOnly { get; init; }
         public ChartEvent? SelectedEvent { get; init; }
         public int? SelectedBeatTick { get; init; }
@@ -58,6 +69,7 @@ public sealed partial class Playfield
     private sealed record EditorClipboardEntry(
         int TickOffset,
         int TrackOffset,
+        int CanonicalTrackOffset,
         int OriginalTrack,
         int Attr,
         int Duration,
@@ -69,13 +81,38 @@ public sealed partial class Playfield
         int OriginalLinePair,
         bool IsSuperFlick,
         string? OriginalTrackSide,
-        string? OriginalTrackBank);
+        string? OriginalTrackBank,
+        int? NoteGroupId,
+        int? NoteGroupInstanceId,
+        int? NoteGroupMemberId,
+        ChartEvent SourceEvent);
+
+    // The clipboard owns snapshots of group definitions and instance metadata so
+    // COPY/CUT remains a group operation even after the source instance is deleted
+    // or the library definition is subsequently changed.
+    private sealed record EditorClipboardGroupSource(
+        NoteGroupDefinition Definition,
+        NoteGroupInstance Instance,
+        int StartTickOffset);
+
+    private sealed record EditorClipboardGroupPastePlan(
+        EditorClipboardGroupSource Source,
+        int[] EntryIndexes,
+        bool ReuseSourceDefinition,
+        List<NoteGroupTrackMapping> TrackMap,
+        List<NoteGroupMember> FittedMembers,
+        int FittedStartTrack,
+        string FittedSignature,
+        int StartTick);
 
     private readonly List<EditorChartSnapshot> _editorUndoStack = new();
     private readonly List<EditorChartSnapshot> _editorRedoStack = new();
     private const int EditorHistoryLimit = 100;
     private EditorChartSnapshot? _editorDragUndoSnapshot;
     private EditorChartSnapshot? _editorPendingRectangleUndoSnapshot;
+    // A click mutation may be synchronized immediately, then committed again on release.
+    // Remember that the pending snapshot already propagated its group changes.
+    private bool _editorPendingRectangleGroupSynchronizationApplied;
     private EditorChartSnapshot? _editorSelectionPendingUndoSnapshot;
     private readonly HashSet<ChartEvent> _editorMultiSelectedEvents = new();
     // Grid positions track note/range selections plus explicit empty-cell and SELECT gestures.
@@ -92,6 +129,9 @@ public sealed partial class Playfield
     private Vector2 _editorSelectLineStart;
     private int _editorSelectLineStartTrack = -1;
     private readonly List<EditorClipboardEntry> _editorClipboard = new();
+    private readonly List<EditorClipboardGroupSource> _editorClipboardGroupSources = new();
+    private NoteGroupInstance? _editorClipboardGroupSourceInstance;
+    private bool _editorClipboardIsNoteGroupInstance;
     private int _editorClipboardAnchorTickOffset;
     private int _editorClipboardAnchorTrackOffset;
     private bool _editorSelectedHoldEnd;
@@ -119,6 +159,26 @@ public sealed partial class Playfield
         if (_chart is null)
             return null;
 
+        if (selectionOnly)
+        {
+            return new EditorChartSnapshot
+            {
+                SourceChart = _chart,
+                SelectionOnly = true,
+                SelectedEvent = TryGetEditorEvent(_selectedEventKey),
+                SelectedBeatTick = _selectedBeatTick,
+                SelectedBeatTrack = _selectedBeatTrack,
+                SelectedTempoEvent = _editorSelectedTempoEvent,
+                SelectedLinkRoot = _editorSelectedLinkRoot,
+                SelectedHoldEnd = _editorSelectedHoldEnd,
+                MultiSelectedEvents = _editorMultiSelectedEvents.ToList(),
+                SelectedGridCells = _editorSelectedGridCells.ToList(),
+                PanelsSelectedEmptyCell = _editorPanelsSelectedEmptyCell,
+                SelectReferenceLineTick = _editorSelectReferenceLineTick,
+                SelectReferenceTickOverride = _editorSelectReferenceTickOverride
+            };
+        }
+
         var tracks = _chart.Tracks
             .Select(track => new EditorTrackSnapshot(track, track.Events.ToList()))
             .ToList();
@@ -135,11 +195,18 @@ public sealed partial class Playfield
             ev.EventIndex,
             ev.LinePair,
             ev.Value,
+            ev.Instrument,
+            ev.Velocity,
+            ev.Pan,
             ev.TwinPairId,
             ev.LoopReconstructed,
-            ev.LoopPhase)).ToList();
+            ev.LoopPhase,
+            ev.NoteGroupId,
+            ev.NoteGroupInstanceId,
+            ev.NoteGroupMemberId)).ToList();
         return new EditorChartSnapshot
         {
+            SourceChart = _chart,
             Tracks = tracks,
             Events = events,
             MetadataBpm = _chart.MetadataBpm,
@@ -155,7 +222,9 @@ public sealed partial class Playfield
             InstrumentNameHuffmanFrequencies = _chart.InstrumentNameHuffmanFrequencies.ToList(),
             InstrumentNameReferences = _chart.InstrumentNameReferences.ToList(),
             Instruments = _chart.Instruments.ToList(),
-            SelectionOnly = selectionOnly,
+            NoteGroups = CloneEditorNoteGroups(_chart.NoteGroups),
+            NoteGroupInstances = _chart.NoteGroupInstances.ToList(),
+            SelectionOnly = false,
             SelectedEvent = _selectedEventKey.HasValue
                 ? _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
                 : null,
@@ -172,9 +241,50 @@ public sealed partial class Playfield
         };
     }
 
+    private ChartEvent? TryGetEditorEvent(ChartEventKey? key)
+    {
+        if (!key.HasValue)
+            return null;
+        return _eventsByKey.TryGetValue(key.Value, out var ev) ? ev : null;
+    }
+
+    private bool IsEditorEventInCurrentChart(ChartEvent? ev)
+    {
+        if (ev is null || _chart is null)
+            return false;
+        return _eventsByKey.TryGetValue(KeyOf(ev), out var current) && ReferenceEquals(current, ev);
+    }
+
+    private static List<NoteGroupDefinition> CloneEditorNoteGroups(IEnumerable<NoteGroupDefinition> groups)
+        => groups.Select(group => new NoteGroupDefinition
+        {
+            Id = group.Id,
+            Name = group.Name,
+            Members = group.Members.ToList()
+        }).ToList();
+
+    private static bool EditorNoteGroupsEqual(
+        IReadOnlyList<NoteGroupDefinition> left,
+        IReadOnlyList<NoteGroupDefinition> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+        for (var i = 0; i < left.Count; i++)
+        {
+            var a = left[i];
+            var b = right[i];
+            if (a.Id != b.Id || a.Name != b.Name || !a.Members.SequenceEqual(b.Members))
+                return false;
+        }
+        return true;
+    }
+
     private bool EditorChartMatchesSnapshot(EditorChartSnapshot snapshot)
     {
-        if (_chart is null || _chart.MetadataBpm != snapshot.MetadataBpm || _chart.InitialTempo != snapshot.InitialTempo ||
+        if (snapshot.SelectionOnly)
+            return _chart is not null && ReferenceEquals(_chart, snapshot.SourceChart);
+
+        if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart) || _chart.MetadataBpm != snapshot.MetadataBpm || _chart.InitialTempo != snapshot.InitialTempo ||
             _chart.PlayTick != snapshot.PlayTick || _chart.PlayTime != snapshot.PlayTime || _chart.AudioOriginTick != snapshot.AudioOriginTick ||
             _chart.RawMagic != snapshot.RawMagic || _chart.AresTrackCount != snapshot.AresTrackCount ||
             _chart.Tracks.Count != snapshot.Tracks.Count)
@@ -199,22 +309,25 @@ public sealed partial class Playfield
                 ev.Duration != state.Duration || ev.RawType != state.RawType ||
                 ev.TypeIndex != state.TypeIndex || ev.Kind != state.Kind || ev.NoteType != state.NoteType ||
                 ev.EventIndex != state.EventIndex || ev.LinePair != state.LinePair ||
-                ev.Value != state.Value || ev.TwinPairId != state.TwinPairId ||
-                ev.LoopReconstructed != state.LoopReconstructed || ev.LoopPhase != state.LoopPhase)
+                ev.Value != state.Value || ev.Instrument != state.Instrument ||
+                ev.Velocity != state.Velocity || ev.Pan != state.Pan || ev.TwinPairId != state.TwinPairId ||
+                ev.LoopReconstructed != state.LoopReconstructed || ev.LoopPhase != state.LoopPhase ||
+                ev.NoteGroupId != state.NoteGroupId || ev.NoteGroupInstanceId != state.NoteGroupInstanceId ||
+                ev.NoteGroupMemberId != state.NoteGroupMemberId)
                 return false;
         }
 
         return _chart.InstrumentNames.SequenceEqual(snapshot.InstrumentNames) &&
                _chart.InstrumentNameHuffmanFrequencies.SequenceEqual(snapshot.InstrumentNameHuffmanFrequencies) &&
                _chart.InstrumentNameReferences.SequenceEqual(snapshot.InstrumentNameReferences) &&
-               _chart.Instruments.SequenceEqual(snapshot.Instruments);
+               _chart.Instruments.SequenceEqual(snapshot.Instruments) &&
+               EditorNoteGroupsEqual(_chart.NoteGroups, snapshot.NoteGroups) &&
+               _chart.NoteGroupInstances.SequenceEqual(snapshot.NoteGroupInstances);
     }
 
     private bool EditorSelectionMatchesSnapshot(EditorChartSnapshot snapshot)
     {
-        var selectedEvent = _selectedEventKey.HasValue && _chart is not null
-            ? _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
-            : null;
+        var selectedEvent = TryGetEditorEvent(_selectedEventKey);
         if (!ReferenceEquals(selectedEvent, snapshot.SelectedEvent) ||
             _selectedBeatTick != snapshot.SelectedBeatTick ||
             _selectedBeatTrack != snapshot.SelectedBeatTrack ||
@@ -238,21 +351,55 @@ public sealed partial class Playfield
             PushEditorUndoSnapshot(snapshot);
     }
 
-    private void CommitEditorUndoSnapshot(EditorChartSnapshot? snapshot)
+    private void ClearEditorPendingRectangleUndoSnapshot()
+    {
+        _editorPendingRectangleUndoSnapshot = null;
+        _editorPendingRectangleGroupSynchronizationApplied = false;
+    }
+
+    private bool CommitEditorUndoSnapshot(EditorChartSnapshot? snapshot, ISet<int>? preserveEmptyGroupIds = null,
+        bool groupChangesAlreadySynchronized = false)
     {
         if (snapshot is null)
-            return;
+            return true;
 
-        // An empty-point click can turn into rectangle selection after the next
-        // pointer movement. Defer its history entry until mouse release so a
-        // drag can cancel the click cleanly.
+        // Editor commands mutate per-track event lists. Keep AresChart.Events in
+        // sync before group identity matching, deletion, or instance-anchor math.
+        if (_chart is not null)
+            AresLoader.FinalizeEvents(_chart);
+
+        // A lane click is initially held open as a possible marquee gesture. In
+        // EDIT GROUP, synchronize its newly placed note immediately instead of
+        // waiting for mouse release: otherwise the source note can appear alone
+        // until a later drag happens to commit another edit. If the pointer turns
+        // into a marquee, RestoreEditorChartSnapshot still rolls the whole edit
+        // (including its counterpart notes and member metadata) back atomically.
+        var synchronizedGroupChanges = groupChangesAlreadySynchronized;
+        if (_editorNoteGroupEditMode && !groupChangesAlreadySynchronized)
+        {
+            if (!SynchronizeEditorNoteGroupChanges(snapshot))
+                return false;
+            synchronizedGroupChanges = true;
+        }
+
+        // Preserve the click-versus-marquee behavior for history. When this
+        // snapshot is committed again on release, skip a second group sync.
         if (_editorRectSelectionArmed)
         {
             _editorPendingRectangleUndoSnapshot = snapshot;
-            return;
+            _editorPendingRectangleGroupSynchronizationApplied = synchronizedGroupChanges;
+            return true;
         }
 
+        if (!_editorNoteGroupEditMode)
+            RefreshEditorNoteGroupInstanceAnchors(snapshot);
+
+        if (_chart is not null)
+            AresLoader.FinalizeEvents(_chart);
+        PruneEmptyEditorNoteGroupInstances(preserveEmptyGroupIds);
+
         PushEditorUndoSnapshot(snapshot);
+        return true;
     }
 
     private void PushEditorUndoSnapshot(EditorChartSnapshot snapshot)
@@ -267,8 +414,14 @@ public sealed partial class Playfield
 
     private void RestoreEditorChartSnapshot(EditorChartSnapshot snapshot)
     {
-        if (_chart is null)
+        if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart))
             return;
+
+        if (snapshot.SelectionOnly)
+        {
+            RestoreEditorSelectionSnapshot(snapshot);
+            return;
+        }
 
         foreach (var state in snapshot.Events)
         {
@@ -283,9 +436,15 @@ public sealed partial class Playfield
             state.Event.EventIndex = state.EventIndex;
             state.Event.LinePair = state.LinePair;
             state.Event.Value = state.Value;
+            state.Event.Instrument = state.Instrument;
+            state.Event.Velocity = state.Velocity;
+            state.Event.Pan = state.Pan;
             state.Event.TwinPairId = state.TwinPairId;
             state.Event.LoopReconstructed = state.LoopReconstructed;
             state.Event.LoopPhase = state.LoopPhase;
+            state.Event.NoteGroupId = state.NoteGroupId;
+            state.Event.NoteGroupInstanceId = state.NoteGroupInstanceId;
+            state.Event.NoteGroupMemberId = state.NoteGroupMemberId;
         }
 
         _chart.MetadataBpm = snapshot.MetadataBpm;
@@ -305,6 +464,10 @@ public sealed partial class Playfield
         _chart.InstrumentNameReferences.AddRange(snapshot.InstrumentNameReferences);
         _chart.Instruments.Clear();
         _chart.Instruments.AddRange(snapshot.Instruments);
+        _chart.NoteGroups.Clear();
+        _chart.NoteGroups.AddRange(CloneEditorNoteGroups(snapshot.NoteGroups));
+        _chart.NoteGroupInstances.Clear();
+        _chart.NoteGroupInstances.AddRange(snapshot.NoteGroupInstances);
         foreach (var currentTrack in _chart.Tracks)
             currentTrack.Events.Clear();
         _chart.Tracks.Clear();
@@ -315,25 +478,21 @@ public sealed partial class Playfield
             _chart.Tracks.Add(trackState.Track);
         }
 
-        _selectedEventKey = snapshot.SelectedEvent is not null && _chart.Events.Any(ev => ReferenceEquals(ev, snapshot.SelectedEvent))
-            ? KeyOf(snapshot.SelectedEvent)
-            : null;
+        _selectedEventKey = snapshot.SelectedEvent is not null ? KeyOf(snapshot.SelectedEvent) : null;
         _selectedBeatTick = snapshot.SelectedBeatTick;
         _selectedBeatTrack = snapshot.SelectedBeatTrack;
-        _editorSelectedTempoEvent = snapshot.SelectedTempoEvent is not null && _chart.Events.Any(ev => ReferenceEquals(ev, snapshot.SelectedTempoEvent))
-            ? snapshot.SelectedTempoEvent : null;
-        _editorSelectedLinkRoot = snapshot.SelectedLinkRoot is not null && _chart.Events.Any(ev => ReferenceEquals(ev, snapshot.SelectedLinkRoot))
-            ? snapshot.SelectedLinkRoot : null;
+        _editorSelectedTempoEvent = snapshot.SelectedTempoEvent;
+        _editorSelectedLinkRoot = snapshot.SelectedLinkRoot;
         _editorSelectedHoldEnd = snapshot.SelectedHoldEnd;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         foreach (var selected in snapshot.MultiSelectedEvents)
-            if (_chart.Events.Any(ev => ReferenceEquals(ev, selected))) _editorMultiSelectedEvents.Add(selected);
+            AddEditorMultiSelectedEvent(selected);
         _editorSelectedGridCells.Clear();
         foreach (var cell in snapshot.SelectedGridCells) _editorSelectedGridCells.Add(cell);
         _editorPanelsSelectedEmptyCell = snapshot.PanelsSelectedEmptyCell;
         _editorSelectReferenceLineTick = snapshot.SelectReferenceLineTick;
         _editorSelectReferenceTickOverride = snapshot.SelectReferenceTickOverride;
-        _editorPendingRectangleUndoSnapshot = null;
+        ClearEditorPendingRectangleUndoSnapshot();
         _editorSelectionPendingUndoSnapshot = null;
         _editorRectSelectionArmed = false;
         _editorRectSelecting = false;
@@ -343,6 +502,47 @@ public sealed partial class Playfield
         _editorDragChanged = false;
         RefreshAfterEditorMutation();
         StoreActiveEditorDifficulty();
+    }
+
+    private void RestoreEditorSelectionSnapshot(EditorChartSnapshot snapshot)
+    {
+        _selectedEventKey = IsEditorEventInCurrentChart(snapshot.SelectedEvent)
+            ? KeyOf(snapshot.SelectedEvent!)
+            : null;
+        _selectedBeatTick = snapshot.SelectedBeatTick;
+        _selectedBeatTrack = snapshot.SelectedBeatTrack;
+        _editorSelectedTempoEvent = IsEditorEventInCurrentChart(snapshot.SelectedTempoEvent)
+            ? snapshot.SelectedTempoEvent
+            : null;
+        _editorSelectedLinkRoot = IsEditorEventInCurrentChart(snapshot.SelectedLinkRoot)
+            ? snapshot.SelectedLinkRoot
+            : null;
+        _editorSelectedHoldEnd = snapshot.SelectedHoldEnd;
+
+        ClearEditorMultiSelection();
+        foreach (var selected in snapshot.MultiSelectedEvents)
+        {
+            if (IsEditorEventInCurrentChart(selected))
+                AddEditorMultiSelectedEvent(selected);
+        }
+
+        _editorSelectedGridCells.Clear();
+        foreach (var cell in snapshot.SelectedGridCells)
+            _editorSelectedGridCells.Add(cell);
+        _editorPanelsSelectedEmptyCell = snapshot.PanelsSelectedEmptyCell;
+        _editorSelectReferenceLineTick = snapshot.SelectReferenceLineTick;
+        _editorSelectReferenceTickOverride = snapshot.SelectReferenceTickOverride;
+
+        ClearEditorPendingRectangleUndoSnapshot();
+        _editorSelectionPendingUndoSnapshot = null;
+        _editorRectSelectionArmed = false;
+        _editorRectSelecting = false;
+        _editorDraggedEvent = null;
+        _editorDragUndoSnapshot = null;
+        _editorDragIsHoldEnd = false;
+        _editorDragChanged = false;
+        _editorHoverCacheValid = false;
+        RefreshEditorNoteGroupLibrarySelectionFromNotes();
     }
 
     private void UndoEditorChange()
@@ -389,14 +589,16 @@ public sealed partial class Playfield
             return new List<ChartEvent>();
 
         var selected = _editorMultiSelectedEvents
-            .Where(ev => _chart.Events.Any(candidate => ReferenceEquals(candidate, ev)) && ev.Kind == "Note" && ev.RawType == 1)
+            .Where(ev => IsEditorEventInCurrentChart(ev) && ev.Kind == "Note" && ev.RawType == 1)
             .ToHashSet();
-        if (selected.Count == 0 && _selectedEventKey.HasValue)
+        if (selected.Count == 0 && _selectedEventKey.HasValue &&
+            _eventsByKey.TryGetValue(_selectedEventKey.Value, out var single) &&
+            single.Kind == "Note" && single.RawType == 1)
         {
-            var single = _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value && ev.Kind == "Note" && ev.RawType == 1);
-            if (single is not null)
-                selected.Add(single);
+            selected.Add(single);
         }
+
+        ExpandEditorNoteGroupSelection(selected);
 
         if (expandLinkFamilies)
         {
@@ -420,21 +622,125 @@ public sealed partial class Playfield
 
     private void CopySelectedEditorNotes()
     {
-        var notes = GetSelectedEditorNotes(expandLinkFamilies: true);
+        // Group instances are copied as complete logical patterns, even when the
+        // current selection contains only one member or several different groups.
+        // The definition/instance snapshots also make CUT independent of whether
+        // pruning removes the original library entry after the notes are deleted.
+        var notes = GetSelectedEditorNotes(expandLinkFamilies: false);
         if (notes.Count == 0)
         {
             _statusMessage = "Select one or more notes to copy.";
             return;
         }
 
-        var minTick = notes.Min(ev => ev.Tick);
-        var minTrack = notes.Min(ev => ev.Track);
+        var groupSources = new List<EditorClipboardGroupSource>();
+        var capturedGroupInstances = new HashSet<(int GroupId, int InstanceId)>();
+        bool TryCaptureGroupInstances(IEnumerable<ChartEvent> candidates, out string? error)
+        {
+            error = null;
+            if (_chart is null)
+                return true;
+
+            var keys = candidates
+                .Where(ev => ev.NoteGroupId.HasValue && ev.NoteGroupInstanceId.HasValue)
+                .Select(ev => (GroupId: ev.NoteGroupId!.Value, InstanceId: ev.NoteGroupInstanceId!.Value))
+                .Distinct()
+                .ToList();
+            foreach (var key in keys)
+            {
+                if (!capturedGroupInstances.Add(key))
+                    continue;
+
+                var definition = _chart.NoteGroups.FirstOrDefault(group => group.Id == key.GroupId);
+                var instance = _chart.NoteGroupInstances.FirstOrDefault(candidate =>
+                    candidate.GroupId == key.GroupId && candidate.InstanceId == key.InstanceId);
+                var instanceNotes = _chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
+                    ev.NoteGroupId == key.GroupId && ev.NoteGroupInstanceId == key.InstanceId &&
+                    ev.Track is >= 0 and <= 15).ToList();
+                var copiedIds = instanceNotes.Where(ev => ev.NoteGroupMemberId.HasValue)
+                    .Select(ev => ev.NoteGroupMemberId!.Value).ToHashSet();
+                var definedIds = definition?.Members.Select(member => member.Id).ToHashSet();
+                if (definition is null || instance is null || definedIds is null ||
+                    instanceNotes.Any(ev => !ev.NoteGroupMemberId.HasValue) ||
+                    instanceNotes.Count != definition.Members.Count || copiedIds.Count != instanceNotes.Count ||
+                    !copiedIds.SetEquals(definedIds))
+                {
+                    error = $"Copy cancelled: group G{key.GroupId} instance {key.InstanceId} is incomplete.";
+                    return false;
+                }
+
+                notes.AddRange(instanceNotes);
+                var definitionSnapshot = new NoteGroupDefinition
+                {
+                    Id = definition.Id,
+                    Name = definition.Name,
+                    Members = definition.Members.ToList()
+                };
+                var instanceSnapshot = instance with { TrackMap = instance.TrackMap?.ToList() };
+                groupSources.Add(new EditorClipboardGroupSource(definitionSnapshot, instanceSnapshot, 0));
+            }
+            return true;
+        }
+
+        if (!TryCaptureGroupInstances(notes, out var groupCaptureError))
+        {
+            _statusMessage = groupCaptureError;
+            return;
+        }
+        if (notes.Any(ev =>
+                ev.NoteGroupId.HasValue != ev.NoteGroupInstanceId.HasValue ||
+                (ev.NoteGroupId.HasValue && !ev.NoteGroupMemberId.HasValue) ||
+                (ev.NoteGroupMemberId.HasValue && !ev.NoteGroupId.HasValue)))
+        {
+            _statusMessage = "Copy cancelled: one or more notes have incomplete group membership metadata.";
+            return;
+        }
+
+        // Close over complete Link families and complete group instances. A
+        // chain can connect members from separate groups, and adding that whole
+        // group can reveal another chain connected to a different instance.
+        // Repeat until both relationships stop expanding so the clipboard never
+        // contains a partial group or a partial Link family.
+        while (true)
+        {
+            var noteCountBeforeExpansion = notes.Count;
+            foreach (var note in notes.ToList())
+            {
+                var root = GetEditorLinkRoot(note);
+                if (root is null || root.NoteType != NoteType.LinkHead)
+                    continue;
+                foreach (var node in GetEditorLinkChainNodes(root))
+                    if (!notes.Contains(node))
+                        notes.Add(node);
+            }
+            if (!TryCaptureGroupInstances(notes, out groupCaptureError))
+            {
+                _statusMessage = groupCaptureError;
+                return;
+            }
+            if (notes.Count == noteCountBeforeExpansion)
+                break;
+        }
+
+        notes = notes.Distinct()
+            .OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).ThenBy(ev => ev.EventIndex).ToList();
+        var anchorTick = notes.Min(ev => ev.Tick);
+        var anchorTrack = notes.Min(ev => ev.Track);
         var selectedAnchor = _selectedEventKey.HasValue
             ? notes.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
             : null;
-        selectedAnchor ??= notes.OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).First();
-        _editorClipboardAnchorTickOffset = selectedAnchor.Tick - minTick;
-        _editorClipboardAnchorTrackOffset = selectedAnchor.Track - minTrack;
+        selectedAnchor ??= notes[0];
+        _editorClipboardAnchorTickOffset = selectedAnchor.Tick - anchorTick;
+        _editorClipboardAnchorTrackOffset = selectedAnchor.Track - anchorTrack;
+
+        // Group start ticks are stored relative to the same bottom-note anchor as
+        // the copied pattern, so all instances keep their relative arrangement
+        // when a multi-group selection is pasted elsewhere.
+        groupSources = groupSources.Select(source => source with
+        {
+            StartTickOffset = source.Instance.StartTick - anchorTick
+        }).ToList();
+
         var chainGroups = new Dictionary<ChartEvent, int>();
         var nextGroup = 0;
         foreach (var note in notes)
@@ -447,14 +753,27 @@ public sealed partial class Playfield
         }
 
         _editorClipboard.Clear();
+        _editorClipboardGroupSources.Clear();
+        _editorClipboardGroupSources.AddRange(groupSources);
+        _editorClipboardGroupSourceInstance = groupSources.Count == 1 ? groupSources[0].Instance : null;
+        _editorClipboardIsNoteGroupInstance = groupSources.Count > 0;
         foreach (var note in notes)
         {
             var root = GetEditorLinkRoot(note);
-            var group = root is not null && chainGroups.TryGetValue(root, out var groupId) ? groupId : -1;
+            var chainGroup = root is not null && chainGroups.TryGetValue(root, out var linkGroupIndex)
+                ? linkGroupIndex : -1;
             var originalPosition = GearState.Position(note.Track);
+            var groupSource = note.NoteGroupId is int groupId && note.NoteGroupInstanceId is int instanceId
+                ? groupSources.FirstOrDefault(source => source.Instance.GroupId == groupId &&
+                    source.Instance.InstanceId == instanceId)
+                : null;
+            var canonicalTrackOffset = groupSource is not null
+                ? GetCanonicalEditorNoteGroupTrack(groupSource.Instance, note.Track) - groupSource.Instance.StartTrack
+                : note.Track - anchorTrack;
             _editorClipboard.Add(new EditorClipboardEntry(
-                note.Tick - minTick,
-                note.Track - minTrack,
+                note.Tick - anchorTick,
+                note.Track - anchorTrack,
+                canonicalTrackOffset,
                 note.Track,
                 note.Attr,
                 Math.Max(1, note.Duration),
@@ -462,14 +781,23 @@ public sealed partial class Playfield
                 note.Velocity,
                 note.Pan,
                 note.NoteType,
-                group,
+                chainGroup,
                 note.LinePair,
                 note.IsSuperFlick,
                 originalPosition?.Side,
-                originalPosition?.Bank));
+                originalPosition?.Bank,
+                note.NoteGroupId,
+                note.NoteGroupInstanceId,
+                note.NoteGroupMemberId,
+                note));
         }
 
-        _statusMessage = $"Copied {notes.Count} note(s).";
+        _statusMessage = groupSources.Count switch
+        {
+            1 => $"Copied Group G{groupSources[0].Instance.GroupId} instance {groupSources[0].Instance.InstanceId} ({notes.Count} note(s)).",
+            > 1 => $"Copied {groupSources.Count} group instance(s) and {notes.Count} note(s).",
+            _ => $"Copied {notes.Count} note(s)."
+        };
     }
 
     private void CutSelectedEditorNotes()
@@ -488,7 +816,7 @@ public sealed partial class Playfield
         var removed = notes.ToHashSet();
         var replacement = DeleteEditorEvents(removed);
         CommitEditorUndoSnapshot(snapshot);
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _selectedEventKey = replacement is not null ? KeyOf(replacement) : null;
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -498,6 +826,24 @@ public sealed partial class Playfield
         _statusMessage = $"Cut {notes.Count} note(s).";
     }
 
+    private int GetEditorClipboardGroupPatternEndTick(int snap)
+    {
+        if (_editorClipboard.Count == 0 || _editorClipboardGroupSources.Count == 0)
+            return 0;
+
+        // The clipboard anchor is shared by every copied group instance. Derive
+        // it from the captured instance metadata instead of live chart events so
+        // CUT and cross-difficulty paste use the same immutable source pattern.
+        var source = _editorClipboardGroupSources[0];
+        var clipboardAnchorTick = (long)source.Instance.StartTick - source.StartTickOffset;
+        var bottomOffset = _editorClipboard.Max(entry =>
+            (long)entry.TickOffset +
+            (entry.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail
+                ? Math.Max(1, entry.Duration) : 0));
+        var endTick = clipboardAnchorTick + bottomOffset + Math.Max(1, snap);
+        return (int)Math.Clamp(endTick, 0L, int.MaxValue);
+    }
+
     private void PasteEditorNotes(bool fitToBank = false)
     {
         if (_chart is null || _tempo is null || _editorClipboard.Count == 0)
@@ -505,6 +851,22 @@ public sealed partial class Playfield
             _statusMessage = _editorClipboard.Count == 0 ? "Clipboard is empty." : "No chart is open.";
             return;
         }
+        // Both PASTE and PASTE FIT preserve captured group instances. PASTE FIT
+        // may need a new group definition when its lane mapping collapses two or
+        // more canonical lanes; it must never silently flatten those notes.
+        var hasGroupClipboardData = _editorClipboardGroupSources.Count > 0;
+        var preserveGroupClipboard = hasGroupClipboardData && IsEditorClipboardCompleteNoteGroupInstance();
+        if (hasGroupClipboardData && !preserveGroupClipboard)
+        {
+            _statusMessage = "Group paste cancelled: one or more copied group instances are incomplete.";
+            return;
+        }
+        // The specialized exact-size placement path aligns a single, pure group
+        // copy to the destination bank. Multi-group selections use the ordinary
+        // clipboard positioning, then receive independent per-instance maps.
+        var createGroupInstance = !fitToBank && preserveGroupClipboard &&
+            _editorClipboardGroupSources.Count == 1 &&
+            _editorClipboard.Count == _editorClipboardGroupSources[0].Definition.Members.Count;
 
         var routeTimeline = new GearTimeline(_chart);
         var clipboardEntries = _editorClipboard.ToList();
@@ -531,16 +893,145 @@ public sealed partial class Playfield
             ? _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
             : null;
         var currentTick = (int)Math.Round(_tempo.SecondsToTick(_playSeconds) / (double)snap, MidpointRounding.AwayFromZero) * snap;
-        var targetAnchorTick = _selectedBeatTick ?? (selected is not null ? selected.Tick + snap : currentTick);
+        var selectedClipboardGroupInstance = preserveGroupClipboard && selected is not null &&
+            selected.NoteGroupId is int selectedGroupId && selected.NoteGroupInstanceId is int selectedInstanceId &&
+            _editorClipboardGroupSources.Any(source => source.Instance.GroupId == selectedGroupId &&
+                source.Instance.InstanceId == selectedInstanceId);
+        var defaultAnchorTick = selectedClipboardGroupInstance
+            ? GetEditorClipboardGroupPatternEndTick(snap)
+            : selected is not null ? selected.Tick + snap : currentTick;
+        var targetAnchorTick = _selectedBeatTick ?? defaultAnchorTick;
         var targetAnchorTrack = _selectedBeatTrack ?? selected?.Track ?? _editorTrack;
-        var baseTick = Math.Max(0, targetAnchorTick - _editorClipboardAnchorTickOffset);
+        // A pasted group's bottom anchor is its earliest note tick. The target
+        // cell is where that bottom-most note belongs; later notes retain their
+        // original offsets above it. Do not use the last note/end of a hold here,
+        // or the whole pattern is shifted by its height and no longer aligns like
+        // PASTE FIT. Keep the stored group origin so member offsets stay intact.
+        var groupBottomTickOffset = preserveGroupClipboard
+            ? clipboardEntries.Min(entry => entry.TickOffset)
+            : _editorClipboardAnchorTickOffset;
+        var baseTickLong = (long)targetAnchorTick - groupBottomTickOffset;
+        if (baseTickLong < 0 || baseTickLong > int.MaxValue)
+        {
+            _statusMessage = preserveGroupClipboard
+                ? "Group paste cancelled: the pattern's bottom note would be before tick 0."
+                : "Paste cancelled: the pasted tick is outside the chart's supported range.";
+            return;
+        }
+        var baseTick = (int)baseTickLong;
         bool AllowedTargetTrack(int track) => _editorPanelsViewEnabled
             ? track is >= 17 and <= 20
             : track is >= 0 and <= 15;
 
         var targetTracks = new int[clipboardEntries.Count];
         var fitDroppedSuperFlicks = 0;
-        if (!fitGameplayToBank)
+        if (createGroupInstance)
+        {
+            var sourceGroupId = clipboardEntries[0].NoteGroupId!.Value;
+            var sourceInstance = _editorClipboardGroupSourceInstance;
+            var destinationPosition = GearState.Position(targetAnchorTrack);
+            if (sourceInstance is null || destinationPosition is null ||
+                sourceInstance.GroupId != sourceGroupId)
+            {
+                _statusMessage = "Group paste cancelled: the source instance or destination bank is unavailable.";
+                return;
+            }
+
+            // Use PASTE FIT's bank choice and lane alignment, but never scale the
+            // pattern. Canonical tracks are mapped to the corresponding side of
+            // the destination bank. A one-sided pattern is edge-aligned while
+            // preserving every lane gap; a two-sided pattern keeps each side's
+            // local lane. Any lane that cannot be represented exactly is rejected.
+            var destinationLaneCount = destinationPosition.Value.Bank == "Center" ? 2 : 3;
+            var bankStart = destinationPosition.Value.Bank switch
+            {
+                "Center" => 12,
+                "Backward" => 6,
+                _ => 0
+            };
+            var canonicalTracks = clipboardEntries
+                .Select(entry => GetCanonicalEditorNoteGroupTrack(sourceInstance, entry.OriginalTrack))
+                .ToArray();
+            var canonicalPositions = canonicalTracks.Select(GearState.Position).ToArray();
+            if (canonicalPositions.Any(position => position is null))
+            {
+                _statusMessage = "Group paste cancelled: the source pattern contains an invalid canonical lane.";
+                return;
+            }
+
+            var sourceHasLeftSide = canonicalPositions.Any(position =>
+                string.Equals(position!.Value.Side, "left", StringComparison.OrdinalIgnoreCase));
+            var sourceHasRightSide = canonicalPositions.Any(position =>
+                string.Equals(position!.Value.Side, "right", StringComparison.OrdinalIgnoreCase));
+            var sourceSpansBothSides = sourceHasLeftSide && sourceHasRightSide;
+            var laneMap = new Dictionary<int, int>();
+            if (sourceSpansBothSides)
+            {
+                foreach (var canonicalTrack in canonicalTracks.Distinct())
+                {
+                    var position = GearState.Position(canonicalTrack);
+                    if (position is null || position.Value.LocalPos >= destinationLaneCount)
+                    {
+                        _statusMessage = "Group paste cancelled: the pattern needs a lane that does not exist in the destination bank. It will not be auto-fitted.";
+                        return;
+                    }
+                    laneMap[canonicalTrack] = EditorTrackForBankPosition(
+                        position.Value.Side, destinationPosition.Value.Bank, position.Value.LocalPos);
+                }
+            }
+            else
+            {
+                var sourcePosition = canonicalPositions.FirstOrDefault(position => position is not null);
+                if (sourcePosition is null)
+                {
+                    _statusMessage = "Group paste cancelled: the source pattern has no valid bank side.";
+                    return;
+                }
+
+                var sourceSide = sourcePosition.Value.Side;
+                var canonicalMin = canonicalTracks.Min();
+                var canonicalMax = canonicalTracks.Max();
+                var sourceWidth = canonicalMax - canonicalMin + 1;
+                if (sourceWidth > destinationLaneCount)
+                {
+                    _statusMessage = "Group paste cancelled: the pattern is wider than this bank side. Group paste does not auto-fit; choose a wider bank.";
+                    return;
+                }
+
+                var fitStart = bankStart +
+                    (string.Equals(sourceSide, "right", StringComparison.OrdinalIgnoreCase)
+                        ? destinationLaneCount : 0);
+                foreach (var canonicalTrack in canonicalTracks.Distinct())
+                    laneMap[canonicalTrack] = fitStart + canonicalTrack - canonicalMin;
+            }
+
+            if (laneMap.Count == 0 || laneMap.Values.Any(track => track is < 0 or > 15) ||
+                laneMap.Values.Distinct().Count() != laneMap.Count)
+            {
+                _statusMessage = "Group paste cancelled: the destination bank cannot preserve the pattern's lane layout.";
+                return;
+            }
+
+            // The group's canonical origin stays unchanged. Per-instance mapping
+            // captures the bank alignment, so synchronized edits can still map
+            // each canonical member to the equivalent lane in every instance.
+            var destinationInstanceTemplate = new NoteGroupInstance(
+                sourceGroupId, -1, baseTick, sourceInstance.StartTrack,
+                sourceInstance.IsMirrored, laneMap.OrderBy(pair => pair.Key)
+                    .Select(pair => new NoteGroupTrackMapping(pair.Key, pair.Value)).ToList());
+
+            for (var i = 0; i < clipboardEntries.Count; i++)
+            {
+                targetTracks[i] = GetPhysicalEditorNoteGroupTrack(
+                    destinationInstanceTemplate, canonicalTracks[i]);
+                if (targetTracks[i] is < 0 or > 15 || !AllowedTargetTrack(targetTracks[i]))
+                {
+                    _statusMessage = "Group paste cancelled: a mapped note would leave the gameplay lanes.";
+                    return;
+                }
+            }
+        }
+        else if (!fitGameplayToBank)
         {
             var baseTrack = targetAnchorTrack - _editorClipboardAnchorTrackOffset;
             for (var i = 0; i < clipboardEntries.Count; i++)
@@ -590,8 +1081,9 @@ public sealed partial class Playfield
                     }
 
                     var sourceLaneCount = sourcePosition.Value.Bank == "Center" ? 2 : 3;
-                    var mappedLocal = ScaleEditorBankLane(
-                        sourcePosition.Value.LocalPos, sourceLaneCount, halfBankWidth);
+                    var mappedLocal = ScaleEditorBankLaneForPasteFit(
+                        sourcePosition.Value.LocalPos, sourceLaneCount, halfBankWidth,
+                        sourcePosition.Value.Side);
                     var rawTarget = EditorTrackForBankPosition(
                         sourcePosition.Value.Side, targetPosition.Value.Bank, mappedLocal);
                     if (rawTarget < 0)
@@ -604,11 +1096,12 @@ public sealed partial class Playfield
             }
             else
             {
-                // When the clipboard comes from just one physical side, fit it
-                // into that same side of the destination bank. Never expand a
-                // one-sided source over both sides just because it is wider than
-                // one target half. The selected track chooses the destination
-                // bank; the source-side identity chooses left or right.
+                // A one-sided pattern that fits within one side of the target
+                // bank should follow the side the user actually selected. Its
+                // source side is irrelevant in that case (for example, a compact
+                // R2K pattern can be pasted into L3K). Only retain the source-side
+                // preference when the pattern is wider than one target side and
+                // therefore needs PASTE FIT's existing lane compression.
                 var sourceSide = sourcePositions.FirstOrDefault(position => position is not null)?.Side;
                 if (sourceSide is null)
                 {
@@ -616,9 +1109,11 @@ public sealed partial class Playfield
                     return;
                 }
 
-                var fitStart = bankStart + (string.Equals(sourceSide, "right", StringComparison.OrdinalIgnoreCase)
-                    ? halfBankWidth : 0);
                 var fitWidth = halfBankWidth;
+                var canFitOnSelectedSide = sourceWidth <= fitWidth;
+                var destinationSide = canFitOnSelectedSide ? targetPosition.Value.Side : sourceSide;
+                var fitStart = bankStart + (string.Equals(destinationSide, "right", StringComparison.OrdinalIgnoreCase)
+                    ? halfBankWidth : 0);
                 var baseTrack = fitStart;
                 for (var i = 0; i < clipboardEntries.Count; i++)
                 {
@@ -629,7 +1124,8 @@ public sealed partial class Playfield
                     else if (sourceWidth <= 1 || fitWidth <= 1)
                         mappedOffset = 0;
                     else
-                        mappedOffset = (int)Math.Round(offset * (fitWidth - 1.0) / (sourceWidth - 1.0), MidpointRounding.AwayFromZero);
+                        mappedOffset = ScaleEditorBankLaneForPasteFit(
+                            offset, sourceWidth, fitWidth, sourceSide);
                     var rawTarget = baseTrack + Math.Clamp(mappedOffset, 0, fitWidth - 1);
                     targetTracks[i] = GetEditorAllowedTrackForNoteType(rawTarget, clipboardEntries[i].NoteType);
                 }
@@ -759,6 +1255,11 @@ public sealed partial class Playfield
                 });
                 if (!collision)
                     return true;
+                if (createGroupInstance)
+                {
+                    _statusMessage = "Group paste cancelled: the anchored pattern overlaps an existing note or hold. Choose another tick.";
+                    return false;
+                }
                 if (baseTick > int.MaxValue - snap)
                     break;
                 baseTick += snap;
@@ -834,7 +1335,9 @@ public sealed partial class Playfield
                     continue;
                 if (!fitGameplayToBank)
                 {
-                    _statusMessage = "Paste cancelled: in 1K, L1/L3/R1/R3 are reserved for link tails. Use PASTE FIT to fit notes into legal lanes.";
+                    _statusMessage = createGroupInstance
+                        ? "Group paste cancelled: this exact pattern places a note on a restricted 1K lane. Group paste does not compress or rearrange notes."
+                        : "Paste cancelled: in 1K, L1/L3/R1/R3 are reserved for link tails. Use PASTE FIT to fit notes into legal lanes.";
                     return;
                 }
                 var allowedTrack = GetEditorAllowedTrackForNoteType(targetTracks[i], effectiveType);
@@ -859,6 +1362,19 @@ public sealed partial class Playfield
         if (!FindCollisionFreeTickBase())
             return;
         AllocateLinkPairs();
+        if (preserveGroupClipboard)
+        {
+            var unallocatedChain = clipboardEntries
+                .Where(entry => entry.ChainGroup >= 0)
+                .Select(entry => entry.ChainGroup)
+                .Distinct()
+                .FirstOrDefault(chainGroup => !groupPairs.ContainsKey(chainGroup), -1);
+            if (unallocatedChain >= 0)
+            {
+                _statusMessage = "Group paste cancelled: one or more Link chains cannot be preserved at the destination. Choose another tick.";
+                return;
+            }
+        }
         for (var i = 0; i < clipboardEntries.Count; i++)
         {
             var entry = clipboardEntries[i];
@@ -1038,7 +1554,33 @@ public sealed partial class Playfield
             }
         }
 
+        if (preserveGroupClipboard)
+        {
+            foreach (var source in _editorClipboardGroupSources)
+            {
+                var groupEntries = clipboardEntries.Where(entry =>
+                    entry.NoteGroupId == source.Instance.GroupId &&
+                    entry.NoteGroupInstanceId == source.Instance.InstanceId).ToList();
+                var pastedMemberIds = groupEntries.Where(entry => entry.NoteGroupMemberId.HasValue)
+                    .Select(entry => entry.NoteGroupMemberId!.Value).ToHashSet();
+                var expectedMemberIds = source.Definition.Members.Select(member => member.Id).ToHashSet();
+                if (groupEntries.Count != source.Definition.Members.Count ||
+                    pastedMemberIds.Count != groupEntries.Count || !pastedMemberIds.SetEquals(expectedMemberIds))
+                {
+                    _statusMessage = fitGameplayToBank
+                        ? "PASTE FIT cancelled: a grouped pattern member would be skipped. Group instances must remain complete."
+                        : "Group paste cancelled: a copied group instance would be incomplete.";
+                    return;
+                }
+            }
+        }
+
         var snapshot = CaptureEditorChartSnapshot();
+        if (snapshot is null)
+        {
+            _statusMessage = "Paste cancelled: an undo snapshot could not be created.";
+            return;
+        }
         if (fitCollisionRemovals.Count > 0)
             DeleteEditorEvents(fitCollisionRemovals);
 
@@ -1100,23 +1642,261 @@ public sealed partial class Playfield
             return;
         }
 
+        var pastedGroupInstances = new List<(int GroupId, int InstanceId)>();
+        if (preserveGroupClipboard && !TryApplyEditorClipboardGroupPasteMetadata(
+                clipboardEntries, targetTracks, pasted, baseTick,
+                out pastedGroupInstances, out var groupPasteError))
+        {
+            RestoreEditorChartSnapshot(snapshot);
+            _statusMessage = groupPasteError ?? "Group paste cancelled: group metadata could not be reconstructed.";
+            return;
+        }
+
+        if (pastedGroupInstances.Count > 0)
+        {
+            _editorNoteGroupPlacementArmed = false;
+            _editorSelectedNoteGroupId = pastedGroupInstances[0].GroupId;
+            _editorNoteGroupEditMode = false;
+            _editorEditingNoteGroupId = null;
+            _editorEditingNoteGroupInstanceId = null;
+        }
+
         CommitEditorUndoSnapshot(snapshot);
         RefreshAfterEditorMutation();
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         foreach (var ev in pasted)
-            _editorMultiSelectedEvents.Add(ev);
+            AddEditorMultiSelectedEvent(ev);
         _selectedEventKey = KeyOf(pasted[0]);
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
         _editorTrack = pasted[0].Track;
         _editorSelectedHoldEnd = false;
         _editorSelectedLinkRoot = GetEditorLinkRoot(pasted[0]);
-        _statusMessage = fitGameplayToBank
-            ? $"Pasted and fitted {pasted.Count} note(s) into the destination bank." +
-              (fitDroppedConflicts > 0 ? $" Skipped {fitDroppedConflicts} lower-priority/conflicting note(s)." : string.Empty) +
-              (fitCollisionRemovals.Count > 0 ? $" Replaced {fitCollisionRemovals.Count} lower-priority note(s)." : string.Empty) +
-              (fitDroppedSuperFlicks > 0 ? $" Removed {fitDroppedSuperFlicks} SuperFlick(s) that needed another track." : string.Empty)
-            : $"Pasted {pasted.Count} note(s).";
+        _statusMessage = pastedGroupInstances.Count switch
+        {
+            1 => $"Pasted Group G{pastedGroupInstances[0].GroupId} as instance {GetEditorNoteGroupDisplayInstanceNumber(pastedGroupInstances[0].GroupId, pastedGroupInstances[0].InstanceId)} with {pasted.Count} note(s).",
+            > 1 => $"Pasted {pasted.Count} note(s) across {pastedGroupInstances.Count} group instance(s)." +
+                   (fitGameplayToBank ? " Group layouts were preserved or rebuilt to match the fitted tracks." : string.Empty),
+            _ when fitGameplayToBank => $"Pasted and fitted {pasted.Count} note(s) into the destination bank." +
+                (fitDroppedConflicts > 0 ? $" Skipped {fitDroppedConflicts} lower-priority/conflicting note(s)." : string.Empty) +
+                (fitCollisionRemovals.Count > 0 ? $" Replaced {fitCollisionRemovals.Count} lower-priority note(s)." : string.Empty) +
+                (fitDroppedSuperFlicks > 0 ? $" Removed {fitDroppedSuperFlicks} SuperFlick(s) that needed another track." : string.Empty),
+            _ => $"Pasted {pasted.Count} note(s)."
+        };
+    }
+
+    private bool TryApplyEditorClipboardGroupPasteMetadata(
+        IReadOnlyList<EditorClipboardEntry> entries,
+        IReadOnlyList<int> targetTracks,
+        IReadOnlyList<ChartEvent> pasted,
+        int baseTick,
+        out List<(int GroupId, int InstanceId)> createdInstances,
+        out string? error)
+    {
+        createdInstances = new List<(int GroupId, int InstanceId)>();
+        error = null;
+        if (_chart is null || entries.Count != targetTracks.Count || entries.Count != pasted.Count)
+        {
+            error = "Group paste cancelled: the pasted note mapping is incomplete.";
+            return false;
+        }
+
+        var plans = new List<EditorClipboardGroupPastePlan>(_editorClipboardGroupSources.Count);
+        foreach (var source in _editorClipboardGroupSources)
+        {
+            var entryIndexes = Enumerable.Range(0, entries.Count).Where(index =>
+                entries[index].NoteGroupId == source.Instance.GroupId &&
+                entries[index].NoteGroupInstanceId == source.Instance.InstanceId).ToArray();
+            var entriesByMember = entryIndexes
+                .Where(index => entries[index].NoteGroupMemberId.HasValue)
+                .GroupBy(index => entries[index].NoteGroupMemberId!.Value)
+                .ToDictionary(group => group.Key, group => group.ToList());
+            var expectedMembers = source.Definition.Members.ToDictionary(member => member.Id);
+            if (entryIndexes.Length != expectedMembers.Count || entriesByMember.Count != expectedMembers.Count ||
+                expectedMembers.Keys.Any(memberId => !entriesByMember.TryGetValue(memberId, out var matches) || matches.Count != 1))
+            {
+                error = "Group paste cancelled: a copied instance no longer contains every group member.";
+                return false;
+            }
+
+            var canonicalToTarget = new Dictionary<int, int>();
+            var canonicalLaneMappingConsistent = true;
+            var rebuiltSourceMembers = new List<NoteGroupMember>(expectedMembers.Count);
+            var fittedMembers = new List<NoteGroupMember>(expectedMembers.Count);
+            foreach (var sourceMember in source.Definition.Members.OrderBy(member => member.Id))
+            {
+                var index = entriesByMember[sourceMember.Id][0];
+                var entry = entries[index];
+                var pastedEvent = pasted[index];
+                var sourceCanonicalTrack = GetCanonicalEditorNoteGroupTrack(source.Instance, entry.OriginalTrack);
+                var canonicalAttr = GetCanonicalEditorNoteGroupAttr(source.Instance, entry.Attr);
+                var memberTickOffset = entry.TickOffset - source.StartTickOffset;
+                var member = new NoteGroupMember(
+                    sourceMember.Id,
+                    memberTickOffset,
+                    sourceCanonicalTrack - source.Instance.StartTrack,
+                    canonicalAttr,
+                    entry.Duration,
+                    entry.Instrument,
+                    entry.Velocity,
+                    entry.Pan,
+                    pastedEvent.NoteType,
+                    sourceMember.ChainGroup,
+                    sourceMember.OriginalLinePair);
+                rebuiltSourceMembers.Add(member);
+
+                var targetTrack = targetTracks[index];
+                var targetCanonicalTrack = source.Instance.IsMirrored
+                    ? MirrorEditorTrackX(targetTrack)
+                    : targetTrack;
+                var targetUnmirroredTrack = targetCanonicalTrack;
+                if (canonicalToTarget.TryGetValue(sourceCanonicalTrack, out var existingTarget))
+                {
+                    if (existingTarget != targetUnmirroredTrack)
+                        canonicalLaneMappingConsistent = false;
+                }
+                else
+                {
+                    canonicalToTarget[sourceCanonicalTrack] = targetUnmirroredTrack;
+                }
+                fittedMembers.Add(new NoteGroupMember(
+                    sourceMember.Id,
+                    memberTickOffset,
+                    targetCanonicalTrack,
+                    canonicalAttr,
+                    entry.Duration,
+                    entry.Instrument,
+                    entry.Velocity,
+                    entry.Pan,
+                    pastedEvent.NoteType,
+                    sourceMember.ChainGroup,
+                    sourceMember.OriginalLinePair));
+            }
+
+            var mappedTargetsAreUnique = canonicalLaneMappingConsistent &&
+                canonicalToTarget.Values.Distinct().Count() == canonicalToTarget.Count;
+            var mappedOffsets = canonicalToTarget.Select(pair => pair.Value - pair.Key).Distinct().Count();
+            var mappingPreservesPatternSize = canonicalLaneMappingConsistent && mappedOffsets <= 1;
+            var rebuiltMatchesClipboardDefinition = rebuiltSourceMembers.SequenceEqual(
+                source.Definition.Members.OrderBy(member => member.Id));
+            var currentDefinition = _chart.NoteGroups.FirstOrDefault(group => group.Id == source.Definition.Id);
+            var currentDefinitionMatchesClipboard = currentDefinition is null ||
+                (currentDefinition.Name == source.Definition.Name &&
+                 currentDefinition.Members.OrderBy(member => member.Id)
+                     .SequenceEqual(source.Definition.Members.OrderBy(member => member.Id)));
+            var reuseSourceDefinition = mappedTargetsAreUnique && mappingPreservesPatternSize &&
+                                       rebuiltMatchesClipboardDefinition && currentDefinitionMatchesClipboard;
+            var trackMap = canonicalToTarget.OrderBy(pair => pair.Key)
+                .Select(pair => new NoteGroupTrackMapping(pair.Key, pair.Value)).ToList();
+            // Fitted group definitions store lane offsets relative to their own
+            // start track, just like groups created from a normal chart selection.
+            // Normalize the mapped canonical lanes so a later library placement can
+            // shift the whole fitted pattern from its new origin.
+            var fittedStartTrack = fittedMembers.Select(member => member.TrackOffset).DefaultIfEmpty(0).Min();
+            var normalizedFittedMembers = fittedMembers.Select(member =>
+                member with { TrackOffset = member.TrackOffset - fittedStartTrack }).ToList();
+            var fittedSignature = string.Join(";", normalizedFittedMembers.OrderBy(member => member.Id).Select(member =>
+                $"{member.Id},{member.TickOffset},{member.TrackOffset},{member.Attr},{member.Duration},{member.Instrument},{member.Velocity},{member.Pan},{(int)member.NoteType},{member.ChainGroup},{member.OriginalLinePair}"));
+            var startTickLong = (long)baseTick + source.StartTickOffset;
+            if (startTickLong < int.MinValue || startTickLong > int.MaxValue)
+            {
+                error = "Group paste cancelled: a copied instance anchor is outside the supported tick range.";
+                return false;
+            }
+
+            plans.Add(new EditorClipboardGroupPastePlan(
+                source,
+                entryIndexes,
+                reuseSourceDefinition,
+                trackMap,
+                normalizedFittedMembers,
+                fittedStartTrack,
+                fittedSignature,
+                (int)startTickLong));
+        }
+
+        if (plans.Count == 0)
+            return true;
+
+        var nextGroupIdLong = Math.Max(
+            _chart.NoteGroups.Select(group => group.Id).DefaultIfEmpty(0).Max(),
+            _editorClipboardGroupSources.Select(source => source.Definition.Id).DefaultIfEmpty(0).Max()) + 1L;
+        var nextInstanceIds = new Dictionary<int, int>();
+        var fittedGroupIds = new Dictionary<(int SourceGroupId, string Signature), int>();
+        foreach (var plan in plans)
+        {
+            var sourceGroupId = plan.Source.Definition.Id;
+            int targetGroupId;
+            int targetStartTrack;
+            bool targetIsMirrored;
+            List<NoteGroupTrackMapping>? targetTrackMap;
+
+            if (plan.ReuseSourceDefinition)
+            {
+                targetGroupId = sourceGroupId;
+                if (!_chart.NoteGroups.Any(group => group.Id == targetGroupId))
+                {
+                    _chart.NoteGroups.Add(new NoteGroupDefinition
+                    {
+                        Id = targetGroupId,
+                        Name = plan.Source.Definition.Name,
+                        Members = plan.Source.Definition.Members.ToList()
+                    });
+                }
+                targetStartTrack = plan.Source.Instance.StartTrack;
+                targetIsMirrored = plan.Source.Instance.IsMirrored;
+                targetTrackMap = plan.TrackMap;
+            }
+            else
+            {
+                var fittedKey = (sourceGroupId, plan.FittedSignature);
+                if (!fittedGroupIds.TryGetValue(fittedKey, out targetGroupId))
+                {
+                    if (nextGroupIdLong > int.MaxValue)
+                    {
+                        error = "Group paste cancelled: no group IDs remain available.";
+                        return false;
+                    }
+                    targetGroupId = (int)nextGroupIdLong++;
+                    fittedGroupIds[fittedKey] = targetGroupId;
+                    _chart.NoteGroups.Add(new NoteGroupDefinition
+                    {
+                        Id = targetGroupId,
+                        Name = plan.Source.Definition.Name,
+                        Members = plan.FittedMembers.ToList()
+                    });
+                }
+                targetStartTrack = plan.FittedStartTrack;
+                targetIsMirrored = plan.Source.Instance.IsMirrored;
+                targetTrackMap = null;
+            }
+
+            if (!nextInstanceIds.TryGetValue(targetGroupId, out var nextInstanceId))
+            {
+                nextInstanceId = _chart.NoteGroupInstances.Where(instance => instance.GroupId == targetGroupId)
+                    .Select(instance => instance.InstanceId).DefaultIfEmpty(0).Max();
+            }
+            if (nextInstanceId == int.MaxValue)
+            {
+                error = $"Group paste cancelled: group G{targetGroupId} has no instance IDs remaining.";
+                return false;
+            }
+            nextInstanceId++;
+            nextInstanceIds[targetGroupId] = nextInstanceId;
+            _chart.NoteGroupInstances.Add(new NoteGroupInstance(
+                targetGroupId, nextInstanceId, plan.StartTick, targetStartTrack,
+                targetIsMirrored, targetTrackMap));
+
+            foreach (var index in plan.EntryIndexes)
+            {
+                pasted[index].NoteGroupId = targetGroupId;
+                pasted[index].NoteGroupInstanceId = nextInstanceId;
+                pasted[index].NoteGroupMemberId = entries[index].NoteGroupMemberId;
+            }
+            createdInstances.Add((targetGroupId, nextInstanceId));
+        }
+
+        return true;
     }
 
     // Remove selected notes while preserving every unbroken run of a link chain.

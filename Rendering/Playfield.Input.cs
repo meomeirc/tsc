@@ -278,6 +278,27 @@ public sealed partial class Playfield
             var pointer = new Microsoft.Xna.Framework.Point(
                 (int)MathF.Round(GlobalInput.Mouse.X * virtualWidth / (float)Math.Max(1, viewport.Width)),
                 (int)MathF.Round(GlobalInput.Mouse.Y * virtualHeight / (float)Math.Max(1, viewport.Height)));
+            if (_editorMenuSection == EditorMenuSection.NoteGroups)
+            {
+                var menuPanel = GetEditorMenuPanelBounds(virtualWidth, virtualHeight);
+                if (menuPanel.Contains(pointer))
+                {
+                    var firstRow = GetEditorNoteGroupEntryBounds(0, virtualWidth, virtualHeight);
+                    var lastRow = GetEditorNoteGroupEntryBounds(EditorNoteGroupMenuVisibleRows - 1,
+                        virtualWidth, virtualHeight);
+                    var scrollbarPadding = (int)MathF.Round(18f * _projection.ScalePixels(1f));
+                    var listBounds = new Rectangle(firstRow.X, firstRow.Y,
+                        lastRow.Right - firstRow.X + scrollbarPadding, lastRow.Bottom - firstRow.Y);
+                    if (listBounds.Contains(pointer))
+                    {
+                        var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
+                        _editorNoteGroupsScrollOffset = Math.Clamp(
+                            _editorNoteGroupsScrollOffset + (wheelDelta < 0 ? steps : -steps),
+                            0, GetEditorNoteGroupScrollMaximum());
+                    }
+                    return;
+                }
+            }
             if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
             {
                 var uiOverMetaContent = _editorMetaPanelOpen &&
@@ -384,7 +405,7 @@ public sealed partial class Playfield
         if (_chartEditorMode && _chart is not null && _tempo is not null)
         {
             var editState = RenderGearState(_tempo.SecondsToTick(_playSeconds));
-            _editorMultiSelectedEvents.RemoveWhere(ev => !ShouldRenderInCurrentBank(ev, editState));
+            RemoveEditorMultiSelectedEventsWhere(ev => !ShouldRenderInCurrentBank(ev, editState));
             if (_selectedEventKey.HasValue)
             {
                 var selected = _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value);

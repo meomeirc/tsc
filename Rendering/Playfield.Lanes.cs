@@ -59,7 +59,8 @@ public sealed partial class Playfield
         // Bank-only passes draw their contents at full opacity. Inactive content
         // is faded once after its lane and notes have been composited together;
         // active content stays fully opaque while that split pass is in use.
-        if (_editorInactiveBankLayerPass || _editorActiveBanksOnlyPass)
+        if (_editorInactiveBankLayerPass || _editorActiveBanksOnlyPass ||
+            _editorNoteGroupPlacementPreviewRendering)
             return 1f;
 
         var activeBank = GearTimeline.ActiveBankForSide(state, side);
@@ -200,6 +201,10 @@ public sealed partial class Playfield
 
     private bool IsEditorTrackVisible(int track, GearState state)
     {
+        // Group ghosts are rendered as a standalone composite and must include
+        // inactive/compact banks regardless of the live chart visibility mode.
+        if (_editorNoteGroupPlacementPreviewRendering)
+            return true;
         var position = GearState.Position(track);
         if (position is null)
             return false;

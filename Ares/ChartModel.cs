@@ -39,13 +39,19 @@ public sealed class ChartEvent
     public int EventIndex { get; set; }
     public int LinePair { get; set; } = -1;
     public int? TwinPairId { get; set; }
+    // Editor-only note-pattern membership. These identifiers are persisted by
+    // NoteGroupMetadataCodec in reserved track-31..40 metadata events (older
+    // TSC-455 files may contain the distributed encoding on tracks 31..63).
+    public int? NoteGroupId { get; set; }
+    public int? NoteGroupInstanceId { get; set; }
+    public int? NoteGroupMemberId { get; set; }
     public bool LoopReconstructed { get; set; }
     public string? LoopPhase { get; set; }
     public string? Kind { get; set; }
     public float Value { get; set; }
-    public int Instrument { get; init; }
-    public int Velocity { get; init; } = 127;
-    public int Pan { get; init; } = 64;
+    public int Instrument { get; set; }
+    public int Velocity { get; set; } = 127;
+    public int Pan { get; set; } = 64;
 
     public int EndTick => Tick + Math.Max(1, Duration);
     public bool IsHoldNote => NoteType is NoteType.SingleLong or NoteType.Vibrato;
@@ -127,6 +133,41 @@ public sealed class ChartEvent
 
 }
 
+
+/// <summary>Reusable note-pattern definition stored inside the chart.</summary>
+public sealed class NoteGroupDefinition
+{
+    public int Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public List<NoteGroupMember> Members { get; set; } = new();
+}
+
+/// <summary>One relative note in a reusable note-pattern definition.</summary>
+public sealed record NoteGroupMember(
+    int Id,
+    int TickOffset,
+    int TrackOffset,
+    int Attr,
+    int Duration,
+    int Instrument,
+    int Velocity,
+    int Pan,
+    NoteType NoteType,
+    int ChainGroup,
+    int OriginalLinePair);
+
+/// <summary>Maps one canonical group lane to its physical lane in a placed instance.</summary>
+public sealed record NoteGroupTrackMapping(int CanonicalTrack, int Track);
+
+/// <summary>One placed copy of a note group. Track mappings allow bank-aware placement without resizing the pattern.</summary>
+public sealed record NoteGroupInstance(
+    int GroupId,
+    int InstanceId,
+    int StartTick,
+    int StartTrack,
+    bool IsMirrored = false,
+    List<NoteGroupTrackMapping>? TrackMap = null);
+
 public sealed class ChartTrack
 {
     public int TrackIndex { get; init; }
@@ -185,6 +226,8 @@ public sealed class AresChart
     public List<AresInstrumentDefinition> Instruments { get; } = new();
     public List<LinkSegment> Links { get; } = new();
     public List<(int Tick, double Bpm)> TempoEvents { get; } = new();
+    public List<NoteGroupDefinition> NoteGroups { get; } = new();
+    public List<NoteGroupInstance> NoteGroupInstances { get; } = new();
     public int InitialGearAttr { get; set; }
     public int AudioOriginTick { get; set; }
     public bool MainLoopGenerated { get; set; }

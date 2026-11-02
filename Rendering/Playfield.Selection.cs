@@ -25,11 +25,404 @@ public sealed partial class Playfield
     private bool _editorTimelineScrubbing;
     private bool _editorTimelineResumeAfterScrub;
     private static readonly Color EditorSelectedColor = new(255, 165, 0);
+    private static readonly Color EditorGroupSelectedColor = new(174, 255, 0);
     private static readonly Color EditorFamilyColor = Color.White;
+
+    private static Color GetEditorSelectedNoteHighlightColor(ChartEvent note)
+        => note.NoteGroupId.HasValue ? EditorGroupSelectedColor : EditorSelectedColor;
     private static readonly Color EditorEndingColor = Color.Cyan;
     // Two selection quads, each with a filled face and four 3D border strips.
     // Reused each frame to avoid creating short-lived geometry arrays.
     private readonly VertexPositionColor[] _editorSelection3DVertices = new VertexPositionColor[60];
+    // All multi-selection highlights are accumulated into one reusable 2D mesh.
+    // The capacity grows only when a denser-than-before visible frame requires it.
+    private VertexPositionColor[] _editorMultiSelectionMarkerVertices = new VertexPositionColor[8192];
+    private int _editorMultiSelectionMarkerVertexCount;
+    private const int EditorMultiSelectionMarkerSegments = 20;
+    private static readonly Vector2[] EditorMultiSelectionMarkerUnitCircle =
+        CreateEditorMultiSelectionMarkerUnitCircle();
+    private readonly record struct EditorMultiSelectionRenderItem(
+        int EventIndex, bool IsDirectlySelected, bool IsInSelectedChain, bool IsChainEnd);
+    private readonly List<EditorMultiSelectionRenderItem> _editorMultiSelectionRenderItems = new(256);
+    // Selection rendering resolves a visible link note back to its cached chain.
+    // It never enumerates the (possibly enormous) selected set to build an overlay.
+    private Dictionary<ChartEvent, ChartEvent> _linkChainRootByMember = new();
+    // Whole-instance selection uses a one-time index, not a chart-wide scan for
+    // every selected group member. It is rebuilt only after chart mutation.
+    private readonly Dictionary<(int GroupId, int InstanceId), List<ChartEvent>> _editorNoteGroupMembersByInstance = new();
+    private readonly HashSet<(int GroupId, int InstanceId)> _editorNoteGroupExpansionKeysScratch = new();
+    private AresChart? _editorNoteGroupMembersCacheChart;
+    private bool _editorNoteGroupMembersCacheDirty = true;
+    // A group-instance link graph is expensive to rebuild because it is isolated
+    // from the chart-wide graph. Cache it once for the active edit instance and
+    // resolve all selected members through this map.
+    private readonly Dictionary<ChartEvent, EditorLinkChainInfo> _editorSelectionGroupChainByMember = new();
+    private readonly List<EditorLinkChainInfo> _editorSelectionGroupChains = new();
+    private bool _editorSelectionGroupChainCacheDirty = true;
+    private AresChart? _editorSelectionGroupChainCacheChart;
+    private int _editorSelectionGroupChainCacheGroupId = -1;
+    private int _editorSelectionGroupChainCacheInstanceId = -1;
+
+    // The group lock and note-group library need only a compact summary of the
+    // current multi-selection. Recompute it when selection changes, never while
+    // rendering every frame.
+    private bool _editorMultiSelectionGroupSummaryDirty = true;
+    private bool _editorMultiSelectionGroupSummaryHasEligibleNote;
+    private bool _editorMultiSelectionHasLogicalNote;
+    private bool _editorMultiSelectionHasPlayableNote;
+    private bool _editorMultiSelectionCreateGroupDirty = true;
+    private bool _editorMultiSelectionCanCreateGroup;
+    private int? _editorMultiSelectionGroupIdSummary;
+    private (int GroupId, int InstanceId)? _editorMultiSelectionGroupInstanceSummary;
+    private int? _editorMultiSelectionMinimumTick;
+
+    private void MarkEditorMultiSelectionChanged()
+    {
+        _editorMultiSelectionGroupSummaryDirty = true;
+        _editorMultiSelectionCreateGroupDirty = true;
+    }
+
+    private void BeginEditorMultiSelectionRenderFrame()
+    {
+        _editorMultiSelectionRenderItems.Clear();
+        _editorEditedGroupHighlightBounds.Clear();
+    }
+
+    private void CollectEditorMultiSelectionRenderItem(
+        int eventIndex, ChartEvent note, GearState currentState)
+    {
+        if (_editorMultiSelectedEvents.Count == 0)
+            return;
+
+        var selectedNodes = _editorMultiSelectedEvents;
+        var isDirectlySelected = selectedNodes.Contains(note) ||
+            (_selectedEventKey.HasValue && KeyOf(note) == _selectedEventKey.Value);
+        var isInSelectedChain = false;
+        var isChainEnd = false;
+        if (note.NoteType is NoteType.LinkHead or NoteType.LinkTail)
+        {
+            isInSelectedChain = IsEditorNoteInSelectedLinkChain(
+                note, selectedNodes, currentState, out isChainEnd);
+        }
+
+        if (!isDirectlySelected && !isInSelectedChain)
+            return;
+        if (!isInSelectedChain && !ShouldRenderInCurrentBank(note, currentState))
+            return;
+
+        _editorMultiSelectionRenderItems.Add(new EditorMultiSelectionRenderItem(
+            eventIndex, isDirectlySelected, isInSelectedChain, isChainEnd));
+    }
+
+    private void ClearEditorMultiSelection()
+    {
+        _editorMultiSelectedEvents.Clear();
+        // A clear gives us a known empty summary. Subsequent adds can update it
+        // incrementally, so Select All does not need another full selection pass.
+        _editorMultiSelectionGroupSummaryDirty = false;
+        _editorMultiSelectionGroupSummaryHasEligibleNote = false;
+        _editorMultiSelectionHasLogicalNote = false;
+        _editorMultiSelectionHasPlayableNote = false;
+        _editorMultiSelectionCreateGroupDirty = false;
+        _editorMultiSelectionCanCreateGroup = false;
+        _editorMultiSelectionGroupIdSummary = null;
+        _editorMultiSelectionGroupInstanceSummary = null;
+        _editorMultiSelectionMinimumTick = null;
+    }
+
+    private bool AddEditorMultiSelectedEvent(ChartEvent note)
+    {
+        var added = _editorMultiSelectedEvents.Add(note);
+        if (!added)
+            return false;
+
+        if (!_editorMultiSelectionGroupSummaryDirty &&
+            (!_editorMultiSelectionMinimumTick.HasValue || note.Tick < _editorMultiSelectionMinimumTick.Value))
+            _editorMultiSelectionMinimumTick = note.Tick;
+        if (_editorMultiSelectionGroupSummaryDirty && !_editorMultiSelectionCreateGroupDirty)
+            _editorMultiSelectionCreateGroupDirty = true;
+
+        if (!_editorMultiSelectionGroupSummaryDirty && note.Kind == "Note" && note.RawType == 1)
+        {
+            _editorMultiSelectionHasLogicalNote = true;
+            if (note.Track is >= 0 and <= 15 && note.NoteType != NoteType.End)
+                _editorMultiSelectionHasPlayableNote = true;
+        }
+
+        if (!_editorMultiSelectionCreateGroupDirty && note.Kind == "Note" && note.RawType == 1)
+        {
+            var canCreateFromNote = note.Track is >= 0 and <= 15 &&
+                note.NoteGroupId is null && note.NoteGroupInstanceId is null && note.NoteGroupMemberId is null;
+            if (!_editorMultiSelectionGroupSummaryHasEligibleNote)
+                _editorMultiSelectionCanCreateGroup = canCreateFromNote;
+            else
+                _editorMultiSelectionCanCreateGroup &= canCreateFromNote;
+        }
+        if (_editorMultiSelectionGroupSummaryDirty || note.Kind != "Note" || note.RawType != 1)
+            return true;
+
+        var instance = note.NoteGroupId is int groupId && note.NoteGroupInstanceId is int instanceId
+            ? (GroupId: groupId, InstanceId: instanceId)
+            : ((int GroupId, int InstanceId)?)null;
+        if (!_editorMultiSelectionGroupSummaryHasEligibleNote)
+        {
+            _editorMultiSelectionGroupSummaryHasEligibleNote = true;
+            _editorMultiSelectionGroupIdSummary = note.NoteGroupId;
+            _editorMultiSelectionGroupInstanceSummary = instance;
+        }
+        else
+        {
+            if (_editorMultiSelectionGroupIdSummary != note.NoteGroupId)
+                _editorMultiSelectionGroupIdSummary = null;
+            if (_editorMultiSelectionGroupInstanceSummary != instance)
+                _editorMultiSelectionGroupInstanceSummary = null;
+        }
+        return true;
+    }
+
+    private bool RemoveEditorMultiSelectedEvent(ChartEvent note)
+    {
+        var removed = _editorMultiSelectedEvents.Remove(note);
+        if (removed)
+            MarkEditorMultiSelectionChanged();
+        return removed;
+    }
+
+    private int RemoveEditorMultiSelectedEventsWhere(Predicate<ChartEvent> predicate)
+    {
+        var removed = _editorMultiSelectedEvents.RemoveWhere(predicate);
+        if (removed > 0)
+            MarkEditorMultiSelectionChanged();
+        return removed;
+    }
+
+    private void EnsureEditorMultiSelectionGroupSummary()
+    {
+        if (!_editorMultiSelectionGroupSummaryDirty)
+            return;
+
+        _editorMultiSelectionGroupIdSummary = null;
+        _editorMultiSelectionGroupInstanceSummary = null;
+        _editorMultiSelectionMinimumTick = null;
+        _editorMultiSelectionGroupSummaryHasEligibleNote = false;
+        _editorMultiSelectionHasLogicalNote = false;
+        _editorMultiSelectionHasPlayableNote = false;
+        _editorMultiSelectionGroupSummaryDirty = false;
+        var sameGroup = true;
+        var sameInstance = true;
+        var allCanCreateGroup = true;
+        var firstGroupId = 0;
+        var firstInstanceId = 0;
+        foreach (var note in _editorMultiSelectedEvents)
+        {
+            if (!_editorMultiSelectionMinimumTick.HasValue || note.Tick < _editorMultiSelectionMinimumTick.Value)
+                _editorMultiSelectionMinimumTick = note.Tick;
+
+            // Match GetSelectedEditorNotes: stale, non-note and reconstructed
+            // events are not part of the logical note selection.
+            if (!IsEditorEventInCurrentChart(note) || note.Kind != "Note" || note.RawType != 1)
+                continue;
+
+            _editorMultiSelectionHasLogicalNote = true;
+            if (note.Track is >= 0 and <= 15 && note.NoteType != NoteType.End)
+                _editorMultiSelectionHasPlayableNote = true;
+            if (note.Track is < 0 or > 15 || note.NoteGroupId.HasValue ||
+                note.NoteGroupInstanceId.HasValue || note.NoteGroupMemberId.HasValue)
+                allCanCreateGroup = false;
+
+            var groupId = note.NoteGroupId;
+            var instanceId = note.NoteGroupInstanceId;
+            if (!_editorMultiSelectionGroupSummaryHasEligibleNote)
+            {
+                _editorMultiSelectionGroupSummaryHasEligibleNote = true;
+                _editorMultiSelectionGroupIdSummary = groupId;
+                if (groupId.HasValue && instanceId.HasValue)
+                    _editorMultiSelectionGroupInstanceSummary = (groupId.Value, instanceId.Value);
+                firstGroupId = groupId ?? 0;
+                firstInstanceId = instanceId ?? 0;
+                if (!groupId.HasValue || !instanceId.HasValue)
+                    sameInstance = false;
+                if (!groupId.HasValue)
+                    sameGroup = false;
+                continue;
+            }
+
+            if (_editorMultiSelectionGroupIdSummary != groupId)
+            {
+                _editorMultiSelectionGroupIdSummary = null;
+                sameGroup = false;
+            }
+            if (!groupId.HasValue || !instanceId.HasValue ||
+                groupId.Value != firstGroupId || instanceId.Value != firstInstanceId)
+            {
+                _editorMultiSelectionGroupInstanceSummary = null;
+                sameInstance = false;
+            }
+        }
+
+        if (!sameGroup)
+            _editorMultiSelectionGroupIdSummary = null;
+        if (!sameInstance)
+            _editorMultiSelectionGroupInstanceSummary = null;
+        _editorMultiSelectionCanCreateGroup = _editorMultiSelectionGroupSummaryHasEligibleNote && allCanCreateGroup;
+        _editorMultiSelectionCreateGroupDirty = false;
+    }
+
+    private bool HasPlayableEditorSelection()
+    {
+        if (_editorMultiSelectedEvents.Count == 0)
+        {
+            if (!_selectedEventKey.HasValue || !_eventsByKey.TryGetValue(_selectedEventKey.Value, out var selected))
+                return false;
+            return selected.Kind == "Note" && selected.RawType == 1 &&
+                   selected.Track is >= 0 and <= 15 && selected.NoteType != NoteType.End;
+        }
+
+        EnsureEditorMultiSelectionGroupSummary();
+        if (_editorMultiSelectionHasPlayableNote)
+            return true;
+        if (_editorMultiSelectionHasLogicalNote || !_selectedEventKey.HasValue ||
+            !_eventsByKey.TryGetValue(_selectedEventKey.Value, out var single))
+            return false;
+
+        return single.Kind == "Note" && single.RawType == 1 &&
+               single.Track is >= 0 and <= 15 && single.NoteType != NoteType.End;
+    }
+
+    private bool CanCreateEditorNoteGroupFromMultiSelection()
+    {
+        if (_editorMultiSelectedEvents.Count == 0)
+        {
+            // Single-note selection is represented separately from the multi-set.
+            if (!_selectedEventKey.HasValue || !_eventsByKey.TryGetValue(_selectedEventKey.Value, out var selected) ||
+                selected.Kind != "Note" || selected.RawType != 1)
+                return false;
+            return selected.Track is >= 0 and <= 15 &&
+                   selected.NoteGroupId is null && selected.NoteGroupInstanceId is null &&
+                   selected.NoteGroupMemberId is null;
+        }
+
+        EnsureEditorMultiSelectionGroupSummary();
+        return !_editorMultiSelectionCreateGroupDirty && _editorMultiSelectionCanCreateGroup;
+    }
+
+    private void InvalidateEditorSelectionRenderCache()
+    {
+        MarkEditorMultiSelectionChanged();
+        _editorSelectionGroupChainCacheDirty = true;
+        _editorNoteGroupMembersCacheDirty = true;
+    }
+
+    private void EnsureEditorNoteGroupMembersCache()
+    {
+        if (_chart is null)
+            return;
+        if (!_editorNoteGroupMembersCacheDirty &&
+            ReferenceEquals(_editorNoteGroupMembersCacheChart, _chart))
+            return;
+
+        _editorNoteGroupMembersByInstance.Clear();
+        foreach (var note in _chart.Events)
+        {
+            if (note.Kind != "Note" || note.RawType != 1 ||
+                note.NoteGroupId is not int groupId ||
+                note.NoteGroupInstanceId is not int instanceId)
+                continue;
+
+            var key = (groupId, instanceId);
+            if (!_editorNoteGroupMembersByInstance.TryGetValue(key, out var members))
+                _editorNoteGroupMembersByInstance[key] = members = new List<ChartEvent>(4);
+            members.Add(note);
+        }
+
+        _editorNoteGroupMembersCacheChart = _chart;
+        _editorNoteGroupMembersCacheDirty = false;
+    }
+
+    private bool IsEditorNoteInSelectedLinkChain(
+        ChartEvent note,
+        HashSet<ChartEvent> selectedNodes,
+        GearState currentState,
+        out bool isChainEnd)
+    {
+        isChainEnd = false;
+        if (note.NoteType is not (NoteType.LinkHead or NoteType.LinkTail))
+            return false;
+
+        List<ChartEvent>? chainNodes = null;
+        if (_editorNoteGroupEditMode &&
+            _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId &&
+            note.NoteGroupId == groupId && note.NoteGroupInstanceId == instanceId)
+        {
+            EnsureEditorSelectionGroupChainCache(groupId, instanceId);
+            if (_editorSelectionGroupChainByMember.TryGetValue(note, out var localChain))
+                chainNodes = localChain.Nodes;
+        }
+        else if (_linkChainRootByMember.TryGetValue(note, out var root) &&
+                 _linkChainCache.TryGetValue(KeyOf(root), out var cachedChain))
+        {
+            chainNodes = cachedChain;
+        }
+
+        if (chainNodes is null || chainNodes.Count == 0)
+            return false;
+
+        isChainEnd = ReferenceEquals(note, chainNodes[^1]);
+        // Link chains are short (at most four members in gameplay). Test the
+        // selected hash directly instead of scanning thousands of selected notes.
+        for (var i = 0; i < chainNodes.Count; i++)
+        {
+            var member = chainNodes[i];
+            if (selectedNodes.Contains(member) && ShouldRenderInCurrentBank(member, currentState))
+                return true;
+        }
+
+        return false;
+    }
+
+    private void EnsureEditorSelectionGroupChainCache(int groupId, int instanceId)
+    {
+        if (_chart is null)
+            return;
+        if (!_editorSelectionGroupChainCacheDirty &&
+            ReferenceEquals(_editorSelectionGroupChainCacheChart, _chart) &&
+            _editorSelectionGroupChainCacheGroupId == groupId &&
+            _editorSelectionGroupChainCacheInstanceId == instanceId)
+            return;
+
+        _editorSelectionGroupChainByMember.Clear();
+        _editorSelectionGroupChains.Clear();
+        foreach (var chain in GetEditorNoteGroupLinkChainInfos(groupId, instanceId))
+        {
+            _editorSelectionGroupChains.Add(chain);
+            foreach (var member in chain.Nodes)
+                _editorSelectionGroupChainByMember.TryAdd(member, chain);
+        }
+
+        _editorSelectionGroupChainCacheChart = _chart;
+        _editorSelectionGroupChainCacheGroupId = groupId;
+        _editorSelectionGroupChainCacheInstanceId = instanceId;
+        _editorSelectionGroupChainCacheDirty = false;
+    }
+
+    private bool TryGetActiveEditorGroupChain(ChartEvent note, out EditorLinkChainInfo chain)
+    {
+        chain = null!;
+        if (!_editorNoteGroupEditMode ||
+            _editorEditingNoteGroupId is not int groupId ||
+            _editorEditingNoteGroupInstanceId is not int instanceId ||
+            note.NoteGroupId != groupId || note.NoteGroupInstanceId != instanceId)
+            return false;
+
+        EnsureEditorSelectionGroupChainCache(groupId, instanceId);
+        if (_editorSelectionGroupChainByMember.TryGetValue(note, out var cachedChain))
+        {
+            chain = cachedChain;
+            return true;
+        }
+        return false;
+    }
 
     private bool BeginEditorSelectLineDrag(Vector2 point, double currentTick, GearState currentState,
         int virtualWidth, int virtualHeight, bool panelsView)
@@ -67,7 +460,8 @@ public sealed partial class Playfield
         _selectedBeatTrack = null;
         _editorSelectedLinkRoot = null;
         _editorSelectedHoldEnd = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
+        ClearEditorNoteGroupLibrarySelection();
         _editorPanelsSelectedEmptyCell = null;
         UpdateEditorSelectLineDrag(point, tick, track, currentTick, currentState,
             virtualWidth, virtualHeight, panelsView);
@@ -275,7 +669,7 @@ public sealed partial class Playfield
         // briefly mirror the finger position through mouse input.
         if (touchInputThisFrame)
             _editorMouseHoverActive = false;
-        else if (mouseMoved)
+        else if (mouseMoved || (_chartEditorMode && (_editorNoteGroupPlacementArmed || _editorPlacementEnabled)))
             _editorMouseHoverActive = true;
 
         var (virtualWidth, virtualHeight) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
@@ -358,7 +752,7 @@ public sealed partial class Playfield
         {
             _editorRectSelecting = false;
             _editorRectSelectionArmed = false;
-            _editorPendingRectangleUndoSnapshot = null;
+            ClearEditorPendingRectangleUndoSnapshot();
             _editorHoverCacheValid = false;
             _hoverBeatTick = null;
             _hoverTrack = null;
@@ -409,6 +803,24 @@ public sealed partial class Playfield
             if (FindClickedQuarterBeat(point, currentTick, currentState, out _) is not null)
                 return;
         }
+
+        // Double-clicking one grouped note enters EDIT GROUP for that exact
+        // group instance. Keep this on the chart-input path (not toolbar clicks),
+        // so the group library remains the only way to arm an instance for placement.
+        if (_chartEditorMode && leftPressed && pointerOverToolbar)
+        {
+            _editorLastGroupNoteClick = null;
+            _editorLastGroupNoteClickTimestamp = 0;
+            _editorLastGroupNoteClickPosition = Vector2.Zero;
+        }
+        if (_chartEditorMode && leftPressed && !touchInputThisFrame && !pointerOverToolbar &&
+            _editorMenuSection is not (EditorMenuSection.Select or EditorMenuSection.Bpm) && !_editorPreviewMode &&
+            !_editorSuperFlickPlacementPending && !_editorBpmPlacementPending &&
+            !_editorStutterStartPlacementPending && !_editorStutterEndPlacementPending &&
+            !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
+            !KeybindSettings.IsDown("editor_connect_modifier") &&
+            TryHandleEditorNoteGroupDoubleClick(point, currentTick, currentState))
+            return;
 
         // The left timeline is a continuous scrub surface. Its five timestamps
         // are landmarks only; mouse and touch can seek to any vertical position.
@@ -481,7 +893,7 @@ public sealed partial class Playfield
             {
                 if (_editorPendingRectangleUndoSnapshot is not null)
                     RestoreEditorChartSnapshot(_editorPendingRectangleUndoSnapshot);
-                _editorPendingRectangleUndoSnapshot = null;
+                ClearEditorPendingRectangleUndoSnapshot();
                 _editorRectSelectionArmed = false;
                 _editorRectSelecting = true;
                 _editorRectCurrent = point;
@@ -491,7 +903,8 @@ public sealed partial class Playfield
                 _selectedBeatTrack = null;
                 _editorSelectedLinkRoot = null;
                 _editorSelectedHoldEnd = false;
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
+                ClearEditorNoteGroupLibrarySelection();
                 _editorSelectedGridCells.Clear();
                 _editorPanelsSelectedEmptyCell = null;
                 _editorSelectReferenceLineTick = null;
@@ -500,10 +913,16 @@ public sealed partial class Playfield
             }
             if (!leftDown)
             {
-                if (_editorPendingRectangleUndoSnapshot is not null)
-                    PushEditorUndoSnapshot(_editorPendingRectangleUndoSnapshot);
-                _editorPendingRectangleUndoSnapshot = null;
+                var pendingSnapshot = _editorPendingRectangleUndoSnapshot;
+                var groupChangesAlreadySynchronized = _editorPendingRectangleGroupSynchronizationApplied;
+                ClearEditorPendingRectangleUndoSnapshot();
                 _editorRectSelectionArmed = false;
+                // A click can mutate the chart and synchronize sibling group
+                // instances immediately. On release, finalize the same snapshot
+                // without applying its movement/link deltas a second time.
+                if (pendingSnapshot is not null)
+                    CommitEditorUndoSnapshot(pendingSnapshot,
+                        groupChangesAlreadySynchronized: groupChangesAlreadySynchronized);
                 return;
             }
         }
@@ -526,9 +945,9 @@ public sealed partial class Playfield
 
         var tempoBoundaryPicking = _chartEditorMode && _editorMenuSection == EditorMenuSection.Stutter &&
                                    (_editorStutterStartPlacementPending || _editorStutterEndPlacementPending);
-        if (_chartEditorMode && (_editorPlacementEnabled || tempoBoundaryPicking ||
-                                  _editorMenuSection == EditorMenuSection.Bpm || _editorBpmPlacementPending ||
-                                  _editorSuperFlickPlacementPending) &&
+        if (_chartEditorMode && (_editorPlacementEnabled || _editorNoteGroupPlacementArmed ||
+                                  tempoBoundaryPicking || _editorMenuSection == EditorMenuSection.Bpm ||
+                                  _editorBpmPlacementPending || _editorSuperFlickPlacementPending) &&
             _editorMouseHoverActive && !touchInputThisFrame && !pointerOverToolbar)
         {
             var signatureHash = new HashCode();
@@ -569,7 +988,8 @@ public sealed partial class Playfield
             _selectedBeatTrack = null;
             _editorSelectedLinkRoot = null;
             _editorSelectedHoldEnd = false;
-            _editorMultiSelectedEvents.Clear();
+            ClearEditorMultiSelection();
+            ClearEditorNoteGroupLibrarySelection();
             _editorSelectedGridCells.Clear();
             _editorPanelsSelectedEmptyCell = null;
             _editorSelectReferenceLineTick = null;
@@ -768,10 +1188,10 @@ public sealed partial class Playfield
                 _editorRectCurrentSide = _editorRectStartSide;
                 _editorRectCurrentBank = _editorRectStartBank;
             }
-            _editorPendingRectangleUndoSnapshot = null;
+            ClearEditorPendingRectangleUndoSnapshot();
         }
 
-        if (_chartEditorMode && _editorPlacementEnabled)
+        if (_chartEditorMode && (_editorPlacementEnabled || _editorNoteGroupPlacementArmed))
         {
             // Existing notes take priority over placement, so a note can still be
             // dragged while a note tool is selected. Empty-lane taps place new notes.
@@ -798,7 +1218,7 @@ public sealed partial class Playfield
                 var preserveMultiSelection = existingHoldEnd is null &&
                     _editorMultiSelectedEvents.Count > 1 && _editorMultiSelectedEvents.Contains(existingNote);
                 if (!preserveMultiSelection)
-                    _editorMultiSelectedEvents.Clear();
+                    ClearEditorMultiSelection();
                 _editorSelectedHoldEnd = existingHoldEnd is not null;
                 var clickedRoot = GetEditorLinkRoot(existingNote);
                 if (_editorConnectorMode)
@@ -838,6 +1258,8 @@ public sealed partial class Playfield
                 _selectedBeatTrack = existingNote.Track;
                 _editorTrack = existingNote.Track;
                 _editorSelectedLinkRoot = clickedRoot;
+                if (!_editorNoteGroupPlacementArmed)
+                    ApplyEditorNoteGroupSelectionForAnchor(existingNote);
                 _statusMessage = existingNote.IsSuperFlick
                     ? $"SuperFlick direction → {GetEditorSuperFlickTargetLabel(existingNote)} (attr {existingNote.Attr}), tick {existingNote.Tick}, track {existingNote.Track}."
                     : existingHoldEnd is not null
@@ -873,7 +1295,7 @@ public sealed partial class Playfield
                 }
 
                 _editorRectSelectionArmed = false;
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
                 _editorSelectedHoldEnd = false;
                 _editorSelectedLinkRoot = GetEditorLinkRoot(clickedChain) ??
                                           (clickedChain.NoteType == NoteType.LinkHead ? clickedChain : null);
@@ -884,6 +1306,7 @@ public sealed partial class Playfield
                 _selectedBeatTick = null;
                 _selectedBeatTrack = null;
                 _editorTrack = selectionPoint.Track;
+                ApplyEditorNoteGroupSelectionForAnchor(selectionPoint);
                 _statusMessage = _editorConnectorMode
                     ? $"Link source {selectionPoint.Tick}/{selectionPoint.Track}; hold Connect and click target."
                     : "Selected link chain. Tap a point to drag it.";
@@ -895,7 +1318,7 @@ public sealed partial class Playfield
                 // Clicking an outer 1K lane with a regular note tool places it on
                 // that side's legal middle lane. Connector mode is kept separate so
                 // its target can use L1/L3/R1/R3 as a link tail.
-                if (!_editorConnectorMode)
+                if (!_editorConnectorMode && !_editorNoteGroupPlacementArmed)
                     placementTrack = GetEditorAllowedTrackForNoteType(placementTrack,
                         _editorSuperFlickTool == EditorSuperFlickTool.Place ? NoteType.Single : _editorNoteType);
 
@@ -922,7 +1345,7 @@ public sealed partial class Playfield
                         return;
                     }
                     _editorRectSelectionArmed = false;
-                    _editorMultiSelectedEvents.Clear();
+                    ClearEditorMultiSelection();
                     _editorSelectedHoldEnd = false;
                     var occupiedRoot = GetEditorLinkRoot(occupiedNote);
                     var selected = _editorConnectorMode && occupiedRoot is not null
@@ -933,6 +1356,8 @@ public sealed partial class Playfield
                     _selectedBeatTrack = null;
                     _editorTrack = selected.Track;
                     _editorSelectedLinkRoot = occupiedRoot;
+                    if (!_editorNoteGroupPlacementArmed)
+                        ApplyEditorNoteGroupSelectionForAnchor(selected);
                     _statusMessage = _editorConnectorMode && occupiedRoot is not null
                         ? $"Link source {selected.Tick}/{selected.Track}; hold Connect and click target."
                         : _editorConnectorMode
@@ -941,11 +1366,16 @@ public sealed partial class Playfield
                     return;
                 }
 
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
                 _editorSelectedHoldEnd = false;
                 _editorTrack = placementTrack;
                 _selectedBeatTick = placementTick;
                 _selectedBeatTrack = placementTrack;
+                if (_editorNoteGroupPlacementArmed)
+                {
+                    PlaceEditorNoteGroupInstance(placementTick, placementTrack);
+                    return;
+                }
                 if (_editorSuperFlickTool == EditorSuperFlickTool.Place)
                 {
                     BeginEditorSuperFlickPlacement(placementTick, placementTrack);
@@ -956,6 +1386,7 @@ public sealed partial class Playfield
                 }
                 else
                 {
+                    ClearEditorNoteGroupLibrarySelection();
                     _selectedEventKey = null;
                     _editorSelectedLinkRoot = null;
                     AddEditorNote();
@@ -989,13 +1420,15 @@ public sealed partial class Playfield
             var preserveMultiSelection = holdEndNote is null &&
                 _editorMultiSelectedEvents.Count > 1 && _editorMultiSelectedEvents.Contains(note);
             if (!preserveMultiSelection)
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
             _editorSelectedHoldEnd = holdEndNote is not null;
             _selectedEventKey = KeyOf(note);
             _selectedBeatTick = null;
             _selectedBeatTrack = note.Track;
             _editorTrack = note.Track;
             _editorSelectedLinkRoot = GetEditorLinkRoot(note);
+            if (_chartEditorMode)
+                ApplyEditorNoteGroupSelectionForAnchor(note);
             _editorPanelsSelectedEmptyCell = null;
             if (_chartEditorMode && _editorMenuSection == EditorMenuSection.Select)
             {
@@ -1023,7 +1456,7 @@ public sealed partial class Playfield
             }
             _editorDurationInputValuePending = false;
             _editorRectSelectionArmed = false;
-            _editorMultiSelectedEvents.Clear();
+            ClearEditorMultiSelection();
             _editorSelectedHoldEnd = false;
             _selectedEventKey = KeyOf(chainPoint);
             _selectedBeatTick = null;
@@ -1031,6 +1464,8 @@ public sealed partial class Playfield
             _editorSelectedLinkRoot = GetEditorLinkRoot(chainPoint) ??
                                       (chainPoint.NoteType == NoteType.LinkHead ? chainPoint : null);
             _editorTrack = chainPoint.Track;
+            if (_chartEditorMode)
+                ApplyEditorNoteGroupSelectionForAnchor(chainPoint);
             _editorPanelsSelectedEmptyCell = null;
             if (_chartEditorMode && _editorMenuSection == EditorMenuSection.Select)
             {
@@ -1046,7 +1481,8 @@ public sealed partial class Playfield
         else if (FindClickedQuarterBeat(point, currentTick, currentState, out var selectedTrack) is int beatTick)
         {
             _editorDurationInputValuePending = false;
-            _editorMultiSelectedEvents.Clear();
+            ClearEditorMultiSelection();
+            ClearEditorNoteGroupLibrarySelection();
             _editorSelectedHoldEnd = false;
             _selectedEventKey = null;
             _selectedBeatTick = beatTick;
@@ -1215,12 +1651,15 @@ public sealed partial class Playfield
     {
         if (_chart is null)
             return false;
-        if (_editorMultiSelectedEvents.Any(ev => ev.Kind == "Note" && ev.RawType == 1))
-            return true;
-        if (!_selectedEventKey.HasValue)
-            return false;
-        var selected = _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value);
-        return selected is not null && selected.Kind == "Note" && selected.RawType == 1;
+        if (_editorMultiSelectedEvents.Count > 0)
+        {
+            EnsureEditorMultiSelectionGroupSummary();
+            if (_editorMultiSelectionHasLogicalNote)
+                return true;
+        }
+        return _selectedEventKey.HasValue &&
+               _eventsByKey.TryGetValue(_selectedEventKey.Value, out var selected) &&
+               selected.Kind == "Note" && selected.RawType == 1;
     }
 
     private bool HasAnyEditorSelection()
@@ -1275,7 +1714,10 @@ public sealed partial class Playfield
         if (_editorSelectedTempoEvent is not null)
             return _editorSelectedTempoEvent.Tick;
         if (_editorMultiSelectedEvents.Count > 0)
-            return _editorMultiSelectedEvents.Min(ev => ev.Tick);
+        {
+            EnsureEditorMultiSelectionGroupSummary();
+            return _editorMultiSelectionMinimumTick ?? 0;
+        }
         return null;
     }
 
@@ -1307,7 +1749,10 @@ public sealed partial class Playfield
         if (_editorSelectedGridCells.Count > 0)
             return _editorSelectedGridCells.Min(cell => cell.Tick);
         if (_editorMultiSelectedEvents.Count > 0)
-            return _editorMultiSelectedEvents.Min(ev => ev.Tick);
+        {
+            EnsureEditorMultiSelectionGroupSummary();
+            return _editorMultiSelectionMinimumTick ?? 0;
+        }
         if (_tempo is null)
             return 0;
         var snap = Math.Max(1.0, GetEditorSnapTicks());
@@ -1331,9 +1776,16 @@ public sealed partial class Playfield
                 .Where(track => panelsView ? track is >= 17 and <= 20 : IsPlayableEditorTrack(track))
                 .ToHashSet();
             if (selectedTracks.Count == 0)
-                selectedTracks = _editorMultiSelectedEvents.Select(ev => ev.Track)
-                    .Where(track => panelsView ? track is >= 17 and <= 20 : IsPlayableEditorTrack(track))
-                    .ToHashSet();
+            {
+                var trackLimit = panelsView ? 4 : 16;
+                foreach (var note in _editorMultiSelectedEvents)
+                {
+                    if (panelsView ? note.Track is >= 17 and <= 20 : IsPlayableEditorTrack(note.Track))
+                        selectedTracks.Add(note.Track);
+                    if (selectedTracks.Count >= trackLimit)
+                        break;
+                }
+            }
             if (selectedTracks.Count == 0 && _selectedBeatTrack.HasValue &&
                 (panelsView ? _selectedBeatTrack.Value is >= 17 and <= 20 : IsPlayableEditorTrack(_selectedBeatTrack.Value)))
                 selectedTracks.Add(_selectedBeatTrack.Value);
@@ -1359,21 +1811,38 @@ public sealed partial class Playfield
                 : Enumerable.Range(0, 16).ToHashSet();
         }
 
-        var selectedNotes = _chart.Events.Where(ev =>
-            ev.Kind == "Note" && ev.RawType == 1 && selectedTracks.Contains(ev.Track) &&
-            (panelsView
-                ? ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108
-                : IsPlayableEditorTrack(ev.Track)) &&
-            (_editorSelectYMode switch
-            {
-                EditorSelectYMode.Above => ev.Tick > referenceTick,
-                EditorSelectYMode.Below => ev.Tick < referenceTick,
-                _ => true
-            })).ToList();
+        ClearEditorMultiSelection();
+        var selectedNoteCount = 0;
+        foreach (var ev in _chart.Events)
+        {
+            if (ev.Kind != "Note" || ev.RawType != 1 || !selectedTracks.Contains(ev.Track) ||
+                !(panelsView
+                    ? ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108
+                    : IsPlayableEditorTrack(ev.Track)) ||
+                !(_editorSelectYMode switch
+                {
+                    EditorSelectYMode.Above => ev.Tick > referenceTick,
+                    EditorSelectYMode.Below => ev.Tick < referenceTick,
+                    _ => true
+                }))
+                continue;
 
-        _editorMultiSelectedEvents.Clear();
-        foreach (var ev in selectedNotes)
-            _editorMultiSelectedEvents.Add(ev);
+            AddEditorMultiSelectedEvent(ev);
+            selectedNoteCount++;
+        }
+
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int editingGroupId &&
+            _editorEditingNoteGroupInstanceId is int editingInstanceId &&
+            _editorMultiSelectedEvents.Any(ev => ev.NoteGroupId != editingGroupId ||
+                ev.NoteGroupInstanceId != editingInstanceId))
+        {
+            _editorNoteGroupEditMode = false;
+            _editorEditingNoteGroupId = null;
+            _editorEditingNoteGroupInstanceId = null;
+            _statusMessage = "Exited EDIT GROUP because SELECT includes notes outside the active instance.";
+        }
+
+        ExpandEditorNoteGroupSelection(_editorMultiSelectedEvents);
         _selectedEventKey = null;
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -1382,7 +1851,7 @@ public sealed partial class Playfield
         _editorPlacementEnabled = false;
         _editorConnectorMode = false;
         _editorPanelsConnectorAwaitTarget = false;
-        _statusMessage = $"SELECT: {_editorSelectYMode.ToString().ToUpperInvariant()}, X={(_editorSelectXSelected ? "SELECTED" : "ALL")}; selected {selectedNotes.Count} {(panelsView ? "animation" : "") } note(s) relative to tick {referenceTick}.";
+        _statusMessage = $"SELECT: {_editorSelectYMode.ToString().ToUpperInvariant()}, X={(_editorSelectXSelected ? "SELECTED" : "ALL")}; selected {selectedNoteCount} {(panelsView ? "animation" : "") } note(s) relative to tick {referenceTick}.";
         CommitEditorSelectionUndoSnapshot(selectionBefore);
     }
 
@@ -1410,6 +1879,46 @@ public sealed partial class Playfield
     }
 
     private List<int> GetVisibleEditorActionIds() => EditorRightActionIds.ToList();
+
+    private bool IsEditorClipboardCompleteNoteGroupInstance()
+    {
+        if (_chart is null || _editorPanelsViewEnabled || _editorClipboard.Count == 0 ||
+            !_editorClipboardIsNoteGroupInstance || _editorClipboardGroupSources.Count == 0)
+            return false;
+
+        // Validate every captured instance independently. Clipboard snapshots are
+        // authoritative so COPY/CUT still works after the source notes or library
+        // definition have been pruned from the live chart.
+        var capturedKeys = new HashSet<(int GroupId, int InstanceId)>();
+        foreach (var source in _editorClipboardGroupSources)
+        {
+            var key = (source.Instance.GroupId, source.Instance.InstanceId);
+            if (!capturedKeys.Add(key) || source.Definition.Id != key.GroupId ||
+                source.Definition.Members.Count == 0)
+                return false;
+
+            var entries = _editorClipboard.Where(entry => entry.NoteGroupId == key.GroupId &&
+                entry.NoteGroupInstanceId == key.InstanceId).ToList();
+            if (entries.Any(entry => entry.OriginalTrack is < 0 or > 15 ||
+                    entry.SourceEvent.RawType != 1 || entry.NoteGroupMemberId is null))
+                return false;
+
+            var copiedMemberIds = entries.Select(entry => entry.NoteGroupMemberId!.Value).ToHashSet();
+            var definedMemberIds = source.Definition.Members.Select(member => member.Id).ToHashSet();
+            if (entries.Count != source.Definition.Members.Count ||
+                copiedMemberIds.Count != entries.Count || !copiedMemberIds.SetEquals(definedMemberIds))
+                return false;
+        }
+
+        // Every grouped clipboard entry must be covered by one captured complete
+        // instance. Ungrouped notes may coexist with grouped instances in the same
+        // clipboard and retain their ordinary paste behavior.
+        return _editorClipboard.Where(entry => entry.NoteGroupId.HasValue || entry.NoteGroupInstanceId.HasValue ||
+                entry.NoteGroupMemberId.HasValue)
+            .All(entry => entry.NoteGroupId.HasValue && entry.NoteGroupInstanceId.HasValue &&
+                entry.NoteGroupMemberId.HasValue &&
+                capturedKeys.Contains((entry.NoteGroupId.Value, entry.NoteGroupInstanceId.Value)));
+    }
 
     private bool IsEditorActionVisible(int actionId) => actionId switch
     {
@@ -1447,15 +1956,15 @@ public sealed partial class Playfield
                 Math.Max(margin, bottomStrip.Y - stripGap - panelHeight), width + padding * 2, panelHeight);
         }
 
-        // Notes / Tools / BPM / Select form a fixed vertical strip immediately
-        // above the bottom toolbar. Their expanded menus open to the left.
+        // Notes / Tools / BPM / Select / Note Groups form a fixed vertical
+        // strip immediately above the bottom toolbar. Expanded menus open left.
         var paddingFixed = Math.Max(1, (int)MathF.Round(8f * unit));
         var desiredContentWidth = (int)MathF.Round(152f * unit);
         var availableContentWidth = Math.Max(76, virtualWidth - margin * 2 - paddingFixed * 2);
         var widthFixed = Math.Min(desiredContentWidth, availableContentWidth);
         var tabHeight = (int)MathF.Round(34f * unit);
-        var tabGap = Math.Max(1, (int)MathF.Round(4f * unit));
-        var panelHeightFixed = tabHeight * 4 + tabGap * 3 + paddingFixed * 2;
+        var tabGap = Math.Max(1, (int)MathF.Round(5f * unit));
+        var panelHeightFixed = tabHeight * 5 + tabGap * 4 + paddingFixed * 2;
         return new Rectangle(virtualWidth - margin - widthFixed - paddingFixed * 2,
             Math.Max(margin, bottomStrip.Y - stripGap - panelHeightFixed),
             widthFixed + paddingFixed * 2, panelHeightFixed);
@@ -1498,6 +2007,24 @@ public sealed partial class Playfield
         var unit = _projection.ScalePixels(1f);
         var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.EdgeMargin * unit);
         var padding = GetEditorMenuPanelPadding(unit);
+        if (!_editorPanelsViewEnabled && _editorMenuSection == EditorMenuSection.NoteGroups)
+        {
+            // Keep the Note Groups panel locals distinct from the general menu
+            // layout locals declared later in this method.
+            var groupDesiredWidth = (int)MathF.Round(520f * unit);
+            var groupAvailableWidth = Math.Max(76, virtualWidth - margin * 2 - padding * 2);
+            var groupResponsiveWidthCap = Math.Max(76, (int)MathF.Round(groupAvailableWidth * 0.46f));
+            var groupWidth = Math.Min(groupDesiredWidth, Math.Min(groupAvailableWidth, groupResponsiveWidthCap));
+            var groupPanelHeight = (int)MathF.Round(EditorNoteGroupMenuPanelHeight * unit);
+            var groupStrip = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
+            var groupStripGap = Math.Max(1, (int)MathF.Round((float)_chartEditorInterfaceLayout.PanelGap * unit));
+            var groupAnchor = GetEditorMenuParentBounds(3, virtualWidth, virtualHeight);
+            var groupMaxY = Math.Max(margin, groupStrip.Bottom - groupPanelHeight);
+            var groupY = Math.Clamp(groupAnchor.Y, margin, groupMaxY);
+            var groupPanelWidth = groupWidth + padding * 2;
+            return new Rectangle(Math.Max(margin, groupStrip.X - groupStripGap - groupPanelWidth),
+                groupY, groupPanelWidth, groupPanelHeight);
+        }
         var tickPicking = _editorMenuSection == EditorMenuSection.Stutter &&
                           (_editorStutterStartPlacementPending || _editorStutterEndPlacementPending);
         var desiredWidthBase = tickPicking ? 300f :
@@ -1523,7 +2050,8 @@ public sealed partial class Playfield
             EditorMenuSection.Notes => 0,
             EditorMenuSection.Tools => 1,
             EditorMenuSection.Bpm => 2,
-            EditorMenuSection.Select => 3,
+            EditorMenuSection.NoteGroups => 3,
+            EditorMenuSection.Select => 4,
             _ => 0
         };
         var anchor = GetEditorMenuParentBounds(rootIndex, virtualWidth, virtualHeight);
@@ -1626,6 +2154,7 @@ public sealed partial class Playfield
         EditorMenuSection.Tools or EditorMenuSection.Duration => EditorMenuSection.Tools,
         EditorMenuSection.Bpm or EditorMenuSection.Stutter => EditorMenuSection.Bpm,
         EditorMenuSection.Select => EditorMenuSection.Select,
+        EditorMenuSection.NoteGroups => EditorMenuSection.NoteGroups,
         _ => EditorMenuSection.None
     };
 
@@ -1815,12 +2344,12 @@ public sealed partial class Playfield
 
     private Rectangle GetEditorMenuParentBounds(int parentIndex, int virtualWidth, int virtualHeight)
     {
-        if (parentIndex is < 0 or > 3)
+        if (parentIndex is < 0 or > 4)
             return Rectangle.Empty;
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
         var padding = Math.Max(1, (int)MathF.Round(8f * unit));
-        var gap = Math.Max(1, (int)MathF.Round(4f * unit));
+        var gap = Math.Max(1, (int)MathF.Round(5f * unit));
         var buttonHeight = (int)MathF.Round(34f * unit);
         var contentX = panel.X + padding;
         var contentY = panel.Y + padding;
@@ -3665,7 +4194,7 @@ public sealed partial class Playfield
                 _editorSelectLineStartTrack = -1;
                 _editorRectSelecting = false;
                 _editorRectSelectionArmed = false;
-                _editorPendingRectangleUndoSnapshot = null;
+                ClearEditorPendingRectangleUndoSnapshot();
                 _editorPanelsMarqueeArmed = false;
                 _editorPanelsMarqueeSelecting = false;
                 _editorPanelsHoverValid = false;
@@ -3754,10 +4283,13 @@ public sealed partial class Playfield
             0 => EditorMenuSection.Notes,
             1 => EditorMenuSection.Tools,
             2 => EditorMenuSection.Bpm,
+            3 => EditorMenuSection.NoteGroups,
             _ => EditorMenuSection.Select
         };
         var current = _editorMenuSection;
         var currentRoot = GetEditorMenuRootSection();
+        if (target != EditorMenuSection.NoteGroups)
+            _editorNoteGroupPlacementArmed = false;
 
         // Commit any active text field before moving to a different part of the
         // toolbar. Invalid input keeps the current panel open for correction.
@@ -3825,7 +4357,7 @@ public sealed partial class Playfield
             _editorSelectLineStartTrack = -1;
             _editorRectSelecting = false;
             _editorRectSelectionArmed = false;
-            _editorPendingRectangleUndoSnapshot = null;
+            ClearEditorPendingRectangleUndoSnapshot();
             _editorPanelsMarqueeArmed = false;
             _editorPanelsMarqueeSelecting = false;
             _editorPanelsHoverValid = false;
@@ -3844,6 +4376,14 @@ public sealed partial class Playfield
         {
             _editorSelectedTempoEvent = null;
             _statusMessage = "Choose a note tool.";
+        }
+        else if (target == EditorMenuSection.NoteGroups)
+        {
+            _editorPlacementEnabled = false;
+            _editorConnectorMode = false;
+            _editorSelectedTempoEvent = null;
+            _editorSelectReferenceTickOverride = null;
+            _statusMessage = "NOTE GROUPS: select a library entry, then click an empty lane to place an instance; manage groups here.";
         }
         else if (target == EditorMenuSection.Select)
         {
@@ -4201,10 +4741,10 @@ public sealed partial class Playfield
                 }
                 if (GetEditorPanelsSelectButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
                 {
-                    // Use the exact same root-category flow as gameplay's bottom-right
-                    // SELECT tab. This captures the selected grid range's first tick
-                    // before the user applies the Y and X filters.
-                    HandleEditorMenuCategoryClick(3);
+                    // SELECT now occupies category slot 4; NOTE GROUPS is slot 3.
+                    // Use the same root-category flow as the SELECT category so the
+                    // selected grid range's first tick is captured before filters.
+                    HandleEditorMenuCategoryClick(4);
                     return true;
                 }
                 if (GetEditorPanelsConnectorButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
@@ -4222,7 +4762,7 @@ public sealed partial class Playfield
                 return true;
             }
 
-            for (var tabIndex = 0; tabIndex < 4; tabIndex++)
+            for (var tabIndex = 0; tabIndex < 5; tabIndex++)
             {
                 if (!GetEditorMenuParentBounds(tabIndex, virtualWidth, virtualHeight).Contains(pixel))
                     continue;
@@ -4309,6 +4849,13 @@ public sealed partial class Playfield
             // The title bar is informational; only the dedicated X button closes it.
             if (GetEditorMenuHeaderBounds(virtualWidth, virtualHeight).Contains(pixel))
                 return true;
+
+            if (_editorMenuSection == EditorMenuSection.NoteGroups)
+            {
+                if (TryHandleEditorNoteGroupsMenuClick(pixel, virtualWidth, virtualHeight))
+                    return true;
+                return submenuBounds.Contains(pixel);
+            }
 
             for (var childIndex = 0; childIndex < GetEditorMenuChildCount(); childIndex++)
             {
@@ -4638,11 +5185,17 @@ public sealed partial class Playfield
                 NoteType = replacementType,
                 EventIndex = eventIndex,
                 LinePair = -1,
-                TwinPairId = null,
+                TwinPairId = destination.Original.TwinPairId,
+                LoopReconstructed = destination.Original.LoopReconstructed,
+                LoopPhase = destination.Original.LoopPhase,
                 Kind = "Note",
-                Instrument = 0,
-                Velocity = 127,
-                Pan = 64
+                Value = destination.Original.Value,
+                Instrument = destination.Original.Instrument,
+                Velocity = destination.Original.Velocity,
+                Pan = destination.Original.Pan,
+                NoteGroupId = destination.Original.NoteGroupId,
+                NoteGroupInstanceId = destination.Original.NoteGroupInstanceId,
+                NoteGroupMemberId = destination.Original.NoteGroupMemberId
             };
             track.Events.Add(replacement);
             replacements[destination.Original] = replacement;
@@ -4650,9 +5203,9 @@ public sealed partial class Playfield
 
         CommitEditorUndoSnapshot(undoSnapshot);
         RefreshAfterEditorMutation();
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         foreach (var replacement in replacements.Values)
-            _editorMultiSelectedEvents.Add(replacement);
+            AddEditorMultiSelectedEvent(replacement);
         var anchor = selectedAnchor is not null && replacements.TryGetValue(selectedAnchor, out var anchoredReplacement)
             ? anchoredReplacement
             : replacements.Values.First();
@@ -4817,8 +5370,7 @@ public sealed partial class Playfield
         if (_chart is null || clickedEvent.Kind != "Note" || clickedEvent.RawType != 1)
             return;
 
-        // The current single selection becomes the anchor on the first modifier
-        // click. Later clicks toggle notes in or out without starting a drag.
+        _editorNoteGroupLibrarySelectionExplicit = false;
         var selection = _editorMultiSelectedEvents.Count > 0
             ? _editorMultiSelectedEvents.ToHashSet()
             : new HashSet<ChartEvent>();
@@ -4830,12 +5382,43 @@ public sealed partial class Playfield
                 selection.Add(current);
         }
 
-        if (!selection.Add(clickedEvent))
-            selection.Remove(clickedEvent);
+        if (_editorNoteGroupEditMode && clickedEvent.NoteGroupId == _editorEditingNoteGroupId)
+        {
+            if (clickedEvent.NoteGroupInstanceId is int clickedInstanceId &&
+                _editorEditingNoteGroupInstanceId != clickedInstanceId)
+                selection.Clear();
+            SetEditorNoteGroupEditingInstance(clickedEvent);
+            if (!selection.Add(clickedEvent))
+                selection.Remove(clickedEvent);
+        }
+        else if (!_editorNoteGroupEditMode && clickedEvent.NoteGroupId is int groupId &&
+                 clickedEvent.NoteGroupInstanceId is int instanceId)
+        {
+            var instanceEvents = _chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
+                ev.NoteGroupId == groupId && ev.NoteGroupInstanceId == instanceId).ToHashSet();
+            if (instanceEvents.Any(selection.Contains))
+                selection.ExceptWith(instanceEvents);
+            else
+                selection.UnionWith(instanceEvents);
+        }
+        else
+        {
+            if (_editorNoteGroupEditMode && clickedEvent.NoteGroupId != _editorEditingNoteGroupId)
+            {
+                _editorNoteGroupEditMode = false;
+                _editorEditingNoteGroupId = null;
+                _editorEditingNoteGroupInstanceId = null;
+            }
+            if (!selection.Add(clickedEvent))
+                selection.Remove(clickedEvent);
+        }
 
-        _editorMultiSelectedEvents.Clear();
+        // If a modifier-selection exits EDIT GROUP by targeting another group,
+        // restore that instance's normal whole-instance selection lock.
+        ExpandEditorNoteGroupSelection(selection);
+        ClearEditorMultiSelection();
         foreach (var ev in selection)
-            _editorMultiSelectedEvents.Add(ev);
+            AddEditorMultiSelectedEvent(ev);
 
         var anchor = _editorMultiSelectedEvents.FirstOrDefault();
         _selectedEventKey = anchor is null ? null : KeyOf(anchor);
@@ -4851,6 +5434,7 @@ public sealed partial class Playfield
         _editorRectSelecting = false;
         if (anchor is not null)
             _editorTrack = anchor.Track;
+        RefreshEditorNoteGroupLibrarySelectionFromNotes();
         _editorHoverCacheValid = false;
         _statusMessage = _editorMultiSelectedEvents.Count switch
         {
@@ -4863,6 +5447,8 @@ public sealed partial class Playfield
     private void DeselectEditorSelection()
     {
         var selectionBefore = CaptureEditorChartSnapshot(selectionOnly: true);
+        _editorNoteGroupPlacementArmed = false;
+        ClearEditorNoteGroupLibrarySelection();
         _selectedEventKey = null;
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -4879,14 +5465,14 @@ public sealed partial class Playfield
         _editorStutterInputReplaceOnNextKey = false;
         _editorSelectedLinkRoot = null;
         _editorSelectedHoldEnd = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedGridCells.Clear();
         _editorPanelsSelectedEmptyCell = null;
         _editorSelectReferenceLineTick = null;
         _editorSelectReferenceTickOverride = null;
         _editorRectSelectionArmed = false;
         _editorRectSelecting = false;
-        _editorPendingRectangleUndoSnapshot = null;
+        ClearEditorPendingRectangleUndoSnapshot();
         _statusMessage = "Selection and grid-cell selection cleared.";
         CommitEditorSelectionUndoSnapshot(selectionBefore);
     }
@@ -5105,7 +5691,15 @@ public sealed partial class Playfield
         var chainList = chains.ToList();
         // Membership must be checked against every chain, even when a caller
         // asks to normalize only the currently edited chain.
-        var membershipCounts = GetEditorLinkChainInfos()
+        var hasSingleActiveGroup = _editorNoteGroupEditMode &&
+            _editorEditingNoteGroupId is int activeGroupId &&
+            _editorEditingNoteGroupInstanceId is int activeInstanceId &&
+            chainList.SelectMany(chain => chain.Nodes).All(node =>
+                node.NoteGroupId == activeGroupId && node.NoteGroupInstanceId == activeInstanceId);
+        var membershipChains = hasSingleActiveGroup
+            ? GetEditorNoteGroupLinkChainInfos(_editorEditingNoteGroupId!.Value, _editorEditingNoteGroupInstanceId!.Value)
+            : GetEditorLinkChainInfos();
+        var membershipCounts = membershipChains
             .SelectMany(chain => chain.Nodes.Select(node => (Node: node, Chain: chain)))
             .GroupBy(item => item.Node)
             .ToDictionary(group => group.Key, group => group.Count());
@@ -5118,11 +5712,10 @@ public sealed partial class Playfield
             if (chain.Nodes.Any(node => !membershipCounts.TryGetValue(node, out var count) || count != 1))
                 continue;
 
-            var nodeSet = chain.Nodes.ToHashSet();
-            var repeatedHorizontalGroups = _chart.Links
-                .Where(link => nodeSet.Contains(link.Head) && nodeSet.Contains(link.Tail) &&
-                               link.Head.Track != link.Tail.Track)
-                .GroupBy(link => link.Tail.Tick)
+            var repeatedHorizontalGroups = Enumerable.Range(0, Math.Max(0, chain.Nodes.Count - 1))
+                .Select(index => (Head: chain.Nodes[index], Tail: chain.Nodes[index + 1]))
+                .Where(edge => edge.Head.Track != edge.Tail.Track)
+                .GroupBy(edge => edge.Tail.Tick)
                 .Where(group => group.Count() > 1)
                 .ToList();
 
@@ -5138,9 +5731,27 @@ public sealed partial class Playfield
                 if (tailsAtTick.Count < group.Count() || tailsAtTick.Count == 0)
                     continue;
 
-                // LinkBuilder orders same-tick points by track and EventIndex. Keep
-                // the last point in the chain, so the chain turns only once at this tick.
+                // Preserve the same logical tail in mirrored group instances. Their
+                // physical track order is reversed, so use canonical group coordinates
+                // instead of the current chart's physical traversal order.
+                var groupedTails = tailsAtTick.Where(node => node.NoteGroupId.HasValue &&
+                    node.NoteGroupInstanceId.HasValue && node.NoteGroupMemberId.HasValue).ToList();
                 var keep = tailsAtTick[^1];
+                if (groupedTails.Count == tailsAtTick.Count &&
+                    groupedTails.Select(node => (node.NoteGroupId, node.NoteGroupInstanceId)).Distinct().Count() == 1)
+                {
+                    var instance = _chart.NoteGroupInstances.FirstOrDefault(candidate =>
+                        candidate.GroupId == groupedTails[0].NoteGroupId &&
+                        candidate.InstanceId == groupedTails[0].NoteGroupInstanceId);
+                    if (instance is not null)
+                    {
+                        keep = groupedTails
+                            .OrderBy(node => GetCanonicalEditorNoteGroupTrack(instance, node.Track))
+                            .ThenBy(node => node.NoteGroupMemberId)
+                            .ThenBy(node => node.EventIndex)
+                            .Last();
+                    }
+                }
                 foreach (var redundant in tailsAtTick.Where(node => !ReferenceEquals(node, keep)))
                 {
                     foreach (var track in _chart.Tracks)
@@ -5295,6 +5906,12 @@ public sealed partial class Playfield
         }
 
         var undoSnapshot = CaptureEditorChartSnapshot();
+        if (undoSnapshot is null)
+        {
+            _statusMessage = "QUICK FIX could not create an undo snapshot; no changes were applied.";
+            return;
+        }
+
         var changed = false;
         var straightConverted = 0;
         var verticalConnectionsFixed = 0;
@@ -5308,6 +5925,15 @@ public sealed partial class Playfield
             AresLoader.FinalizeEvents(_chart);
             LinkBuilder.Build(_chart);
         }
+
+        // FORCE FIX: every note participates in the ordinary cleanup. Group
+        // recovery runs afterward and reconstructs counterpart identities from
+        // the most reliable surviving instance instead of protecting whole groups.
+        RebuildEditorLinkGraph();
+        var preservedGroupIds = _chart.NoteGroups.Select(group => group.Id)
+            .Concat(_chart.NoteGroupInstances.Select(instance => instance.GroupId))
+            .Concat(_chart.Events.Where(ev => ev.NoteGroupId.HasValue).Select(ev => ev.NoteGroupId!.Value))
+            .ToHashSet();
 
         void ConvertLinkPointToStandalone(ChartEvent ev)
         {
@@ -5324,7 +5950,6 @@ public sealed partial class Playfield
         // Remove the redundant LinkTail endpoint and let LinkBuilder reconnect the
         // preceding point to the next actual lane change, just as the LINK tool does
         // when a same-track connection sets a duration on the selected point.
-        RebuildEditorLinkGraph();
         for (var verticalPass = 0; verticalPass < 256; verticalPass++)
         {
             LinkSegment? verticalLinkMatch = _chart.Links
@@ -5477,85 +6102,142 @@ public sealed partial class Playfield
         if (orphanHeadsConverted > 0)
             RebuildEditorLinkGraph();
 
-        // Step 4: with straight chains and orphan points cleaned up, reassign
-        // the route-aware pair IDs. If the remaining paths are structurally unsafe,
-        // keep the cleanup as one undoable change and explain why ID repair stopped.
-        var claimed = new HashSet<ChartEvent>();
-        var chains = GetEditorLinkChainInfos(claimed)
-            .OrderBy(chain => chain.StartTick)
-            .ThenBy(chain => chain.Root.Track)
-            .ThenBy(chain => chain.Root.EventIndex)
-            .ToList();
+        void ReassignRouteAwareLinkIds()
+        {
+            idFixFailure = null;
+            var claimed = new HashSet<ChartEvent>();
+            var chains = GetEditorLinkChainInfos(claimed)
+                .OrderBy(chain => chain.StartTick)
+                .ThenBy(chain => chain.Root.Track)
+                .ThenBy(chain => chain.Root.EventIndex)
+                .ToList();
 
-        var memberships = chains.SelectMany(chain => chain.Nodes.Select(node => (Node: node, Chain: chain)))
-            .GroupBy(item => item.Node)
-            .Where(group => group.Count() > 1)
-            .ToList();
-        if (memberships.Count > 0)
-        {
-            var node = memberships[0].Key;
-            idFixFailure = $"tick {node.Tick}/track {node.Track} is shared by multiple chain paths";
-        }
-        else
-        {
-            foreach (var chain in chains)
+            var memberships = chains.SelectMany(chain => chain.Nodes.Select(node => (Node: node, Chain: chain)))
+                .GroupBy(item => item.Node)
+                .Where(group => group.Count() > 1)
+                .ToList();
+            if (memberships.Count > 0)
             {
-                if (chain.Family is null || chain.Nodes.Any(node =>
-                        !string.Equals(LinkBuilder.Family(node.Track), chain.Family, StringComparison.Ordinal)))
+                var node = memberships[0].Key;
+                idFixFailure = $"tick {node.Tick}/track {node.Track} is shared by multiple chain paths";
+            }
+            else
+            {
+                foreach (var chain in chains)
                 {
-                    idFixFailure = $"chain at tick {chain.StartTick} crosses banks";
-                    break;
+                    if (chain.Family is null || chain.Nodes.Any(node =>
+                            !string.Equals(LinkBuilder.Family(node.Track), chain.Family, StringComparison.Ordinal)))
+                    {
+                        idFixFailure = $"chain at tick {chain.StartTick} crosses banks";
+                        break;
+                    }
                 }
+            }
+
+            var assignments = new List<(EditorLinkChainInfo Chain, int Pair)>();
+            var routeTimeline = new GearTimeline(_chart);
+            if (idFixFailure is null)
+            {
+                foreach (var chain in chains)
+                {
+                    var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !assignments.Any(existing =>
+                        existing.Pair == candidate && EditorLinkChainsConflictInTime(routeTimeline, existing.Chain, chain)));
+                    if (pair == 0)
+                    {
+                        idFixFailure = $"more than four chains overlap near tick {chain.StartTick}";
+                        break;
+                    }
+                    assignments.Add((chain, pair));
+                }
+            }
+
+            if (idFixFailure is null)
+            {
+                var assignmentChanged = false;
+                foreach (var assignment in assignments)
+                {
+                    var chainChanged = assignment.Chain.Nodes.Any(node =>
+                        node.LinePair != assignment.Pair || node.Attr !=
+                            (node.NoteType == NoteType.LinkHead ? assignment.Pair : assignment.Pair + 1));
+                    if (!chainChanged)
+                        continue;
+
+                    foreach (var node in assignment.Chain.Nodes)
+                    {
+                        node.LinePair = assignment.Pair;
+                        node.Attr = node.NoteType == NoteType.LinkHead ? assignment.Pair : assignment.Pair + 1;
+                    }
+                    idsReassigned++;
+                    assignmentChanged = true;
+                    changed = true;
+                }
+                if (assignmentChanged)
+                    RebuildEditorLinkGraph();
             }
         }
 
-        var assignments = new List<(EditorLinkChainInfo Chain, int Pair)>();
-        var routeTimeline = new GearTimeline(_chart);
-        if (idFixFailure is null)
-        {
-            foreach (var chain in chains)
-            {
-                var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate => !assignments.Any(existing =>
-                    existing.Pair == candidate && EditorLinkChainsConflictInTime(routeTimeline, existing.Chain, chain)));
-                if (pair == 0)
-                {
-                    idFixFailure = $"more than four chains overlap near tick {chain.StartTick}";
-                    break;
-                }
-                assignments.Add((chain, pair));
-            }
-        }
-
-        if (idFixFailure is null)
-        {
-            foreach (var assignment in assignments)
-            {
-                var chainChanged = assignment.Chain.Nodes.Any(node =>
-                    node.LinePair != assignment.Pair || node.Attr !=
-                        (node.NoteType == NoteType.LinkHead ? assignment.Pair : assignment.Pair + 1));
-                if (!chainChanged)
-                    continue;
-
-                foreach (var node in assignment.Chain.Nodes)
-                {
-                    node.LinePair = assignment.Pair;
-                    node.Attr = node.NoteType == NoteType.LinkHead ? assignment.Pair : assignment.Pair + 1;
-                }
-                idsReassigned++;
-                changed = true;
-            }
-            if (idsReassigned > 0)
-                RebuildEditorLinkGraph();
-        }
+        // Recover all grouped instances first. Their temporary pair IDs are then
+        // normalized together with every ungrouped chain in one route-aware pass.
+        var groupRepairStats = ForceRepairEditorQuickFixGroups();
+        if (groupRepairStats.Changed)
+            changed = true;
+        RebuildEditorLinkGraph();
+        ReassignRouteAwareLinkIds();
 
         if (changed)
         {
-            CommitEditorUndoSnapshot(undoSnapshot);
+            // Force recovery has already rebuilt each recoverable group from its
+            // best surviving instance. A malformed member is detached and kept as
+            // a note; it must not cancel repairs to unrelated groups.
+
+            // QUICK FIX already repairs every mirrored instance independently and
+            // verifies equivalence. Do not let the currently selected EDIT GROUP
+            // instance re-run a second, source-only synchronization over that work.
+            var restoreGroupEditMode = _editorNoteGroupEditMode;
+            var restoreEditingGroupId = _editorEditingNoteGroupId;
+            var restoreEditingInstanceId = _editorEditingNoteGroupInstanceId;
+            if (restoreGroupEditMode)
+            {
+                _editorNoteGroupEditMode = false;
+                _editorEditingNoteGroupId = null;
+                _editorEditingNoteGroupInstanceId = null;
+            }
+            try
+            {
+                CommitEditorUndoSnapshot(undoSnapshot, preservedGroupIds);
+            }
+            finally
+            {
+                if (restoreGroupEditMode && restoreEditingGroupId is int editingGroupId &&
+                    restoreEditingInstanceId is int editingInstanceId &&
+                    _chart.NoteGroupInstances.Any(instance => instance.GroupId == editingGroupId &&
+                        instance.InstanceId == editingInstanceId))
+                {
+                    _editorNoteGroupEditMode = true;
+                    _editorEditingNoteGroupId = editingGroupId;
+                    _editorEditingNoteGroupInstanceId = editingInstanceId;
+                }
+            }
+
+            // CommitEditorUndoSnapshot refreshes instance anchors. Rebuild only
+            // the chosen reference definitions in one indexed pass afterward.
+            RefreshEditorQuickFixGroupDefinitions(groupRepairStats.ReferenceInstances);
             RefreshAfterEditorMutation();
         }
 
-        var remainingIssues = GetEditorLinkPathIssues(GetEditorLinkChainInfos());
+        var finalChains = GetEditorLinkChainInfos();
+        var remainingIssues = GetEditorLinkPathIssues(finalChains);
         var cleanupSummary = new List<string>();
+        if (groupRepairStats.RepairedGroups > 0)
+            cleanupSummary.Add($"force-repaired {groupRepairStats.RepairedGroups} group(s)");
+        if (groupRepairStats.RecoveredMemberIds > 0)
+            cleanupSummary.Add($"recovered {groupRepairStats.RecoveredMemberIds} group member ID(s)");
+        if (groupRepairStats.CreatedCounterparts > 0)
+            cleanupSummary.Add($"recreated {groupRepairStats.CreatedCounterparts} missing group counterpart(s)");
+        if (groupRepairStats.DetachedNotes > 0)
+            cleanupSummary.Add($"preserved {groupRepairStats.DetachedNotes} unmatched note(s) outside their groups");
+        if (groupRepairStats.RepairedDefinitions > 0)
+            cleanupSummary.Add($"rebuilt {groupRepairStats.RepairedDefinitions} group definition/instance record(s)");
         if (verticalConnectionsFixed > 0)
             cleanupSummary.Add($"fixed {verticalConnectionsFixed} same-track vertical link connection(s)");
         if (normalizedSameTickTails > 0)
@@ -5576,9 +6258,10 @@ public sealed partial class Playfield
         }
         else if (!changed)
         {
+            var skippedText = cleanupSummary.Count > 0 ? string.Join("; ", cleanupSummary) + ". " : string.Empty;
             _statusMessage = remainingIssues.Count == 0
-                ? $"QUICK FIX: all {chains.Count} chain(s) are already clean and have valid IDs."
-                : $"QUICK FIX made no changes; {remainingIssues.Count} path issue(s) remain. {remainingIssues[0].Message}";
+                ? $"QUICK FIX: {skippedText}all {finalChains.Count} chain(s) are already clean and have valid IDs."
+                : $"QUICK FIX: {skippedText}made no changes; {remainingIssues.Count} path issue(s) remain. {remainingIssues[0].Message}";
         }
         else
         {
@@ -5863,7 +6546,7 @@ public sealed partial class Playfield
                 SyncEditorLinkChainDurations(plan.Points[0]);
         RefreshAfterEditorMutation();
 
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _selectedEventKey = firstRoot is not null ? KeyOf(firstRoot) : KeyOf(plans[0].Points[0]);
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -6236,7 +6919,7 @@ public sealed partial class Playfield
                 SyncEditorLinkChainDurations(plan.Points[0]);
         RefreshAfterEditorMutation();
 
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _selectedEventKey = firstRoot is not null ? KeyOf(firstRoot) : KeyOf(plans[0].Points[0]);
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -6419,9 +7102,9 @@ public sealed partial class Playfield
             SyncEditorLinkChainDurations(head);
         RefreshAfterEditorMutation();
 
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         foreach (var note in standaloneSelection)
-            _editorMultiSelectedEvents.Add(note);
+            AddEditorMultiSelectedEvent(note);
         var selectedNote = standaloneSelection.OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).First();
         _selectedEventKey = KeyOf(selectedNote);
         _selectedBeatTick = null;
@@ -6479,6 +7162,48 @@ public sealed partial class Playfield
             .Distinct()
             .ToList();
 
+    private List<NoteGroupInstance> GetCompleteSelectedEditorNoteGroupInstancesForMirror(
+        IReadOnlyCollection<ChartEvent> selected)
+    {
+        if (_chart is null || _editorNoteGroupEditMode || selected.Count == 0)
+            return new List<NoteGroupInstance>();
+
+        var selectedSet = selected.ToHashSet();
+        var result = new List<NoteGroupInstance>();
+        foreach (var key in selected.Where(ev => ev.NoteGroupId.HasValue && ev.NoteGroupInstanceId.HasValue)
+                     .Select(ev => (GroupId: ev.NoteGroupId!.Value, InstanceId: ev.NoteGroupInstanceId!.Value))
+                     .Distinct())
+        {
+            var instance = _chart.NoteGroupInstances.FirstOrDefault(candidate =>
+                candidate.GroupId == key.GroupId && candidate.InstanceId == key.InstanceId);
+            if (instance is null)
+                continue;
+
+            var instanceNotes = _chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
+                ev.NoteGroupId == key.GroupId && ev.NoteGroupInstanceId == key.InstanceId).ToList();
+            if (instanceNotes.Count > 0 && instanceNotes.All(selectedSet.Contains))
+                result.Add(instance);
+        }
+        return result;
+    }
+
+    private void ToggleEditorNoteGroupMirrorFlags(IEnumerable<NoteGroupInstance> instances)
+    {
+        if (_chart is null || _editorNoteGroupEditMode)
+            return;
+
+        foreach (var instance in instances)
+        {
+            var index = _chart.NoteGroupInstances.FindIndex(candidate =>
+                candidate.GroupId == instance.GroupId && candidate.InstanceId == instance.InstanceId);
+            if (index >= 0)
+                _chart.NoteGroupInstances[index] = _chart.NoteGroupInstances[index] with
+                {
+                    IsMirrored = !_chart.NoteGroupInstances[index].IsMirrored
+                };
+        }
+    }
+
     private void MirrorSelectedEditorNotesAcrossSides()
     {
         if (!_chartEditorMode || _chart is null)
@@ -6495,6 +7220,7 @@ public sealed partial class Playfield
         }
 
         var undoSnapshot = CaptureEditorChartSnapshot();
+        var mirroredGroupInstances = GetCompleteSelectedEditorNoteGroupInstancesForMirror(selected);
         var selectedAnchor = _selectedEventKey.HasValue
             ? selected.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
             : null;
@@ -6519,11 +7245,12 @@ public sealed partial class Playfield
             }
         }
 
+        ToggleEditorNoteGroupMirrorFlags(mirroredGroupInstances);
         CommitEditorUndoSnapshot(undoSnapshot);
         RefreshAfterEditorMutation();
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         foreach (var ev in selected)
-            _editorMultiSelectedEvents.Add(ev);
+            AddEditorMultiSelectedEvent(ev);
         selectedAnchor ??= selected.OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).First();
         _selectedEventKey = KeyOf(selectedAnchor);
         _selectedBeatTick = null;
@@ -6546,6 +7273,15 @@ public sealed partial class Playfield
         if (selected.Count == 0)
         {
             _statusMessage = "Select one or more notes to mirror around the center of the selection.";
+            return;
+        }
+
+        // A complete group instance has one persistent mirror orientation. Use
+        // the same canonical reflection for either mirror command so future
+        // synchronized edits can invert the transform from that single flag.
+        if (GetCompleteSelectedEditorNoteGroupInstancesForMirror(selected).Count > 0)
+        {
+            MirrorSelectedEditorNotesAcrossSides();
             return;
         }
 
@@ -6622,9 +7358,9 @@ public sealed partial class Playfield
 
         CommitEditorUndoSnapshot(undoSnapshot);
         RefreshAfterEditorMutation();
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         foreach (var ev in selected)
-            _editorMultiSelectedEvents.Add(ev);
+            AddEditorMultiSelectedEvent(ev);
         selectedAnchor ??= selected.OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).First();
         _selectedEventKey = KeyOf(selectedAnchor);
         _selectedBeatTick = null;
@@ -6925,7 +7661,35 @@ public sealed partial class Playfield
     {
         if (ev.NoteType is not (NoteType.LinkHead or NoteType.LinkTail))
             return null;
+
+        // During EDIT GROUP, never resolve a member through the chart-wide graph.
+        // Pair IDs may be reused by other group instances at different time ranges,
+        // and a stale/global predecessor can make a valid local tail appear to
+        // belong to another chain. Resolve the member only inside its active copy.
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId &&
+            ev.NoteGroupId == groupId && ev.NoteGroupInstanceId == instanceId)
+        {
+            EnsureEditorSelectionGroupChainCache(groupId, instanceId);
+            return _editorSelectionGroupChainByMember.TryGetValue(ev, out var localChain)
+                ? localChain.Root
+                : ev.NoteType == NoteType.LinkHead ? ev : null;
+        }
+
         return FindLinkRootHead(ev) ?? (ev.NoteType == NoteType.LinkHead ? ev : null);
+    }
+
+    private ChartEvent? GetEditorPreferredLinkRoot(ChartEvent ev)
+    {
+        // A cached selected root can outlive an EDIT GROUP mode/instance change.
+        // For members of the active instance, the freshly resolved local root is
+        // authoritative, including null for an orphaned tail.
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId &&
+            ev.NoteGroupId == groupId && ev.NoteGroupInstanceId == instanceId)
+            return GetEditorLinkRoot(ev);
+
+        return _editorSelectedLinkRoot ?? GetEditorLinkRoot(ev);
     }
 
     private List<ChartEvent> GetEditorLinkChainNodes(ChartEvent root)
@@ -6934,25 +7698,30 @@ public sealed partial class Playfield
         if (_chart is null || root.NoteType != NoteType.LinkHead)
             return nodes;
 
+        // While editing a group instance, physical LinkPair IDs may be reused by
+        // sibling instances. Resolve the complete logical chain once per active
+        // instance and reuse that mapping for every selected member.
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId &&
+            root.NoteGroupId == groupId && root.NoteGroupInstanceId == instanceId)
+        {
+            EnsureEditorSelectionGroupChainCache(groupId, instanceId);
+            return _editorSelectionGroupChainByMember.TryGetValue(root, out var localChain) &&
+                   ReferenceEquals(localChain.Root, root)
+                ? localChain.Nodes
+                : nodes;
+        }
+
         var visited = new HashSet<ChartEvent> { root };
         var current = root;
         for (var guard = 0; guard < 256; guard++)
         {
-            var outgoing = _chart.Links
-                .Where(link => ReferenceEquals(link.Head, current))
-                .ToList();
-            if (outgoing.Count == 0)
+            var currentKey = KeyOf(current);
+            if (_ambiguousNextLinkHeadKeys.Contains(currentKey) ||
+                !_nextLinkByHeadKey.TryGetValue(currentKey, out var nextLink))
                 break;
 
-            // A valid path has one next point. If multiple points branch at the
-            // same earliest tick, the graph is ambiguous; do not pick a lane by
-            // track number to manufacture a route.
-            var nextTick = outgoing.Min(link => link.Tail.Tick);
-            var candidates = outgoing.Where(link => link.Tail.Tick == nextTick).ToList();
-            if (candidates.Count != 1)
-                break;
-
-            var next = candidates[0].Tail;
+            var next = nextLink.Tail;
             if (!visited.Add(next))
                 break;
             nodes.Add(next);
@@ -6965,6 +7734,15 @@ public sealed partial class Playfield
     {
         if (_chart is null)
             return null;
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId &&
+            point.NoteGroupId == groupId && point.NoteGroupInstanceId == instanceId)
+        {
+            if (!TryGetActiveEditorGroupChain(point, out var chain))
+                return null;
+            var index = chain.Nodes.FindIndex(node => ReferenceEquals(node, point));
+            return index > 0 ? chain.Nodes[index - 1] : null;
+        }
         var incoming = _chart.Links
             .Where(link => ReferenceEquals(link.Tail, point))
             .ToList();
@@ -6980,16 +7758,21 @@ public sealed partial class Playfield
     {
         if (_chart is null || point.NoteType is not (NoteType.LinkHead or NoteType.LinkTail))
             return null;
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId &&
+            point.NoteGroupId == groupId && point.NoteGroupInstanceId == instanceId)
+        {
+            if (!TryGetActiveEditorGroupChain(point, out var chain))
+                return null;
+            var index = chain.Nodes.FindIndex(node => ReferenceEquals(node, point));
+            return index >= 0 && index + 1 < chain.Nodes.Count ? chain.Nodes[index + 1] : null;
+        }
 
-        var outgoing = _chart.Links
-            .Where(link => ReferenceEquals(link.Head, point))
-            .ToList();
-        if (outgoing.Count == 0)
+        var pointKey = KeyOf(point);
+        if (_ambiguousNextLinkHeadKeys.Contains(pointKey) ||
+            !_nextLinkByHeadKey.TryGetValue(pointKey, out var nextLink))
             return null;
-
-        var nextTick = outgoing.Min(link => link.Tail.Tick);
-        var candidates = outgoing.Where(link => link.Tail.Tick == nextTick).ToList();
-        return candidates.Count == 1 ? candidates[0].Tail : null;
+        return nextLink.Tail;
     }
 
     private ChartEvent GetEditorLinkChainEnd(ChartEvent point)
@@ -7043,13 +7826,27 @@ public sealed partial class Playfield
 
     private ChartEvent? FindClickedLinkChainBody(Vector2 point, double currentTick, GearState currentState)
     {
-        if (_chart is null || _chart.Links.Count == 0)
+        if (_chart is null || (_chart.Links.Count == 0 && !_editorNoteGroupEditMode))
             return null;
 
         ChartEvent? bestNode = null;
         var bestDistance = float.MaxValue;
         var hitDistance = Math.Max(6f, _projection.ScalePixels(10f));
-        foreach (var link in _chart.Links)
+        IEnumerable<(ChartEvent Head, ChartEvent Tail)> hitEdges;
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId)
+        {
+            EnsureEditorSelectionGroupChainCache(groupId, instanceId);
+            hitEdges = _editorSelectionGroupChains
+                .SelectMany(chain => Enumerable.Range(0, Math.Max(0, chain.Nodes.Count - 1))
+                    .Select(index => (Head: chain.Nodes[index], Tail: chain.Nodes[index + 1])));
+        }
+        else
+        {
+            hitEdges = _chart.Links.Select(link => (Head: link.Head, Tail: link.Tail));
+        }
+
+        foreach (var link in hitEdges)
         {
             if (!ShouldRenderInCurrentBank(link.Head, currentState) ||
                 !ShouldRenderInCurrentBank(link.Tail, currentState))
@@ -7101,7 +7898,7 @@ public sealed partial class Playfield
         _editorDragEndpointOriginalTick = _editorDragMovedEndpoint?.Tick ?? -1;
         _editorDragMovedChainAcrossBanks = false;
         _editorDragChainNodes.Clear();
-        var dragChainRoot = _editorSelectedLinkRoot ?? GetEditorLinkRoot(ev);
+        var dragChainRoot = GetEditorPreferredLinkRoot(ev);
         if (!holdEnd && dragChainRoot is not null && dragChainRoot.NoteType == NoteType.LinkHead)
             _editorDragChainNodes.AddRange(GetEditorLinkChainNodes(dragChainRoot).Distinct());
 
@@ -7274,6 +8071,36 @@ public sealed partial class Playfield
         return Math.Clamp((int)Math.Round(localPosition * (targetCount - 1.0) / (sourceCount - 1.0), MidpointRounding.AwayFromZero), 0, targetCount - 1);
     }
 
+    // PASTE FIT compresses lane coordinates when moving a wider bank into a
+    // narrower one. At an exact midpoint, bias the left side toward the right
+    // (higher local index) and the right side toward the left (lower local
+    // index). The two physical sides are mirrored, so they must not share the
+    // same midpoint rounding direction.
+    private static int ScaleEditorBankLaneForPasteFit(
+        int localPosition, int sourceCount, int targetCount, string side)
+    {
+        if (sourceCount <= 1 || targetCount <= 1)
+            return 0;
+
+        var scaled = Math.Clamp(localPosition, 0, sourceCount - 1) *
+                     (targetCount - 1.0) / (sourceCount - 1.0);
+        var lower = (int)Math.Floor(scaled);
+        var fraction = scaled - lower;
+        int mapped;
+        if (Math.Abs(fraction - 0.5) <= 0.000000001)
+        {
+            mapped = string.Equals(side, "right", StringComparison.OrdinalIgnoreCase)
+                ? lower
+                : lower + 1;
+        }
+        else
+        {
+            mapped = (int)Math.Round(scaled, MidpointRounding.AwayFromZero);
+        }
+
+        return Math.Clamp(mapped, 0, targetCount - 1);
+    }
+
     private bool TryMoveEditorLinkChainToBank(ChartEvent root, ChartEvent draggedEvent, int destinationTrack)
     {
         if (_chart is null)
@@ -7380,7 +8207,7 @@ public sealed partial class Playfield
             return;
         }
 
-        var selectedRoot = _editorSelectedLinkRoot ?? GetEditorLinkRoot(ev);
+        var selectedRoot = GetEditorPreferredLinkRoot(ev);
         if (!_editorDragIsHoldEnd && (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
             selectedRoot is not null && selectedRoot.NoteType == NoteType.LinkHead)
         {
@@ -7826,7 +8653,8 @@ public sealed partial class Playfield
                 destination.Events.Add(item.Event);
             }
 
-            CommitEditorUndoSnapshot(undoSnapshot);
+            if (!CommitEditorUndoSnapshot(undoSnapshot))
+                return;
             RefreshAfterEditorMutation();
             _selectedEventKey = KeyOf(ev);
             _selectedBeatTick = null;
@@ -7867,7 +8695,8 @@ public sealed partial class Playfield
                 }
             }
 
-            CommitEditorUndoSnapshot(undoSnapshot);
+            if (!CommitEditorUndoSnapshot(undoSnapshot))
+                return;
             RefreshAfterEditorMutation();
             _selectedEventKey = KeyOf(ev);
             _selectedBeatTick = null;
@@ -7972,32 +8801,31 @@ public sealed partial class Playfield
             mergedSameLane = true;
         }
 
-        if (!mergedSameLane)
-            SyncEditorLinkChainDurations(_editorSelectedLinkRoot ?? GetEditorLinkRoot(ev));
-
-        CommitEditorUndoSnapshot(undoSnapshot);
-        RefreshAfterEditorMutation();
-
-        // LinkBuilder has now rebuilt the actual connections. If lane merges left
-        // an all-same-track chain, there is no cross-track connection left to keep
-        // as a LinkHead family: flatten it into one normal hold and remove the now
-        // redundant tail points.
+        // Normalize same-lane merges before committing the edit. In EDIT GROUP,
+        // any note removals/type conversions performed after CommitEditorUndoSnapshot
+        // would affect only the source instance and could leave sibling tails behind.
         if (mergedSameLane)
         {
+            RefreshAfterEditorMutation();
             var normalizedSelection = NormalizeEditorSameTrackLinkChains(finalSelection, out var normalized);
             if (normalized)
-            {
                 finalSelection = normalizedSelection ?? finalSelection;
-                RefreshAfterEditorMutation();
-            }
         }
+        else
+        {
+            SyncEditorLinkChainDurations(GetEditorPreferredLinkRoot(ev));
+        }
+
+        if (!CommitEditorUndoSnapshot(undoSnapshot))
+            return;
+        RefreshAfterEditorMutation();
 
         _selectedEventKey = KeyOf(finalSelection);
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
         _editorTrack = finalSelection.Track;
         _editorSelectedHoldEnd = wasHoldEnd && !mergedSameLane;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedLinkRoot = GetEditorLinkRoot(finalSelection);
         _statusMessage = mergedSameLane && finalSelection.NoteType == NoteType.SingleLong
             ? $"Merged link points into one hold ending at tick {finalSelection.EndTick}, track {finalSelection.Track}."
@@ -8385,10 +9213,28 @@ public sealed partial class Playfield
         double currentTick,
         GearState currentState,
         out Vector2 markerCenter,
-        ChartEvent? ev = null)
+        ChartEvent? ev = null,
+        ProjectedPoint? projectedOverride = null,
+        float? travelOverride = null)
+        => GetEditorMarkerGeometry(track, tick, currentTick, currentState,
+            out markerCenter, out _, out _, ev, projectedOverride, travelOverride);
+
+    private float GetEditorMarkerGeometry(
+        int track,
+        int tick,
+        double currentTick,
+        GearState currentState,
+        out Vector2 markerCenter,
+        out Vector2 markerBoundsMin,
+        out Vector2 markerBoundsMax,
+        ChartEvent? ev = null,
+        ProjectedPoint? projectedOverride = null,
+        float? travelOverride = null)
     {
-        var projected = _projection.ProjectAtTicks(track, tick, currentTick, currentState);
+        var projected = projectedOverride ?? _projection.ProjectAtTicks(track, tick, currentTick, currentState);
         markerCenter = projected.Position;
+        markerBoundsMin = projected.Position;
+        markerBoundsMax = projected.Position;
         var isFlick = ev?.IsFlick ?? (_editorAttr is 10 or 50);
         var noteType = ev?.NoteType ?? _editorNoteType;
         var width = isFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
@@ -8406,7 +9252,7 @@ public sealed partial class Playfield
         var direction = ev?.FlickDirection ?? (_editorAttr == 50 ? 5 : 1);
         var rotation = isFlick && direction == 3 ? -MathF.PI * 0.5f : 0f;
         var flipU = isFlick && direction == 5;
-        var travel = (float)_projection.ScrollPixelsAtTicks(tick, currentTick);
+        var travel = travelOverride ?? (float)_projection.ScrollPixelsAtTicks(tick, currentTick);
 
         if (texture is not null)
         {
@@ -8422,11 +9268,18 @@ public sealed partial class Playfield
             var c = _projection.ScreenPositionFromCameraSpace(vertices[2].Position);
             var d = _projection.ScreenPositionFromCameraSpace(vertices[5].Position);
             markerCenter = (a + b + c + d) * 0.25f;
+            markerBoundsMin = Vector2.Min(Vector2.Min(a, b), Vector2.Min(c, d));
+            markerBoundsMax = Vector2.Max(Vector2.Max(a, b), Vector2.Max(c, d));
             _quad3DVertexPool.Push(vertices);
             return Math.Max(1.25f, 0.25f * (Vector2.Distance(a, b) + Vector2.Distance(d, c)));
         }
 
-        return Math.Max(1.25f, width * projected.Scale * projected.LaneRotationDepthScale * 0.5f);
+        var fallbackHalfWidth = Math.Max(0.5f,
+            width * projected.Scale * projected.LaneRotationDepthScale * 0.5f);
+        var fallbackHalfHeight = fallbackHalfWidth * 0.75f;
+        markerBoundsMin = markerCenter - new Vector2(fallbackHalfWidth, fallbackHalfHeight);
+        markerBoundsMax = markerCenter + new Vector2(fallbackHalfWidth, fallbackHalfHeight);
+        return Math.Max(1.25f, fallbackHalfWidth);
     }
 
     private bool TryGetEditorFreeformAnchor(Vector2 point, double currentTick, GearState currentState,
@@ -8600,7 +9453,7 @@ public sealed partial class Playfield
         var endX = _editorRectCurrentLaneX;
         var lowX = Math.Min(startX, endX) - 0.0001f;
         var highX = Math.Max(startX, endX) + 0.0001f;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedGridCells.Clear();
         var selectedTracks = Enumerable.Range(0, 16)
             .Where(track => IsEditorTrackVisible(track, currentState))
@@ -8623,8 +9476,26 @@ public sealed partial class Playfield
             // them beyond the visible screen while the marquee remained anchored.
             var laneX = _projection.LaneNormalizedX(ev.Track);
             if (laneX >= lowX && laneX <= highX)
-                _editorMultiSelectedEvents.Add(ev);
+                AddEditorMultiSelectedEvent(ev);
         }
+
+        // EDIT GROUP only permits individual editing in one source instance at
+        // a time. A marquee spanning anything outside that instance exits the mode
+        // and returns to normal whole-instance selection for all touched groups.
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int editingGroupId &&
+            _editorEditingNoteGroupInstanceId is int editingInstanceId &&
+            _editorMultiSelectedEvents.Any(ev => ev.NoteGroupId != editingGroupId ||
+                ev.NoteGroupInstanceId != editingInstanceId))
+        {
+            _editorNoteGroupEditMode = false;
+            _editorEditingNoteGroupId = null;
+            _editorEditingNoteGroupInstanceId = null;
+            _statusMessage = "Exited EDIT GROUP because the selection includes notes outside the active instance.";
+        }
+
+        // In normal mode, a rectangle that touches a grouped instance selects the
+        // entire instance. EDIT GROUP keeps individual note selection unlocked.
+        ExpandEditorNoteGroupSelection(_editorMultiSelectedEvents);
 
         // A rectangle selects notes, not every empty grid cell crossed by the range.
         // Keep occupied note coordinates for the SELECT X=SELECTED filter.
@@ -8633,7 +9504,7 @@ public sealed partial class Playfield
 
         _editorRectSelecting = false;
         _editorRectSelectionArmed = false;
-        _editorPendingRectangleUndoSnapshot = null;
+        ClearEditorPendingRectangleUndoSnapshot();
         _editorPanelsSelectedEmptyCell = null;
         _editorSelectReferenceLineTick = _editorMenuSection == EditorMenuSection.Select && _editorSelectedGridCells.Count > 0
             ? _editorSelectedGridCells.Min(cell => cell.Tick)
@@ -8648,8 +9519,144 @@ public sealed partial class Playfield
 
     private void DrawEditorMarker(Vector2 position, float radius, Color color, float fillOpacity = 0.12f)
     {
+        // Keep the established single-marker appearance. Multi-selection uses the
+        // reusable triangle batch below instead of this per-marker path.
         DrawCircle(_spriteBatch, position, radius, color * fillOpacity);
-        DrawCircleOutline(_spriteBatch, position, radius, Math.Clamp(radius * 0.16f, 1f, 2.25f), color);
+        DrawCircleOutline(_spriteBatch, position, radius,
+            Math.Clamp(radius * 0.16f, 1f, 2.25f), color);
+    }
+
+    private static Vector2[] CreateEditorMultiSelectionMarkerUnitCircle()
+    {
+        var points = new Vector2[EditorMultiSelectionMarkerSegments];
+        for (var i = 0; i < points.Length; i++)
+        {
+            var angle = MathHelper.TwoPi * i / points.Length;
+            points[i] = new Vector2(MathF.Cos(angle), MathF.Sin(angle));
+        }
+        return points;
+    }
+
+    private void AddEditorMultiSelectionMarker(Vector2 center, float radius, Color color, float fillOpacity)
+    {
+        radius = Math.Max(0.75f, radius);
+        var borderWidth = Math.Clamp(radius * 0.16f, 1f, 2.25f);
+        var innerRadius = Math.Max(0f, radius - borderWidth);
+        const int segments = EditorMultiSelectionMarkerSegments;
+        const int verticesPerSegment = 9; // One fill triangle and two ring triangles.
+        var required = _editorMultiSelectionMarkerVertexCount + segments * verticesPerSegment;
+        if (required > _editorMultiSelectionMarkerVertices.Length)
+        {
+            var capacity = _editorMultiSelectionMarkerVertices.Length;
+            while (capacity < required)
+                capacity = checked(capacity * 2);
+            Array.Resize(ref _editorMultiSelectionMarkerVertices, capacity);
+        }
+
+        var fillColor = color * fillOpacity;
+        var unitCircle = EditorMultiSelectionMarkerUnitCircle;
+        for (var i = 0; i < segments; i++)
+        {
+            var unitA = unitCircle[i];
+            var unitB = unitCircle[(i + 1) % segments];
+            var outerA = center + unitA * radius;
+            var outerB = center + unitB * radius;
+            var innerA = center + unitA * innerRadius;
+            var innerB = center + unitB * innerRadius;
+
+            // Fill disk, then opaque annulus. Both are submitted in the same draw.
+            AddEditorMultiSelectionTriangle(center, outerA, outerB, fillColor);
+            AddEditorMultiSelectionTriangle(outerA, outerB, innerB, color);
+            AddEditorMultiSelectionTriangle(outerA, innerB, innerA, color);
+        }
+    }
+
+    private void AddEditorMultiSelectionTriangle(Vector2 a, Vector2 b, Vector2 c, Color color)
+    {
+        var offset = _editorMultiSelectionMarkerVertexCount;
+        _editorMultiSelectionMarkerVertices[offset] = new VertexPositionColor(new Vector3(a, 0f), color);
+        _editorMultiSelectionMarkerVertices[offset + 1] = new VertexPositionColor(new Vector3(b, 0f), color);
+        _editorMultiSelectionMarkerVertices[offset + 2] = new VertexPositionColor(new Vector3(c, 0f), color);
+        _editorMultiSelectionMarkerVertexCount += 3;
+    }
+
+    private void DrawEditorMultiSelectionMarkerBatch()
+    {
+        var vertexCount = _editorMultiSelectionMarkerVertexCount;
+        _editorMultiSelectionMarkerVertexCount = 0;
+        if (vertexCount < 3)
+            return;
+
+        _graphics.BlendState = BlendState.AlphaBlend;
+        _graphics.DepthStencilState = DepthStencilState.None;
+        _graphics.RasterizerState = RasterizerState.CullNone;
+        _primitiveEffect.World = Matrix.Identity;
+        _primitiveEffect.View = Matrix.Identity;
+        _primitiveEffect.Projection = Matrix.CreateOrthographicOffCenter(
+            0f, _graphics.Viewport.Width, _graphics.Viewport.Height, 0f, -1f, 1f);
+        foreach (var pass in _primitiveEffect.CurrentTechnique.Passes)
+        {
+            pass.Apply();
+            _graphics.DrawUserPrimitives(PrimitiveType.TriangleList,
+                _editorMultiSelectionMarkerVertices, 0, vertexCount / 3);
+        }
+    }
+
+    // Selection markers only need a rough circular size. Building the full note
+    // card here repeated the renderer's most expensive per-note geometry work for
+    // every selected note, even though the highlight itself is just a circle.
+    private float GetEditorSelectionMarkerRadius(ChartEvent note, ProjectedPoint projected)
+    {
+        var noteWidth = note.IsFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
+        var projectedRadius = noteWidth * projected.Scale * MathF.Abs(projected.LaneRotationDepthScale) * 0.5f;
+        return float.IsFinite(projectedRadius) ? Math.Max(1.25f, projectedRadius) : 1.25f;
+    }
+
+    private static readonly Color EditorGroupLockIndicatorColor = new(255, 180, 64);
+
+    private bool TryGetEditorNoteGroupSelectionLock(out (int GroupId, int InstanceId) instance)
+    {
+        instance = default;
+        if (!_chartEditorMode || _chart is null || _editorNoteGroupEditMode ||
+            _editorNoteGroupLibrarySelectionExplicit || _editorSelectedNoteGroupId is not int groupId)
+            return false;
+
+        var selectedInstance = GetSelectedEditorNoteGroupInstance();
+        if (selectedInstance is not { } selected || selected.GroupId != groupId)
+            return false;
+
+        instance = selected;
+        return true;
+    }
+
+    // Reuse the same compact pointer-following label for SuperFlick and group-mode
+    // feedback so these indicators stay visually consistent in size, placement,
+    // background, border thickness, and viewport-edge handling.
+    private void DrawEditorHoverIndicator(
+        string text, Vector2 markerCenter, float markerRadius, Color borderColor, Color textColor)
+    {
+        var safeText = FontSafeText(_font, text);
+        var textSize = UnicodeTextRenderer.MeasureString(_font, safeText);
+        var padding = Math.Max(4f, _projection.ScalePixels(6f));
+        var labelWidth = (int)MathF.Ceiling(textSize.X + padding * 2);
+        var labelHeight = (int)MathF.Ceiling(textSize.Y + padding * 2);
+        var viewportWidth = _graphics.Viewport.Width;
+        var viewportHeight = _graphics.Viewport.Height;
+        labelWidth = Math.Min(labelWidth, Math.Max(1, viewportWidth - 8));
+        var labelX = (int)MathF.Round(markerCenter.X + markerRadius + padding);
+        if (labelX + labelWidth > viewportWidth - 4)
+            labelX = Math.Max(4, (int)MathF.Round(markerCenter.X - markerRadius - padding - labelWidth));
+        var labelY = Math.Clamp((int)MathF.Round(markerCenter.Y - labelHeight * 0.5f),
+            4, Math.Max(4, viewportHeight - labelHeight - 4));
+        var labelBounds = new Rectangle(labelX, labelY, labelWidth, labelHeight);
+        _spriteBatch.Draw(_pixel, labelBounds, new Color(10, 10, 11, 238));
+        var thickness = Math.Max(1, (int)MathF.Round(_projection.ScalePixels(1f)));
+        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Y, labelBounds.Width, thickness), borderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Bottom - thickness, labelBounds.Width, thickness), borderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Y, thickness, labelBounds.Height), borderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.Right - thickness, labelBounds.Y, thickness, labelBounds.Height), borderColor);
+        UnicodeTextRenderer.DrawString(_spriteBatch, _font, safeText,
+            new Vector2(labelBounds.X + padding, labelBounds.Y + padding), textColor);
     }
 
     // The selections are real meshes on the chart's 3D lane surface. These points
@@ -8759,12 +9766,24 @@ public sealed partial class Playfield
         if (_chart is null || _tempo is null)
             return;
 
+        _editorMultiSelectionMarkerVertexCount = 0;
         _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
 
         if (_selectedEventKey.HasValue)
         {
-            var selectedEvent = _chart.Events.FirstOrDefault(e => KeyOf(e) == _selectedEventKey.Value)
+            ChartEvent? selectedEvent;
+            if (_eventsByKey.TryGetValue(_selectedEventKey.Value, out var cachedSelectedEvent))
+            {
+                selectedEvent = cachedSelectedEvent;
+            }
+            else
+            {
+                // Newly placed or transiently re-keyed editor events may not have
+                // reached RebuildRenderEventCache yet. Preserve the old lookup as
+                // a rare fallback instead of scanning the chart every frame.
+                selectedEvent = _chart.Events.FirstOrDefault(e => KeyOf(e) == _selectedEventKey.Value)
                                 ?? _editorDraggedEvent;
+            }
             // This overlay belongs to the gameplay-lane view. Auxiliary tracks
             // (including panels 17–20 and metadata track 16) must never be
             // projected onto the gameplay lanes, even if they remain selected
@@ -8784,62 +9803,79 @@ public sealed partial class Playfield
                     var isChainEnd = i == chainNodes.Count - 1;
                     if (!ShouldRenderInCurrentBank(node, currentState))
                         continue;
-                    var nodePoint = _projection.ProjectAtTicks(node.Track, node.Tick, currentTick, currentState);
-                    if (!OutsideNoteView(nodePoint, nodePoint))
+                    var nodeTravel = (float)_projection.ScrollPixelsAtTicks(node.Tick, currentTick);
+                    if (_projection.WithinRenderDistance(nodeTravel))
                     {
-                        var nodeRadius = GetEditorMarkerRadius(
-                            node.Track, node.Tick, currentTick, currentState, out var nodeCenter, node);
-                        var selectedHoldEndNode = _editorSelectedHoldEnd && selectedEvent is not null &&
-                            ReferenceEquals(node, GetEditorNextLinkPoint(selectedEvent));
-                        var draggedHoldEndNode = _editorDragIsHoldEnd && _editorDraggedEvent is not null &&
-                            ReferenceEquals(node, GetEditorNextLinkPoint(_editorDraggedEvent));
-                        var directNodeSelected =
-                            (ReferenceEquals(node, selectedEvent) && !_editorSelectedHoldEnd) ||
-                            (ReferenceEquals(node, _editorDraggedEvent) && !_editorDragIsHoldEnd) ||
-                            selectedHoldEndNode || draggedHoldEndNode;
-                        var selectedColor = directNodeSelected
-                            ? EditorSelectedColor
-                            : isChainEnd ? EditorEndingColor : EditorFamilyColor;
-                        // Link tails are endpoint markers, so keep their highlight
-                        // visually secondary to the note heads while preserving the
-                        // normal size for every other note marker.
-                        DrawEditorMarker(nodeCenter,
-                            node.NoteType == NoteType.LinkTail ? nodeRadius * 0.5f : nodeRadius,
-                            selectedColor, 0.14f);
+                        var nodePoint = _projection.ProjectAtTravel(node.Track, nodeTravel, currentState);
+                        if (!OutsideNoteView(nodePoint, nodePoint))
+                        {
+                            var nodeRadius = GetEditorMarkerRadius(
+                                node.Track, node.Tick, currentTick, currentState, out var nodeCenter, node,
+                                nodePoint, nodeTravel);
+                            var selectedHoldEndNode = _editorSelectedHoldEnd && selectedEvent is not null &&
+                                ReferenceEquals(node, GetEditorNextLinkPoint(selectedEvent));
+                            var draggedHoldEndNode = _editorDragIsHoldEnd && _editorDraggedEvent is not null &&
+                                ReferenceEquals(node, GetEditorNextLinkPoint(_editorDraggedEvent));
+                            var directNodeSelected =
+                                (ReferenceEquals(node, selectedEvent) && !_editorSelectedHoldEnd) ||
+                                (ReferenceEquals(node, _editorDraggedEvent) && !_editorDragIsHoldEnd) ||
+                                selectedHoldEndNode || draggedHoldEndNode;
+                            var selectedColor = directNodeSelected
+                                ? GetEditorSelectedNoteHighlightColor(node)
+                                : isChainEnd ? EditorEndingColor : EditorFamilyColor;
+                            // Link tails are endpoint markers, so keep their highlight
+                            // visually secondary to the note heads while preserving the
+                            // normal size for every other note marker.
+                            DrawEditorMarker(nodeCenter,
+                                node.NoteType == NoteType.LinkTail ? nodeRadius * 0.5f : nodeRadius,
+                                selectedColor, 0.14f);
+                        }
                     }
 
                     var nextNode = i + 1 < chainNodes.Count ? chainNodes[i + 1] : null;
                     var endpointTick = nextNode?.Tick ?? node.EndTick;
                     if (nextNode is not null || node.Duration > 6)
                     {
-                        var endDepth = _projection.ScrollPixelsAtTicks(endpointTick, currentTick);
-                        var endPoint = _projection.ProjectAtTicks(node.Track, endpointTick, currentTick, currentState);
-                        if (_projection.WithinRenderDistance((float)endDepth) && !OutsideNoteView(endPoint, endPoint))
+                        var endDepth = (float)_projection.ScrollPixelsAtTicks(endpointTick, currentTick);
+                        if (_projection.WithinRenderDistance(endDepth))
                         {
-                            var endRadius = GetEditorMarkerRadius(
-                                node.Track, endpointTick, currentTick, currentState, out var endCenter, node);
-                            var directEndSelected =
-                                (ReferenceEquals(node, selectedEvent) && _editorSelectedHoldEnd) ||
-                                (ReferenceEquals(node, _editorDraggedEvent) && _editorDragIsHoldEnd);
-                            var nextNodeDirectlySelected = nextNode is not null &&
-                                ReferenceEquals(nextNode, selectedEvent) && !_editorSelectedHoldEnd;
-                            var endColor = directEndSelected || nextNodeDirectlySelected
-                                ? EditorSelectedColor
-                                : nextNode is null ? EditorEndingColor : EditorFamilyColor;
-                            DrawEditorMarker(endCenter, endRadius * 0.5f, endColor, 0.15f);
+                            var endPoint = _projection.ProjectAtTravel(node.Track, endDepth, currentState);
+                            if (!OutsideNoteView(endPoint, endPoint))
+                            {
+                                var endRadius = GetEditorMarkerRadius(
+                                    node.Track, endpointTick, currentTick, currentState, out var endCenter, node,
+                                    endPoint, endDepth);
+                                var directEndSelected =
+                                    (ReferenceEquals(node, selectedEvent) && _editorSelectedHoldEnd) ||
+                                    (ReferenceEquals(node, _editorDraggedEvent) && _editorDragIsHoldEnd);
+                                var nextNodeDirectlySelected = nextNode is not null &&
+                                    ReferenceEquals(nextNode, selectedEvent) && !_editorSelectedHoldEnd;
+                                var endColor = directEndSelected
+                                    ? GetEditorSelectedNoteHighlightColor(node)
+                                    : nextNodeDirectlySelected && nextNode is not null
+                                        ? GetEditorSelectedNoteHighlightColor(nextNode)
+                                        : nextNode is null ? EditorEndingColor : EditorFamilyColor;
+                                DrawEditorMarker(endCenter, endRadius * 0.5f, endColor, 0.15f);
+                            }
                         }
                     }
                 }
             }
             else if (selectedEvent is not null)
             {
-                var point = _projection.ProjectAtTicks(selectedEvent.Track, selectedEvent.Tick, currentTick, currentState);
-                if (!OutsideNoteView(point, point))
+                var selectedTravel = (float)_projection.ScrollPixelsAtTicks(selectedEvent.Tick, currentTick);
+                if (_projection.WithinRenderDistance(selectedTravel))
                 {
-                    var radius = GetEditorMarkerRadius(selectedEvent.Track, selectedEvent.Tick, currentTick, currentState, out var markerCenter, selectedEvent);
-                    DrawEditorMarker(markerCenter,
-                        selectedEvent.NoteType == NoteType.LinkTail ? radius * 0.5f : radius,
-                        (_editorSelectedHoldEnd || _editorDragIsHoldEnd) ? EditorFamilyColor : EditorSelectedColor, 0.10f);
+                    var point = _projection.ProjectAtTravel(selectedEvent.Track, selectedTravel, currentState);
+                    if (!OutsideNoteView(point, point))
+                    {
+                        var radius = GetEditorMarkerRadius(
+                            selectedEvent.Track, selectedEvent.Tick, currentTick, currentState,
+                            out var markerCenter, selectedEvent, point, selectedTravel);
+                        DrawEditorMarker(markerCenter,
+                            selectedEvent.NoteType == NoteType.LinkTail ? radius * 0.5f : radius,
+                            GetEditorSelectedNoteHighlightColor(selectedEvent), 0.10f);
+                    }
                 }
 
                 // Long-note endpoints (including terminal link tails selected before
@@ -8851,16 +9887,20 @@ public sealed partial class Playfield
                     (selectedEvent.IsHoldNote || isLinkPoint))
                 {
                     var endpointTrack = nextPoint?.Track ?? selectedEvent.Track;
-                    var endDepth = _projection.ScrollPixelsAtTicks(endpointTick, currentTick);
-                    var endPoint = _projection.ProjectAtTicks(endpointTrack, endpointTick, currentTick, currentState);
-                    if (_projection.WithinRenderDistance((float)endDepth) && !OutsideNoteView(endPoint, endPoint))
+                    var endDepth = (float)_projection.ScrollPixelsAtTicks(endpointTick, currentTick);
+                    if (_projection.WithinRenderDistance(endDepth))
                     {
-                        var endRadius = GetEditorMarkerRadius(
-                            endpointTrack, endpointTick, currentTick, currentState, out var endCenter, selectedEvent);
-                        var endColor = _editorSelectedHoldEnd || _editorDragIsHoldEnd
-                            ? EditorSelectedColor
-                            : EditorEndingColor;
-                        DrawEditorMarker(endCenter, endRadius * 0.5f, endColor, 0.13f);
+                        var endPoint = _projection.ProjectAtTravel(endpointTrack, endDepth, currentState);
+                        if (!OutsideNoteView(endPoint, endPoint))
+                        {
+                            var endRadius = GetEditorMarkerRadius(
+                                endpointTrack, endpointTick, currentTick, currentState, out var endCenter, selectedEvent,
+                                endPoint, endDepth);
+                            var endColor = _editorSelectedHoldEnd || _editorDragIsHoldEnd
+                                ? GetEditorSelectedNoteHighlightColor(selectedEvent)
+                                : EditorEndingColor;
+                            DrawEditorMarker(endCenter, endRadius * 0.5f, endColor, 0.13f);
+                        }
                     }
                 }
             }
@@ -8868,52 +9908,71 @@ public sealed partial class Playfield
 
         if (_editorMultiSelectedEvents.Count > 0)
         {
-            var visitedNodes = new HashSet<ChartEvent>();
-            foreach (var selected in _editorMultiSelectedEvents)
+            // DrawNotes populated this compact list while it was already walking
+            // the normal render-distance range (including both editor bank passes).
+            // Only visible selected notes reach this loop; the selection HashSet and
+            // link-chain maps are not traversed again here.
+            var renderItems = _editorMultiSelectionRenderItems;
+            var currentScrollUnits = GetEditorAwareScrollCoordinate(currentTick);
+
+            for (var renderIndex = 0; renderIndex < renderItems.Count; renderIndex++)
             {
-                if (!_chart.Events.Any(ev => ReferenceEquals(ev, selected)) || selected.Kind != "Note" ||
-                    (selected.Track is < 0 or > 15) ||
-                    !ShouldRenderInCurrentBank(selected, currentState))
+                var item = renderItems[renderIndex];
+                var eventIndex = item.EventIndex;
+                var note = _orderedRenderableEvents[eventIndex];
+                var isDirectlySelected = item.IsDirectlySelected;
+                var isInSelectedChain = item.IsInSelectedChain;
+                var isChainEnd = item.IsChainEnd;
+
+                var travel = _projection.ScrollPixelsFromCachedScrollUnits(
+                    _eventScrollUnits[eventIndex], currentScrollUnits);
+                var headVisible = _projection.WithinRenderDistance((float)travel);
+                var hasSeparateEnd = !isInSelectedChain &&
+                    (note.IsHoldNote || note.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
+                    note.Duration > 6;
+                var endTravel = hasSeparateEnd
+                    ? _projection.ScrollPixelsFromCachedScrollUnits(
+                        _eventEffectiveEndScrollUnits[eventIndex], currentScrollUnits)
+                    : 0f;
+                var endVisible = hasSeparateEnd && _projection.WithinRenderDistance((float)endTravel);
+                if (!headVisible && !endVisible)
                     continue;
-                var root = GetEditorLinkRoot(selected);
-                if (root is not null && root.NoteType == NoteType.LinkHead)
+
+                if (headVisible)
                 {
-                    foreach (var node in GetEditorLinkChainNodes(root))
+                    var projected = _projection.ProjectAtTravel(note.Track, (float)travel, currentState);
+                    if (!OutsideNoteView(projected, projected))
                     {
-                        if (!visitedNodes.Add(node))
-                            continue;
-                        var isSelected = _editorMultiSelectedEvents.Contains(node) ||
-                                         (_selectedEventKey.HasValue && KeyOf(node) == _selectedEventKey.Value);
-                        var isEnd = ReferenceEquals(node, GetEditorLinkChainEnd(root));
-                        var projectedNode = _projection.ProjectAtTicks(node.Track, node.Tick, currentTick, currentState);
-                        if (OutsideNoteView(projectedNode, projectedNode))
-                            continue;
-                        var nodeRadius = GetEditorMarkerRadius(node.Track, node.Tick, currentTick, currentState, out var center, node);
-                        DrawEditorMarker(center,
-                            node.NoteType == NoteType.LinkTail ? nodeRadius * 0.5f : nodeRadius,
-                            isSelected ? EditorSelectedColor : isEnd ? EditorEndingColor : EditorFamilyColor, 0.14f);
+                        var radius = GetEditorSelectionMarkerRadius(note, projected);
+                        var color = isDirectlySelected
+                            ? GetEditorSelectedNoteHighlightColor(note)
+                            : isChainEnd ? EditorEndingColor : EditorFamilyColor;
+                        AddEditorMultiSelectionMarker(projected.Position,
+                            note.NoteType == NoteType.LinkTail ? radius * 0.5f : radius,
+                            color, 0.14f);
                     }
                 }
-                else
+
+                if (endVisible)
                 {
-                    var projectedNode = _projection.ProjectAtTicks(selected.Track, selected.Tick, currentTick, currentState);
-                    if (OutsideNoteView(projectedNode, projectedNode))
-                        continue;
-                    var nodeRadius = GetEditorMarkerRadius(selected.Track, selected.Tick, currentTick, currentState, out var center, selected);
-                    DrawEditorMarker(center,
-                        selected.NoteType == NoteType.LinkTail ? nodeRadius * 0.5f : nodeRadius,
-                        _editorSelectedHoldEnd ? EditorFamilyColor : EditorSelectedColor, 0.14f);
-                    if ((selected.IsHoldNote || selected.NoteType is NoteType.LinkHead or NoteType.LinkTail) && selected.Duration > 6)
+                    var endPoint = _projection.ProjectAtTravel(note.Track, (float)endTravel, currentState);
+                    if (!OutsideNoteView(endPoint, endPoint))
                     {
-                        var endPoint = _projection.ProjectAtTicks(selected.Track, selected.EndTick, currentTick, currentState);
-                        if (!OutsideNoteView(endPoint, endPoint))
-                        {
-                            var endRadius = GetEditorMarkerRadius(selected.Track, selected.EndTick, currentTick, currentState, out var endCenter, selected);
-                            DrawEditorMarker(endCenter, endRadius * 0.5f,
-                                _editorSelectedHoldEnd ? EditorSelectedColor : EditorEndingColor, 0.13f);
-                        }
+                        var endRadius = GetEditorSelectionMarkerRadius(note, endPoint);
+                        var endColor = _editorSelectedHoldEnd
+                            ? GetEditorSelectedNoteHighlightColor(note)
+                            : EditorEndingColor;
+                        AddEditorMultiSelectionMarker(endPoint.Position,
+                            endRadius * 0.5f, endColor, 0.13f);
                     }
                 }
+            }
+
+            if (_editorMultiSelectionMarkerVertexCount > 0)
+            {
+                _spriteBatch.End();
+                DrawEditorMultiSelectionMarkerBatch();
+                _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
             }
         }
 
@@ -9081,11 +10140,14 @@ public sealed partial class Playfield
             }
         }
 
-        // Live mouse-hover preview. Touch presses do not drive this marker; touch
-        // input edits directly at the tapped lane/tick without a hover state.
-        if (!_editorPanelsViewEnabled && _chartEditorMode && _editorPlacementEnabled &&
+        // Hover previews are only active while a note-placement tool is active.
+        // In EDIT GROUP this is a placement indicator across the entire lane grid,
+        // including empty ticks and notes outside the current group instance.
+        if (!_editorPanelsViewEnabled && _chartEditorMode &&
+            _editorPlacementEnabled && !_editorConnectorMode &&
             _hoverBeatTick.HasValue && _hoverTrack is >= 0 and <= 15)
         {
+            var groupPlacementHover = _editorNoteGroupEditMode;
             var hoverMatchesSelection = _selectedBeatTick == _hoverBeatTick && _selectedBeatTrack == _hoverTrack;
             if (_selectedEventKey.HasValue)
             {
@@ -9094,17 +10156,24 @@ public sealed partial class Playfield
                     selectedEvent.Tick == _hoverBeatTick.Value && selectedEvent.Track == _hoverTrack.Value;
             }
 
-            // Avoid drawing two circles on top of each other immediately after a
-            // placement; the selected-note marker already identifies that exact spot.
-            if (!hoverMatchesSelection)
+            // In EDIT GROUP the marker means "place a new member here", so it
+            // remains visible even when the cursor is over a selected note.
+            if (!hoverMatchesSelection || groupPlacementHover)
             {
-                var point = _projection.ProjectAtTicks(_hoverTrack.Value, _hoverBeatTick.Value, currentTick, currentState);
+                // Normal note placement may redirect an outer 1K lane to its
+                // legal middle lane. Show the highlight at the actual destination.
+                var markerTrack = groupPlacementHover
+                    ? GetEditorAllowedTrackForNoteType(_hoverTrack.Value,
+                        _editorSuperFlickTool == EditorSuperFlickTool.Place ? NoteType.Single : _editorNoteType)
+                    : _hoverTrack.Value;
+                var point = _projection.ProjectAtTicks(markerTrack, _hoverBeatTick.Value, currentTick, currentState);
                 if (!OutsideNoteView(point, point))
                 {
-                    var radius = GetEditorMarkerRadius(_hoverTrack.Value, _hoverBeatTick.Value, currentTick, currentState, out var markerCenter);
-                    if (_editorSuperFlickTool == EditorSuperFlickTool.Place)
+                    var radius = GetEditorMarkerRadius(markerTrack, _hoverBeatTick.Value,
+                        currentTick, currentState, out var markerCenter);
+                    if (_editorSuperFlickTool == EditorSuperFlickTool.Place && !groupPlacementHover)
                     {
-                        var position = GearState.Position(_hoverTrack.Value);
+                        var position = GearState.Position(markerTrack);
                         // Any authored bank is a valid source in the editor, even if
                         // the chart's current route has that bank inactive. In collapsed
                         // view the configured inactive-bank modifier identifies the overlapping bank explicitly.
@@ -9114,31 +10183,15 @@ public sealed partial class Playfield
                         var previewText = validSource
                             ? $"SUPERFLICK SOURCE {position!.Value.Side.ToUpperInvariant()} {mode} — CLICK, THEN CHOOSE TARGET"
                             : "SUPERFLICK SOURCE MUST BE ON A LANE";
-                        var safeText = FontSafeText(_font, previewText);
-                        var textSize = UnicodeTextRenderer.MeasureString(_font, safeText);
-                        var padding = Math.Max(4f, _projection.ScalePixels(6f));
-                        var labelWidth = (int)MathF.Ceiling(textSize.X + padding * 2);
-                        var labelHeight = (int)MathF.Ceiling(textSize.Y + padding * 2);
-                        var viewportWidth = _graphics.Viewport.Width;
-                        var viewportHeight = _graphics.Viewport.Height;
-                        labelWidth = Math.Min(labelWidth, Math.Max(1, viewportWidth - 8));
-                        var labelX = (int)MathF.Round(markerCenter.X + radius + padding);
-                        if (labelX + labelWidth > viewportWidth - 4)
-                            labelX = Math.Max(4, (int)MathF.Round(markerCenter.X - radius - padding - labelWidth));
-                        var labelY = Math.Clamp((int)MathF.Round(markerCenter.Y - labelHeight * 0.5f), 4, Math.Max(4, viewportHeight - labelHeight - 4));
-                        var labelBounds = new Rectangle(labelX, labelY, labelWidth, labelHeight);
-                        _spriteBatch.Draw(_pixel, labelBounds, new Color(10, 10, 11, 238));
                         var border = validSource ? OuterSuperFlick : new Color(255, 78, 88);
-                        var thickness = Math.Max(1, (int)MathF.Round(_projection.ScalePixels(1f)));
-                        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Y, labelBounds.Width, thickness), border);
-                        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Bottom - thickness, labelBounds.Width, thickness), border);
-                        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Y, thickness, labelBounds.Height), border);
-                        _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.Right - thickness, labelBounds.Y, thickness, labelBounds.Height), border);
-                        UnicodeTextRenderer.DrawString(_spriteBatch, _font, safeText, new Vector2(labelBounds.X + padding, labelBounds.Y + padding), validSource ? Color.White : new Color(255, 137, 143));
+                        DrawEditorHoverIndicator(previewText, markerCenter, radius, border,
+                            validSource ? Color.White : new Color(255, 137, 143));
                     }
                     else
                     {
-                        DrawEditorMarker(markerCenter, radius, EditorSelectedColor, 0.16f);
+                        DrawEditorMarker(markerCenter, radius,
+                            groupPlacementHover ? EditorGroupSelectedColor : EditorSelectedColor,
+                            groupPlacementHover ? 0.20f : 0.16f);
                     }
                 }
             }

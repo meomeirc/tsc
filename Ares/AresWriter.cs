@@ -90,6 +90,7 @@ public static class AresWriter
         }
         var chartTracksByIndex = chart.Tracks.GroupBy(t => t.TrackIndex)
             .ToDictionary(g => g.Key, g => g.First());
+        var noteGroupMetadataEvents = NoteGroupMetadataCodec.CreateMetadataEvents(chart, forAresExport: true);
         var highestChartTrackCount = chartTracksByIndex.Keys
             .Select(index => checked(index + 1)).DefaultIfEmpty(0).Max();
         var disabledTempoBackups = chart.Tracks.SelectMany(track => track.Events)
@@ -99,6 +100,8 @@ public static class AresWriter
             .ThenBy(ev => ev.EventIndex)
             .ToList();
         var outputTrackCount = Math.Max(Math.Max(1, chart.AresTrackCount), highestChartTrackCount);
+        if (noteGroupMetadataEvents.Count > 0)
+            outputTrackCount = Math.Max(outputTrackCount, NoteGroupMetadataCodec.RequiredTrackCount);
         // Legacy type-30 tempo backups are temporarily converted into ordinary
         // kind-1 metadata notes on track 30, which is reserved for editor data.
         if (disabledTempoBackups.Count > 0)
@@ -112,11 +115,24 @@ public static class AresWriter
         for (var trackIndex = 0; trackIndex < outputTrackCount; trackIndex++)
         {
             chartTracksByIndex.TryGetValue(trackIndex, out var chartTrack);
+            // Track 16 is reserved for chart metadata (audio origin/start gear/end marker)
+            // and does not carry the post-end callback stream used by playable and panel
+            // tracks. Stale auxiliary notes beyond PlayTick are rejected by the native
+            // game's chart-end validation, so do not preserve them in an export.
             var trackEvents = chartTrack?.Events
-                .Where(e => !e.LoopReconstructed && e.RawType != 30)
+                .Where(e => !e.LoopReconstructed && e.RawType != 30 &&
+                    !NoteGroupMetadataCodec.IsMetadataEvent(e) &&
+                    (trackIndex != 16 || e.Tick <= chart.PlayTick))
                 .OrderBy(e => e.Tick)
                 .ThenBy(e => e.EventIndex)
                 .ToList() ?? new List<ChartEvent>();
+
+            if (trackIndex is >= NoteGroupMetadataCodec.FirstMetadataTrack and <= NoteGroupMetadataCodec.LastMetadataTrack &&
+                noteGroupMetadataEvents.Count > 0)
+            {
+                trackEvents.AddRange(noteGroupMetadataEvents.Where(ev => ev.Track == trackIndex));
+                trackEvents = trackEvents.OrderBy(e => e.Tick).ThenBy(e => e.EventIndex).ToList();
+            }
 
             if (trackIndex == 30 && disabledTempoBackups.Count > 0)
             {
@@ -214,6 +230,50 @@ public static class AresWriter
         // parallel track-16 ending marker and the start-gear/audio-origin marker
         // must both remain synchronized with their metadata values.
         var validatedChart = AresLoader.LoadBytes(output);
+        if (chart.NoteGroups.Count > 0)
+        {
+            var expectedGroups = chart.NoteGroups.OrderBy(group => group.Id).ToList();
+            var actualGroups = validatedChart.NoteGroups.OrderBy(group => group.Id).ToList();
+            var groupsMatch = expectedGroups.Count == actualGroups.Count &&
+                expectedGroups.Zip(actualGroups).All(pair =>
+                    pair.First.Id == pair.Second.Id &&
+                    pair.First.Name == pair.Second.Name &&
+                    pair.First.Members.SequenceEqual(pair.Second.Members));
+            var expectedInstances = chart.NoteGroupInstances
+                .OrderBy(instance => instance.GroupId).ThenBy(instance => instance.InstanceId).ToArray();
+            var actualInstances = validatedChart.NoteGroupInstances
+                .OrderBy(instance => instance.GroupId).ThenBy(instance => instance.InstanceId).ToArray();
+            var instancesMatch = expectedInstances.Length == actualInstances.Length &&
+                expectedInstances.Zip(actualInstances).All(pair =>
+                    pair.First.GroupId == pair.Second.GroupId &&
+                    pair.First.InstanceId == pair.Second.InstanceId &&
+                    pair.First.StartTick == pair.Second.StartTick &&
+                    pair.First.StartTrack == pair.Second.StartTrack &&
+                    pair.First.IsMirrored == pair.Second.IsMirrored &&
+                    (pair.First.TrackMap ?? new List<NoteGroupTrackMapping>()).SequenceEqual(
+                        pair.Second.TrackMap ?? new List<NoteGroupTrackMapping>()));
+
+            static IEnumerable<(int Track, int Tick, int Attr, int Duration, int Instrument,
+                int Velocity, int Pan, int? GroupId, int? InstanceId, int? MemberId)> Membership(AresChart value)
+                => value.Tracks.Where(track => track.TrackIndex is >= 0 and <= 15)
+                    .OrderBy(track => track.TrackIndex)
+                    .SelectMany(track => track.Events
+                        .Where(ev => !ev.LoopReconstructed && ev.RawType == 1)
+                        .OrderBy(ev => ev.Tick).ThenBy(ev => ev.EventIndex)
+                        .Select(ev => (track.TrackIndex, ev.Tick, ev.Attr, ev.Duration, ev.Instrument,
+                            ev.Velocity, ev.Pan, ev.NoteGroupId, ev.NoteGroupInstanceId, ev.NoteGroupMemberId)));
+
+            var membershipMatches = Membership(chart).SequenceEqual(Membership(validatedChart));
+            if (!groupsMatch || !instancesMatch || !membershipMatches)
+                throw new InvalidDataException(
+                    "ARES export validation failed: note-group definitions, instances, or note memberships did not round-trip through reserved-track metadata.");
+        }
+        var futureAuxiliaryEvent = validatedChart.FindTrack(16)?.Events
+            .FirstOrDefault(ev => ev.Tick > validatedChart.PlayTick);
+        if (futureAuxiliaryEvent is not null)
+            throw new InvalidDataException(
+                $"ARES export validation failed: metadata track 16 contains an event at tick {futureAuxiliaryEvent.Tick}, " +
+                $"beyond chart end {validatedChart.PlayTick}.");
         if (validatedChart.PlayTick != chart.PlayTick)
             throw new InvalidDataException(
                 $"ARES export validation failed: play tick changed from {chart.PlayTick} to {validatedChart.PlayTick}.");

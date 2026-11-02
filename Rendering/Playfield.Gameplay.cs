@@ -524,6 +524,9 @@ public sealed partial class Playfield
 
     private void RebuildRenderEventCache()
     {
+        if (!_editorNoteGroupPlacementPreviewRendering)
+            InvalidateEditorNoteGroupPlacementPreviewCache();
+
         _orderedRenderableEvents.Clear();
         _eventSeconds.Clear();
         _eventScrollUnits.Clear();
@@ -548,6 +551,7 @@ public sealed partial class Playfield
         _editorTimelineTraceChart = null;
         _linkChainCache.Clear();
         _linkChainEffectiveEndTickCache.Clear();
+        _linkChainRootByMember.Clear();
 
         if (_chart is null || _tempo is null)
             return;
@@ -587,6 +591,8 @@ public sealed partial class Playfield
 
             var key = KeyOf(ev);
             _linkChainCache[key] = nodes;
+            foreach (var node in nodes)
+                _linkChainRootByMember[node] = ev;
             var terminal = nodes[^1];
             _linkChainEffectiveEndTickCache[key] = nodes.Count > 1
                 ? (terminal.Duration > 6 ? terminal.EndTick : terminal.Tick)

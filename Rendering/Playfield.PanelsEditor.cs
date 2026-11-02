@@ -361,7 +361,7 @@ public sealed partial class Playfield
         _editorMetaPanelOpen = false;
         _editorRectSelecting = false;
         _editorRectSelectionArmed = false;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedGridCells.Clear();
         _editorPanelsSelectedEmptyCell = null;
         _editorSelectReferenceLineTick = null;
@@ -532,7 +532,7 @@ public sealed partial class Playfield
                 _editorPanelsMarqueeSelecting = true;
                 // Gameplay selection replaces the old selection when an actual drag
                 // begins. Shift is reserved for note-level multi-select, not ranges.
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
                 _editorSelectedGridCells.Clear();
                 _editorPanelsSelectedEmptyCell = null;
                 _editorSelectReferenceLineTick = null;
@@ -570,7 +570,7 @@ public sealed partial class Playfield
                 _editorSelectedGridCells.Clear();
                 _editorSelectedGridCells.Add((emptyTick, emptyTrack));
                 _editorPanelsSelectedEmptyCell = (emptyTick, emptyTrack);
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
                 _selectedEventKey = null;
                 _selectedBeatTick = null;
                 _selectedBeatTrack = null;
@@ -616,7 +616,7 @@ public sealed partial class Playfield
             _editorPanelsConnectorAwaitTarget = false;
             _editorPanelsConnectorPreviewValid = false;
             _editorDurationInputValuePending = false;
-            _editorMultiSelectedEvents.Clear();
+            ClearEditorMultiSelection();
             _editorSelectedGridCells.Clear();
             _editorPanelsSelectedEmptyCell = null;
             _editorSelectReferenceLineTick = null;
@@ -672,24 +672,24 @@ public sealed partial class Playfield
             {
                 // A duration endpoint is an independent edit target. Do not retain a
                 // multi-selection behind it; only this note's duration is being edited.
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
             }
             else if (shift)
             {
                 if (_editorMultiSelectedEvents.Contains(selectedNote))
                 {
-                    _editorMultiSelectedEvents.Remove(selectedNote);
+                    RemoveEditorMultiSelectedEvent(selectedNote);
                     _selectedEventKey = _editorMultiSelectedEvents.Count > 0
                         ? KeyOf(_editorMultiSelectedEvents.First())
                         : null;
                     _statusMessage = "Panel note removed from multi-selection.";
                     return true;
                 }
-                _editorMultiSelectedEvents.Add(selectedNote);
+                AddEditorMultiSelectedEvent(selectedNote);
             }
             else if (!(_editorMultiSelectedEvents.Count > 1 && _editorMultiSelectedEvents.Contains(selectedNote)))
             {
-                _editorMultiSelectedEvents.Clear();
+                ClearEditorMultiSelection();
             }
 
             _selectedEventKey = selectedKey;
@@ -777,9 +777,9 @@ public sealed partial class Playfield
         }
 
         if (!additive)
-            _editorMultiSelectedEvents.Clear();
+            ClearEditorMultiSelection();
         if (!_editorMultiSelectedEvents.Contains(clicked))
-            _editorMultiSelectedEvents.Add(clicked);
+            AddEditorMultiSelectedEvent(clicked);
         _selectedEventKey = KeyOf(clicked);
         _selectedBeatTick = null;
         _selectedBeatTrack = clicked.Track;
@@ -859,8 +859,8 @@ public sealed partial class Playfield
             clickedTargetNote.Kind == "Note" && clickedTargetNote.RawType == 1 &&
             clickedTargetNote.Track is >= 17 and <= 20 && clickedTargetNote.Attr is >= 101 and <= 108)
         {
-            _editorMultiSelectedEvents.Clear();
-            _editorMultiSelectedEvents.Add(clickedTargetNote);
+            ClearEditorMultiSelection();
+            AddEditorMultiSelectedEvent(clickedTargetNote);
             _selectedEventKey = KeyOf(clickedTargetNote);
             _selectedBeatTick = null;
             _selectedBeatTrack = clickedTargetNote.Track;
@@ -923,7 +923,7 @@ public sealed partial class Playfield
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
         _editorTrack = trackIndex;
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedHoldEnd = false;
         _statusMessage = $"Added panel animation attr {ev.Attr} at tick {tick}, track {trackIndex}.";
     }
@@ -1046,13 +1046,13 @@ public sealed partial class Playfield
             .Where(track => track + 0.5f >= lowTrackCoord && track + 0.5f <= highTrackCoord)
             .ToList();
 
-        _editorMultiSelectedEvents.Clear();
+        ClearEditorMultiSelection();
         _editorSelectedGridCells.Clear();
         foreach (var ev in _chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
                      ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108))
         {
             if (selectedTracks.Contains(ev.Track) && ev.Tick >= lowTick && ev.Tick <= highTick)
-                _editorMultiSelectedEvents.Add(ev);
+                AddEditorMultiSelectedEvent(ev);
         }
 
         // The rectangle selects animation notes only. Empty cells crossed by the
@@ -1074,11 +1074,18 @@ public sealed partial class Playfield
 
         if (_editorMultiSelectedEvents.Count > 0)
         {
-            var first = _editorMultiSelectedEvents.OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).First();
+            ChartEvent? first = null;
+            foreach (var selected in _editorMultiSelectedEvents)
+            {
+                if (first is null || selected.Tick < first.Tick ||
+                    (selected.Tick == first.Tick && selected.Track < first.Track))
+                    first = selected;
+            }
             // Keep the note group multi-selected, but do not set _selectedEventKey:
             // SELECT's reference comes from the selected grid range's first tick,
             // not from whichever note happens to be inside it.
-            _editorTrack = first.Track;
+            if (first is not null)
+                _editorTrack = first.Track;
         }
         _statusMessage = $"Rectangle selected {_editorMultiSelectedEvents.Count} animation note(s) across {selectedTracks.Count} track(s); empty cells ignored.";
     }

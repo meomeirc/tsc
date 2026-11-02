@@ -416,7 +416,7 @@ local function drawToolbar(state, screenWidth, x, stripY, width, layer)
     local panelTabGap = 4 * ACTIVE_SCALE
     local stripH = isPanels
         and (16 * ACTIVE_SCALE + panelTabH * 3 + panelTabGap * 2)
-        or (pad * 2 + tabH * 4 + gap * 3)
+        or (pad * 2 + tabH * 5 + gap * 4)
     local tabs = state.tabs or {}
 
     -- The bottom toolbar spans the window. This category strip sits just above
@@ -490,7 +490,7 @@ local function drawToolbar(state, screenWidth, x, stripY, width, layer)
             local row = state.section == "duration" and 2 or 3
             targetY = stripY + 12 * ACTIVE_SCALE + (row - 1) * (panelTabH + panelTabGap)
         else
-            local rootIndex = ({ notes = 1, tools = 2, bpm = 3, select = 4 })[state.root_section] or 1
+            local rootIndex = ({ notes = 1, tools = 2, bpm = 3, notegroups = 4, select = 5 })[state.root_section] or 1
             targetY = stripY + pad + (rootIndex - 1) * (tabH + gap)
         end
         return clamp(targetY, menuMargin, math.max(menuMargin, dockBottom - menuH))
@@ -582,6 +582,102 @@ local function drawToolbar(state, screenWidth, x, stripY, width, layer)
             button(childByValue[index], innerX + (i - 1) * (actionW + actionGap), actionY,
                 actionW, childH, { layer = (layer or 4) + 4, text_size = fontSize("body"),
                     variant = variant })
+        end
+        return
+    end
+
+    if state.section == "notegroups" then
+        local menuH = 481 * ACTIVE_SCALE
+        local menuY = menuTopForHeight(menuH)
+        panel("editor_toolbar_menu", menuX, menuY, menuWidth, menuH, state.menu_title or "NOTE GROUPS", (layer or 4) + 1)
+        UI.draw_button({ id = "editor_menu_close", x = menuX + menuWidth - 38 * ACTIVE_SCALE,
+            y = menuY + 5 * ACTIVE_SCALE, width = closeButtonSize, height = closeButtonSize,
+            label = "X", action = "editor.menu.close", variant = "danger", accent = false,
+            font = F.medium, text_size = fontSize("body"), layer = (layer or 4) + 4 })
+
+        local innerX = menuX + menuPadding
+        local innerW = menuWidth - menuPadding * 2
+        local listTop = menuY + menuPadding + menuHeaderH + headerGap
+        local rowH = 50 * ACTIVE_SCALE
+        local rowGap = 5 * ACTIVE_SCALE
+        local scrollbarW = 18 * ACTIVE_SCALE
+        local rowW = math.max(1, innerW - scrollbarW)
+        local groups = state.note_groups or {}
+        for slot = 1, 5 do
+            local item = groups[slot]
+            local rowY = listTop + (slot - 1) * (rowH + rowGap)
+            if item then
+                button(item, innerX, rowY, rowW, rowH, {
+                    layer = (layer or 4) + 3, text_size = fontSize("small"),
+                    variant = item.primary_active == true and "primary" or "secondary",
+                })
+                local heading = tostring(item.header or "")
+                local description = tostring(item.description or "")
+                local groupTextColor = item.primary_active == true and C.primary_text or C.text
+                draw.text(fittedMeasuredText(heading, rowW - 14 * ACTIVE_SCALE, fontSize("body"), F.medium), {
+                    x = innerX + 10 * ACTIVE_SCALE, y = rowY + 15 * ACTIVE_SCALE,
+                    size = fontSize("body"), color = groupTextColor, font = F.medium, anchor = "left",
+                    layer = (layer or 4) + 5 })
+                draw.text(fittedMeasuredText(description, rowW - 14 * ACTIVE_SCALE, fontSize("small"), F.regular), {
+                    x = innerX + 10 * ACTIVE_SCALE, y = rowY + 36 * ACTIVE_SCALE,
+                    size = fontSize("small"), color = groupTextColor, font = F.regular, anchor = "left",
+                    layer = (layer or 4) + 5 })
+            else
+                draw.rect({ x = innerX, y = rowY, width = rowW, height = rowH,
+                    color = C.button, alpha = 0.48, layer = (layer or 4) + 2 })
+                if slot == 1 and #groups == 0 then
+                    draw.text("NO GROUPS YET", { x = innerX + rowW * 0.5, y = rowY + rowH * 0.5,
+                        size = fontSize("small"), color = C.muted, font = F.regular, anchor = "center",
+                        layer = (layer or 4) + 4 })
+                end
+            end
+        end
+
+        local scrollMax = num(state.note_groups_scroll_max, 0)
+        if scrollMax > 0 then
+            local barX = innerX + innerW - 9 * ACTIVE_SCALE
+            local barY = listTop
+            local barH = 5 * rowH + 4 * rowGap
+            local thumbH = math.max(24 * ACTIVE_SCALE, barH * 5 / (5 + scrollMax))
+            thumbH = math.min(barH, thumbH)
+            local thumbTravel = math.max(0, barH - thumbH)
+            local thumbY = barY + thumbTravel * num(state.note_groups_scroll, 0) / scrollMax
+            draw.rect({ x = barX, y = barY, width = 6 * ACTIVE_SCALE, height = barH,
+                color = C.button, layer = (layer or 4) + 4 })
+            draw.rect({ x = barX, y = thumbY, width = 6 * ACTIVE_SCALE, height = thumbH,
+                color = C.accent, layer = (layer or 4) + 5 })
+            ui.slider({ id = "editor_note_groups_scrollbar", x = barX - 6 * ACTIVE_SCALE, y = barY,
+                width = 18 * ACTIVE_SCALE, height = barH, min = 0, max = scrollMax, step = 1,
+                axis = "vertical", action = "editor.note_groups.scroll_to" })
+        end
+
+        local actions = state.note_group_actions or {}
+        local groupChildH = 38 * ACTIVE_SCALE
+        local groupChildGap = 5 * ACTIVE_SCALE
+        local footerY = menuY + menuH - menuPadding - 3 * groupChildH - 2 * groupChildGap
+        local actionGap = 5 * ACTIVE_SCALE
+        local topW = (innerW - actionGap * 2) / 3
+        for i, key in ipairs({ "create", "edit", "ungroup" }) do
+            local item = actions[key]
+            if item then
+                button(item, innerX + (i - 1) * (topW + actionGap), footerY, topW, groupChildH,
+                    { layer = (layer or 4) + 4, text_size = fontSize("small") })
+            end
+        end
+        local bottomY = footerY + groupChildH + groupChildGap
+        local bottomW = (innerW - actionGap) / 2
+        for i, key in ipairs({ "remove", "delete_all" }) do
+            local item = actions[key]
+            if item then
+                button(item, innerX + (i - 1) * (bottomW + actionGap), bottomY, bottomW, groupChildH,
+                    { layer = (layer or 4) + 4, text_size = fontSize("small") })
+            end
+        end
+        local consolidate = actions.consolidate
+        if consolidate then
+            local consolidateY = bottomY + groupChildH + groupChildGap
+            button(consolidate, innerX, consolidateY, innerW, groupChildH,
+                { layer = (layer or 4) + 4, text_size = fontSize("small") })
         end
         return
     end
@@ -1872,7 +1968,7 @@ function render()
     local leftPanelY = h - margin - leftPanelH
     local rightStripH = s.panels_view == true
         and (16 + 32 * 3 + 4 * 2) * scale
-        or (8 * 2 + 34 * 4 + 5 * 3) * scale
+        or (8 * 2 + 34 * 5 + 5 * 4) * scale
     local rightStripY = leftPanelY - LAYOUT.panel_gap * scale - rightStripH
     local actionWidth = math.min(LAYOUT.action_column_width * scale, w * 0.28)
     local actionX = w - margin - actionWidth
@@ -1990,7 +2086,7 @@ return {
         button_font = F.medium, label_font = F.regular, header_font = F.regular,
         panel = C.panel, header = C.panel, button = C.button, hover = C.hover,
         pressed = C.pressed, selected_button = C.selected, text = C.text,
-        muted_text = C.muted, accent = C.accent, danger = C.error,
+        primary_text = C.primary_text, muted_text = C.muted, accent = C.accent, danger = C.error,
     },
     labels = {},
 }

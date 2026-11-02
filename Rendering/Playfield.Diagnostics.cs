@@ -323,6 +323,7 @@ public sealed partial class Playfield
     {
         _nextLinkByHeadKey.Clear();
         _linkHeadByTailKey.Clear();
+        _ambiguousNextLinkHeadKeys.Clear();
         _linkHeadKeys.Clear();
         if (_chart is null)
             return;
@@ -334,12 +335,20 @@ public sealed partial class Playfield
             _linkHeadKeys.Add(headKey);
             _linkHeadByTailKey[tailKey] = link.Head;
 
-            // Match the old FirstOrDefault(OrderBy(Tick, Track)) semantics.
+            // Keep the earliest outgoing edge, but remember if more than one
+            // edge shares that earliest tick. Selection traversal must stop at
+            // that ambiguity instead of manufacturing a route by track order.
             if (!_nextLinkByHeadKey.TryGetValue(headKey, out var existing) ||
-                link.Tail.Tick < existing.Tail.Tick ||
-                (link.Tail.Tick == existing.Tail.Tick && link.Tail.Track < existing.Tail.Track))
+                link.Tail.Tick < existing.Tail.Tick)
             {
                 _nextLinkByHeadKey[headKey] = link;
+                _ambiguousNextLinkHeadKeys.Remove(headKey);
+            }
+            else if (link.Tail.Tick == existing.Tail.Tick)
+            {
+                _ambiguousNextLinkHeadKeys.Add(headKey);
+                if (link.Tail.Track < existing.Tail.Track)
+                    _nextLinkByHeadKey[headKey] = link;
             }
         }
     }
@@ -404,6 +413,15 @@ public sealed partial class Playfield
 
     private ChartEvent? FindLinkRootHead(ChartEvent ev)
     {
+        if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
+            _editorEditingNoteGroupInstanceId is int instanceId &&
+            ev.NoteGroupId == groupId && ev.NoteGroupInstanceId == instanceId)
+        {
+            var localChain = GetEditorNoteGroupLinkChainInfos(groupId, instanceId)
+                .FirstOrDefault(chain => chain.Nodes.Any(node => ReferenceEquals(node, ev)));
+            return localChain?.Root;
+        }
+
         var key = (ev.Tick, ev.Track, ev.EventIndex);
         if (_linkRootByKey.TryGetValue(key, out var root) && root is not null)
             return root;

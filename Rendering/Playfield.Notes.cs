@@ -31,7 +31,7 @@ public sealed partial class Playfield
         // The inactive-bank pass is only used to prepare the faded background
         // layer. Keep the connector preview and its source/target replacements in
         // the main pass so the preview is composited once over the complete frame.
-        if (!_editorInactiveBankLayerPass &&
+        if (!_editorNoteGroupPlacementPreviewRendering && !_editorInactiveBankLayerPass &&
             TryGetEditorConnectorPreviewTarget(out var previewSource, out var previewTargetHead))
         {
             _editorConnectorPreviewTargetHead = previewTargetHead;
@@ -149,8 +149,33 @@ public sealed partial class Playfield
         headCommands.Clear();
         head3DCommands.Clear();
         superFlicks.Clear();
+        var groupMarkerBuffer = _editorNoteGroupMarkerBuffer;
+        var collectGroupMarkers = _chartEditorMode && !_editorPanelsViewEnabled &&
+            !_editorPreviewMode && !_gameplayMode && !_editorNoteGroupPlacementPreviewRendering;
+        // Build label layouts and reserve the reusable marker buffer before the
+        // normal render pass starts appending visible candidates.
+        if (collectGroupMarkers)
+        {
+            EnsureEditorNoteGroupMarkerCache();
+            EnsureEditorNoteGroupLabelLayouts();
+        }
+        groupMarkerBuffer.Clear();
+        var liveDraggedGroupNotes = _editorNoteGroupMarkerLiveDragEvents;
+        liveDraggedGroupNotes.Clear();
+        if (collectGroupMarkers && _editorDragChanged)
+        {
+            AddLiveEditorGroupMarkerEvent(_editorDraggedEvent, liveDraggedGroupNotes);
+            AddLiveEditorGroupMarkerEvent(_editorDragMovedEndpoint, liveDraggedGroupNotes);
+            foreach (var chainEvent in _editorDragChainNodes)
+                AddLiveEditorGroupMarkerEvent(chainEvent, liveDraggedGroupNotes);
+            foreach (var item in _editorMultiDragItems)
+                AddLiveEditorGroupMarkerEvent(item.Event, liveDraggedGroupNotes);
+        }
         var renderEventCount = BuildRenderEventIndexScratch(currentTick);
         var renderEventIndices = _renderEventIndexScratch;
+
+        var collectSelectionCandidates = _chartEditorMode && !_editorPreviewMode &&
+            !_editorNoteGroupPlacementPreviewRendering && _editorMultiSelectedEvents.Count > 0;
 
         // All bodies share one depth-sorted pass. Far/future objects are drawn
         // first so near/earlier objects always appear on top of them.
@@ -165,11 +190,17 @@ public sealed partial class Playfield
             if (!ShouldRenderTrackInCurrentEditorPass(ev.Track, currentState))
                 continue;
 
+            // Collect selected visible notes as part of this exact render pass. The
+            // inactive and active bank passes contribute disjoint candidates, so
+            // the overlay does not need a second render-distance event scan.
+            if (collectSelectionCandidates)
+                CollectEditorMultiSelectionRenderItem(eventIndex, ev, currentState);
+
             // In compact mode, a note is visible only when its physical source
             // bank is the active bank. Never bypass this check because a SuperFlick
             // is invalid on the chart's authored route: that caused a SuperFlick
             // from another bank to ghost into the active bank.
-            var renderInBank = !_compact ||
+            var renderInBank = _editorNoteGroupPlacementPreviewRendering || !_compact ||
                                (notePosition.Side == "left"
                                     ? activeLeftBank == notePosition.Bank
                                     : activeRightBank == notePosition.Bank);
@@ -218,14 +249,39 @@ public sealed partial class Playfield
             // behind the camera based on their ending point, so an old head does
             // not kill a still-visible body/tail.
             var behindTravel = isLongOrLinkBody ? endTravel : startTravel;
-            if (startTravel > renderAhead || behindTravel < -renderBehind)
+            if (!_editorNoteGroupPlacementPreviewRendering &&
+                (startTravel > renderAhead || behindTravel < -renderBehind))
                 continue;
 
-            if (_projection.BeyondLaneStart(startTravel, endTravel))
+            // Placement previews must remain visible at the exact hovered grid
+            // cell, including the bottom-most rows beyond the ordinary lane-start
+            // clipping boundary. The actual placement hit-test already limits
+            // the ghost to valid chart lanes.
+            if (!_editorNoteGroupPlacementPreviewRendering &&
+                _projection.BeyondLaneStart(startTravel, endTravel))
                 continue;
+
+            // Connected link nodes exit through the chain renderer before the
+            // ordinary group-label collection below. Collect each node here,
+            // during its own depth-ordered event visit, so labels retain the
+            // correct active/inactive bank layer and no second chain scan is needed.
+            if (collectGroupMarkers && ev.RawType == 1 &&
+                (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
+                (_linkHeadKeys.Contains(eventKey) || _linkHeadByTailKey.ContainsKey(eventKey)) &&
+                ev.NoteGroupId is int linkGroupId &&
+                ev.NoteGroupInstanceId is int linkInstanceId &&
+                ev.NoteGroupMemberId.HasValue &&
+                !liveDraggedGroupNotes.Contains(ev) &&
+                renderInBank && ShouldRenderInCurrentBank(ev, currentState) &&
+                (_chart.PlayTick <= 0 || ev.Tick <= _chart.PlayTick) &&
+                _projection.WithinRenderDistance(startTravel))
+            {
+                var linkMarkerPoint = _projection.ProjectAtTravel(ev.Track, startTravel, currentState);
+                AddEditorNoteGroupMarker(ev, linkGroupId, linkInstanceId, linkMarkerPoint, null);
+            }
 
             if (showEditorAttributes && ev.Track is >= 0 and <= 15 && renderInBank &&
-                (_chart.PlayTick <= 0 || ev.Tick <= _chart.PlayTick) &&
+                (_editorNoteGroupPlacementPreviewRendering || _chart.PlayTick <= 0 || ev.Tick <= _chart.PlayTick) &&
                 (!_gameplayMode || !_hitEvents.Contains(eventKey)) &&
                 (_gameplayMode || isLongOrLinkBody || startTravel > 0f))
             {
@@ -301,7 +357,7 @@ public sealed partial class Playfield
                 (_linkHeadByTailKey.ContainsKey(eventKey) || _linkHeadKeys.Contains(eventKey)))
                 continue;
 
-            if ((_chart.PlayTick > 0 && ev.Tick > _chart.PlayTick) ||
+            if ((!_editorNoteGroupPlacementPreviewRendering && _chart.PlayTick > 0 && ev.Tick > _chart.PlayTick) ||
                 (_gameplayMode && _hitEvents.Contains(eventKey)) ||
                 !renderInBank)
                 continue;
@@ -311,7 +367,7 @@ public sealed partial class Playfield
             // Holds and links are intentionally excluded because their bodies/tails
             // have their own past-judge rendering lifetime. Gameplay already removes
             // successfully hit ordinary notes through ShouldIncludeRenderableEvent.
-            if (!_gameplayMode && !isLongOrLinkBody && startTravel <= 0f)
+            if (!_editorNoteGroupPlacementPreviewRendering && !_gameplayMode && !isLongOrLinkBody && startTravel <= 0f)
                 continue;
 
             var startPastJudgement = startTravel < -1f;
@@ -410,6 +466,37 @@ public sealed partial class Playfield
                     }
                 }
 
+            }
+
+            // Collect grouped-note labels in the normal note pass. This pass has
+            // already resolved render distance, lane clipping, track visibility,
+            // and the note's standing basis. Keeping candidates in this same
+            // depth order avoids a second chart scan, projection lookup, hash-set
+            // deduplication, and per-frame sort in the label pass.
+            if (collectGroupMarkers && ev.RawType == 1 &&
+                ev.NoteGroupId is int groupMarkerGroupId &&
+                ev.NoteGroupInstanceId is int groupMarkerInstanceId &&
+                ev.NoteGroupMemberId.HasValue && startBasis is { } groupMarkerBasis &&
+                _projection.WithinRenderDistance(startTravel) &&
+                !liveDraggedGroupNotes.Contains(ev) &&
+                renderInBank && ShouldRenderInCurrentBank(ev, currentState) &&
+                (_chart.PlayTick <= 0 || ev.Tick <= _chart.PlayTick))
+            {
+                var groupMarkerCenter = groupMarkerBasis.Center;
+                var groupMarkerPosition = _projection.ScreenPositionFromCameraSpace(groupMarkerCenter);
+                if (float.IsFinite(groupMarkerPosition.X) && float.IsFinite(groupMarkerPosition.Y) &&
+                    groupMarkerPosition.X >= -128f && groupMarkerPosition.Y >= -128f &&
+                    groupMarkerPosition.X <= _graphics.Viewport.Width + 128f &&
+                    groupMarkerPosition.Y <= _graphics.Viewport.Height + 128f)
+                {
+                    var groupMarkerPoint = new ProjectedPoint(
+                        groupMarkerPosition,
+                        1f,
+                        Math.Max(0f, -groupMarkerCenter.Z),
+                        1f, 1f, 1f, groupMarkerCenter.Z);
+                    AddEditorNoteGroupMarker(ev, groupMarkerGroupId, groupMarkerInstanceId,
+                        groupMarkerPoint, groupMarkerBasis);
+                }
             }
 
             if (ev.IsSuperFlick)
@@ -535,7 +622,8 @@ public sealed partial class Playfield
             // In autoplay/preview, endpoint art should disappear as soon as the
             // authored end passes the judgement line. Manual gameplay keeps its
             // hit/miss endpoint feedback through the separate gameplay hold renderer.
-            var showAutoplayEndpointOverlay = _gameplayMode || endTravel > 0f;
+            var showAutoplayEndpointOverlay = _editorNoteGroupPlacementPreviewRendering ||
+                                              _gameplayMode || endTravel > 0f;
             if (ev.NoteType == NoteType.Vibrato)
             {
                 var endDim = simultaneous ? dimMultiTexture : dimVibratoTexture;
@@ -667,6 +755,45 @@ public sealed partial class Playfield
             }
         }
 
+        // A dragged grouped note can move outside the cached render-index interval
+        // because that index is based on its previous tick. Resolve only those few
+        // live drag events that the ordinary pass did not collect.
+        if (collectGroupMarkers && liveDraggedGroupNotes.Count > 0)
+        {
+            foreach (var ev in liveDraggedGroupNotes)
+            {
+                if (ev.NoteGroupId is not int groupId ||
+                    ev.NoteGroupInstanceId is not int instanceId ||
+                    !ev.NoteGroupMemberId.HasValue ||
+                    ev.Track is < 0 or > 15 ||
+                    (_chart.PlayTick > 0 && ev.Tick > _chart.PlayTick) ||
+                    !ShouldRenderTrackInCurrentEditorPass(ev.Track, currentState) ||
+                    !ShouldRenderInCurrentBank(ev, currentState))
+                    continue;
+
+                var travel = _projection.ScrollPixelsAtTicks(ev.Tick, currentTick);
+                if (!_projection.WithinRenderDistance(travel) ||
+                    _projection.BeyondLaneStart(travel, travel))
+                    continue;
+
+                var point = _projection.ProjectAtTravel(ev.Track, travel, currentState);
+                if (!float.IsFinite(point.Position.X) || !float.IsFinite(point.Position.Y) ||
+                    point.Position.X < -128f || point.Position.Y < -128f ||
+                    point.Position.X > _graphics.Viewport.Width + 128f ||
+                    point.Position.Y > _graphics.Viewport.Height + 128f)
+                    continue;
+
+                GetEditorGroupMarkerGeometry(ev, point, null,
+                    out var markerCenter, out var markerBoundsMin, out var markerBoundsMax);
+                groupMarkerBuffer.Add((markerCenter, markerBoundsMin, markerBoundsMax,
+                    groupId, instanceId));
+                if (_editorNoteGroupEditMode &&
+                    _editorEditingNoteGroupId == groupId &&
+                    _editorEditingNoteGroupInstanceId == instanceId)
+                    _editorEditedGroupHighlightBounds.Add((markerBoundsMin, markerBoundsMax));
+            }
+        }
+
         // Link chains are rendered through DrawLinkChainUnified from their LinkHead
         // event above. This keeps autoplay and gameplay on the same link renderer
         // instead of maintaining a separate autoplay link pass.
@@ -720,6 +847,371 @@ public sealed partial class Playfield
         DrawFallbackHeadShapes(currentState, counts);
         if (showEditorAttributes)
             DrawEditorNoteAttributeLabels();
+        DrawEditorNoteGroupMarkers();
+    }
+
+    // Filled by the ordinary note render pass in its existing far-to-near order.
+    // Capacity is reserved when the chart's group metadata cache is built so a
+    // newly visible instance does not trigger list growth during drawing.
+    private readonly List<(Vector2 Center, Vector2 BoundsMin, Vector2 BoundsMax, int GroupId, int InstanceId)> _editorNoteGroupMarkerBuffer = new();
+    private readonly List<(Vector2 BoundsMin, Vector2 BoundsMax)> _editorEditedGroupHighlightBounds = new(128);
+    private readonly HashSet<ChartEvent> _editorNoteGroupMarkerLiveDragEvents = new();
+    private bool _editorGroupedNoteMarkerCacheDirty = true;
+    private AresChart? _editorGroupedNoteMarkerCacheChart;
+    private int _editorGroupedNoteMarkerCacheEventCount = -1;
+    private int _editorGroupedNoteMarkerCacheInstanceCount = -1;
+    private readonly Dictionary<int, List<NoteGroupInstance>> _editorMarkerInstancesByGroup = new();
+    private readonly Dictionary<(int GroupId, int InstanceId), int> _editorMarkerDisplayInstanceNumbers = new();
+    private readonly Dictionary<int, int> _editorMarkerInstanceCounts = new();
+    private readonly Dictionary<(int GroupId, int InstanceId), (int DisplayNumber, string Label, Vector2 Size)> _editorMarkerLabelLayouts = new();
+    private SpriteFont? _editorMarkerLabelLayoutFont;
+    private bool _editorMarkerLabelLayoutsDirty = true;
+
+    private void InvalidateEditorNoteGroupMarkerCache()
+    {
+        _editorGroupedNoteMarkerCacheDirty = true;
+        _editorMarkerLabelLayoutsDirty = true;
+        InvalidateEditorNoteGroupPlacementPreviewCache();
+    }
+
+    private void EnsureEditorNoteGroupMarkerCache()
+    {
+        if (_chart is null)
+            return;
+        if (!_editorGroupedNoteMarkerCacheDirty &&
+            ReferenceEquals(_editorGroupedNoteMarkerCacheChart, _chart) &&
+            _editorGroupedNoteMarkerCacheEventCount == _chart.Events.Count &&
+            _editorGroupedNoteMarkerCacheInstanceCount == _chart.NoteGroupInstances.Count)
+            return;
+
+        var groupedNoteCount = 0;
+        foreach (var ev in _chart.Events)
+        {
+            if (ev.Kind == "Note" && ev.RawType == 1 && ev.Track is >= 0 and <= 15 &&
+                ev.NoteGroupId.HasValue && ev.NoteGroupInstanceId.HasValue && ev.NoteGroupMemberId.HasValue)
+                groupedNoteCount++;
+        }
+
+        // A few thousand entries is already well above the normal visible range.
+        // Reserve once here (chart/cache change), never while an instance scrolls
+        // into view. Keep the initial working set bounded for enormous charts.
+        var markerCapacity = Math.Min(groupedNoteCount, 8192);
+        if (_editorNoteGroupMarkerBuffer.Capacity < markerCapacity)
+            _editorNoteGroupMarkerBuffer.Capacity = markerCapacity;
+
+        var instancesByGroup = _editorMarkerInstancesByGroup;
+        instancesByGroup.Clear();
+        foreach (var instance in _chart.NoteGroupInstances)
+        {
+            if (!instancesByGroup.TryGetValue(instance.GroupId, out var groupInstances))
+            {
+                groupInstances = new List<NoteGroupInstance>();
+                instancesByGroup.Add(instance.GroupId, groupInstances);
+            }
+            groupInstances.Add(instance);
+        }
+
+        var displayInstanceNumbers = _editorMarkerDisplayInstanceNumbers;
+        displayInstanceNumbers.Clear();
+        var instanceCounts = _editorMarkerInstanceCounts;
+        instanceCounts.Clear();
+        foreach (var (groupId, groupInstances) in instancesByGroup)
+        {
+            if (groupInstances.Count == 0)
+                continue;
+            groupInstances.Sort(static (left, right) =>
+            {
+                var tickOrder = left.StartTick.CompareTo(right.StartTick);
+                if (tickOrder != 0)
+                    return tickOrder;
+                var trackOrder = left.StartTrack.CompareTo(right.StartTrack);
+                return trackOrder != 0 ? trackOrder : left.InstanceId.CompareTo(right.InstanceId);
+            });
+            instanceCounts[groupId] = groupInstances.Count;
+            for (var i = 0; i < groupInstances.Count; i++)
+                displayInstanceNumbers[(groupId, groupInstances[i].InstanceId)] = i + 1;
+        }
+
+        _editorMarkerLabelLayouts.Clear();
+        _editorMarkerLabelLayoutsDirty = true;
+        _editorGroupedNoteMarkerCacheChart = _chart;
+        _editorGroupedNoteMarkerCacheEventCount = _chart.Events.Count;
+        _editorGroupedNoteMarkerCacheInstanceCount = _chart.NoteGroupInstances.Count;
+        _editorGroupedNoteMarkerCacheDirty = false;
+    }
+
+
+    // Label strings and measurements are prepared with the chart's group index,
+    // not lazily when the corresponding instance first scrolls into view. This
+    // keeps a newly visible instance from causing a one-frame text-layout spike.
+    private void EnsureEditorNoteGroupLabelLayouts()
+    {
+        if (_font is null)
+            return;
+
+        if (!ReferenceEquals(_editorMarkerLabelLayoutFont, _font))
+        {
+            _editorMarkerLabelLayoutFont = _font;
+            _editorMarkerLabelLayoutsDirty = true;
+        }
+
+        if (!_editorMarkerLabelLayoutsDirty)
+            return;
+
+        var layouts = _editorMarkerLabelLayouts;
+        layouts.Clear();
+        foreach (var (key, displayNumber) in _editorMarkerDisplayInstanceNumbers)
+            AddEditorNoteGroupLabelLayout(layouts, key, displayNumber);
+
+        // Keep malformed/incomplete charts safe too: a note can still carry a
+        // group/instance id even when its instance record is missing. Prepare its
+        // fallback label here rather than measuring it when that note scrolls in.
+        if (_chart is { } chart)
+        {
+            foreach (var ev in chart.Events)
+            {
+                if (ev.Kind != "Note" || ev.RawType != 1 ||
+                    ev.NoteGroupId is not int groupId || ev.NoteGroupInstanceId is not int instanceId)
+                    continue;
+                var key = (groupId, instanceId);
+                if (!layouts.ContainsKey(key))
+                    AddEditorNoteGroupLabelLayout(layouts, key, instanceId);
+            }
+        }
+
+        _editorMarkerLabelLayoutsDirty = false;
+    }
+
+    private void AddEditorNoteGroupLabelLayout(
+        Dictionary<(int GroupId, int InstanceId), (int DisplayNumber, string Label, Vector2 Size)> layouts,
+        (int GroupId, int InstanceId) key,
+        int displayNumber)
+    {
+        var labelText = $"G{key.GroupId} | {displayNumber}";
+        const float measuredLabelScale = 0.82f;
+        var measuredLabelSize = UnicodeTextRenderer.MeasureString(_font!, labelText) * measuredLabelScale;
+        layouts[key] = (displayNumber, labelText, measuredLabelSize);
+    }
+
+    // Group notes are circular, so their projected across-width is enough to
+    // position their labels. Reuse the note renderer's basis and project only its
+    // two across-edge points instead of rebuilding all six card vertices.
+    private void GetEditorGroupMarkerGeometry(
+        ChartEvent ev,
+        ProjectedPoint projected,
+        StandingNoteBasis? basis,
+        out Vector2 markerCenter,
+        out Vector2 markerBoundsMin,
+        out Vector2 markerBoundsMax)
+    {
+        markerCenter = projected.Position;
+        var nominalWidth = ev.IsFlick
+            ? _projection.SmallFlickNoteWidth
+            : _projection.NoteWidth;
+
+        float halfExtent;
+        if (basis is { } noteBasis)
+        {
+            // Match the note renderer's physical width calibration using the basis
+            // it already built for this note. Project only the two across-edge
+            // points; do not allocate or construct a note-card vertex array.
+            var laneTrackWidth = Math.Max(0.0001f, _projection.LaneTrackWidth);
+            var physicalHalfWidth = Math.Max(0.0001f,
+                noteBasis.BankWidth / 6f * (nominalWidth / laneTrackWidth));
+            var acrossOffset = noteBasis.Across * physicalHalfWidth;
+            var left = _projection.ScreenPositionFromCameraSpace(noteBasis.Center - acrossOffset);
+            var right = _projection.ScreenPositionFromCameraSpace(noteBasis.Center + acrossOffset);
+            halfExtent = Vector2.Distance(left, right) * 0.5f;
+        }
+        else
+        {
+            // Rare fallback for a grouped note the normal note pass didn't process.
+            var perspectiveScale = _projection.FocalLength / Math.Max(1f, projected.Depth);
+            halfExtent = nominalWidth * 0.5f * perspectiveScale;
+        }
+
+        halfExtent = Math.Max(0.5f, halfExtent);
+        var extent = new Vector2(halfExtent, halfExtent);
+        markerBoundsMin = markerCenter - extent;
+        markerBoundsMax = markerCenter + extent;
+    }
+
+    private void AddEditorNoteGroupMarker(
+        ChartEvent ev, int groupId, int instanceId, ProjectedPoint point, StandingNoteBasis? basis)
+    {
+        var position = point.Position;
+        if (!float.IsFinite(position.X) || !float.IsFinite(position.Y) ||
+            position.X < -128f || position.Y < -128f ||
+            position.X > _graphics.Viewport.Width + 128f ||
+            position.Y > _graphics.Viewport.Height + 128f)
+            return;
+
+        GetEditorGroupMarkerGeometry(ev, point, basis,
+            out var markerCenter, out var markerBoundsMin, out var markerBoundsMax);
+        _editorNoteGroupMarkerBuffer.Add((markerCenter, markerBoundsMin, markerBoundsMax,
+            groupId, instanceId));
+        if (_editorNoteGroupEditMode &&
+            _editorEditingNoteGroupId == groupId &&
+            _editorEditingNoteGroupInstanceId == instanceId)
+            _editorEditedGroupHighlightBounds.Add((markerBoundsMin, markerBoundsMax));
+    }
+
+    private static void AddLiveEditorGroupMarkerEvent(ChartEvent? ev, HashSet<ChartEvent> liveDraggedEvents)
+    {
+        if (ev is not null && ev.Kind == "Note" && ev.RawType == 1 &&
+            ev.Track is >= 0 and <= 15 && ev.NoteGroupId.HasValue &&
+            ev.NoteGroupInstanceId.HasValue && ev.NoteGroupMemberId.HasValue)
+            liveDraggedEvents.Add(ev);
+    }
+
+    private void DrawEditorNoteGroupMarkers()
+    {
+        if (!_chartEditorMode || _editorPanelsViewEnabled || _editorPreviewMode || _gameplayMode ||
+            _editorNoteGroupPlacementPreviewRendering ||
+            _chart is null || _pixel is null || _font is null)
+            return;
+
+        EnsureEditorNoteGroupMarkerCache();
+        EnsureEditorNoteGroupLabelLayouts();
+        var visible = _editorNoteGroupMarkerBuffer;
+
+        var editingGroup = _editorNoteGroupEditMode &&
+            _editorEditingNoteGroupId.HasValue && _editorEditingNoteGroupInstanceId.HasValue;
+        int? indicatorGroupId = editingGroup ? _editorEditingNoteGroupId : null;
+        int? indicatorInstanceId = editingGroup ? _editorEditingNoteGroupInstanceId : null;
+        var indicatorColor = EditorGroupSelectedColor;
+        var indicatorTitle = "EDITING GROUP";
+
+        if (!editingGroup && TryGetEditorNoteGroupSelectionLock(out var lockedInstance))
+        {
+            indicatorGroupId = lockedInstance.GroupId;
+            indicatorInstanceId = lockedInstance.InstanceId;
+            indicatorColor = EditorGroupLockIndicatorColor;
+            indicatorTitle = "GROUP LOCK";
+        }
+
+        if (visible.Count == 0 && (!indicatorGroupId.HasValue || !indicatorInstanceId.HasValue))
+            return;
+
+        // Instance order and display labels are prepared only when the chart changes.
+        var displayInstanceNumbers = _editorMarkerDisplayInstanceNumbers;
+        var instanceCounts = _editorMarkerInstanceCounts;
+
+        var labelLayouts = _editorMarkerLabelLayouts;
+
+        var labelColor = new Color((byte)174, (byte)255, (byte)0);
+        _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        var reverseMarkerOrder = _projection.ScrollPixelsFromCachedScrollUnits(1.0, 0.0) >= 0f;
+        var markerIndex = reverseMarkerOrder ? visible.Count : -1;
+        for (var markerDrawIndex = 0; markerDrawIndex < visible.Count; markerDrawIndex++)
+        {
+            markerIndex += reverseMarkerOrder ? -1 : 1;
+            var (noteCenter, noteBoundsMin, noteBoundsMax, groupId, instanceId) = visible[markerIndex];
+            var displayNumber = displayInstanceNumbers.TryGetValue((groupId, instanceId), out var number)
+                ? number
+                : instanceId;
+            // All labels are laid out when the chart/group cache changes. Never
+            // measure or construct a new label because an instance became visible.
+            if (!labelLayouts.TryGetValue((groupId, instanceId), out var labelLayout) ||
+                labelLayout.DisplayNumber != displayNumber)
+                continue;
+
+            var label = labelLayout.Label;
+            const float labelScale = 0.82f;
+            var labelSize = labelLayout.Size;
+            var halfWidth = Math.Max(0.5f, (noteBoundsMax.X - noteBoundsMin.X) * 0.5f);
+            var halfHeight = Math.Max(0.5f, (noteBoundsMax.Y - noteBoundsMin.Y) * 0.5f);
+
+            // Group notes are circular. The corner of their projected bounding box
+            // lies well outside the visible circle, so anchor the label to the
+            // ellipse perimeter along the lower-right diagonal instead.
+            var inverseRadiusSquared = 0.5f / (halfWidth * halfWidth) +
+                                       0.5f / (halfHeight * halfHeight);
+            var diagonalEdgeOffset = inverseRadiusSquared > 0f && float.IsFinite(inverseRadiusSquared)
+                ? 0.70710678f / MathF.Sqrt(inverseRadiusSquared)
+                : 0f;
+            const float labelGap = 0.2f;
+            var edgeOffset = diagonalEdgeOffset + labelGap;
+            var textPosition = noteCenter + new Vector2(edgeOffset, edgeOffset);
+            if (textPosition.X + labelSize.X > _graphics.Viewport.Width - 4f)
+                textPosition.X = noteCenter.X - edgeOffset - labelSize.X;
+            if (textPosition.Y + labelSize.Y > _graphics.Viewport.Height - 4f)
+                textPosition.Y = noteCenter.Y - edgeOffset - labelSize.Y;
+            // A slightly enlarged black underlay gives the label a clean outline
+            // in one text pass rather than drawing four offset copies.
+            const float outlineScale = 0.92f;
+            var outlineScaleRatio = outlineScale / labelScale;
+            var outlineSize = labelSize * outlineScaleRatio;
+            var outlinePosition = textPosition - (outlineSize - labelSize) * 0.5f;
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, outlinePosition,
+                Color.Black, 0f, Vector2.Zero, outlineScale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, _font, label, textPosition,
+                labelColor, 0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
+        }
+
+        // Keep the status badge beside the current pointer, as with the original
+        // SuperFlick hover indicator. Its group/instance identity comes from the
+        // stored edit or lock context, so deselecting notes does not hide or change it.
+        if (indicatorGroupId is int statusGroupId && indicatorInstanceId is int statusInstanceId)
+        {
+            var instanceCount = instanceCounts.TryGetValue(statusGroupId, out var count) ? count : 0;
+            var displayInstance = displayInstanceNumbers.TryGetValue((statusGroupId, statusInstanceId), out var number)
+                ? number
+                : statusInstanceId;
+            var statusText = $"{indicatorTitle} · G{statusGroupId} · INSTANCE {displayInstance}/{Math.Max(1, instanceCount)}";
+            DrawEditorHoverIndicator(statusText, _editorPointerPosition, 4f,
+                indicatorColor, Color.White);
+        }
+        _spriteBatch.End();
+    }
+
+    private void DrawEditorEditedGroupHighlights()
+    {
+        if (!_chartEditorMode || _editorPreviewMode || _gameplayMode ||
+            _editorNoteGroupPlacementPreviewRendering || !_editorNoteGroupEditMode ||
+            !_editorEditingNoteGroupId.HasValue || !_editorEditingNoteGroupInstanceId.HasValue ||
+            _pixel is null || _editorEditedGroupHighlightBounds.Count == 0)
+            return;
+
+        _spriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+        foreach (var (boundsMin, boundsMax) in _editorEditedGroupHighlightBounds)
+            DrawEditorGroupInstanceHighlight(boundsMin, boundsMax, EditorSelectedColor);
+        _spriteBatch.End();
+    }
+
+    private void DrawEditorGroupInstanceHighlight(Vector2 boundsMin, Vector2 boundsMax, Color color)
+    {
+        if (!float.IsFinite(boundsMin.X) || !float.IsFinite(boundsMin.Y) ||
+            !float.IsFinite(boundsMax.X) || !float.IsFinite(boundsMax.Y))
+            return;
+
+        const int expansion = 2;
+        var left = (int)MathF.Floor(boundsMin.X) - expansion;
+        var top = (int)MathF.Floor(boundsMin.Y) - expansion;
+        var right = (int)MathF.Ceiling(boundsMax.X) + expansion;
+        var bottom = (int)MathF.Ceiling(boundsMax.Y) + expansion;
+        left = Math.Clamp(left, 0, _graphics.Viewport.Width);
+        top = Math.Clamp(top, 0, _graphics.Viewport.Height);
+        right = Math.Clamp(right, 0, _graphics.Viewport.Width);
+        bottom = Math.Clamp(bottom, 0, _graphics.Viewport.Height);
+        var width = right - left;
+        var height = bottom - top;
+        if (width < 4 || height < 4)
+            return;
+
+        // Corner brackets identify the active instance without boxing in every
+        // note or obscuring the chart artwork.
+        var cornerLength = Math.Clamp((int)MathF.Round(Math.Min(width, height) * 0.22f), 3, 8);
+        const int thickness = 2;
+        var accent = color;
+        _spriteBatch.Draw(_pixel, new Rectangle(left, top, cornerLength, thickness), accent);
+        _spriteBatch.Draw(_pixel, new Rectangle(left, top, thickness, cornerLength), accent);
+        _spriteBatch.Draw(_pixel, new Rectangle(right - cornerLength, top, cornerLength, thickness), accent);
+        _spriteBatch.Draw(_pixel, new Rectangle(right - thickness, top, thickness, cornerLength), accent);
+        _spriteBatch.Draw(_pixel, new Rectangle(left, bottom - thickness, cornerLength, thickness), accent);
+        _spriteBatch.Draw(_pixel, new Rectangle(left, bottom - cornerLength, thickness, cornerLength), accent);
+        _spriteBatch.Draw(_pixel, new Rectangle(right - cornerLength, bottom - thickness, cornerLength, thickness), accent);
+        _spriteBatch.Draw(_pixel, new Rectangle(right - thickness, bottom - cornerLength, thickness, cornerLength), accent);
     }
 
     private void DrawEditorNoteAttributeLabels()
@@ -1272,7 +1764,7 @@ public sealed partial class Playfield
     private void DrawEditorConnectorPreviewComposite()
     {
         const float previewOpacity = 0.42f;
-        if (_editorInactiveBankLayerPass ||
+        if (_editorInactiveBankLayerPass || _editorNoteGroupPlacementPreviewRendering ||
             (_editorConnectorPreviewBody3DCommands.Count == 0 &&
              _editorConnectorPreviewHeadCommands.Count == 0))
             return;

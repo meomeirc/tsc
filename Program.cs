@@ -47,6 +47,7 @@ public static class Program
         }
     }
 
+
     private static void InstallGlobalExceptionLogging()
     {
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>

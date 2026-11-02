@@ -142,6 +142,7 @@ public sealed partial class Playfield
             ? RenderGearState(laneTick)
             : null;
 
+        BeginEditorMultiSelectionRenderFrame();
         if (editorGroupInactiveBanks && laneState is not null)
         {
             PrepareEditorInactiveBankLayer(laneTick, laneState, virtualWidth, virtualHeight);
@@ -242,6 +243,11 @@ public sealed partial class Playfield
                 _debugTexturedNoteDrawCalls = _debugTexturedDrawCalls - noteDrawCallsStart;
                 _debugTexturedNoteVertices = _debugTexturedVertices - noteVerticesStart;
             }
+            // The inactive-bank layer is collected first, but the active-bank
+            // note pass runs later in the main target. Draw the brackets only
+            // after both passes have contributed their bounds so active notes
+            // receive the same edited-instance highlight as inactive notes.
+            DrawEditorEditedGroupHighlights();
 
             var feedbackDrawCallsStart = _debugTexturedDrawCalls;
             var feedbackVerticesStart = _debugTexturedVertices;
@@ -251,6 +257,8 @@ public sealed partial class Playfield
                 DrawSelectionOverlay(currentTick, currentState);
             if (_chartEditorMode && !_editorPreviewMode && _editorPanelsViewEnabled)
                 DrawEditorPanelsView(currentTick, currentState);
+            if (_chartEditorMode && !_editorPreviewMode && !_editorPanelsViewEnabled)
+                DrawEditorNoteGroupPlacementPreview(currentTick, currentState);
             if (!_hideDebugHud && !_chartEditorMode)
                 DrawHud(currentState, currentTick);
             if (_showAuxTrackDebug && !_chartEditorMode)
@@ -527,11 +535,12 @@ public sealed partial class Playfield
 
     private void EnsureGameplayRenderTarget(int width, int height)
     {
-        // The connector preview renders to a transparent overlay before blending
-        // it back. Preserve the in-progress scene while that overlay target is bound;
-        // otherwise keep the faster discard-contents path used elsewhere.
+        // Connector and note-group previews render to transparent overlays before
+        // blending them back. Preserve the in-progress scene while either overlay
+        // target is bound; otherwise keep the faster discard-contents path.
         var preserveContents = _chartEditorMode && !_editorPreviewMode &&
-                               _chart is not null && _editorConnectorMode;
+                               _chart is not null &&
+                               (_editorConnectorMode || _editorNoteGroupPlacementArmed);
         if (_gameplayRenderTarget is not null &&
             _gameplayRenderTarget.Width == width &&
             _gameplayRenderTarget.Height == height &&

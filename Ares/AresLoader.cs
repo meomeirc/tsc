@@ -902,6 +902,9 @@ public sealed class AresLoader
 
     internal static void FinalizeChart(AresChart chart, bool reconstructAresCallbacks)
     {
+        // Reserved-track note-group records are editor metadata, not chart notes.
+        // Restore memberships before callback/twin/link reconstruction can inspect them.
+        NoteGroupMetadataCodec.Reconstruct(chart);
         if (reconstructAresCallbacks)
         {
             CallbackReconstructor.Reconstruct(chart);
