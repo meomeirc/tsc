@@ -67,7 +67,7 @@ public sealed partial class Playfield
         // A LinkHead hit early must remain visible until its authored judgement
         // time. Only a successfully judged head is removed at/after the judge;
         // missed or dropped heads remain visible with the miss texture.
-        var showLinkHead = placementPreview ||
+        var showLinkHead = isSplitPreview || placementPreview ||
             (!rootHasReachedJudge && !IsEditorConnectorPreviewReplacingTargetHead(root));
         if (interactive)
             showLinkHead = runtime!.StartMissed || runtime.Dropped || !runtime.Started || !rootHasReachedJudge;

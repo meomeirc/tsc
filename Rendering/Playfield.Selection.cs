@@ -6340,7 +6340,10 @@ public sealed partial class Playfield
         return track;
     }
 
-    private void LinkSelectedEditorNotes(IReadOnlyCollection<ChartEvent>? selectedNotesOverride = null, List<ChartEvent>? previewNodesOut = null)
+    private void LinkSelectedEditorNotes(
+        IReadOnlyCollection<ChartEvent>? selectedNotesOverride = null,
+        List<ChartEvent>? previewNodesOut = null,
+        IReadOnlySet<ChartEvent>? durationSplitEvents = null)
     {
         if (!_chartEditorMode || _chart is null)
         {
@@ -6486,7 +6489,7 @@ public sealed partial class Playfield
             {
                 var point = points[i];
                 var nextTick = i + 1 < points.Count ? points[i + 1].Tick : int.MaxValue;
-                if (point.Duration > 6 &&
+                if (point.Duration > 6 && durationSplitEvents?.Contains(point) != true &&
                     (point.NoteType == NoteType.SingleLong ||
                      ((point.NoteType is NoteType.LinkHead or NoteType.LinkTail) && GetEditorNextLinkPoint(point) is null)) &&
                     i + 1 < points.Count && nextTick < point.EndTick)
@@ -6740,7 +6743,10 @@ public sealed partial class Playfield
     /// Longer paths retain a tail at each later lane-run endpoint so subsequent
     /// horizontal connections remain part of one link chain.
     /// </summary>
-    private void LinkSelectedEditorNotesHorizontalFirst(IReadOnlyCollection<ChartEvent>? selectedNotesOverride = null, List<ChartEvent>? previewNodesOut = null)
+    private void LinkSelectedEditorNotesHorizontalFirst(
+        IReadOnlyCollection<ChartEvent>? selectedNotesOverride = null,
+        List<ChartEvent>? previewNodesOut = null,
+        IReadOnlySet<ChartEvent>? durationSplitEvents = null)
     {
         if (!_chartEditorMode || _chart is null)
         {
@@ -6912,7 +6918,7 @@ public sealed partial class Playfield
             {
                 var point = points[i];
                 var nextTick = i + 1 < points.Count ? points[i + 1].Tick : int.MaxValue;
-                if (point.Duration > 6 &&
+                if (point.Duration > 6 && durationSplitEvents?.Contains(point) != true &&
                     (point.NoteType == NoteType.SingleLong ||
                      ((point.NoteType is NoteType.LinkHead or NoteType.LinkTail) && GetEditorNextLinkPoint(point) is null)) &&
                     i + 1 < points.Count && nextTick < point.EndTick)

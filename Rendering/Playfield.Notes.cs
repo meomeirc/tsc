@@ -40,6 +40,7 @@ public sealed partial class Playfield
         // composited in the main pass. Split previews follow the selected chain's
         // own bank pass so they also work for chains currently shown as inactive.
         if (!_editorNoteGroupPlacementPreviewRendering && !_editorInactiveBankLayerPass &&
+            _editorConnectorSplitPreviewRoot is null &&
             TryGetEditorConnectorPreviewTarget(out var previewSource, out var previewTargetHead))
         {
             _editorConnectorPreviewTargetHead = previewTargetHead;
@@ -335,6 +336,17 @@ public sealed partial class Playfield
             // to the ordinary note rendering below instead of silently dropping it.
             if (_gameplayMode && ev.NoteType == NoteType.LinkTail && _linkHeadByTailKey.ContainsKey(eventKey))
                 continue;
+
+            // A regular hold being split is temporarily rendered through the link
+            // renderer so the ghost path replaces the original hold body instead of
+            // drawing both on top of each other.
+            if (!_gameplayMode && renderInBank &&
+                ReferenceEquals(_editorConnectorSplitPreviewRoot, ev) &&
+                _editorConnectorSplitPreviewNodes is { Count: > 1 })
+            {
+                DrawLinkChainUnified(ev, currentState, counts, bodyCommands, connectorCommands, headCommands, currentTick);
+                continue;
+            }
 
             // Real link chains use the exact same renderer in autoplay and gameplay.
             // Only their state model differs; geometry, projection, connectors and tails
@@ -1372,7 +1384,7 @@ public sealed partial class Playfield
         source = null!;
         targetHead = null;
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
-            IsEditorConnectorPreviewGestureBlocked() ||
+            IsEditorConnectorPreviewGestureBlocked() || _editorConnectorSplitPreviewRoot is not null ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
             return false;
@@ -1387,6 +1399,9 @@ public sealed partial class Playfield
 
         var targetTick = Math.Max(0, _hoverBeatTick.Value);
         var targetTrack = Math.Clamp(_hoverTrack.Value, 0, 15);
+        if (source.NoteType == NoteType.LinkTail && source.Duration > 6 && targetTick < source.EndTick)
+            return false;
+
         var existingTarget = FindEditorNoteAtGridCell(targetTick, targetTrack);
         if (existingTarget is not null)
         {
@@ -1483,6 +1498,7 @@ public sealed partial class Playfield
     {
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
             IsEditorConnectorPreviewGestureBlocked() ||
+            _editorConnectorSplitPreviewRoot is not null ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
             return;
@@ -1499,6 +1515,12 @@ public sealed partial class Playfield
 
         var targetTick = Math.Max(0, _hoverBeatTick.Value);
         var targetTrack = Math.Clamp(_hoverTrack.Value, 0, 15);
+        // The connector splitter owns the terminal LinkTail's duration body. Do
+        // not draw a competing extension route there, even when the split itself
+        // is invalid at the currently hovered cell.
+        if (source.NoteType == NoteType.LinkTail && source.Duration > 6 && targetTick < source.EndTick)
+            return;
+
         var hoveredExistingNote = FindEditorNoteAtGridCell(targetTick, targetTrack);
         if (hoveredExistingNote is not null)
         {

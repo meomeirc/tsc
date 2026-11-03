@@ -9211,27 +9211,42 @@ public sealed partial class Playfield
         int targetTrack,
         out List<ChartEvent> selectedNotes,
         out ChartEvent virtualTap,
+        out HashSet<ChartEvent> durationSplitEvents,
         out string? error)
     {
         selectedNotes = new List<ChartEvent>();
         virtualTap = null!;
+        durationSplitEvents = new HashSet<ChartEvent>();
         error = null;
-        if (_chart is null || root.NoteType != NoteType.LinkHead)
+        if (_chart is null || root.NoteType is not (NoteType.LinkHead or NoteType.SingleLong))
             return false;
 
-        var chainNodes = GetEditorLinkChainNodes(root);
-        if (chainNodes.Count < 2)
+        // A regular hold is a one-point path. A link starts with its complete
+        // logical chain. If that path ends in a duration, materialize its end as
+        // an explicit tap-like endpoint while the path is rebuilt.
+        var chainNodes = root.NoteType == NoteType.LinkHead
+            ? GetEditorLinkChainNodes(root)
+            : new List<ChartEvent> { root };
+        if (chainNodes.Count == 0 ||
+            (root.NoteType == NoteType.LinkHead && chainNodes.Count < 2))
             return false;
-        var terminalEndTick = chainNodes[^1].Duration > 6
-            ? chainNodes[^1].EndTick
-            : chainNodes[^1].Tick;
+
+        var terminalNode = chainNodes[^1];
+        var hasDurationEndpoint = terminalNode.Duration > 6;
+        var terminalEndTick = hasDurationEndpoint ? terminalNode.EndTick : terminalNode.Tick;
         if (targetTick <= chainNodes[0].Tick || targetTick >= terminalEndTick)
             return false;
 
         var family = LinkBuilder.Family(root.Track);
         if (family is null || !string.Equals(family, LinkBuilder.Family(targetTrack), StringComparison.Ordinal))
         {
-            error = "A split point must stay within the link chain's track family.";
+            error = "A split point must stay within the source path's track family.";
+            return true;
+        }
+        if (root.NoteType == NoteType.SingleLong &&
+            !IsEditorTrackAllowedForNoteType(root.Track, NoteType.LinkHead))
+        {
+            error = "The hold's starting lane cannot become a link head under the current track rules.";
             return true;
         }
         if (!IsEditorTrackAllowedForNoteType(targetTrack, NoteType.LinkTail))
@@ -9241,7 +9256,7 @@ public sealed partial class Playfield
         }
         if (FindEditorNoteAtGridCell(targetTick, targetTrack) is not null)
         {
-            error = $"Cannot split the link: tick {targetTick}, track {targetTrack} is already occupied.";
+            error = $"Cannot split the path: tick {targetTick}, track {targetTrack} is already occupied.";
             return true;
         }
 
@@ -9290,19 +9305,84 @@ public sealed partial class Playfield
             TwinPairId = null,
             NoteGroupId = activeGroupId,
             NoteGroupInstanceId = activeInstanceId,
+            NoteGroupMemberId = null,
             Kind = "Note",
             Instrument = 0,
             Velocity = 127,
             Pan = 64
         };
-        selectedNotes = chainNodes.Append(virtualTap).ToList();
+
+        ChartEvent? terminalEndpoint = null;
+        if (hasDurationEndpoint)
+        {
+            terminalEndpoint = _chart.Events.FirstOrDefault(ev =>
+                !chainNodes.Contains(ev) && ev.Kind == "Note" && ev.RawType == 1 &&
+                ev.Tick == terminalEndTick && ev.Track == terminalNode.Track);
+            if (terminalEndpoint is not null)
+            {
+                if (terminalEndpoint.NoteType is not (NoteType.Single or NoteType.SingleLong) ||
+                    terminalEndpoint.IsFlick || terminalEndpoint.IsSuperFlick)
+                {
+                    error = $"Cannot split the hold: its duration end at tick {terminalEndTick}, track {terminalNode.Track} is occupied by another note type.";
+                    return true;
+                }
+
+                var endpointHasGroupIdentity = terminalEndpoint.NoteGroupId.HasValue ||
+                    terminalEndpoint.NoteGroupInstanceId.HasValue || terminalEndpoint.NoteGroupMemberId.HasValue;
+                var endpointIsUngrouped = !endpointHasGroupIdentity;
+                var endpointIsSameInstance = activeGroupId.HasValue &&
+                    terminalEndpoint.NoteGroupId == activeGroupId &&
+                    terminalEndpoint.NoteGroupInstanceId == activeInstanceId;
+                if ((endpointHasGroupIdentity && !endpointIsSameInstance) ||
+                    (activeGroupId.HasValue && !endpointIsUngrouped && !endpointIsSameInstance))
+                {
+                    error = "Cannot split the hold at its duration end because the endpoint belongs to another group instance.";
+                    return true;
+                }
+            }
+            else
+            {
+                terminalEndpoint = new ChartEvent
+                {
+                    Tick = terminalEndTick,
+                    Track = terminalNode.Track,
+                    Attr = 0,
+                    RawType = 1,
+                    TypeIndex = -1,
+                    Duration = 6,
+                    NoteType = NoteType.Single,
+                    EventIndex = nextEventIndex + 1,
+                    LinePair = -1,
+                    TwinPairId = null,
+                    NoteGroupId = activeGroupId,
+                    NoteGroupInstanceId = activeInstanceId,
+                    NoteGroupMemberId = null,
+                    LoopReconstructed = terminalNode.LoopReconstructed,
+                    LoopPhase = terminalNode.LoopPhase,
+                    Kind = "Note",
+                    Value = terminalNode.Value,
+                    Instrument = terminalNode.Instrument,
+                    Velocity = terminalNode.Velocity,
+                    Pan = terminalNode.Pan
+                };
+            }
+
+            // Only the source hold (for a regular hold) or terminal LinkTail may
+            // be cut by the synthetic split point. Its former duration end is now
+            // an explicit tap-like endpoint for the LINK Y/X rebuild.
+            durationSplitEvents.Add(terminalNode);
+        }
+
+        selectedNotes = terminalEndpoint is null
+            ? chainNodes.Append(virtualTap).ToList()
+            : chainNodes.Append(virtualTap).Append(terminalEndpoint).ToList();
         return true;
     }
 
     private bool TryRebuildEditorLinkWithSplitPoint(ChartEvent root, int targetTick, int targetTrack)
     {
         if (!TryCreateEditorConnectorSplitPath(root, targetTick, targetTrack,
-                out var selectedNotes, out _, out var error))
+                out var selectedNotes, out _, out var durationSplitEvents, out var error))
             return false;
         if (error is not null)
         {
@@ -9311,12 +9391,11 @@ public sealed partial class Playfield
         }
 
         // Use precisely the existing LINK Y or LINK X path builder, with the
-        // virtual tap inserted into the selected path. LINK Y keeps the new point
-        // at its authored tick; horizontal-first uses the existing LINK X rules.
+        // inserted point and explicit hold-end tap included in the selected path.
         if (KeybindSettings.IsModifierBindingDown("editor_connector_horizontal_first"))
-            LinkSelectedEditorNotesHorizontalFirst(selectedNotes);
+            LinkSelectedEditorNotesHorizontalFirst(selectedNotes, durationSplitEvents: durationSplitEvents);
         else
-            LinkSelectedEditorNotes(selectedNotes);
+            LinkSelectedEditorNotes(selectedNotes, durationSplitEvents: durationSplitEvents);
         return true;
     }
 
@@ -9331,10 +9410,16 @@ public sealed partial class Playfield
             return false;
 
         var selected = _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value);
-        if (selected is null || selected.NoteType is not (NoteType.LinkHead or NoteType.LinkTail))
+        if (selected is null)
             return false;
-        var root = GetEditorLinkRoot(selected);
-        if (root is null || root.NoteType != NoteType.LinkHead)
+        var root = selected.NoteType switch
+        {
+            NoteType.LinkHead => selected,
+            NoteType.LinkTail => GetEditorLinkRoot(selected),
+            NoteType.SingleLong => selected,
+            _ => null
+        };
+        if (root is null || root.NoteType is not (NoteType.LinkHead or NoteType.SingleLong))
             return false;
 
         var targetTick = Math.Max(0, _hoverBeatTick.Value);
@@ -9375,16 +9460,18 @@ public sealed partial class Playfield
             _editorConnectorSplitPreviewCacheNodes.Clear();
 
             if (TryCreateEditorConnectorSplitPath(root, targetTick, targetTrack,
-                    out var selectedNotes, out var virtualTap, out var error) && error is null)
+                    out var selectedNotes, out var virtualTap, out var durationSplitEvents, out var error) && error is null)
             {
                 _editorConnectorSplitPreviewCacheInsertedEventIndex = virtualTap.EventIndex;
                 var priorStatus = _statusMessage;
                 try
                 {
                     if (horizontalFirst)
-                        LinkSelectedEditorNotesHorizontalFirst(selectedNotes, _editorConnectorSplitPreviewCacheNodes);
+                        LinkSelectedEditorNotesHorizontalFirst(selectedNotes, _editorConnectorSplitPreviewCacheNodes,
+                            durationSplitEvents);
                     else
-                        LinkSelectedEditorNotes(selectedNotes, _editorConnectorSplitPreviewCacheNodes);
+                        LinkSelectedEditorNotes(selectedNotes, _editorConnectorSplitPreviewCacheNodes,
+                            durationSplitEvents);
                 }
                 finally
                 {
@@ -9446,12 +9533,15 @@ public sealed partial class Playfield
             return;
         }
 
-        // A click before the selected chain's terminal end is a split operation:
-        // feed the existing chain plus a virtual tap into LINK Y/X. A click at or
-        // after the terminal end retains the usual connector-extension behavior.
+        // A click before the selected chain/hold's terminal end is a split:
+        // feed the existing path, a virtual tap, and (for holds) its duration-end
+        // tap into LINK Y/X. At or after the terminal end, use normal extension.
         var selectedRoot = GetEditorLinkRoot(source);
-        if (existingTarget is null && selectedRoot is { NoteType: NoteType.LinkHead } &&
-            TryRebuildEditorLinkWithSplitPoint(selectedRoot, targetTick, targetTrack))
+        var splitRoot = selectedRoot is { NoteType: NoteType.LinkHead }
+            ? selectedRoot
+            : source.NoteType == NoteType.SingleLong ? source : null;
+        if (existingTarget is null && splitRoot is not null &&
+            TryRebuildEditorLinkWithSplitPoint(splitRoot, targetTick, targetTrack))
             return;
 
         // A chain is one connector source. If any of its points was selected,
