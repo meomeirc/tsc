@@ -1,5 +1,12 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.30
+
+- added note groups
+- optimized multi-select highlight rendering
+- improved panel animation track controls to be more consistent
+- other fixes 
+
 # 0.0.24
 
 - added note attr overlay toggle
