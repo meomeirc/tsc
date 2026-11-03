@@ -642,6 +642,9 @@ public sealed partial class Playfield
     private Dictionary<ChartEventKey, int> _linkChainEffectiveEndTickCache = new();
     private Dictionary<ChartEventKey, double> _eventSecondsByKey = new();
     private Dictionary<ChartEventKey, ChartEvent> _eventsByKey = new();
+    // Panel animation notes are intentionally excluded from the gameplay render
+    // cache, but editor selection/history still needs a fast current-chart lookup.
+    private Dictionary<ChartEventKey, ChartEvent> _editorPanelEventsByKey = new();
     private readonly List<HitAnimationState> _hitAnimations = new();
     private bool _feedbackRenderWarmupDone;
     private Dictionary<(string Left, string Right), Dictionary<int, int>> _simultaneousCountsCache = new();
@@ -6551,6 +6554,10 @@ public sealed partial class Playfield
         if (_editorPanelsViewEnabled && KeybindSettings.IsPressed("editor_cancel") && _editorPlacementEnabled)
         {
             _editorPlacementEnabled = false;
+            _editorPanelsPlacementPending = false;
+            _editorPanelsPendingPlacementTrack = -1;
+            _editorPanelsMarqueeArmed = false;
+            _editorPanelsMarqueeSelecting = false;
             _statusMessage = "Panel placement tool off. Drag on empty space to multi-select panel notes.";
             return;
         }

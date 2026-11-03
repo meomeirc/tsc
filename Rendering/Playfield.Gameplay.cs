@@ -539,6 +539,9 @@ public sealed partial class Playfield
         _renderEventMarkStamp = 0;
         _eventSecondsByKey.Clear();
         _eventsByKey.Clear();
+        _editorPanelEventsByKey.Clear();
+        _editorPanelEventsByCell.Clear();
+        _editorPanelsNextEventIndexByTrack.Clear();
         _cachedRenderRangeTick = double.NaN;
         _cachedRenderRangeFirst = 0;
         _cachedRenderRangeLast = 0;
@@ -555,6 +558,28 @@ public sealed partial class Playfield
 
         if (_chart is null || _tempo is null)
             return;
+
+        // Panels view animation events are editor-authored notes on tracks 17–20.
+        // Keep them out of the gameplay render list, while indexing them separately
+        // so selection, copy, undo snapshots, and other editor actions recognize
+        // that their references still belong to the open chart.
+        foreach (var panelEvent in _chart.Events)
+        {
+            if (IsEditorPanelAnimationEvent(panelEvent))
+            {
+                _editorPanelEventsByKey[KeyOf(panelEvent)] = panelEvent;
+                var cell = (panelEvent.Tick, panelEvent.Track);
+                if (!_editorPanelEventsByCell.ContainsKey(cell))
+                    _editorPanelEventsByCell[cell] = panelEvent;
+            }
+        }
+
+        for (var panelTrackIndex = 17; panelTrackIndex <= 20; panelTrackIndex++)
+        {
+            var panelTrack = _chart.FindTrack(panelTrackIndex);
+            _editorPanelsNextEventIndexByTrack[panelTrackIndex] =
+                (panelTrack?.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() ?? -1) + 1;
+        }
 
         RebuildBankChangingSuperFlickCache();
 

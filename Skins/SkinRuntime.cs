@@ -2626,36 +2626,105 @@ public sealed class SkinRuntime : IDisposable
         RefreshPanelTracksGlobal();
     }
 
+    /// <summary>
+    /// Adds one panel animation event without rebuilding all four panel tracks.
+    /// Placement is frequent in the chart editor, so the normal path updates only
+    /// the affected track's cached rows and Lua table.
+    /// </summary>
+    public void AddPanelTrackEvent(ChartEvent ev, TempoMap tempo)
+    {
+        if (ev.Track is < 17 or > 20 ||
+            !string.Equals(ev.Kind, "Note", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (!_panelTrackEvents.TryGetValue(ev.Track, out var output))
+            _panelTrackEvents[ev.Track] = output = new List<SkinPanelEventData>();
+
+        var start = tempo.TickToSeconds(ev.Tick);
+        var end = tempo.TickToSeconds(ev.Tick + Math.Max(0, ev.Duration));
+        var item = new SkinPanelEventData(
+            ev.Tick, ev.Track, ev.Attr, ev.Duration, start, end, ev.EventIndex);
+        var low = 0;
+        var high = output.Count;
+        while (low < high)
+        {
+            var mid = low + ((high - low) >> 1);
+            var candidate = output[mid];
+            var compare = candidate.Tick.CompareTo(item.Tick);
+            if (compare == 0)
+                compare = candidate.EventIndex.CompareTo(item.EventIndex);
+            if (compare <= 0) low = mid + 1;
+            else high = mid;
+        }
+        output.Insert(low, item);
+
+        if (_script is null)
+            return;
+
+        DynValue tracksValue = _script.Globals.Get("panel_tracks");
+        if (tracksValue.Type == DataType.Table)
+        {
+            var eventsValue = tracksValue.Table.Get(ev.Track);
+            if (eventsValue.Type == DataType.Table)
+            {
+                var eventsTable = eventsValue.Table;
+                var oldCount = output.Count - 1;
+                // The Lua array is already sorted. Shift existing row references
+                // rather than reconstructing every row after each placement.
+                for (var index = oldCount; index > low; index--)
+                    eventsTable.Set(index + 1, eventsTable.Get(index));
+                eventsTable.Set(low + 1, DynValue.NewTable(CreatePanelTrackEventRow(_script, item)));
+            }
+            else
+            {
+                tracksValue.Table.Set(ev.Track,
+                    DynValue.NewTable(CreatePanelTrackEventsTable(_script, output)));
+            }
+        }
+        else
+        {
+            RefreshPanelTracksGlobal();
+        }
+    }
+
     private Table CreatePanelTracksTable(Script script)
     {
         var tracks = new Table(script);
         for (var track = 17; track <= 20; track++)
         {
-            var events = new Table(script);
-            if (_panelTrackEvents.TryGetValue(track, out var source))
-            {
-                var luaIndex = 1;
-                foreach (var ev in source)
-                {
-                    var row = new Table(script);
-                    row.Set("tick", DynValue.NewNumber(ev.Tick));
-                    row.Set("end_tick", DynValue.NewNumber(ev.Tick + ev.DurationTicks));
-                    row.Set("track", DynValue.NewNumber(ev.Track));
-                    row.Set("attr", DynValue.NewNumber(ev.Attr));
-                    row.Set("duration", DynValue.NewNumber(ev.DurationTicks));
-                    row.Set("duration_ticks", DynValue.NewNumber(ev.DurationTicks));
-                    row.Set("start_time", DynValue.NewNumber(ev.StartTime));
-                    row.Set("end_time", DynValue.NewNumber(ev.EndTime));
-                    row.Set("duration_seconds", DynValue.NewNumber(Math.Max(0.0, ev.EndTime - ev.StartTime)));
-                    row.Set("event_index", DynValue.NewNumber(ev.EventIndex));
-                    events.Set(luaIndex++, DynValue.NewTable(row));
-                }
-            }
-
-            tracks.Set(track, DynValue.NewTable(events));
+            _panelTrackEvents.TryGetValue(track, out var source);
+            tracks.Set(track, DynValue.NewTable(CreatePanelTrackEventsTable(script, source)));
         }
 
         return tracks;
+    }
+
+    private static Table CreatePanelTrackEventsTable(Script script, IReadOnlyList<SkinPanelEventData>? source)
+    {
+        var events = new Table(script);
+        if (source is null)
+            return events;
+
+        var luaIndex = 1;
+        foreach (var ev in source)
+            events.Set(luaIndex++, DynValue.NewTable(CreatePanelTrackEventRow(script, ev)));
+        return events;
+    }
+
+    private static Table CreatePanelTrackEventRow(Script script, SkinPanelEventData ev)
+    {
+        var row = new Table(script);
+        row.Set("tick", DynValue.NewNumber(ev.Tick));
+        row.Set("end_tick", DynValue.NewNumber(ev.Tick + ev.DurationTicks));
+        row.Set("track", DynValue.NewNumber(ev.Track));
+        row.Set("attr", DynValue.NewNumber(ev.Attr));
+        row.Set("duration", DynValue.NewNumber(ev.DurationTicks));
+        row.Set("duration_ticks", DynValue.NewNumber(ev.DurationTicks));
+        row.Set("start_time", DynValue.NewNumber(ev.StartTime));
+        row.Set("end_time", DynValue.NewNumber(ev.EndTime));
+        row.Set("duration_seconds", DynValue.NewNumber(Math.Max(0.0, ev.EndTime - ev.StartTime)));
+        row.Set("event_index", DynValue.NewNumber(ev.EventIndex));
+        return row;
     }
 
     private void RefreshPanelTracksGlobal()

@@ -567,6 +567,9 @@ public sealed partial class Playfield
                     fill, active ? Color.White : color);
             }
 
+            DrawControlButton(GetEditorPanelsReplaceButtonBounds(virtualWidth, virtualHeight), interfaceUi.Label("panels_replace", "REPLACE SELECTION"),
+                new Color(62, 45, 47, 245), new Color(248, 113, 113));
+
             DrawControlButton(GetEditorPanelsDurationButtonBounds(virtualWidth, virtualHeight), interfaceUi.Label("panels_duration", "DURATION"),
                 _editorMenuSection == EditorMenuSection.Duration
                     ? new Color(62, 62, 65, 245) : new Color(25, 25, 27, 242),

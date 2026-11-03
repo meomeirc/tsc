@@ -19,6 +19,20 @@ public sealed partial class Playfield
     private int _editorPanelDragEndTickOffset;
     private bool _editorPanelsMarqueeArmed;
     private bool _editorPanelsMarqueeSelecting;
+    private bool _editorPanelsPlacementPending;
+    private int _editorPanelsPendingPlacementTick;
+    private int _editorPanelsPendingPlacementTrack = -1;
+    private bool _editorPanelsConnectorClickPending;
+    private int _editorPanelsPendingConnectorTick;
+    private ChartEvent? _editorPanelsPendingConnectorNote;
+    private bool _editorPanelsPendingConnectorAdditive;
+    private ChartEvent? _editorPanelsPendingSelectNote;
+    private bool _editorPanelsPendingSelectAdditive;
+    private ChartEvent? _editorPanelsPendingSelectedMoveNote;
+    private bool _editorPanelsPendingSelectedMoveDurationGrip;
+    private bool _editorPanelsPendingSelectedMoveTouch;
+    private int _editorPanelsPendingSelectedMoveTick;
+    private int _editorPanelsPendingSelectedMoveTrack = -1;
     private Vector2 _editorPanelsMarqueeStart;
     private Vector2 _editorPanelsMarqueeCurrent;
     private double _editorPanelsMarqueeStartTick;
@@ -31,6 +45,8 @@ public sealed partial class Playfield
     private bool _editorPanelsConnectorAwaitTarget;
     private bool _editorPanelsConnectorPreviewValid;
     private int _editorPanelsConnectorPreviewTick = -1;
+    private readonly Dictionary<(int Tick, int Track), ChartEvent> _editorPanelEventsByCell = new();
+    private readonly Dictionary<int, int> _editorPanelsNextEventIndexByTrack = new();
 
     private static Color GetEditorPanelsAttributeColor(int attr) => attr switch
     {
@@ -44,6 +60,10 @@ public sealed partial class Playfield
         108 => new Color(255, 45, 146),  // pink
         _ => Color.White
     };
+
+    private static bool IsEditorPanelAnimationEvent(ChartEvent ev)
+        => ev.Kind == "Note" && ev.RawType == 1 &&
+           ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108;
 
     // Panel attrs 107–108 use a short 6-tick duration by default.
     // All other panel attrs use a 48-tick duration by default.
@@ -279,18 +299,25 @@ public sealed partial class Playfield
     }
 
     private ChartEvent? FindEditorPanelsNoteAtPoint(Vector2 point, double currentTick, GearState currentState,
-        int virtualWidth, int virtualHeight, out bool durationGrip)
+        int virtualWidth, int virtualHeight, out bool durationGrip, out bool noteHead)
     {
         durationGrip = false;
+        noteHead = false;
         if (_chart is null)
             return null;
         ChartEvent? best = null;
         var bestScore = float.MaxValue;
         var gripTolerance = Math.Max(8f, _projection.ScalePixels(6f));
         var gripWidth = Math.Max(24f, _projection.ScalePixels(28f));
-        foreach (var ev in _chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
-                     ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108))
+        var trackIndex = GetEditorPanelsTrackAtX(point.X, virtualWidth, virtualHeight);
+        var source = _chart.FindTrack(trackIndex)?.Events;
+        if (source is null)
+            return null;
+
+        foreach (var ev in source)
         {
+            if (!IsEditorPanelAnimationEvent(ev))
+                continue;
             var rect = GetEditorPanelsNoteBounds(ev, currentTick, currentState, virtualWidth, virtualHeight);
             var head = GetEditorPanelsNoteHeadBounds(ev, currentTick, currentState, virtualWidth, virtualHeight);
             var column = GetEditorPanelsTrackColumnBounds(ev.Track, virtualWidth, virtualHeight);
@@ -310,22 +337,27 @@ public sealed partial class Playfield
                     virtualWidth, virtualHeight)
                 : Rectangle.Empty;
             var inGripX = MathF.Abs(point.X - column.Center.X) <= gripWidth * 0.5f;
-            var isGrip = !_editorConnectorMode && ev.Duration > 6 && float.IsFinite(gripY) &&
+            var hitHead = !head.IsEmpty && head.Contains((int)point.X, (int)point.Y);
+            var isGrip = !_editorConnectorMode && !hitHead && ev.Duration > 6 && float.IsFinite(gripY) &&
                          ((!selectedEndBounds.IsEmpty && selectedEndBounds.Contains((int)point.X, (int)point.Y)) ||
                           (inGripX && MathF.Abs(point.Y - gripY) <= gripTolerance));
             var hitNote = rect.Contains((int)point.X, (int)point.Y);
             if (!isGrip && !hitNote)
                 continue;
 
-            // In ordinary selection, a visible grip wins over the body hit region.
-            // Connector mode ignores grips so the target note's head can be chosen.
-            var score = isGrip ? -1000f + MathF.Abs(point.Y - gripY) :
-                Vector2.DistanceSquared(point, new Vector2(head.Center.X, GetEditorPanelsTickY(ev.Tick, currentTick, currentState)));
+            // While an animation tool is armed, its note head remains the one
+            // unambiguous selection target. The body and endpoint are placement
+            // surfaces, so rank a head hit above a body/grip hit when notes overlap.
+            var headDistance = Vector2.DistanceSquared(point,
+                new Vector2(head.Center.X, GetEditorPanelsTickY(ev.Tick, currentTick, currentState)));
+            var score = hitHead ? -2000f + headDistance :
+                isGrip ? -1000f + MathF.Abs(point.Y - gripY) : headDistance;
             if (score < bestScore)
             {
                 best = ev;
                 bestScore = score;
                 durationGrip = isGrip;
+                noteHead = hitHead;
             }
         }
         return best;
@@ -353,6 +385,11 @@ public sealed partial class Playfield
         _editorPanelUsingSharedDrag = false;
         _editorPanelsMarqueeArmed = false;
         _editorPanelsMarqueeSelecting = false;
+        _editorPanelsPlacementPending = false;
+        _editorPanelsPendingPlacementTrack = -1;
+        _editorPanelsConnectorClickPending = false;
+        _editorPanelsPendingConnectorNote = null;
+        _editorPanelsPendingSelectNote = null;
         _editorPanelsHoverValid = false;
         _editorPanelsHoverTick = -1;
         _editorPanelsHoverTrack = -1;
@@ -401,6 +438,13 @@ public sealed partial class Playfield
         _editorSuperFlickTool = EditorSuperFlickTool.None;
         _editorPanelsConnectorAwaitTarget = !alreadyActive &&
             GetSelectedEditorDurationSelection().Any(ev => ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108);
+        _editorPanelsConnectorClickPending = false;
+        _editorPanelsPendingConnectorNote = null;
+        _editorPanelsPendingSelectNote = null;
+        _editorPanelsPlacementPending = false;
+        _editorPanelsPendingPlacementTrack = -1;
+        _editorPanelsMarqueeArmed = false;
+        _editorPanelsMarqueeSelecting = false;
         _editorPanelsConnectorPreviewValid = false;
         _editorPanelsHoverValid = false;
         if (alreadyActive)
@@ -429,6 +473,13 @@ public sealed partial class Playfield
         _editorConnectorMode = false;
         _editorPanelsConnectorAwaitTarget = false;
         _editorPanelsConnectorPreviewValid = false;
+        _editorPanelsConnectorClickPending = false;
+        _editorPanelsPendingConnectorNote = null;
+        _editorPanelsPendingSelectNote = null;
+        _editorPanelsPlacementPending = false;
+        _editorPanelsPendingPlacementTrack = -1;
+        _editorPanelsMarqueeArmed = false;
+        _editorPanelsMarqueeSelecting = false;
         _editorNoteType = NoteType.Single;
         _editorDuration = GetDefaultEditorPanelAnimationDuration(_editorPanelsSelectedAttr);
         _editorSuperFlickTool = EditorSuperFlickTool.None;
@@ -490,7 +541,7 @@ public sealed partial class Playfield
         // Connector previews follow the pointer's tick, not the track column. The
         // endpoint can now be placed on any tick, including blank space between notes.
         if (_editorMouseHoverActive && !touchInputThisFrame && !pointerOverToolbar &&
-            _editorConnectorMode && _editorPanelsConnectorAwaitTarget)
+            _editorConnectorMode && _editorPanelsConnectorAwaitTarget && !_editorPanelsMarqueeSelecting)
         {
             _editorPanelsConnectorPreviewTick = GetEditorPanelsSnappedTickAtY(
                 Math.Clamp(point.Y, area.Top, area.Bottom - 1), currentTick, currentState);
@@ -508,7 +559,7 @@ public sealed partial class Playfield
             var held = _editorDragStartedByTouch ? touchActive : leftDown;
             if (held)
             {
-                if (!pointerOverToolbar && (mouseMoved || touchMoved || touchPressed))
+                if (mouseMoved || touchMoved || touchPressed)
                     UpdateEditorPanelsDrag(point, currentTick, currentState, virtualWidth, virtualHeight);
             }
             else
@@ -522,14 +573,52 @@ public sealed partial class Playfield
         if (_editorPanelsMarqueeArmed || _editorPanelsMarqueeSelecting)
         {
             var held = leftDown || touchActive;
-            if (!pointerOverToolbar)
-                _editorPanelsMarqueeCurrent = point;
+            var areaForMarquee = GetEditorPanelsTrackAreaBounds(virtualWidth, virtualHeight);
+            _editorPanelsMarqueeCurrent = new Vector2(
+                Math.Clamp(point.X, areaForMarquee.Left, Math.Max(areaForMarquee.Left, areaForMarquee.Right - 1)),
+                Math.Clamp(point.Y, areaForMarquee.Top, Math.Max(areaForMarquee.Top, areaForMarquee.Bottom - 1)));
 
             if (_editorPanelsMarqueeArmed &&
                 Vector2.DistanceSquared(_editorPanelsMarqueeStart, _editorPanelsMarqueeCurrent) >= 36f)
             {
+                if (_editorPanelsPendingSelectedMoveNote is { } pendingMoveNote)
+                {
+                    // A drag that began on an already-selected note moves the note
+                    // (or its multi-selection) even with an animation/connector tool
+                    // armed. The no-drag release still follows the normal tool click.
+                    var moveDurationGrip = _editorPanelsPendingSelectedMoveDurationGrip;
+                    var moveStartedByTouch = _editorPanelsPendingSelectedMoveTouch;
+                    var moveStartTick = _editorPanelsPendingSelectedMoveTick;
+                    var moveStartTrack = _editorPanelsPendingSelectedMoveTrack;
+                    var moveStartPoint = _editorPanelsMarqueeStart;
+                    _editorPanelsPendingSelectedMoveNote = null;
+                    _editorPanelsPendingSelectedMoveDurationGrip = false;
+                    _editorPanelsPendingSelectedMoveTouch = false;
+                    _editorPanelsPendingSelectedMoveTrack = -1;
+                    _editorPanelsMarqueeArmed = false;
+                    _editorPanelsMarqueeSelecting = false;
+                    _editorPanelsPlacementPending = false;
+                    _editorPanelsPendingPlacementTrack = -1;
+                    _editorPanelsConnectorClickPending = false;
+                    _editorPanelsPendingConnectorNote = null;
+                    _editorPanelsPendingSelectNote = null;
+
+                    SelectEditorPanelsNote(pendingMoveNote, moveDurationGrip, false,
+                        true, moveStartedByTouch, moveStartPoint, currentTick, currentState,
+                        moveStartTick, moveStartTrack);
+                    _editorPanelUsingSharedDrag = _editorDraggedEvent is not null;
+                    if (_editorPanelUsingSharedDrag)
+                        UpdateEditorPanelsDrag(point, currentTick, currentState, virtualWidth, virtualHeight);
+                    return true;
+                }
+
                 _editorPanelsMarqueeArmed = false;
                 _editorPanelsMarqueeSelecting = true;
+                _editorPanelsPlacementPending = false;
+                _editorPanelsPendingPlacementTrack = -1;
+                _editorPanelsConnectorClickPending = false;
+                _editorPanelsPendingConnectorNote = null;
+                _editorPanelsPendingSelectNote = null;
                 // Gameplay selection replaces the old selection when an actual drag
                 // begins. Shift is reserved for note-level multi-select, not ranges.
                 ClearEditorMultiSelection();
@@ -559,6 +648,50 @@ public sealed partial class Playfield
             {
                 FinishEditorPanelsMarquee(currentTick, currentState, virtualWidth, virtualHeight);
             }
+            else if (_editorPanelsConnectorClickPending)
+            {
+                var connectorTick = _editorPanelsPendingConnectorTick;
+                var connectorNote = _editorPanelsPendingConnectorNote;
+                var connectorAdditive = _editorPanelsPendingConnectorAdditive;
+                _editorPanelsConnectorClickPending = false;
+                _editorPanelsPendingConnectorNote = null;
+                if (_editorPanelsConnectorAwaitTarget)
+                {
+                    HandleEditorPanelsConnectorTargetTick(connectorTick,
+                        connectorNote is not null && connectorNote.Tick == connectorTick ? connectorNote : null);
+                }
+                else if (connectorNote is null)
+                {
+                    _statusMessage = "Panel connector: click a source animation note first, then click any later tick to set its duration end.";
+                }
+                else
+                {
+                    HandleEditorPanelsConnectorSourceClick(connectorNote, connectorAdditive);
+                }
+            }
+            else if (_editorPanelsPendingSelectNote is { } pendingSelectNote)
+            {
+                var additive = _editorPanelsPendingSelectAdditive;
+                _editorPanelsPendingSelectNote = null;
+                SelectEditorPanelsNote(pendingSelectNote, false, additive,
+                    false, false, point, currentTick, currentState,
+                    pendingSelectNote.Tick, pendingSelectNote.Track);
+            }
+            else if (_editorPanelsPlacementPending && area.Contains(pixel) && !pointerOverToolbar)
+            {
+                var placementTick = _editorPanelsPendingPlacementTick;
+                var placementTrack = _editorPanelsPendingPlacementTrack;
+                _editorPanelsPlacementPending = false;
+                _editorPanelsPendingPlacementTrack = -1;
+                _editorPanelsMarqueeArmed = false;
+                _editorSelectedGridCells.Clear();
+                _editorPanelsSelectedEmptyCell = null;
+                _editorSelectReferenceLineTick = null;
+                _editorSelectReferenceTickOverride = null;
+                _editorSelectedLinkRoot = null;
+                _editorSelectedHoldEnd = false;
+                AddEditorPanelNote(placementTick, placementTrack);
+            }
             else if (_editorPanelsMarqueeArmed && area.Contains(pixel) &&
                      TryMapEditorPanelsPointToCell(point, currentTick, currentState, virtualWidth, virtualHeight,
                          out var emptyTick, out var emptyTrack) &&
@@ -582,30 +715,50 @@ public sealed partial class Playfield
             }
             _editorPanelsMarqueeArmed = false;
             _editorPanelsMarqueeSelecting = false;
+            _editorPanelsPlacementPending = false;
+            _editorPanelsPendingPlacementTrack = -1;
+            _editorPanelsPendingSelectedMoveNote = null;
+            _editorPanelsPendingSelectedMoveDurationGrip = false;
+            _editorPanelsPendingSelectedMoveTouch = false;
+            _editorPanelsPendingSelectedMoveTrack = -1;
             return true;
         }
 
-        // Preserve the common timeline scrubber and every visible button.
-        if (GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pixel) || pointerOverToolbar)
+        // Preserve the common timeline scrubber and actual toolbar controls.
+        // The toolbar panel includes blank padding; that padding is valid canvas
+        // for starting a marquee, but real controls keep their normal click action.
+        if (GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pixel))
             return false;
+        if (pointerOverToolbar && (leftPressed || touchPressed))
+        {
+            var luaUiActive = _chartEditorInterfaceRuntime.IsLoaded &&
+                              _chartEditorInterfaceRuntime.LastError is null;
+            if (!luaUiActive && TryHandleChartEditorToolbarClick(point, virtualWidth, virtualHeight))
+                return true;
+            if (TryHandleEditorBankIndicatorClick(point, virtualWidth, virtualHeight))
+                return true;
+        }
+        else if (pointerOverToolbar)
+        {
+            return false;
+        }
 
         var shift = _editorConnectorMode
             ? KeybindSettings.IsModifierBindingDown("editor_connect_modifier")
             : KeybindSettings.IsDown("editor_connect_modifier");
         if (!area.Contains(pixel))
         {
-            if (!_editorPlacementEnabled && !_editorConnectorMode && (leftPressed || touchPressed))
+            if (leftPressed || touchPressed)
             {
                 BeginEditorPanelsMarquee(point, currentTick, currentState, virtualWidth, virtualHeight);
-                return true;
-            }
-            // Ignore the pointer's X position when setting a connector endpoint;
-            // only the snapped tick (Y) matters.
-            if (_editorConnectorMode && _editorPanelsConnectorAwaitTarget && (leftPressed || touchPressed))
-            {
-                var targetTick = GetEditorPanelsSnappedTickAtY(
-                    Math.Clamp(point.Y, area.Top, area.Bottom - 1), currentTick, currentState);
-                HandleEditorPanelsConnectorTargetTick(targetTick, clickedTargetNote: null);
+                if (_editorConnectorMode && _editorPanelsConnectorAwaitTarget)
+                {
+                    _editorPanelsConnectorClickPending = true;
+                    _editorPanelsPendingConnectorTick = GetEditorPanelsSnappedTickAtY(
+                        Math.Clamp(point.Y, area.Top, area.Bottom - 1), currentTick, currentState);
+                    _editorPanelsPendingConnectorNote = null;
+                    _editorPanelsPendingConnectorAdditive = shift;
+                }
                 return true;
             }
             return true; // Panels mode must never fall through to gameplay-note placement.
@@ -615,6 +768,8 @@ public sealed partial class Playfield
         {
             _editorPanelsConnectorAwaitTarget = false;
             _editorPanelsConnectorPreviewValid = false;
+            _editorPanelsPlacementPending = false;
+            _editorPanelsPendingPlacementTrack = -1;
             _editorDurationInputValuePending = false;
             ClearEditorMultiSelection();
             _editorSelectedGridCells.Clear();
@@ -635,119 +790,236 @@ public sealed partial class Playfield
             return true;
 
         var selectedNote = FindEditorPanelsNoteAtPoint(point, currentTick, currentState,
-            virtualWidth, virtualHeight, out var durationGrip);
-        if (_editorConnectorMode)
+            virtualWidth, virtualHeight, out var durationGrip, out var noteHead);
+
+        // A note that is already selected is an explicit drag target, even while
+        // another animation attribute or the connector tool is armed. Do not route
+        // this gesture into the tools' deferred placement/connector click paths:
+        // selected notes (and the selected set) must remain directly movable.
+        // Keep the multi-select modifier's click-to-toggle behavior intact.
+        var selectedNoteIsAlreadySelected = selectedNote is not null &&
+            (_editorMultiSelectedEvents.Contains(selectedNote) ||
+             (_selectedEventKey.HasValue && KeyOf(selectedNote) == _selectedEventKey.Value));
+        if (selectedNoteIsAlreadySelected && !shift && (_editorPlacementEnabled || _editorConnectorMode))
         {
-            _editorSelectedGridCells.Clear();
-            _editorPanelsSelectedEmptyCell = null;
-            _editorSelectReferenceLineTick = null;
-            _editorSelectReferenceTickOverride = null;
-            if (_editorPanelsConnectorAwaitTarget)
+            BeginEditorPanelsMarquee(point, currentTick, currentState, virtualWidth, virtualHeight);
+            _editorPanelsPendingSelectedMoveNote = selectedNote;
+            _editorPanelsPendingSelectedMoveDurationGrip = durationGrip;
+            _editorPanelsPendingSelectedMoveTouch = touchPressed;
+            _editorPanelsPendingSelectedMoveTick = snappedTick;
+            _editorPanelsPendingSelectedMoveTrack = trackIndex;
+
+            if (_editorConnectorMode)
+            {
+                _editorSelectedGridCells.Clear();
+                _editorPanelsSelectedEmptyCell = null;
+                _editorSelectReferenceLineTick = null;
+                _editorSelectReferenceTickOverride = null;
+                _editorDurationInputValuePending = false;
+                _editorPanelsConnectorClickPending = true;
+                _editorPanelsPendingConnectorTick = snappedTick;
+                _editorPanelsPendingConnectorNote = selectedNote;
+                _editorPanelsPendingConnectorAdditive = false;
+                _statusMessage = "Click to use the panel connector, or drag to move the selected animation notes.";
+            }
+            else if (noteHead)
             {
                 _editorDurationInputValuePending = false;
-                HandleEditorPanelsConnectorTargetTick(snappedTick,
-                    selectedNote is not null && selectedNote.Tick == snappedTick ? selectedNote : null);
-            }
-            else if (selectedNote is null)
-            {
-                _statusMessage = "Panel connector: click a source animation note first, then click any later tick to set its duration end.";
+                _editorPanelsPendingSelectNote = selectedNote;
+                _editorPanelsPendingSelectAdditive = false;
+                _statusMessage = "Click the selected note head to keep it selected, or drag to move the selection.";
             }
             else
             {
                 _editorDurationInputValuePending = false;
-                HandleEditorPanelsConnectorSourceClick(selectedNote, shift);
+                _editorPanelsPlacementPending = true;
+                _editorPanelsPendingPlacementTick = snappedTick;
+                _editorPanelsPendingPlacementTrack = trackIndex;
+                _statusMessage = "Click to place the armed animation note, or drag to move the selected note.";
             }
+            return true;
+        }
+
+        if (selectedNoteIsAlreadySelected && !shift)
+        {
+            SelectEditorPanelsNote(selectedNote!, durationGrip, false,
+                true, touchPressed, point, currentTick, currentState, snappedTick, trackIndex);
+            return true;
+        }
+
+        if (_editorConnectorMode)
+        {
+            // Connector clicks are deferred until release. A short click keeps the
+            // normal source/endpoint behavior, while a drag becomes a marquee range
+            // even when the connector tool is active.
+            _editorSelectedGridCells.Clear();
+            _editorPanelsSelectedEmptyCell = null;
+            _editorSelectReferenceLineTick = null;
+            _editorSelectReferenceTickOverride = null;
+            _editorDurationInputValuePending = false;
+            BeginEditorPanelsMarquee(point, currentTick, currentState, virtualWidth, virtualHeight);
+            _editorPanelsConnectorClickPending = true;
+            _editorPanelsPendingConnectorTick = snappedTick;
+            _editorPanelsPendingConnectorNote = selectedNote;
+            _editorPanelsPendingConnectorAdditive = shift;
+            _statusMessage = "Click to use the panel connector, or drag to select animation notes.";
+            return true;
+        }
+
+        // With an animation tool armed, a note-head click still selects the note,
+        // but the gesture is deferred so dragging from the head can become a
+        // marquee selection instead of being captured as a note move.
+        if (_editorPlacementEnabled && _editorPanelsSelectedAttr is >= 101 and <= 108 &&
+            selectedNote is not null && noteHead)
+        {
+            _editorDurationInputValuePending = false;
+            BeginEditorPanelsMarquee(point, currentTick, currentState, virtualWidth, virtualHeight);
+            _editorPanelsPendingSelectNote = selectedNote;
+            _editorPanelsPendingSelectAdditive = shift;
+            _statusMessage = "Click the note head to select it, or drag to select animation notes.";
+            return true;
+        }
+
+        // An armed animation tool reserves an existing note's body and duration
+        // endpoint for placement. Dragging from either surface still becomes a
+        // marquee selection; only a short click commits placement.
+        if (_editorPlacementEnabled && _editorPanelsSelectedAttr is >= 101 and <= 108 &&
+            selectedNote is not null && !noteHead)
+        {
+            // A body/end click places the armed animation note, but defer that
+            // action until release so the same pointer-down can become a marquee
+            // drag. Note heads intentionally bypass this path and remain selectable.
+            _editorDurationInputValuePending = false;
+            BeginEditorPanelsMarquee(point, currentTick, currentState, virtualWidth, virtualHeight);
+            _editorPanelsPlacementPending = true;
+            _editorPanelsPendingPlacementTick = snappedTick;
+            _editorPanelsPendingPlacementTrack = trackIndex;
+            _statusMessage = "Click to place the armed animation note, or drag to select animation notes.";
             return true;
         }
 
         if (selectedNote is not null)
         {
-            _editorSelectedGridCells.Clear();
-            _editorPanelsSelectedEmptyCell = null;
-            _editorSelectReferenceLineTick = _editorMenuSection == EditorMenuSection.Select ? selectedNote.Tick : null;
-            _editorSelectReferenceTickOverride = null;
-            _editorDurationInputValuePending = false;
-            var selectedKey = KeyOf(selectedNote);
-            if (durationGrip)
-            {
-                // A duration endpoint is an independent edit target. Do not retain a
-                // multi-selection behind it; only this note's duration is being edited.
-                ClearEditorMultiSelection();
-            }
-            else if (shift)
-            {
-                if (_editorMultiSelectedEvents.Contains(selectedNote))
-                {
-                    RemoveEditorMultiSelectedEvent(selectedNote);
-                    _selectedEventKey = _editorMultiSelectedEvents.Count > 0
-                        ? KeyOf(_editorMultiSelectedEvents.First())
-                        : null;
-                    _statusMessage = "Panel note removed from multi-selection.";
-                    return true;
-                }
-                AddEditorMultiSelectedEvent(selectedNote);
-            }
-            else if (!(_editorMultiSelectedEvents.Count > 1 && _editorMultiSelectedEvents.Contains(selectedNote)))
-            {
-                ClearEditorMultiSelection();
-            }
-
-            _selectedEventKey = selectedKey;
-            _selectedBeatTick = null;
-            _selectedBeatTrack = selectedNote.Track;
-            _editorTrack = selectedNote.Track;
-            _editorSelectedLinkRoot = null;
-            _editorSelectedHoldEnd = durationGrip;
-            _statusMessage = durationGrip
-                ? $"Selected panel note attr {selectedNote.Attr}; drag its duration handle to resize."
-                : $"Selected panel note attr {selectedNote.Attr}: tick {selectedNote.Tick}, track {selectedNote.Track}. Drag to move.";
-            if (IsEditorDraggableNote(selectedNote))
-            {
-                BeginEditorDrag(selectedNote, durationGrip, touchPressed, point, currentTick, currentState);
-                _editorPanelUsingSharedDrag = true;
-                _editorPanelDragStartPointerTrack = trackIndex;
-                _editorPanelDragTickOffset = selectedNote.Tick - snappedTick;
-                _editorPanelDragEndTickOffset = selectedNote.EndTick - snappedTick;
-                if (_editorDragIsMultiSelection)
-                {
-                    _editorMultiDragAnchorTick = snappedTick;
-                    _editorMultiDragAnchorTrack = trackIndex;
-                    // Force the first update through even if the pointer remains
-                    // in its initial snap cell, so any existing off-grid notes are
-                    // corrected to the actual grid when dragging starts.
-                    _editorMultiDragLastTickDelta = int.MinValue;
-                    _editorMultiDragLastTrackDelta = int.MinValue;
-                }
-            }
-            return true;
-        }
-
-        if (_editorPlacementEnabled && _editorPanelsSelectedAttr is >= 101 and <= 108)
-        {
-            _editorSelectedGridCells.Clear();
-            _editorPanelsSelectedEmptyCell = null;
-            _editorSelectReferenceLineTick = null;
-            _editorSelectReferenceTickOverride = null;
-            _editorDurationInputValuePending = false;
-            AddEditorPanelNote(snappedTick, trackIndex);
+            SelectEditorPanelsNote(selectedNote, durationGrip, shift,
+                true, touchPressed, point, currentTick, currentState, snappedTick, trackIndex);
             return true;
         }
 
         _editorDurationInputValuePending = false;
         BeginEditorPanelsMarquee(point, currentTick, currentState, virtualWidth, virtualHeight);
+        if (_editorPlacementEnabled && _editorPanelsSelectedAttr is >= 101 and <= 108)
+        {
+            // Defer the click placement until release. If the pointer moves far
+            // enough first, the same gesture becomes a marquee selection instead.
+            _editorPanelsPlacementPending = true;
+            _editorPanelsPendingPlacementTick = snappedTick;
+            _editorPanelsPendingPlacementTrack = trackIndex;
+            _statusMessage = "Click to place the armed animation note, or drag to select animation notes.";
+        }
         return true;
+    }
+
+    private void SelectEditorPanelsNote(ChartEvent selectedNote, bool durationGrip, bool shift,
+        bool beginDrag, bool touchPressed, Vector2 point, double currentTick, GearState currentState,
+        int snappedTick, int trackIndex)
+    {
+        _editorSelectedGridCells.Clear();
+        _editorPanelsSelectedEmptyCell = null;
+        _editorSelectReferenceLineTick = _editorMenuSection == EditorMenuSection.Select ? selectedNote.Tick : null;
+        _editorSelectReferenceTickOverride = null;
+        _editorDurationInputValuePending = false;
+        var selectedKey = KeyOf(selectedNote);
+        if (durationGrip)
+        {
+            // A duration endpoint is an independent edit target. Do not retain a
+            // multi-selection behind it; only this note's duration is being edited.
+            ClearEditorMultiSelection();
+        }
+        else if (shift)
+        {
+            // Match gameplay multi-select behavior: when the modifier is pressed
+            // for the first time, promote the note that was already selected on its
+            // own into the multi-selection before toggling the newly clicked note.
+            // Only carry it forward when it is an animation note in this view; a
+            // stale gameplay selection must never leak into the panel selection.
+            if (_editorMultiSelectedEvents.Count == 0 && _selectedEventKey.HasValue && _chart is not null)
+            {
+                var previouslySelectedPanelNote = _chart.Events.FirstOrDefault(ev =>
+                    IsEditorPanelAnimationEvent(ev) && KeyOf(ev) == _selectedEventKey.Value);
+                if (previouslySelectedPanelNote is not null)
+                    AddEditorMultiSelectedEvent(previouslySelectedPanelNote);
+            }
+
+            if (_editorMultiSelectedEvents.Contains(selectedNote))
+            {
+                RemoveEditorMultiSelectedEvent(selectedNote);
+                _selectedEventKey = _editorMultiSelectedEvents.Count > 0
+                    ? KeyOf(_editorMultiSelectedEvents.First())
+                    : null;
+                _statusMessage = "Panel note removed from multi-selection.";
+                return;
+            }
+            AddEditorMultiSelectedEvent(selectedNote);
+        }
+        else if (!(_editorMultiSelectedEvents.Count > 1 && _editorMultiSelectedEvents.Contains(selectedNote)))
+        {
+            ClearEditorMultiSelection();
+        }
+
+        _selectedEventKey = selectedKey;
+        _selectedBeatTick = null;
+        _selectedBeatTrack = selectedNote.Track;
+        _editorTrack = selectedNote.Track;
+        _editorSelectedLinkRoot = null;
+        _editorSelectedHoldEnd = durationGrip;
+        _statusMessage = durationGrip
+            ? $"Selected panel note attr {selectedNote.Attr}; drag its duration handle to resize."
+            : beginDrag
+                ? $"Selected panel note attr {selectedNote.Attr}: tick {selectedNote.Tick}, track {selectedNote.Track}. Drag to move."
+                : $"Selected panel note attr {selectedNote.Attr}: tick {selectedNote.Tick}, track {selectedNote.Track}.";
+        if (beginDrag && IsEditorDraggableNote(selectedNote))
+        {
+            BeginEditorDrag(selectedNote, durationGrip, touchPressed, point, currentTick, currentState);
+            _editorPanelUsingSharedDrag = true;
+            _editorPanelDragStartPointerTrack = trackIndex;
+            _editorPanelDragTickOffset = selectedNote.Tick - snappedTick;
+            _editorPanelDragEndTickOffset = selectedNote.EndTick - snappedTick;
+            if (_editorDragIsMultiSelection)
+            {
+                _editorMultiDragAnchorTick = snappedTick;
+                _editorMultiDragAnchorTrack = trackIndex;
+                // Force the first update through even if the pointer remains
+                // in its initial snap cell, so any existing off-grid notes are
+                // corrected to the actual grid when dragging starts.
+                _editorMultiDragLastTickDelta = int.MinValue;
+                _editorMultiDragLastTrackDelta = int.MinValue;
+            }
+        }
     }
 
     private void BeginEditorPanelsMarquee(Vector2 point, double currentTick, GearState currentState,
         int virtualWidth, int virtualHeight)
     {
+        _editorPanelsPendingSelectedMoveNote = null;
+        _editorPanelsPendingSelectedMoveDurationGrip = false;
+        _editorPanelsPendingSelectedMoveTouch = false;
+        _editorPanelsPendingSelectedMoveTrack = -1;
+        _editorPanelsPlacementPending = false;
+        _editorPanelsPendingPlacementTrack = -1;
+        _editorPanelsConnectorClickPending = false;
+        _editorPanelsPendingConnectorNote = null;
+        _editorPanelsPendingSelectNote = null;
         _editorPanelsMarqueeArmed = true;
         _editorPanelsMarqueeSelecting = false;
-        _editorPanelsMarqueeStart = point;
-        _editorPanelsMarqueeCurrent = point;
-        _editorPanelsMarqueeStartTick = GetEditorPanelsContinuousTickAtY(point.Y, currentTick, currentState);
+        var area = GetEditorPanelsTrackAreaBounds(virtualWidth, virtualHeight);
+        var clampedPoint = new Vector2(
+            Math.Clamp(point.X, area.Left, Math.Max(area.Left, area.Right - 1)),
+            Math.Clamp(point.Y, area.Top, Math.Max(area.Top, area.Bottom - 1)));
+        _editorPanelsMarqueeStart = clampedPoint;
+        _editorPanelsMarqueeCurrent = clampedPoint;
+        _editorPanelsMarqueeStartTick = GetEditorPanelsContinuousTickAtY(clampedPoint.Y, currentTick, currentState);
         _editorPanelsMarqueeCurrentTick = _editorPanelsMarqueeStartTick;
-        _editorPanelsMarqueeStartTrackCoord = GetEditorPanelsTrackCoordinateAtX(point.X, virtualWidth, virtualHeight);
+        _editorPanelsMarqueeStartTrackCoord = GetEditorPanelsTrackCoordinateAtX(clampedPoint.X, virtualWidth, virtualHeight);
         _editorPanelsMarqueeCurrentTrackCoord = _editorPanelsMarqueeStartTrackCoord;
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -758,13 +1030,42 @@ public sealed partial class Playfield
     {
         if (_chart is null || track is < 17 or > 20)
             return null;
-        return _chart.Events
-            .Where(ev => ev.Kind == "Note" && ev.RawType == 1 && ev.Track == track && ev.Attr is >= 101 and <= 108 &&
-                        ev.Tick <= tick && tick <= ev.EndTick)
-            .OrderBy(ev => ev.Tick == tick ? 0 : 1)
-            .ThenBy(ev => ev.Tick)
-            .ThenBy(ev => ev.EventIndex)
-            .FirstOrDefault();
+        var source = _chart.FindTrack(track)?.Events;
+        if (source is null)
+            return null;
+
+        ChartEvent? exact = null;
+        ChartEvent? covering = null;
+        foreach (var ev in source)
+        {
+            if (ev.Tick > tick)
+                break;
+            if (!IsEditorPanelAnimationEvent(ev))
+                continue;
+            if (tick > ev.EndTick)
+                continue;
+            if (ev.Tick == tick)
+            {
+                if (exact is null || ev.EventIndex < exact.EventIndex)
+                    exact = ev;
+            }
+            else if (covering is null || ev.Tick < covering.Tick ||
+                     (ev.Tick == covering.Tick && ev.EventIndex < covering.EventIndex))
+            {
+                covering = ev;
+            }
+        }
+        return exact ?? covering;
+    }
+
+    // Placement only conflicts with another animation cue that starts at the
+    // exact same cell. A cue's duration body is still a valid location for a new
+    // animation event; selection hit-testing continues to use the full duration.
+    private ChartEvent? FindEditorPanelsNoteStartingAtGridCell(int tick, int track)
+    {
+        if (_chart is null || track is < 17 or > 20)
+            return null;
+        return _editorPanelEventsByCell.TryGetValue((tick, track), out var ev) ? ev : null;
     }
 
     private void HandleEditorPanelsConnectorSourceClick(ChartEvent clicked, bool additive)
@@ -879,27 +1180,148 @@ public sealed partial class Playfield
               (tooLong ? " Some notes exceeded the 65535-tick limit and were skipped." : "");
     }
 
+    private void ReplaceSelectedEditorPanelNotes()
+    {
+        if (!_chartEditorMode || _chart is null)
+        {
+            _statusMessage = "Open a chart in the Chart Editor before replacing animation notes.";
+            return;
+        }
+        if (_editorConnectorMode)
+        {
+            _statusMessage = "Choose an animation attribute before replacing. The connector tool cannot replace notes.";
+            return;
+        }
+        if (!_editorPlacementEnabled || _editorPanelsSelectedAttr is < 101 or > 108)
+        {
+            _statusMessage = "Arm an animation attribute (101–108), select one or more animation notes, then press REPLACE SELECTION.";
+            return;
+        }
+
+        var selected = GetSelectedEditorDurationSelection()
+            .Where(IsEditorPanelAnimationEvent)
+            .Distinct()
+            .OrderBy(ev => ev.Tick)
+            .ThenBy(ev => ev.Track)
+            .ThenBy(ev => ev.EventIndex)
+            .ToList();
+        if (selected.Count == 0)
+        {
+            _statusMessage = "Select one or more animation notes, arm an attribute, then press REPLACE SELECTION.";
+            return;
+        }
+
+        var selectedSet = selected.ToHashSet();
+        var duplicateTarget = selected
+            .GroupBy(ev => (ev.Tick, ev.Track))
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicateTarget is not null)
+        {
+            _statusMessage = $"Cannot replace animation notes: multiple selected notes occupy tick {duplicateTarget.Key.Tick}, track {duplicateTarget.Key.Track}.";
+            return;
+        }
+
+        foreach (var original in selected)
+        {
+            var conflict = _chart.Events.FirstOrDefault(ev => !selectedSet.Contains(ev) &&
+                ev.Kind == "Note" && ev.RawType == 1 && ev.Tick == original.Tick && ev.Track == original.Track);
+            if (conflict is not null)
+            {
+                _statusMessage = $"Cannot replace animation note: tick {original.Tick}, track {original.Track} is already occupied by another note.";
+                return;
+            }
+        }
+
+        var selectedAnchor = _selectedEventKey.HasValue
+            ? selected.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
+            : null;
+        var undoSnapshot = CaptureEditorChartSnapshot();
+        _ = DeleteEditorEvents(selectedSet);
+
+        var replacements = new Dictionary<ChartEvent, ChartEvent>();
+        foreach (var original in selected)
+        {
+            var track = _chart.FindTrack(original.Track);
+            if (track is null)
+            {
+                track = new ChartTrack { TrackIndex = original.Track };
+                _chart.Tracks.Add(track);
+            }
+
+            var duration = original.Duration;
+            var replacement = new ChartEvent
+            {
+                Tick = original.Tick,
+                Track = original.Track,
+                Attr = _editorPanelsSelectedAttr,
+                RawType = 1,
+                TypeIndex = -1,
+                Duration = duration,
+                NoteType = duration > 6 ? NoteType.SingleLong : NoteType.Single,
+                EventIndex = track.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1,
+                LinePair = -1,
+                TwinPairId = original.TwinPairId,
+                LoopReconstructed = original.LoopReconstructed,
+                LoopPhase = original.LoopPhase,
+                Kind = "Note",
+                Value = original.Value,
+                Instrument = original.Instrument,
+                Velocity = original.Velocity,
+                Pan = original.Pan,
+                NoteGroupId = original.NoteGroupId,
+                NoteGroupInstanceId = original.NoteGroupInstanceId,
+                NoteGroupMemberId = original.NoteGroupMemberId
+            };
+            track.Events.Add(replacement);
+            replacements[original] = replacement;
+        }
+
+        CommitEditorUndoSnapshot(undoSnapshot);
+        RefreshAfterEditorMutation();
+        ClearEditorMultiSelection();
+        foreach (var replacement in replacements.Values)
+            AddEditorMultiSelectedEvent(replacement);
+        var anchor = selectedAnchor is not null && replacements.TryGetValue(selectedAnchor, out var anchoredReplacement)
+            ? anchoredReplacement
+            : replacements.Values.First();
+        _selectedEventKey = KeyOf(anchor);
+        _selectedBeatTick = null;
+        _selectedBeatTrack = anchor.Track;
+        _editorSelectedLinkRoot = null;
+        _editorSelectedHoldEnd = false;
+        _editorSelectedGridCells.Clear();
+        _editorPanelsSelectedEmptyCell = null;
+        _editorTrack = anchor.Track;
+        _statusMessage = $"Replaced {replacements.Count} selected animation note(s) with attr {_editorPanelsSelectedAttr}; original durations preserved.";
+    }
+
     private void AddEditorPanelNote(int tick, int trackIndex)
     {
         if (!_chartEditorMode || !_editorPanelsViewEnabled || _chart is null || trackIndex is < 17 or > 20 ||
             _editorPanelsSelectedAttr is < 101 or > 108)
             return;
 
-        var occupied = FindEditorPanelsNoteAtGridCell(tick, trackIndex) is not null;
+        var occupied = FindEditorPanelsNoteStartingAtGridCell(tick, trackIndex) is not null;
         if (occupied)
         {
             _statusMessage = "A panel note already exists at that track and tick.";
             return;
         }
 
-        var undoSnapshot = CaptureEditorChartSnapshot();
         var track = _chart.FindTrack(trackIndex);
+        var trackAlreadyExisted = track is not null;
         if (track is null)
         {
             track = new ChartTrack { TrackIndex = trackIndex };
-            _chart.Tracks.Add(track);
+            var insertAt = _chart.Tracks.FindIndex(candidate => candidate.TrackIndex > trackIndex);
+            if (insertAt < 0) _chart.Tracks.Add(track);
+            else _chart.Tracks.Insert(insertAt, track);
         }
         var duration = Math.Max(6, _editorDuration);
+        if (!_editorPanelsNextEventIndexByTrack.TryGetValue(trackIndex, out var nextEventIndex))
+        {
+            nextEventIndex = track.Events.Select(item => item.EventIndex).DefaultIfEmpty(-1).Max() + 1;
+        }
         var ev = new ChartEvent
         {
             Tick = tick,
@@ -909,16 +1331,26 @@ public sealed partial class Playfield
             TypeIndex = -1,
             Duration = duration,
             NoteType = duration > 6 ? NoteType.SingleLong : NoteType.Single,
-            EventIndex = track.Events.Select(item => item.EventIndex).DefaultIfEmpty(-1).Max() + 1,
+            EventIndex = nextEventIndex,
             LinePair = -1,
             Kind = "Note",
             Instrument = 0,
             Velocity = 127,
             Pan = 64
         };
-        track.Events.Add(ev);
-        CommitEditorUndoSnapshot(undoSnapshot);
-        RefreshAfterEditorMutation();
+        var undoSnapshot = CaptureEditorPanelEventSnapshot(
+            trackIndex, track, ev, trackAlreadyExisted, eventPresent: false);
+        InsertEditorPanelEventIntoTrack(track, ev);
+        // The writer serializes from sorted Track.Events, not from this flattened
+        // lookup list. Appending avoids shifting every gameplay event in a large
+        // chart for each panel-note placement; FinalizeEvents rebuilds the sorted
+        // flattened list on save/load and on full editor refreshes.
+        _chart.Events.Add(ev);
+        _editorPanelsNextEventIndexByTrack[trackIndex] = nextEventIndex + 1;
+        _editorPanelEventsByKey[KeyOf(ev)] = ev;
+        _editorPanelEventsByCell[(tick, trackIndex)] = ev;
+        CommitEditorPanelEventUndoSnapshot(undoSnapshot);
+        RefreshAfterEditorPanelAnimationNoteAdded(ev);
         _selectedEventKey = KeyOf(ev);
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -926,6 +1358,40 @@ public sealed partial class Playfield
         ClearEditorMultiSelection();
         _editorSelectedHoldEnd = false;
         _statusMessage = $"Added panel animation attr {ev.Attr} at tick {tick}, track {trackIndex}.";
+    }
+
+    private static void InsertEditorPanelEventIntoTrack(ChartTrack track, ChartEvent ev)
+    {
+        var low = 0;
+        var high = track.Events.Count;
+        while (low < high)
+        {
+            var mid = low + ((high - low) >> 1);
+            var candidate = track.Events[mid];
+            var compare = candidate.Tick.CompareTo(ev.Tick);
+            if (compare == 0)
+                compare = candidate.EventIndex.CompareTo(ev.EventIndex);
+            if (compare <= 0) low = mid + 1;
+            else high = mid;
+        }
+        track.Events.Insert(low, ev);
+    }
+
+    private void RefreshAfterEditorPanelAnimationNoteAdded(ChartEvent ev)
+    {
+        if (_tempo is null)
+            return;
+
+        // Animation notes are auxiliary panel data and are intentionally absent
+        // from the gameplay render/link/score caches. Updating those chart-wide
+        // structures for every panel click caused a visible pause on large charts.
+        // Keep the dedicated lookup and Lua panel-track tables current instead.
+        _editorDiagnosticsDirty = true;
+        // Panel notes carry no gameplay group/link membership, so do not dirty the
+        // gameplay selection/group caches as a side effect of every placement.
+        _skinRuntime.AddPanelTrackEvent(ev, _tempo);
+        _pauseSkinRuntime.AddPanelTrackEvent(ev, _tempo);
+        _resultSkinRuntime.AddPanelTrackEvent(ev, _tempo);
     }
 
     private void UpdateEditorPanelsDrag(Vector2 point, double currentTick, GearState currentState,
@@ -1211,7 +1677,7 @@ public sealed partial class Playfield
         // it previews the shape without showing a specific animation attribute.
         if (_editorPanelsHoverValid && _editorPlacementEnabled &&
             _editorPanelsSelectedAttr is >= 101 and <= 108 &&
-            FindEditorPanelsNoteAtGridCell(_editorPanelsHoverTick, _editorPanelsHoverTrack) is null)
+            FindEditorPanelsNoteStartingAtGridCell(_editorPanelsHoverTick, _editorPanelsHoverTrack) is null)
         {
             var duration = Math.Max(6, _editorDuration);
             var preview = new ChartEvent

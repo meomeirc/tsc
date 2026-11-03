@@ -53,6 +53,14 @@ public sealed partial class Playfield
         public List<NoteGroupDefinition> NoteGroups { get; init; } = new();
         public List<NoteGroupInstance> NoteGroupInstances { get; init; } = new();
         public bool SelectionOnly { get; init; }
+        // A panel-note placement is a single-event add/remove. Store that delta
+        // instead of cloning the entire panel track for every placement.
+        public bool PanelEventOnly { get; init; }
+        public int PanelTrackIndex { get; init; } = -1;
+        public bool PanelTrackShouldExist { get; init; }
+        public ChartTrack? PanelTrack { get; init; }
+        public ChartEvent? PanelEvent { get; init; }
+        public bool PanelEventPresent { get; init; }
         public ChartEvent? SelectedEvent { get; init; }
         public int? SelectedBeatTick { get; init; }
         public int? SelectedBeatTrack { get; init; }
@@ -241,18 +249,63 @@ public sealed partial class Playfield
         };
     }
 
+    private EditorChartSnapshot? CaptureEditorPanelEventSnapshot(
+        int trackIndex, ChartTrack track, ChartEvent panelEvent,
+        bool trackShouldExist, bool eventPresent)
+    {
+        if (_chart is null || trackIndex is < 17 or > 20)
+            return null;
+
+        return new EditorChartSnapshot
+        {
+            SourceChart = _chart,
+            PanelEventOnly = true,
+            PanelTrackIndex = trackIndex,
+            PanelTrackShouldExist = trackShouldExist,
+            PanelTrack = track,
+            PanelEvent = panelEvent,
+            PanelEventPresent = eventPresent,
+            SelectedEvent = TryGetEditorEvent(_selectedEventKey),
+            SelectedBeatTick = _selectedBeatTick,
+            SelectedBeatTrack = _selectedBeatTrack,
+            SelectedTempoEvent = _editorSelectedTempoEvent,
+            SelectedLinkRoot = _editorSelectedLinkRoot,
+            SelectedHoldEnd = _editorSelectedHoldEnd,
+            MultiSelectedEvents = _editorMultiSelectedEvents.ToList(),
+            SelectedGridCells = _editorSelectedGridCells.ToList(),
+            PanelsSelectedEmptyCell = _editorPanelsSelectedEmptyCell,
+            SelectReferenceLineTick = _editorSelectReferenceLineTick,
+            SelectReferenceTickOverride = _editorSelectReferenceTickOverride
+        };
+    }
+
+    private EditorChartSnapshot? CaptureCurrentEditorPanelEventSnapshot(EditorChartSnapshot snapshot)
+    {
+        if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart) ||
+            snapshot.PanelTrack is null || snapshot.PanelEvent is null)
+            return null;
+
+        var currentTrack = _chart.FindTrack(snapshot.PanelTrackIndex);
+        var trackShouldExist = ReferenceEquals(currentTrack, snapshot.PanelTrack);
+        var eventPresent = trackShouldExist && currentTrack!.Events.Any(ev => ReferenceEquals(ev, snapshot.PanelEvent));
+        return CaptureEditorPanelEventSnapshot(snapshot.PanelTrackIndex, snapshot.PanelTrack,
+            snapshot.PanelEvent, trackShouldExist, eventPresent);
+    }
+
     private ChartEvent? TryGetEditorEvent(ChartEventKey? key)
     {
         if (!key.HasValue)
             return null;
-        return _eventsByKey.TryGetValue(key.Value, out var ev) ? ev : null;
+        if (_eventsByKey.TryGetValue(key.Value, out var gameplayEvent))
+            return gameplayEvent;
+        return _editorPanelEventsByKey.TryGetValue(key.Value, out var panelEvent) ? panelEvent : null;
     }
 
     private bool IsEditorEventInCurrentChart(ChartEvent? ev)
     {
         if (ev is null || _chart is null)
             return false;
-        return _eventsByKey.TryGetValue(KeyOf(ev), out var current) && ReferenceEquals(current, ev);
+        return ReferenceEquals(TryGetEditorEvent(KeyOf(ev)), ev);
     }
 
     private static List<NoteGroupDefinition> CloneEditorNoteGroups(IEnumerable<NoteGroupDefinition> groups)
@@ -283,6 +336,19 @@ public sealed partial class Playfield
     {
         if (snapshot.SelectionOnly)
             return _chart is not null && ReferenceEquals(_chart, snapshot.SourceChart);
+
+        if (snapshot.PanelEventOnly)
+        {
+            if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart) ||
+                snapshot.PanelTrack is null || snapshot.PanelEvent is null)
+                return false;
+            var currentTrack = _chart.FindTrack(snapshot.PanelTrackIndex);
+            var trackExists = ReferenceEquals(currentTrack, snapshot.PanelTrack);
+            if (trackExists != snapshot.PanelTrackShouldExist)
+                return false;
+            var eventPresent = trackExists && currentTrack!.Events.Any(ev => ReferenceEquals(ev, snapshot.PanelEvent));
+            return eventPresent == snapshot.PanelEventPresent;
+        }
 
         if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart) || _chart.MetadataBpm != snapshot.MetadataBpm || _chart.InitialTempo != snapshot.InitialTempo ||
             _chart.PlayTick != snapshot.PlayTick || _chart.PlayTime != snapshot.PlayTime || _chart.AudioOriginTick != snapshot.AudioOriginTick ||
@@ -412,6 +478,14 @@ public sealed partial class Playfield
         _editorRedoStack.Clear();
     }
 
+    private void CommitEditorPanelEventUndoSnapshot(EditorChartSnapshot? snapshot)
+    {
+        // Panel animation placement changes one auxiliary event only. Keep this
+        // O(1) undo record instead of copying a potentially large panel track.
+        if (snapshot is not null)
+            PushEditorUndoSnapshot(snapshot);
+    }
+
     private void RestoreEditorChartSnapshot(EditorChartSnapshot snapshot)
     {
         if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart))
@@ -420,6 +494,74 @@ public sealed partial class Playfield
         if (snapshot.SelectionOnly)
         {
             RestoreEditorSelectionSnapshot(snapshot);
+            return;
+        }
+
+        if (snapshot.PanelEventOnly)
+        {
+            if (snapshot.PanelTrack is null || snapshot.PanelEvent is null)
+                return;
+
+            var currentTrack = _chart.FindTrack(snapshot.PanelTrackIndex);
+            if (snapshot.PanelTrackShouldExist)
+            {
+                if (currentTrack is not null && !ReferenceEquals(currentTrack, snapshot.PanelTrack))
+                    _chart.Tracks.Remove(currentTrack);
+                if (!_chart.Tracks.Contains(snapshot.PanelTrack))
+                {
+                    var insertAt = _chart.Tracks.FindIndex(track => track.TrackIndex > snapshot.PanelTrackIndex);
+                    if (insertAt < 0) _chart.Tracks.Add(snapshot.PanelTrack);
+                    else _chart.Tracks.Insert(insertAt, snapshot.PanelTrack);
+                }
+
+                var eventIndex = snapshot.PanelTrack.Events.FindIndex(ev => ReferenceEquals(ev, snapshot.PanelEvent));
+                if (snapshot.PanelEventPresent && eventIndex < 0)
+                    InsertEditorPanelEventIntoTrack(snapshot.PanelTrack, snapshot.PanelEvent);
+                else if (!snapshot.PanelEventPresent && eventIndex >= 0)
+                    snapshot.PanelTrack.Events.RemoveAt(eventIndex);
+            }
+            else if (currentTrack is not null)
+            {
+                // The pre-placement state had no track at this index. Remove
+                // whichever instance currently occupies it before rebuilding caches.
+                _chart.Tracks.Remove(currentTrack);
+            }
+
+            if (snapshot.PanelEventPresent)
+            {
+                if (!_chart.Events.Any(ev => ReferenceEquals(ev, snapshot.PanelEvent)))
+                    _chart.Events.Add(snapshot.PanelEvent);
+            }
+            else
+            {
+                _chart.Events.RemoveAll(ev => ReferenceEquals(ev, snapshot.PanelEvent));
+            }
+
+            _selectedEventKey = snapshot.SelectedEvent is not null ? KeyOf(snapshot.SelectedEvent) : null;
+            _selectedBeatTick = snapshot.SelectedBeatTick;
+            _selectedBeatTrack = snapshot.SelectedBeatTrack;
+            _editorSelectedTempoEvent = snapshot.SelectedTempoEvent;
+            _editorSelectedLinkRoot = snapshot.SelectedLinkRoot;
+            _editorSelectedHoldEnd = snapshot.SelectedHoldEnd;
+            ClearEditorMultiSelection();
+            foreach (var selected in snapshot.MultiSelectedEvents)
+                AddEditorMultiSelectedEvent(selected);
+            _editorSelectedGridCells.Clear();
+            foreach (var cell in snapshot.SelectedGridCells)
+                _editorSelectedGridCells.Add(cell);
+            _editorPanelsSelectedEmptyCell = snapshot.PanelsSelectedEmptyCell;
+            _editorSelectReferenceLineTick = snapshot.SelectReferenceLineTick;
+            _editorSelectReferenceTickOverride = snapshot.SelectReferenceTickOverride;
+            ClearEditorPendingRectangleUndoSnapshot();
+            _editorSelectionPendingUndoSnapshot = null;
+            _editorRectSelectionArmed = false;
+            _editorRectSelecting = false;
+            _editorDraggedEvent = null;
+            _editorDragUndoSnapshot = null;
+            _editorDragIsHoldEnd = false;
+            _editorDragChanged = false;
+            RefreshAfterEditorMutation();
+            StoreActiveEditorDifficulty();
             return;
         }
 
@@ -554,7 +696,9 @@ public sealed partial class Playfield
         }
 
         var previous = _editorUndoStack[^1];
-        var current = CaptureEditorChartSnapshot(selectionOnly: previous.SelectionOnly);
+        var current = previous.PanelEventOnly
+            ? CaptureCurrentEditorPanelEventSnapshot(previous)
+            : CaptureEditorChartSnapshot(selectionOnly: previous.SelectionOnly);
         _editorUndoStack.RemoveAt(_editorUndoStack.Count - 1);
         if (current is not null)
             _editorRedoStack.Add(current);
@@ -573,7 +717,9 @@ public sealed partial class Playfield
         }
 
         var next = _editorRedoStack[^1];
-        var current = CaptureEditorChartSnapshot(selectionOnly: next.SelectionOnly);
+        var current = next.PanelEventOnly
+            ? CaptureCurrentEditorPanelEventSnapshot(next)
+            : CaptureEditorChartSnapshot(selectionOnly: next.SelectionOnly);
         _editorRedoStack.RemoveAt(_editorRedoStack.Count - 1);
         if (current is not null)
             _editorUndoStack.Add(current);
@@ -592,7 +738,7 @@ public sealed partial class Playfield
             .Where(ev => IsEditorEventInCurrentChart(ev) && ev.Kind == "Note" && ev.RawType == 1)
             .ToHashSet();
         if (selected.Count == 0 && _selectedEventKey.HasValue &&
-            _eventsByKey.TryGetValue(_selectedEventKey.Value, out var single) &&
+            TryGetEditorEvent(_selectedEventKey) is { } single &&
             single.Kind == "Note" && single.RawType == 1)
         {
             selected.Add(single);
@@ -620,8 +766,71 @@ public sealed partial class Playfield
             : selected.OrderBy(ev => ev.Tick).ToList();
     }
 
+    private void CopySelectedEditorPanelNotes()
+    {
+        var notes = GetSelectedEditorNotes(expandLinkFamilies: false)
+            .Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
+                        ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108)
+            .Distinct()
+            .OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).ThenBy(ev => ev.EventIndex)
+            .ToList();
+        if (notes.Count == 0)
+        {
+            _statusMessage = "Select one or more animation notes to copy.";
+            return;
+        }
+
+        // Panel animation cues are independent timeline events, not gameplay
+        // note-group members or Link chains. Copy their exact four-track layout
+        // and durations without passing them through gameplay group expansion.
+        var anchorTick = notes.Min(ev => ev.Tick);
+        var anchorTrack = notes.Min(ev => ev.Track);
+        var selectedAnchor = _selectedEventKey.HasValue
+            ? notes.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
+            : null;
+        selectedAnchor ??= notes[0];
+        _editorClipboardAnchorTickOffset = selectedAnchor.Tick - anchorTick;
+        _editorClipboardAnchorTrackOffset = selectedAnchor.Track - anchorTrack;
+
+        _editorClipboard.Clear();
+        _editorClipboardGroupSources.Clear();
+        _editorClipboardGroupSourceInstance = null;
+        _editorClipboardIsNoteGroupInstance = false;
+        foreach (var note in notes)
+        {
+            _editorClipboard.Add(new EditorClipboardEntry(
+                note.Tick - anchorTick,
+                note.Track - anchorTrack,
+                note.Track - anchorTrack,
+                note.Track,
+                note.Attr,
+                Math.Max(1, note.Duration),
+                note.Instrument,
+                note.Velocity,
+                note.Pan,
+                note.NoteType,
+                -1,
+                -1,
+                false,
+                null,
+                null,
+                null,
+                null,
+                null,
+                note));
+        }
+
+        _statusMessage = $"Copied {notes.Count} animation note(s).";
+    }
+
     private void CopySelectedEditorNotes()
     {
+        if (_editorPanelsViewEnabled)
+        {
+            CopySelectedEditorPanelNotes();
+            return;
+        }
+
         // Group instances are copied as complete logical patterns, even when the
         // current selection contains only one member or several different groups.
         // The definition/instance snapshots also make CUT independent of whether
@@ -870,10 +1079,11 @@ public sealed partial class Playfield
 
         var routeTimeline = new GearTimeline(_chart);
         var clipboardEntries = _editorClipboard.ToList();
-        var clipboardContainsPanelEvents = clipboardEntries.Any(entry => entry.Attr is >= 101 and <= 108);
+        var clipboardContainsPanelEvents = clipboardEntries.Any(entry =>
+            entry.OriginalTrack is >= 17 and <= 20 || entry.Attr is >= 101 and <= 108);
         var clipboardIsPanelOnly = clipboardEntries.All(entry =>
-            entry.Attr is >= 101 and <= 108 &&
-            (entry.NoteType is NoteType.Single or NoteType.SingleLong));
+            entry.OriginalTrack is >= 17 and <= 20 && entry.Attr is >= 101 and <= 108);
+        var isPanelAnimationPaste = _editorPanelsViewEnabled && clipboardIsPanelOnly;
         if (_editorPanelsViewEnabled && !clipboardIsPanelOnly)
         {
             _statusMessage = "Paste cancelled: Panels view accepts only animation events with attrs 101–108. Copy them in Panels view first.";
@@ -900,8 +1110,9 @@ public sealed partial class Playfield
         var defaultAnchorTick = selectedClipboardGroupInstance
             ? GetEditorClipboardGroupPatternEndTick(snap)
             : selected is not null ? selected.Tick + snap : currentTick;
-        var targetAnchorTick = _selectedBeatTick ?? defaultAnchorTick;
-        var targetAnchorTrack = _selectedBeatTrack ?? selected?.Track ?? _editorTrack;
+        var panelDestination = _editorPanelsViewEnabled ? _editorPanelsSelectedEmptyCell : null;
+        var targetAnchorTick = panelDestination?.Tick ?? _selectedBeatTick ?? defaultAnchorTick;
+        var targetAnchorTrack = panelDestination?.Track ?? _selectedBeatTrack ?? selected?.Track ?? _editorTrack;
         // A pasted group's bottom anchor is its earliest note tick. The target
         // cell is where that bottom-most note belongs; later notes retain their
         // original offsets above it. Do not use the last note/end of a hold here,
@@ -1241,7 +1452,7 @@ public sealed partial class Playfield
                         return true;
                     var targetTrack = targetTracks[item.index];
                     if (_editorPanelsViewEnabled)
-                        return FindEditorPanelsNoteAtGridCell((int)targetTick, targetTrack) is not null;
+                        return FindEditorPanelsNoteStartingAtGridCell((int)targetTick, targetTrack) is not null;
                     if (!fitGameplayToBank && item.entry.IsSuperFlick &&
                         HasSuperFlickBankCollision((int)targetTick, targetTrack))
                         return true;
@@ -1316,7 +1527,11 @@ public sealed partial class Playfield
 
         // Allocate chain pairs first so an orphaned copied LinkTail (which must
         // become an ordinary note) is also moved off a restricted 1K outer lane.
-        for (var pass = 0; pass < 3; pass++)
+        // Tracks 17–20 are panel-animation lanes, not gameplay lanes in
+        // GearState. They must not pass through the 1K LinkTail lane validator:
+        // that validator treats every non-gameplay track as an invalid outer
+        // lane and rejects otherwise valid panel pastes.
+        for (var pass = 0; !isPanelAnimationPaste && pass < 3; pass++)
         {
             if (!FindCollisionFreeTickBase())
                 return;
@@ -1384,7 +1599,7 @@ public sealed partial class Playfield
                 : entry.NoteType is NoteType.LinkHead or NoteType.LinkTail
                     ? entry.Duration > 6 ? NoteType.SingleLong : NoteType.Single
                     : entry.NoteType;
-            if (!IsEditorTrackAllowedForNoteType(targetTracks[i], effectiveType))
+            if (!isPanelAnimationPaste && !IsEditorTrackAllowedForNoteType(targetTracks[i], effectiveType))
             {
                 _statusMessage = fitGameplayToBank
                     ? "PASTE FIT cancelled: a note would land on a restricted 1K outer lane."
@@ -1664,6 +1879,8 @@ public sealed partial class Playfield
         CommitEditorUndoSnapshot(snapshot);
         RefreshAfterEditorMutation();
         ClearEditorMultiSelection();
+        _editorSelectedGridCells.Clear();
+        _editorPanelsSelectedEmptyCell = null;
         foreach (var ev in pasted)
             AddEditorMultiSelectedEvent(ev);
         _selectedEventKey = KeyOf(pasted[0]);

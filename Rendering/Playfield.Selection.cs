@@ -689,23 +689,38 @@ public sealed partial class Playfield
         var pointerPixel = new Microsoft.Xna.Framework.Point((int)MathF.Round(point.X), (int)MathF.Round(point.Y));
         var editorLuaUiActive = _chartEditorMode && _chartEditorInterfaceRuntime.IsLoaded &&
                                 _chartEditorInterfaceRuntime.LastError is null;
+        // Once a gesture belongs to the chart canvas, keep pointer ownership there
+        // until release. Lua buttons/sliders may still show hover, but they must not
+        // capture or interrupt a note drag, marquee, SELECT line, or timeline scrub.
+        var editorCanvasGestureActive = _chartEditorMode &&
+            (_editorRectSelectionArmed || _editorRectSelecting || _editorDraggedEvent is not null ||
+             _editorPanelsMarqueeArmed || _editorPanelsMarqueeSelecting || _editorPanelUsingSharedDrag ||
+             _editorTimelineScrubbing || _editorSelectLineDragging);
         if (editorLuaUiActive)
         {
-            UpdateChartEditorInterfacePointer(point, leftDown || touchActive);
-            if (leftPressed || touchPressed)
+            if (editorCanvasGestureActive)
             {
-                var hitLuaControl = _chartEditorInterfaceRuntime.HandleUiPointerPressed(point.X, point.Y);
-                var action = _chartEditorInterfaceRuntime.ConsumeUiAction();
-                if (hitLuaControl)
+                // Clear any stale UI capture while retaining live hover feedback.
+                _chartEditorInterfaceRuntime.UpdateUiPointer(point.X, point.Y, leftDown: false);
+            }
+            else
+            {
+                UpdateChartEditorInterfacePointer(point, leftDown || touchActive);
+                if (leftPressed || touchPressed)
                 {
-                    DispatchChartEditorInterfaceAction(action, virtualWidth, virtualHeight);
+                    var hitLuaControl = _chartEditorInterfaceRuntime.HandleUiPointerPressed(point.X, point.Y);
+                    var action = _chartEditorInterfaceRuntime.ConsumeUiAction();
+                    if (hitLuaControl)
+                    {
+                        DispatchChartEditorInterfaceAction(action, virtualWidth, virtualHeight);
+                        return;
+                    }
+                }
+                else if (leftDown && _chartEditorInterfaceRuntime.HandleUiPointerDrag(point.X, point.Y))
+                {
+                    DispatchChartEditorInterfaceAction(_chartEditorInterfaceRuntime.ConsumeUiAction(), virtualWidth, virtualHeight);
                     return;
                 }
-            }
-            else if (leftDown && _chartEditorInterfaceRuntime.HandleUiPointerDrag(point.X, point.Y))
-            {
-                DispatchChartEditorInterfaceAction(_chartEditorInterfaceRuntime.ConsumeUiAction(), virtualWidth, virtualHeight);
-                return;
             }
         }
 
@@ -882,14 +897,19 @@ public sealed partial class Playfield
         // or connector target can be cancelled without creating an undo step.
         if (_chartEditorMode && _editorRectSelecting)
         {
-            UpdateEditorRectangleEndpoint(point, currentTick, currentState, updatePointer: !pointerOverToolbar);
-            if (!leftDown)
+            // Once a drag gesture has started, keep capturing the pointer even
+            // when it passes over toolbar buttons. Toolbar controls only get a
+            // chance to handle the initial press; hovering them must not pause a
+            // chart-space selection gesture.
+            UpdateEditorRectangleEndpoint(point, currentTick, currentState, updatePointer: true);
+            if (!leftDown && !touchActive)
                 FinishEditorRectangleSelection(currentTick, currentState);
             return;
         }
-        if (_chartEditorMode && _editorRectSelectionArmed && !touchInputThisFrame)
+        if (_chartEditorMode && _editorRectSelectionArmed)
         {
-            if (leftDown && !pointerOverToolbar && Vector2.DistanceSquared(point, _editorRectStart) >= 36f)
+            var rectanglePointerHeld = leftDown || touchActive;
+            if (rectanglePointerHeld && Vector2.DistanceSquared(point, _editorRectStart) >= 36f)
             {
                 if (_editorPendingRectangleUndoSnapshot is not null)
                     RestoreEditorChartSnapshot(_editorPendingRectangleUndoSnapshot);
@@ -911,7 +931,7 @@ public sealed partial class Playfield
                 _statusMessage = "Selecting notes and empty grid cells…";
                 return;
             }
-            if (!leftDown)
+            if (!rectanglePointerHeld)
             {
                 var pendingSnapshot = _editorPendingRectangleUndoSnapshot;
                 var groupChangesAlreadySynchronized = _editorPendingRectangleGroupSynchronizationApplied;
@@ -932,7 +952,7 @@ public sealed partial class Playfield
             var dragHeld = _editorDragStartedByTouch ? touchActive : leftDown;
             if (dragHeld)
             {
-                if (!pointerOverToolbar && (touchMoved || mouseMoved || touchPressed))
+                if (touchMoved || mouseMoved || touchPressed)
                     UpdateEditorDrag(point, currentTick, currentState);
             }
             else
@@ -1038,6 +1058,29 @@ public sealed partial class Playfield
         }
         if (_chartEditorMode && TryHandleEditorBankIndicatorClick(point, virtualWidth, virtualHeight))
             return;
+
+        // A placement tool normally gets first chance at lane clicks, but an
+        // outside-lane press cannot place anything. Arm the canvas gesture before
+        // that tool path returns so dragging into the playfield still becomes a
+        // marquee selection even with a note or connector armed.
+        if (_chartEditorMode && !_editorPanelsViewEnabled && (leftPressed || touchPressed) &&
+            (_editorPlacementEnabled || _editorConnectorMode || _editorNoteGroupPlacementArmed) &&
+            _editorMenuSection is not (EditorMenuSection.Select or EditorMenuSection.Bpm or EditorMenuSection.Stutter) &&
+            !_editorPreviewMode &&
+            !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
+            FindClickedQuarterBeat(point, currentTick, currentState, out _) is null &&
+            FindClickedLinkHeadMarker(point, currentTick, currentState) is null &&
+            FindClickedHoldEnd(point, currentTick, currentState) is null &&
+            FindClickedNote(point, currentTick, currentState, out _) is null &&
+            FindClickedLinkChainBody(point, currentTick, currentState) is null &&
+            !_editorRectSelectionArmed && !_editorRectSelecting)
+        {
+            ArmEditorRectangleSelection(point, currentTick, currentState);
+            // This press began outside every lane/note hit target, so the armed
+            // tool has nothing to place or select. Let the canvas gesture own it
+            // immediately; the next frames will promote it to a marquee if moved.
+            return;
+        }
 
         // While SELECT is open, a click/drag on the projected lane places the
         // cyan X-range line. This is deliberately separate from ordinary note
@@ -1153,43 +1196,9 @@ public sealed partial class Playfield
             return;
         }
 
-        if (_chartEditorMode && !touchPressed && !pointerOverToolbar)
-        {
-            _editorDurationInputValuePending = false;
-            _editorRectSelectionArmed = true;
-            _editorRectStart = point;
-            _editorRectCurrent = point;
-            if (TryGetEditorFreeformAnchor(point, currentTick, currentState,
-                    out var rectangleStartTick, out var rectangleStartTrack, out var rectangleStartLaneX,
-                    out var rectangleStartSide, out var rectangleStartBank))
-            {
-                _editorRectStartTick = rectangleStartTick;
-                _editorRectStartTrack = rectangleStartTrack;
-                _editorRectStartLaneX = rectangleStartLaneX;
-                _editorRectStartSide = rectangleStartSide;
-                _editorRectStartBank = rectangleStartBank;
-                _editorRectCurrentTick = rectangleStartTick;
-                _editorRectCurrentTrack = rectangleStartTrack;
-                _editorRectCurrentLaneX = rectangleStartLaneX;
-                _editorRectCurrentSide = rectangleStartSide;
-                _editorRectCurrentBank = rectangleStartBank;
-            }
-            else
-            {
-                _editorRectStartTick = currentTick;
-                _editorRectStartTrack = Math.Clamp(_editorTrack, 0, 15);
-                _editorRectStartLaneX = _projection.LaneNormalizedX(_editorRectStartTrack);
-                var fallbackPosition = GearState.Position(_editorRectStartTrack);
-                _editorRectStartSide = fallbackPosition?.Side ?? "left";
-                _editorRectStartBank = fallbackPosition?.Bank ?? "Forward";
-                _editorRectCurrentTick = _editorRectStartTick;
-                _editorRectCurrentTrack = _editorRectStartTrack;
-                _editorRectCurrentLaneX = _editorRectStartLaneX;
-                _editorRectCurrentSide = _editorRectStartSide;
-                _editorRectCurrentBank = _editorRectStartBank;
-            }
-            ClearEditorPendingRectangleUndoSnapshot();
-        }
+        if (_chartEditorMode && !_editorPanelsViewEnabled &&
+            (leftPressed || touchPressed) && !_editorRectSelectionArmed && !_editorRectSelecting)
+            ArmEditorRectangleSelection(point, currentTick, currentState);
 
         if (_chartEditorMode && (_editorPlacementEnabled || _editorNoteGroupPlacementArmed))
         {
@@ -1658,7 +1667,7 @@ public sealed partial class Playfield
                 return true;
         }
         return _selectedEventKey.HasValue &&
-               _eventsByKey.TryGetValue(_selectedEventKey.Value, out var selected) &&
+               TryGetEditorEvent(_selectedEventKey) is { } selected &&
                selected.Kind == "Note" && selected.RawType == 1;
     }
 
@@ -1947,10 +1956,10 @@ public sealed partial class Playfield
             var width = Math.Min(desiredWidth, Math.Min(availableWidth, responsiveWidthCap));
             var attributeGap = (int)MathF.Round(4f * unit);
             // The panels toolbar contains its header, CONNECTOR, four rows of
-            // attributes, DURATION, and SELECT. Dock it directly above the
+            // attributes, DURATION, SELECT, and REPLACE SELECTION. Dock it above the
             // full-width bottom toolbar rather than against the window edge.
             var contentHeight = (int)MathF.Round(38f * unit) + attributeGap +
-                                7 * ((int)MathF.Round(32f * unit) + attributeGap);
+                                8 * ((int)MathF.Round(32f * unit) + attributeGap);
             var panelHeight = contentHeight + padding * 2;
             return new Rectangle(virtualWidth - margin - width - padding * 2,
                 Math.Max(margin, bottomStrip.Y - stripGap - panelHeight), width + padding * 2, panelHeight);
@@ -2070,9 +2079,9 @@ public sealed partial class Playfield
         var headerHeight = (int)MathF.Round(38f * unit);
         var gap = (int)MathF.Round(4f * unit);
         var buttonHeight = (int)MathF.Round(32f * unit);
-        // SELECT occupies the bottom row of the Panels toolbar, like the SELECT
-        // category at the bottom-right of the gameplay editor. Its handler opens
-        // the shared Y RANGE / X RANGE / APPLY SELECT menu, it is not a mode toggle.
+        // SELECT occupies the second-last row, immediately above REPLACE SELECTION.
+        // Its handler opens the shared Y RANGE / X RANGE / APPLY SELECT menu; it is
+        // not a mode toggle.
         var firstRowY = panel.Y + padding + headerHeight + gap;
         var rowStride = buttonHeight + gap;
         return new Rectangle(panel.X + padding, firstRowY + 6 * rowStride,
@@ -2090,6 +2099,20 @@ public sealed partial class Playfield
         var firstRowY = panel.Y + padding + headerHeight + gap;
         var rowStride = buttonHeight + gap;
         return new Rectangle(panel.X + padding, firstRowY + 5 * rowStride,
+            panel.Width - padding * 2, buttonHeight);
+    }
+
+    private Rectangle GetEditorPanelsReplaceButtonBounds(int virtualWidth, int virtualHeight)
+    {
+        var unit = _projection.ScalePixels(1f);
+        var panel = GetEditorTopStripPanelBounds(virtualWidth, virtualHeight);
+        var padding = (int)MathF.Round(5f * unit);
+        var headerHeight = (int)MathF.Round(38f * unit);
+        var gap = (int)MathF.Round(4f * unit);
+        var buttonHeight = (int)MathF.Round(32f * unit);
+        var firstRowY = panel.Y + padding + headerHeight + gap;
+        var rowStride = buttonHeight + gap;
+        return new Rectangle(panel.X + padding, firstRowY + 7 * rowStride,
             panel.Width - padding * 2, buttonHeight);
     }
 
@@ -2120,7 +2143,7 @@ public sealed partial class Playfield
         var contentWidth = panel.Width - padding * 2;
         var buttonWidth = (contentWidth - gap) / 2;
         var column = index % 2;
-        var row = 1 + index / 2; // CONNECTOR, four attribute rows, then SELECT at the bottom.
+        var row = 1 + index / 2; // CONNECTOR, then four attribute rows above DURATION/SELECT/REPLACE.
         return new Rectangle(contentX + column * (buttonWidth + gap),
             contentY + row * (buttonHeight + gap), buttonWidth, buttonHeight);
     }
@@ -4125,7 +4148,14 @@ public sealed partial class Playfield
     private bool HandleEditorToolKeybinds()
     {
         if (_editorPanelsViewEnabled)
+        {
+            if (KeybindSettings.IsPressed("editor_tool_replace_selection"))
+            {
+                ReplaceSelectedEditorNotes();
+                return true;
+            }
             return false;
+        }
         if (KeybindSettings.IsPressed("editor_tool_tap")) { SelectEditorTool(0); return true; }
         if (KeybindSettings.IsPressed("editor_tool_connector")) { SelectEditorTool(1); return true; }
         if (KeybindSettings.IsPressed("editor_tool_flick_left")) { SelectEditorTool(2); return true; }
@@ -4747,6 +4777,11 @@ public sealed partial class Playfield
                     HandleEditorMenuCategoryClick(4);
                     return true;
                 }
+                if (GetEditorPanelsReplaceButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
+                {
+                    ReplaceSelectedEditorNotes();
+                    return true;
+                }
                 if (GetEditorPanelsConnectorButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
                 {
                     ToggleEditorPanelsConnectorTool();
@@ -5092,6 +5127,11 @@ public sealed partial class Playfield
         if (!_chartEditorMode || _chart is null)
         {
             _statusMessage = "Open a chart in the Chart Editor before replacing notes.";
+            return;
+        }
+        if (_editorPanelsViewEnabled)
+        {
+            ReplaceSelectedEditorPanelNotes();
             return;
         }
         if (_editorConnectorMode)
@@ -5562,14 +5602,19 @@ public sealed partial class Playfield
         if (_chart is null)
             return selected;
 
+        bool IsEligibleForCurrentView(ChartEvent ev)
+            => _editorPanelsViewEnabled
+                ? IsEditorPanelAnimationEvent(ev)
+                : IsEditorDurationNoteEvent(ev);
+
         foreach (var ev in _editorMultiSelectedEvents)
-            if (IsEditorDurationNoteEvent(ev))
+            if (IsEligibleForCurrentView(ev))
                 selected.Add(ev);
 
         if (_selectedEventKey.HasValue)
         {
             var current = _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value);
-            if (current is not null && IsEditorDurationNoteEvent(current))
+            if (current is not null && IsEligibleForCurrentView(current))
                 selected.Add(current);
         }
 
@@ -9418,6 +9463,44 @@ public sealed partial class Playfield
                 track = 0;
         }
         return true;
+    }
+
+    private void ArmEditorRectangleSelection(Vector2 point, double currentTick, GearState currentState)
+    {
+        _editorDurationInputValuePending = false;
+        _editorRectSelectionArmed = true;
+        _editorRectStart = point;
+        _editorRectCurrent = point;
+        if (TryGetEditorFreeformAnchor(point, currentTick, currentState,
+                out var rectangleStartTick, out var rectangleStartTrack, out var rectangleStartLaneX,
+                out var rectangleStartSide, out var rectangleStartBank))
+        {
+            _editorRectStartTick = rectangleStartTick;
+            _editorRectStartTrack = rectangleStartTrack;
+            _editorRectStartLaneX = rectangleStartLaneX;
+            _editorRectStartSide = rectangleStartSide;
+            _editorRectStartBank = rectangleStartBank;
+            _editorRectCurrentTick = rectangleStartTick;
+            _editorRectCurrentTrack = rectangleStartTrack;
+            _editorRectCurrentLaneX = rectangleStartLaneX;
+            _editorRectCurrentSide = rectangleStartSide;
+            _editorRectCurrentBank = rectangleStartBank;
+        }
+        else
+        {
+            _editorRectStartTick = currentTick;
+            _editorRectStartTrack = Math.Clamp(_editorTrack, 0, 15);
+            _editorRectStartLaneX = _projection.LaneNormalizedX(_editorRectStartTrack);
+            var fallbackPosition = GearState.Position(_editorRectStartTrack);
+            _editorRectStartSide = fallbackPosition?.Side ?? "left";
+            _editorRectStartBank = fallbackPosition?.Bank ?? "Forward";
+            _editorRectCurrentTick = _editorRectStartTick;
+            _editorRectCurrentTrack = _editorRectStartTrack;
+            _editorRectCurrentLaneX = _editorRectStartLaneX;
+            _editorRectCurrentSide = _editorRectStartSide;
+            _editorRectCurrentBank = _editorRectStartBank;
+        }
+        ClearEditorPendingRectangleUndoSnapshot();
     }
 
     private void UpdateEditorRectangleEndpoint(Vector2 point, double currentTick, GearState currentState, bool updatePointer)

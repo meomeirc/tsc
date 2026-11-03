@@ -662,6 +662,7 @@ public sealed partial class Playfield
             ["panel_connector"] = EditorUiItem("panel_connector", "CONNECTOR", "editor.panel_connector", null, _editorConnectorMode),
             ["panel_select"] = EditorUiItem("panel_select", "SELECT", "editor.panel_select", null, _editorMenuSection == EditorMenuSection.Select),
             ["panel_duration"] = EditorUiItem("panel_duration", "DURATION", "editor.panel_duration", null, _editorMenuSection == EditorMenuSection.Duration),
+            ["panel_replace"] = EditorUiItem("panel_replace", "REPLACE SELECTION", "editor.panel_replace"),
             ["panel_attributes"] = panelAttributes,
             ["snap_options"] = snapOptions,
             ["metronome_options"] = metronomeOptions,
@@ -876,6 +877,8 @@ public sealed partial class Playfield
                 if (_editorMenuSection == EditorMenuSection.Duration) CloseEditorInterfaceMenu();
                 else OpenEditorDurationTool();
                 return true;
+            case "editor.panel_replace":
+                ReplaceSelectedEditorNotes(); return true;
             case "editor.menu.close":
                 CloseEditorInterfaceMenu(); return true;
             case "editor.snap":

@@ -415,7 +415,7 @@ local function drawToolbar(state, screenWidth, x, stripY, width, layer)
     local panelTabH = 32 * ACTIVE_SCALE
     local panelTabGap = 4 * ACTIVE_SCALE
     local stripH = isPanels
-        and (16 * ACTIVE_SCALE + panelTabH * 3 + panelTabGap * 2)
+        and (16 * ACTIVE_SCALE + panelTabH * 4 + panelTabGap * 3)
         or (pad * 2 + tabH * 5 + gap * 4)
     local tabs = state.tabs or {}
 
@@ -429,7 +429,7 @@ local function drawToolbar(state, screenWidth, x, stripY, width, layer)
                 { layer = (layer or 4) + 2, text_size = fontSize("body") })
         end
     else
-        local panelTabs = { state.panel_connector, state.panel_duration, state.panel_select }
+        local panelTabs = { state.panel_connector, state.panel_duration, state.panel_select, state.panel_replace }
         for index, item in ipairs(panelTabs) do
             button(item, x + pad, stripY + 8 * ACTIVE_SCALE + (index - 1) * (panelTabH + panelTabGap),
                 width - pad * 2, panelTabH,
@@ -1967,7 +1967,7 @@ function render()
     local leftPanelH = LAYOUT.bottom_action_height * scale + leftPadding * 2
     local leftPanelY = h - margin - leftPanelH
     local rightStripH = s.panels_view == true
-        and (16 + 32 * 3 + 4 * 2) * scale
+        and (16 + 32 * 4 + 4 * 3) * scale
         or (8 * 2 + 34 * 5 + 5 * 4) * scale
     local rightStripY = leftPanelY - LAYOUT.panel_gap * scale - rightStripH
     local actionWidth = math.min(LAYOUT.action_column_width * scale, w * 0.28)
