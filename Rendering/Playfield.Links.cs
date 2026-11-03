@@ -31,7 +31,12 @@ public sealed partial class Playfield
         if (interactive && runtime!.Completed)
             return;
 
-        var nodeList = interactive ? runtime!.ChainNodes : BuildHoldChain(root);
+        var isSplitPreview = !interactive &&
+            ReferenceEquals(_editorConnectorSplitPreviewRoot, root) &&
+            _editorConnectorSplitPreviewNodes is { Count: > 1 };
+        var nodeList = isSplitPreview
+            ? _editorConnectorSplitPreviewNodes!
+            : interactive ? runtime!.ChainNodes : BuildHoldChain(root);
         if (nodeList.Count < 2)
             return;
 
@@ -92,12 +97,20 @@ public sealed partial class Playfield
         {
             var head = nodeList[i];
             var tail = nodeList[i + 1];
-            if (!_nextLinkByHeadKey.TryGetValue(KeyOf(head), out var link))
-                continue;
-            if (!SameEvent(link.Head, head) || !SameEvent(link.Tail, tail))
-                continue;
-            if (!ShouldIncludeLink(link, currentState))
-                continue;
+            if (isSplitPreview)
+            {
+                if (!ShouldIncludeLink(new LinkSegment(head, tail), currentState))
+                    continue;
+            }
+            else
+            {
+                if (!_nextLinkByHeadKey.TryGetValue(KeyOf(head), out var link))
+                    continue;
+                if (!SameEvent(link.Head, head) || !SameEvent(link.Tail, tail))
+                    continue;
+                if (!ShouldIncludeLink(link, currentState))
+                    continue;
+            }
 
             var headSeconds = _tempo.TickToSeconds(head.Tick);
             var tailSeconds = _tempo.TickToSeconds(tail.Tick);
@@ -227,8 +240,10 @@ public sealed partial class Playfield
             if (node.NoteType != NoteType.LinkTail || node.Duration <= 6)
                 continue;
 
-            var hasOutgoingLink = _nextLinkByHeadKey.TryGetValue(KeyOf(node), out var outgoingLink) &&
-                                  SameEvent(outgoingLink.Head, node);
+            var hasOutgoingLink = isSplitPreview
+                ? nodeListIndex + 1 < nodeList.Count
+                : _nextLinkByHeadKey.TryGetValue(KeyOf(node), out var outgoingLink) &&
+                  SameEvent(outgoingLink.Head, node);
             if (hasOutgoingLink)
                 continue;
 
@@ -300,11 +315,18 @@ public sealed partial class Playfield
             if (node.Duration <= 6 || tailTexture is null)
                 continue;
 
-            if (!_nextLinkByHeadKey.TryGetValue(KeyOf(node), out var nextLink) ||
-                !SameEvent(nextLink.Head, node))
-                continue;
-
-            var connectedTail = nextLink.Tail;
+            ChartEvent connectedTail;
+            if (isSplitPreview)
+            {
+                connectedTail = nodeList[i + 1];
+            }
+            else
+            {
+                if (!_nextLinkByHeadKey.TryGetValue(KeyOf(node), out var nextLink) ||
+                    !SameEvent(nextLink.Head, node))
+                    continue;
+                connectedTail = nextLink.Tail;
+            }
             var connectedTailEndTick = connectedTail.Tick;
             // The source hold end-marker belongs to the connected LinkTail.
             // Reaching the authored LinkTail tick does not make it disappear by
@@ -346,7 +368,9 @@ public sealed partial class Playfield
         {
             var node = nodeList[i];
             var terminalNode = i == nodeList.Count - 1;
-            var bodyEndTick = GetLinkBodyEndTick(node, terminalNode);
+            var bodyEndTick = isSplitPreview && !terminalNode
+                ? nodeList[i + 1].Tick
+                : GetLinkBodyEndTick(node, terminalNode);
             var endpointNode = terminalNode ? node : nodeList[i + 1];
 
             if (interactive)
@@ -406,6 +430,66 @@ public sealed partial class Playfield
                 true,
                 currentTick,
                 (float)_projection.ScrollPixels(_tempo.TickToSeconds(terminalEndTick), _playSeconds));
+        }
+
+        if (isSplitPreview)
+        {
+            const float previewOpacity = 0.58f;
+            // The editor's 2D body pass is separate from the connector/head
+            // commands. Tint its vertices too so the complete rebuilt path reads
+            // as one ghost preview rather than showing opaque lane bodies.
+            for (var commandIndex = debugBody2DStart; commandIndex < bodyCommands.Count; commandIndex++)
+            {
+                var vertices = bodyCommands[commandIndex].Vertices;
+                for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+                {
+                    var vertex = vertices[vertexIndex];
+                    vertex.Color *= previewOpacity;
+                    vertices[vertexIndex] = vertex;
+                }
+            }
+            for (var commandIndex = debugBody3DStart; commandIndex < _body3DCommands.Count; commandIndex++)
+            {
+                var command = _body3DCommands[commandIndex];
+                if (command.Vertices is { } vertices)
+                {
+                    for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+                    {
+                        var vertex = vertices[vertexIndex];
+                        vertex.Color *= previewOpacity;
+                        vertices[vertexIndex] = vertex;
+                    }
+                }
+            }
+            for (var commandIndex = debugHead3DStart; commandIndex < _head3DCommands.Count; commandIndex++)
+            {
+                var command = _head3DCommands[commandIndex];
+                if (command.Vertices is { } vertices)
+                {
+                    for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+                    {
+                        var vertex = vertices[vertexIndex];
+                        vertex.Color *= previewOpacity;
+                        vertices[vertexIndex] = vertex;
+                    }
+                }
+            }
+            for (var commandIndex = debugHead2DStart; commandIndex < headCommands.Count; commandIndex++)
+            {
+                var command = headCommands[commandIndex];
+                headCommands[commandIndex] = command with
+                {
+                    Tint = (command.Tint ?? Color.White) * previewOpacity
+                };
+            }
+            for (var commandIndex = debugConnector2DStart; commandIndex < connectorCommands.Count; commandIndex++)
+            {
+                var command = connectorCommands[commandIndex];
+                connectorCommands[commandIndex] = command with
+                {
+                    Tint = (command.Tint ?? Color.White) * previewOpacity
+                };
+            }
         }
 
         if (_performanceDebugInstrumentFrame)

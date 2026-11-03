@@ -587,6 +587,22 @@ public sealed partial class Playfield
     private ChartEvent? _editorConnectorPreviewTargetHead;
     private ChartEvent? _editorConnectorPreviewSourceTap;
     private ChartEvent? _editorConnectorPreviewAbsorbedTargetBody;
+    private ChartEvent? _editorConnectorSplitPreviewRoot;
+    private List<ChartEvent>? _editorConnectorSplitPreviewNodes;
+    private AresChart? _editorConnectorSplitPreviewCacheChart;
+    private ChartEvent? _editorConnectorSplitPreviewCacheRoot;
+    private int _editorConnectorSplitPreviewCacheRootTick = int.MinValue;
+    private int _editorConnectorSplitPreviewCacheRootTrack = -1;
+    private int _editorConnectorSplitPreviewCacheRootEventIndex = -1;
+    private int _editorConnectorSplitPreviewCacheTick = int.MinValue;
+    private int _editorConnectorSplitPreviewCacheTrack = -1;
+    private bool _editorConnectorSplitPreviewCacheHorizontalFirst;
+    private bool _editorConnectorSplitPreviewCacheGroupEditMode;
+    private int? _editorConnectorSplitPreviewCacheGroupId;
+    private int? _editorConnectorSplitPreviewCacheInstanceId;
+    private bool _editorConnectorSplitPreviewCacheResolved;
+    private bool _editorConnectorSplitPreviewCacheValid;
+    private readonly List<ChartEvent> _editorConnectorSplitPreviewCacheNodes = new();
     private ChartEvent? _editorSelectedLinkRoot;
     private readonly record struct EditorMultiDragItem(
         ChartEvent Event, int Tick, int Track, int Duration, int EventIndex);
@@ -9181,6 +9197,222 @@ public sealed partial class Playfield
         return requestedRangeOccupied || (hasLinkTailAtStart && occupiedUntil == startTick);
     }
 
+    private bool TryCreateEditorConnectorSplitPath(
+        ChartEvent root,
+        int targetTick,
+        int targetTrack,
+        out List<ChartEvent> selectedNotes,
+        out ChartEvent virtualTap,
+        out string? error)
+    {
+        selectedNotes = new List<ChartEvent>();
+        virtualTap = null!;
+        error = null;
+        if (_chart is null || root.NoteType != NoteType.LinkHead)
+            return false;
+
+        var chainNodes = GetEditorLinkChainNodes(root);
+        if (chainNodes.Count < 2)
+            return false;
+        var terminalEndTick = chainNodes[^1].Duration > 6
+            ? chainNodes[^1].EndTick
+            : chainNodes[^1].Tick;
+        if (targetTick <= chainNodes[0].Tick || targetTick >= terminalEndTick)
+            return false;
+
+        var family = LinkBuilder.Family(root.Track);
+        if (family is null || !string.Equals(family, LinkBuilder.Family(targetTrack), StringComparison.Ordinal))
+        {
+            error = "A split point must stay within the link chain's track family.";
+            return true;
+        }
+        if (!IsEditorTrackAllowedForNoteType(targetTrack, NoteType.LinkTail))
+        {
+            error = "That lane cannot accept a link tail under the current track rules.";
+            return true;
+        }
+        if (FindEditorNoteAtGridCell(targetTick, targetTrack) is not null)
+        {
+            error = $"Cannot split the link: tick {targetTick}, track {targetTrack} is already occupied.";
+            return true;
+        }
+
+        var hasGroupIdentity = chainNodes.Any(node => node.NoteGroupId.HasValue ||
+            node.NoteGroupInstanceId.HasValue || node.NoteGroupMemberId.HasValue);
+        int? activeGroupId = null;
+        int? activeInstanceId = null;
+        if (hasGroupIdentity)
+        {
+            if (!_editorNoteGroupEditMode || _editorEditingNoteGroupId is not int editingGroupId ||
+                _editorEditingNoteGroupInstanceId is not int editingInstanceId ||
+                root.NoteGroupId != editingGroupId || root.NoteGroupInstanceId != editingInstanceId)
+            {
+                error = "Enter EDIT GROUP for this instance before splitting a grouped link.";
+                return true;
+            }
+
+            foreach (var candidate in chainNodes)
+            {
+                var isUngrouped = candidate.NoteGroupId is null && candidate.NoteGroupInstanceId is null &&
+                                  candidate.NoteGroupMemberId is null;
+                var isSameInstance = candidate.NoteGroupId == editingGroupId &&
+                                     candidate.NoteGroupInstanceId == editingInstanceId;
+                if (!isUngrouped && !isSameInstance)
+                {
+                    error = "Cannot split a link that crosses another group or group instance while EDIT GROUP is active.";
+                    return true;
+                }
+            }
+            activeGroupId = editingGroupId;
+            activeInstanceId = editingInstanceId;
+        }
+
+        var nextEventIndex = _chart.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1;
+        virtualTap = new ChartEvent
+        {
+            Tick = targetTick,
+            Track = targetTrack,
+            Attr = 0,
+            RawType = 1,
+            TypeIndex = -1,
+            Duration = 6,
+            NoteType = NoteType.Single,
+            EventIndex = nextEventIndex,
+            LinePair = -1,
+            TwinPairId = null,
+            NoteGroupId = activeGroupId,
+            NoteGroupInstanceId = activeInstanceId,
+            Kind = "Note",
+            Instrument = 0,
+            Velocity = 127,
+            Pan = 64
+        };
+        selectedNotes = chainNodes.Append(virtualTap).ToList();
+        return true;
+    }
+
+    private bool TryRebuildEditorLinkWithSplitPoint(ChartEvent root, int targetTick, int targetTrack)
+    {
+        if (!TryCreateEditorConnectorSplitPath(root, targetTick, targetTrack,
+                out var selectedNotes, out _, out var error))
+            return false;
+        if (error is not null)
+        {
+            _statusMessage = error;
+            return true;
+        }
+
+        // Use precisely the existing LINK Y or LINK X path builder, with the
+        // virtual tap inserted into the selected path. LINK Y keeps the new point
+        // at its authored tick; horizontal-first uses the existing LINK X rules.
+        if (KeybindSettings.IsModifierBindingDown("editor_connector_horizontal_first"))
+            LinkSelectedEditorNotesHorizontalFirst(selectedNotes);
+        else
+            LinkSelectedEditorNotes(selectedNotes);
+        return true;
+    }
+
+    private bool TryPrepareEditorConnectorSplitPreview()
+    {
+        _editorConnectorSplitPreviewRoot = null;
+        _editorConnectorSplitPreviewNodes = null;
+        if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
+            _chart is null || !_selectedEventKey.HasValue || !_hoverBeatTick.HasValue ||
+            !_hoverTrack.HasValue || _editorDraggedEvent is not null || _editorRectSelecting)
+            return false;
+
+        var selected = _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value);
+        if (selected is null || selected.NoteType is not (NoteType.LinkHead or NoteType.LinkTail))
+            return false;
+        var root = GetEditorLinkRoot(selected);
+        if (root is null || root.NoteType != NoteType.LinkHead)
+            return false;
+
+        var targetTick = Math.Max(0, _hoverBeatTick.Value);
+        var targetTrack = Math.Clamp(_hoverTrack.Value, 0, 15);
+        var horizontalFirst = KeybindSettings.IsModifierBindingDown("editor_connector_horizontal_first");
+        // Link-pair availability can inspect the full chart. Cache the result for
+        // this hovered cell so the preview does not rebuild the LINK Y/X plan on
+        // every frame while the pointer is stationary.
+        var cacheMatches = _editorConnectorSplitPreviewCacheResolved &&
+            ReferenceEquals(_editorConnectorSplitPreviewCacheChart, _chart) &&
+            ReferenceEquals(_editorConnectorSplitPreviewCacheRoot, root) &&
+            _editorConnectorSplitPreviewCacheRootTick == root.Tick &&
+            _editorConnectorSplitPreviewCacheRootTrack == root.Track &&
+            _editorConnectorSplitPreviewCacheRootEventIndex == root.EventIndex &&
+            _editorConnectorSplitPreviewCacheTick == targetTick &&
+            _editorConnectorSplitPreviewCacheTrack == targetTrack &&
+            _editorConnectorSplitPreviewCacheHorizontalFirst == horizontalFirst &&
+            _editorConnectorSplitPreviewCacheGroupEditMode == _editorNoteGroupEditMode &&
+            _editorConnectorSplitPreviewCacheGroupId == _editorEditingNoteGroupId &&
+            _editorConnectorSplitPreviewCacheInstanceId == _editorEditingNoteGroupInstanceId;
+
+        if (!cacheMatches)
+        {
+            _editorConnectorSplitPreviewCacheChart = _chart;
+            _editorConnectorSplitPreviewCacheRoot = root;
+            _editorConnectorSplitPreviewCacheRootTick = root.Tick;
+            _editorConnectorSplitPreviewCacheRootTrack = root.Track;
+            _editorConnectorSplitPreviewCacheRootEventIndex = root.EventIndex;
+            _editorConnectorSplitPreviewCacheTick = targetTick;
+            _editorConnectorSplitPreviewCacheTrack = targetTrack;
+            _editorConnectorSplitPreviewCacheHorizontalFirst = horizontalFirst;
+            _editorConnectorSplitPreviewCacheGroupEditMode = _editorNoteGroupEditMode;
+            _editorConnectorSplitPreviewCacheGroupId = _editorEditingNoteGroupId;
+            _editorConnectorSplitPreviewCacheInstanceId = _editorEditingNoteGroupInstanceId;
+            _editorConnectorSplitPreviewCacheResolved = true;
+            _editorConnectorSplitPreviewCacheValid = false;
+            _editorConnectorSplitPreviewCacheNodes.Clear();
+
+            if (TryCreateEditorConnectorSplitPath(root, targetTick, targetTrack,
+                    out var selectedNotes, out _, out var error) && error is null)
+            {
+                var priorStatus = _statusMessage;
+                try
+                {
+                    if (horizontalFirst)
+                        LinkSelectedEditorNotesHorizontalFirst(selectedNotes, _editorConnectorSplitPreviewCacheNodes);
+                    else
+                        LinkSelectedEditorNotes(selectedNotes, _editorConnectorSplitPreviewCacheNodes);
+                }
+                finally
+                {
+                    _statusMessage = priorStatus;
+                }
+
+                _editorConnectorSplitPreviewCacheValid =
+                    _editorConnectorSplitPreviewCacheNodes.Count > 1 &&
+                    _editorConnectorSplitPreviewCacheNodes[0].Tick == root.Tick &&
+                    _editorConnectorSplitPreviewCacheNodes[0].Track == root.Track;
+            }
+        }
+
+        if (!_editorConnectorSplitPreviewCacheValid)
+            return false;
+
+        _editorConnectorSplitPreviewRoot = root;
+        _editorConnectorSplitPreviewNodes = _editorConnectorSplitPreviewCacheNodes;
+        return true;
+    }
+
+    private void InvalidateEditorConnectorSplitPreviewCache()
+    {
+        _editorConnectorSplitPreviewCacheChart = null;
+        _editorConnectorSplitPreviewCacheRoot = null;
+        _editorConnectorSplitPreviewCacheRootTick = int.MinValue;
+        _editorConnectorSplitPreviewCacheRootTrack = -1;
+        _editorConnectorSplitPreviewCacheRootEventIndex = -1;
+        _editorConnectorSplitPreviewCacheTick = int.MinValue;
+        _editorConnectorSplitPreviewCacheTrack = -1;
+        _editorConnectorSplitPreviewCacheHorizontalFirst = false;
+        _editorConnectorSplitPreviewCacheGroupEditMode = false;
+        _editorConnectorSplitPreviewCacheGroupId = null;
+        _editorConnectorSplitPreviewCacheInstanceId = null;
+        _editorConnectorSplitPreviewCacheResolved = false;
+        _editorConnectorSplitPreviewCacheValid = false;
+        _editorConnectorSplitPreviewCacheNodes.Clear();
+    }
+
     private void AddEditorConnector(int targetTick, int targetTrack, ChartEvent? existingTarget = null)
     {
         if (!_chartEditorMode || _chart is null || _tempo is null || !_selectedEventKey.HasValue)
@@ -9197,10 +9429,17 @@ public sealed partial class Playfield
             return;
         }
 
+        // A click before the selected chain's terminal end is a split operation:
+        // feed the existing chain plus a virtual tap into LINK Y/X. A click at or
+        // after the terminal end retains the usual connector-extension behavior.
+        var selectedRoot = GetEditorLinkRoot(source);
+        if (existingTarget is null && selectedRoot is { NoteType: NoteType.LinkHead } &&
+            TryRebuildEditorLinkWithSplitPoint(selectedRoot, targetTick, targetTrack))
+            return;
+
         // A chain is one connector source. If any of its points was selected,
         // continue from its actual ending instead of forcing another click on the
         // final tail first.
-        var selectedRoot = GetEditorLinkRoot(source);
         if (selectedRoot is not null && selectedRoot.NoteType == NoteType.LinkHead)
         {
             source = GetEditorLinkChainEnd(source);
@@ -10061,6 +10300,7 @@ public sealed partial class Playfield
         if (_chart is null)
             return;
 
+        InvalidateEditorConnectorSplitPreviewCache();
         InvalidateEditorNoteGroupMarkerCache();
         InvalidateEditorSelectionRenderCache();
         _editorDiagnosticsDirty = true;

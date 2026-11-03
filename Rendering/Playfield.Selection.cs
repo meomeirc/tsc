@@ -6340,7 +6340,7 @@ public sealed partial class Playfield
         return track;
     }
 
-    private void LinkSelectedEditorNotes()
+    private void LinkSelectedEditorNotes(IReadOnlyCollection<ChartEvent>? selectedNotesOverride = null, List<ChartEvent>? previewNodesOut = null)
     {
         if (!_chartEditorMode || _chart is null)
         {
@@ -6349,7 +6349,9 @@ public sealed partial class Playfield
         }
 
         var routeTimeline = new GearTimeline(_chart);
-        var selected = GetSelectedEditorNotes(expandLinkFamilies: true, orderByTrack: false)
+        var selected = (selectedNotesOverride is null
+                ? GetSelectedEditorNotes(expandLinkFamilies: true, orderByTrack: false)
+                : selectedNotesOverride.ToList())
             .Where(IsEditorLinkableNote)
             .Distinct()
             .ToList();
@@ -6530,7 +6532,25 @@ public sealed partial class Playfield
             return;
         }
 
+        if (previewNodesOut is not null)
+        {
+            previewNodesOut.Clear();
+            foreach (var plan in plans.Where(plan => !plan.VerticalOnly))
+                AppendEditorLinkPreviewPoints(previewNodesOut, plan.Points, plan.Pair, plan.EndTick);
+            return;
+        }
+
         var undoSnapshot = CaptureEditorChartSnapshot();
+        // Connector split supplies a virtual tap as one of the path points. Add it
+        // only after capturing history so one Undo removes the complete rebuild.
+        foreach (var point in plans.SelectMany(plan => plan.Points).Distinct())
+        {
+            if (_chart.Events.Contains(point))
+                continue;
+            var destinationTrack = GetOrCreateEditorTrack(point.Track);
+            point.EventIndex = destinationTrack.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() + 1;
+            destinationTrack.Events.Add(point);
+        }
         ChartEvent? firstRoot = null;
         var absorbedEvents = plans.SelectMany(plan => plan.Absorbed).ToHashSet();
         foreach (var relocation in relocatedLinkPoints)
@@ -6665,6 +6685,29 @@ public sealed partial class Playfield
         _ => 4
     };
 
+    private static void AppendEditorLinkPreviewPoints(
+        List<ChartEvent> output,
+        IReadOnlyList<ChartEvent> points,
+        int pair,
+        int endTick)
+    {
+        for (var i = 0; i < points.Count; i++)
+        {
+            var point = points[i];
+            var nextTick = i + 1 < points.Count ? points[i + 1].Tick : endTick;
+            var preview = CloneEditorLinkNote(point, point.Tick, point.Track,
+                Math.Max(6, nextTick - point.Tick));
+            preview.EventIndex = point.EventIndex;
+            preview.NoteType = i == 0 ? NoteType.LinkHead : NoteType.LinkTail;
+            preview.Attr = i == 0 ? pair : pair + 1;
+            preview.LinePair = pair;
+            preview.TwinPairId = null;
+            // Preview points must keep the same stable event identity as their
+            // authored counterparts; the synthetic tap receives a unique identity.
+            output.Add(preview);
+        }
+    }
+
     private static ChartEvent CloneEditorLinkNote(ChartEvent source, int tick, int track, int duration)
         => new()
         {
@@ -6678,6 +6721,9 @@ public sealed partial class Playfield
             EventIndex = 0, // Assigned when added to the destination track.
             LinePair = -1,
             TwinPairId = null,
+            NoteGroupId = source.NoteGroupId,
+            NoteGroupInstanceId = source.NoteGroupInstanceId,
+            NoteGroupMemberId = source.NoteGroupMemberId,
             LoopReconstructed = source.LoopReconstructed,
             LoopPhase = source.LoopPhase,
             Kind = source.Kind,
@@ -6694,7 +6740,7 @@ public sealed partial class Playfield
     /// Longer paths retain a tail at each later lane-run endpoint so subsequent
     /// horizontal connections remain part of one link chain.
     /// </summary>
-    private void LinkSelectedEditorNotesHorizontalFirst()
+    private void LinkSelectedEditorNotesHorizontalFirst(IReadOnlyCollection<ChartEvent>? selectedNotesOverride = null, List<ChartEvent>? previewNodesOut = null)
     {
         if (!_chartEditorMode || _chart is null)
         {
@@ -6703,7 +6749,9 @@ public sealed partial class Playfield
         }
 
         var routeTimeline = new GearTimeline(_chart);
-        var selected = GetSelectedEditorNotes(expandLinkFamilies: true, orderByTrack: false)
+        var selected = (selectedNotesOverride is null
+                ? GetSelectedEditorNotes(expandLinkFamilies: true, orderByTrack: false)
+                : selectedNotesOverride.ToList())
             .Where(IsEditorLinkableNote)
             .Distinct()
             .ToList();
@@ -6906,6 +6954,14 @@ public sealed partial class Playfield
         if (plans.Count == 0)
         {
             _statusMessage = "Select notes from one track family to build a link path.";
+            return;
+        }
+
+        if (previewNodesOut is not null)
+        {
+            previewNodesOut.Clear();
+            foreach (var plan in plans.Where(plan => !plan.VerticalOnly))
+                AppendEditorLinkPreviewPoints(previewNodesOut, plan.Points, plan.Pair, plan.EndTick);
             return;
         }
 

@@ -171,6 +171,207 @@ internal static class LanGameResourceOpus
     }
 }
 
+
+internal static class LanEditorTestMetadataPacket
+{
+    public const int MaxImageBytes = 2 * 1024 * 1024;
+    private const int MaxTextBytes = 1024;
+    private const int HeaderBytes = 32;
+    private const int MaxPacketBytes = HeaderBytes + MaxTextBytes * 2 + MaxImageBytes;
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+
+    public static byte[] Encode(int songId, string title, string artist, double bpm, ReadOnlySpan<byte> image)
+    {
+        if (songId is not (9999991 or 9999992 or 9999993))
+            throw new InvalidDataException("Unknown Local Test song ID.");
+        var titleBytes = EncodeText(title, "title");
+        var artistBytes = EncodeText(artist, "artist");
+        if (!double.IsFinite(bpm) || bpm <= 0 || bpm > 1_000_000)
+            throw new InvalidDataException("Metadata BPM must be a positive finite number.");
+        ValidateImage(image);
+
+        var packet = new byte[checked(HeaderBytes + titleBytes.Length + artistBytes.Length + image.Length)];
+        "TSTMETA1"u8.CopyTo(packet);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(8, 4), (uint)songId);
+        BinaryPrimitives.WriteInt64LittleEndian(packet.AsSpan(12, 8), BitConverter.DoubleToInt64Bits(bpm));
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(20, 4), (uint)titleBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(24, 4), (uint)artistBytes.Length);
+        BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(28, 4), (uint)image.Length);
+        var offset = HeaderBytes;
+        titleBytes.CopyTo(packet, offset);
+        offset += titleBytes.Length;
+        artistBytes.CopyTo(packet, offset);
+        offset += artistBytes.Length;
+        image.CopyTo(packet.AsSpan(offset));
+        return packet;
+    }
+
+    public static void Validate(ReadOnlySpan<byte> packet)
+    {
+        if (packet.Length < HeaderBytes || packet.Length > MaxPacketBytes ||
+            !packet[..8].SequenceEqual("TSTMETA1"u8))
+            throw new InvalidDataException("Invalid live metadata packet header.");
+
+        var songId = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(8, 4));
+        var bpm = BitConverter.Int64BitsToDouble(BinaryPrimitives.ReadInt64LittleEndian(packet.Slice(12, 8)));
+        var titleLength = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(20, 4));
+        var artistLength = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(24, 4));
+        var imageLength = BinaryPrimitives.ReadUInt32LittleEndian(packet.Slice(28, 4));
+        if (songId is not (9999991u or 9999992u or 9999993u) ||
+            !double.IsFinite(bpm) || bpm <= 0 || bpm > 1_000_000 ||
+            titleLength is 0 or > MaxTextBytes || artistLength is 0 or > MaxTextBytes ||
+            imageLength is 0 or > MaxImageBytes ||
+            (ulong)HeaderBytes + titleLength + artistLength + imageLength != (ulong)packet.Length)
+            throw new InvalidDataException("Invalid live metadata packet fields.");
+
+        var titleStart = HeaderBytes;
+        var artistStart = checked(titleStart + (int)titleLength);
+        var imageStart = checked(artistStart + (int)artistLength);
+        ValidateText(packet.Slice(titleStart, (int)titleLength), "title");
+        ValidateText(packet.Slice(artistStart, (int)artistLength), "artist");
+        ValidateImage(packet.Slice(imageStart, (int)imageLength));
+    }
+
+    public static byte[] BindSongId(ReadOnlySpan<byte> packet, int songId)
+    {
+        if (songId is not (9999991 or 9999992 or 9999993))
+            throw new InvalidDataException("Unknown Local Test song ID.");
+        Validate(packet);
+        var result = packet.ToArray();
+        BinaryPrimitives.WriteUInt32LittleEndian(result.AsSpan(8, 4), (uint)songId);
+        return result;
+    }
+
+    private static byte[] EncodeText(string? value, string name)
+    {
+        if (string.IsNullOrWhiteSpace(value) || value.Any(character => character < 0x20 || character == 0x7f))
+            throw new InvalidDataException($"Metadata {name} must be nonempty and contain no control characters.");
+        try
+        {
+            var bytes = StrictUtf8.GetBytes(value);
+            if (bytes.Length > MaxTextBytes)
+                throw new InvalidDataException($"Metadata {name} exceeds 1024 UTF-8 bytes.");
+            return bytes;
+        }
+        catch (EncoderFallbackException ex)
+        {
+            throw new InvalidDataException($"Metadata {name} is not valid UTF-8 text.", ex);
+        }
+    }
+
+    private static void ValidateText(ReadOnlySpan<byte> bytes, string name)
+    {
+        string value;
+        try { value = StrictUtf8.GetString(bytes); }
+        catch (DecoderFallbackException ex)
+        {
+            throw new InvalidDataException($"Metadata {name} is not valid UTF-8 text.", ex);
+        }
+        if (string.IsNullOrWhiteSpace(value) || value.Any(character => character < 0x20 || character == 0x7f))
+            throw new InvalidDataException($"Metadata {name} must be nonempty and contain no control characters.");
+    }
+
+    private static void ValidateImage(ReadOnlySpan<byte> image)
+    {
+        if (image.Length is < 1 or > MaxImageBytes)
+            throw new InvalidDataException("Metadata cover must be between 1 byte and 2 MiB.");
+
+        int width;
+        int height;
+        if (image.Length >= 24 && image[..8].SequenceEqual(new byte[] { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a }) &&
+            image.Slice(12, 4).SequenceEqual("IHDR"u8))
+        {
+            var pngWidth = BinaryPrimitives.ReadUInt32BigEndian(image.Slice(16, 4));
+            var pngHeight = BinaryPrimitives.ReadUInt32BigEndian(image.Slice(20, 4));
+            if (pngWidth is 0 or > 2048 || pngHeight is 0 or > 2048)
+                throw new InvalidDataException("Metadata cover dimensions must not exceed 2048 × 2048.");
+            width = (int)pngWidth;
+            height = (int)pngHeight;
+        }
+        else if (image.Length >= 4 && image[0] == 0xff && image[1] == 0xd8)
+        {
+            (width, height) = ReadJpegDimensions(image);
+        }
+        else if (image.Length >= 30 && image[..4].SequenceEqual("RIFF"u8) && image.Slice(8, 4).SequenceEqual("WEBP"u8))
+        {
+            (width, height) = ReadWebpDimensions(image);
+        }
+        else
+        {
+            throw new InvalidDataException("Metadata cover must be PNG, JPEG or WebP.");
+        }
+
+        if (width is < 1 or > 2048 || height is < 1 or > 2048)
+            throw new InvalidDataException("Metadata cover dimensions must not exceed 2048 × 2048.");
+    }
+
+    private static (int Width, int Height) ReadJpegDimensions(ReadOnlySpan<byte> image)
+    {
+        var position = 2;
+        while (position + 4 <= image.Length)
+        {
+            if (image[position] != 0xff)
+                throw new InvalidDataException("Invalid JPEG marker sequence in metadata cover.");
+            while (position < image.Length && image[position] == 0xff)
+                position++;
+            if (position >= image.Length)
+                break;
+            var marker = image[position++];
+            if (marker is 0xd8 or 0xd9 or 0x01 or >= 0xd0 and <= 0xd7)
+                continue;
+            if (position + 2 > image.Length)
+                break;
+            var segmentLength = BinaryPrimitives.ReadUInt16BigEndian(image.Slice(position, 2));
+            if (segmentLength < 2 || position + segmentLength > image.Length)
+                throw new InvalidDataException("Truncated JPEG metadata cover.");
+            if (marker is 0xc0 or 0xc1 or 0xc2 or 0xc3 or 0xc5 or 0xc6 or 0xc7 or 0xc9 or 0xca or 0xcb or 0xcd or 0xce or 0xcf)
+            {
+                if (segmentLength < 7)
+                    throw new InvalidDataException("Invalid JPEG frame header in metadata cover.");
+                var height = BinaryPrimitives.ReadUInt16BigEndian(image.Slice(position + 3, 2));
+                var width = BinaryPrimitives.ReadUInt16BigEndian(image.Slice(position + 5, 2));
+                return (width, height);
+            }
+            if (marker == 0xda)
+                break;
+            position += segmentLength;
+        }
+        throw new InvalidDataException("Could not read JPEG dimensions from metadata cover.");
+    }
+
+    private static (int Width, int Height) ReadWebpDimensions(ReadOnlySpan<byte> image)
+    {
+        var chunk = image.Slice(12, 4);
+        if (chunk.SequenceEqual("VP8X"u8) && image.Length >= 30)
+        {
+            var width = 1 + ReadUInt24LittleEndian(image.Slice(24, 3));
+            var height = 1 + ReadUInt24LittleEndian(image.Slice(27, 3));
+            return (width, height);
+        }
+        if (chunk.SequenceEqual("VP8L"u8) && image.Length >= 25 && image[20] == 0x2f)
+        {
+            var b1 = image[21];
+            var b2 = image[22];
+            var b3 = image[23];
+            var b4 = image[24];
+            var width = 1 + b1 + ((b2 & 0x3f) << 8);
+            var height = 1 + (b2 >> 6) + (b3 << 2) + ((b4 & 0x0f) << 10);
+            return (width, height);
+        }
+        if (chunk.SequenceEqual("VP8 "u8) && image.Length >= 30 &&
+            image.Slice(23, 3).SequenceEqual(new byte[] { 0x9d, 0x01, 0x2a }))
+        {
+            var width = BinaryPrimitives.ReadUInt16LittleEndian(image.Slice(26, 2)) & 0x3fff;
+            var height = BinaryPrimitives.ReadUInt16LittleEndian(image.Slice(28, 2)) & 0x3fff;
+            return (width, height);
+        }
+        throw new InvalidDataException("Could not read WebP dimensions from metadata cover.");
+    }
+
+    private static int ReadUInt24LittleEndian(ReadOnlySpan<byte> value)
+        => value[0] | (value[1] << 8) | (value[2] << 16);
+}
+
 /// <summary>
 /// In-process implementation of the TST-EDITOR/1 LAN test service. It replaces the Python
 /// conversion/check/server subprocesses while preserving the phone-facing HTTP and UDP protocol.
@@ -181,6 +382,7 @@ internal sealed class LanEditorTestService : IDisposable
     private const int MaxMusicBytes = 100 * 1024 * 1024;
     private const int MaxChartBytes = 8 * 1024 * 1024;
     private const int MaxJudgmentsBytes = 1024 * 1024;
+    private const int MaxMetadataPacketBytes = 32 + 2 * 1024 + LanEditorTestMetadataPacket.MaxImageBytes;
     private const int MaxActiveClients = 32;
     private const int MaxActivePlays = 8;
     private const long PlayLifetimeMs = 120_000;
@@ -200,6 +402,7 @@ internal sealed class LanEditorTestService : IDisposable
     private static readonly Regex PlayIdPattern = new(@"\A[0-9a-f]{16}\z", RegexOptions.Compiled);
     private static readonly Regex NoncePattern = new(@"\A[0-9a-f]{32}\z", RegexOptions.Compiled);
     private static readonly Regex AvailabilityPathPattern = new(@"\A/tst-editor/v1/songs/(999999[123])/(easy|normal|hard|expert|sc)/availability\z", RegexOptions.Compiled);
+    private static readonly Regex MetadataPathPattern = new(@"\A/tst-editor/v1/songs/(999999[123])/metadata\z", RegexOptions.Compiled);
     private static readonly Regex ResourcePathPattern = new(@"\A/tst-editor/v1/songs/(999999[123])/(easy|normal|hard|expert|sc)/(chart\.ares|music\.opus)\z", RegexOptions.Compiled);
 
     private readonly object _sync = new();
@@ -518,7 +721,11 @@ internal sealed class LanEditorTestService : IDisposable
         }
         if (charts.Count == 0)
             throw new InvalidDataException("No easy/normal/hard/expert/sc .ares chart in chart directory: " + _chartDirectory);
-        return new SelectedFiles(music, charts, judgments);
+        var workspace = Directory.GetParent(_audioDirectory)?.FullName;
+        var metadataPath = workspace is not null ? Path.Combine(workspace, "metadata.bin") : null;
+        if (metadataPath is not null && !File.Exists(metadataPath))
+            metadataPath = null;
+        return new SelectedFiles(music, charts, judgments, metadataPath);
     }
 
     private static string GetIdentity(SelectedFiles selected)
@@ -529,6 +736,8 @@ internal sealed class LanEditorTestService : IDisposable
             AppendFileIdentity(builder, path);
         if (selected.JudgmentsPath is not null)
             AppendFileIdentity(builder, selected.JudgmentsPath);
+        if (selected.MetadataPath is not null)
+            AppendFileIdentity(builder, selected.MetadataPath);
         return builder.ToString();
     }
 
@@ -559,9 +768,23 @@ internal sealed class LanEditorTestService : IDisposable
         var judgments = selected.JudgmentsPath is null
             ? new Dictionary<string, JudgmentWindow>(StringComparer.Ordinal)
             : ReadJudgments(selected.JudgmentsPath);
+        byte[]? metadataPacket = null;
+        if (selected.MetadataPath is not null)
+        {
+            try
+            {
+                var candidate = ReadExport(selected.MetadataPath, MaxMetadataPacketBytes);
+                LanEditorTestMetadataPacket.Validate(candidate);
+                metadataPacket = candidate;
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
+            {
+                _log("Live difficulty-screen metadata unavailable: " + ex.Message);
+            }
+        }
         if (!string.Equals(GetIdentity(SelectFiles()), beforeIdentity, StringComparison.Ordinal))
             throw new InvalidDataException("Exports changed while reading; wait for the editor to finish.");
-        return new PreparedPackage(selected.MusicPath, beforeIdentity, music, charts, judgments);
+        return new PreparedPackage(selected.MusicPath, beforeIdentity, music, charts, judgments, metadataPacket);
     }
 
 
@@ -690,6 +913,19 @@ internal sealed class LanEditorTestService : IDisposable
             if (!IPAddress.IsLoopback(address) && !IsPrivateAddress(address))
             {
                 Reply(stream, 403, "Forbidden", "Private LAN access only", "text/plain; charset=utf-8");
+                return;
+            }
+
+            var metadataMatch = MetadataPathPattern.Match(path);
+            if (metadataMatch.Success)
+            {
+                if (release)
+                    throw new LanRequestException(404, "Unknown LAN resource");
+                if (rawQuery.Length != 0)
+                    throw new LanRequestException(400, "Metadata takes no query parameters");
+                var songId = int.Parse(metadataMatch.Groups[1].Value, CultureInfo.InvariantCulture);
+                var metadataPacket = GetMetadataPacket(songId);
+                Reply(stream, 200, "OK", metadataPacket, "application/octet-stream");
                 return;
             }
 
@@ -853,6 +1089,25 @@ internal sealed class LanEditorTestService : IDisposable
         _ => "Error"
     };
 
+    private byte[] GetMetadataPacket(int songId)
+    {
+        if (songId is not (9999991 or 9999992 or 9999993))
+            throw new LanRequestException(404, "Unknown Local Test song ID");
+        lock (_sync)
+        {
+            if (_current?.MetadataPacket is not { Length: > 0 } packet)
+                throw new LanRequestException(404, "Complete live metadata is unavailable");
+            try
+            {
+                return LanEditorTestMetadataPacket.BindSongId(packet, songId);
+            }
+            catch (InvalidDataException ex)
+            {
+                throw new LanRequestException(404, "Complete live metadata is unavailable: " + ex.Message);
+            }
+        }
+    }
+
     private ResourceResponse GetResource(string peer, string playId, int song, string difficulty, string resource)
     {
         if (song is not (9999991 or 9999992 or 9999993) || !Difficulties.Contains(difficulty, StringComparer.Ordinal) ||
@@ -996,13 +1251,14 @@ internal sealed class LanEditorTestService : IDisposable
     private static IPAddress NormalizeAddress(IPAddress address)
         => address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
 
-    private sealed record SelectedFiles(string MusicPath, Dictionary<string, string> ChartPaths, string? JudgmentsPath);
+    private sealed record SelectedFiles(string MusicPath, Dictionary<string, string> ChartPaths, string? JudgmentsPath, string? MetadataPath);
     private sealed record PreparedPackage(
         string MusicPath,
         string Identity,
         byte[] Music,
         Dictionary<string, byte[]> Charts,
-        Dictionary<string, JudgmentWindow> Judgments);
+        Dictionary<string, JudgmentWindow> Judgments,
+        byte[]? MetadataPacket);
     private readonly record struct JudgmentWindow(int PerfectPlus, int Perfect, int Good)
     {
         public int[] ToArray() => [PerfectPlus, Perfect, Good];

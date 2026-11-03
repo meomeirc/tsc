@@ -28,9 +28,13 @@ public sealed partial class Playfield
         _editorConnectorPreviewAbsorbedTargetBody = null;
         _editorConnectorPreviewBody3DCommands.Clear();
         _editorConnectorPreviewHeadCommands.Clear();
-        // The inactive-bank pass is only used to prepare the faded background
-        // layer. Keep the connector preview and its source/target replacements in
-        // the main pass so the preview is composited once over the complete frame.
+        _editorConnectorSplitPreviewRoot = null;
+        _editorConnectorSplitPreviewNodes = null;
+        if (!_editorNoteGroupPlacementPreviewRendering)
+            TryPrepareEditorConnectorSplitPreview();
+        // The standard extension preview and source/target replacements are
+        // composited in the main pass. Split previews follow the selected chain's
+        // own bank pass so they also work for chains currently shown as inactive.
         if (!_editorNoteGroupPlacementPreviewRendering && !_editorInactiveBankLayerPass &&
             TryGetEditorConnectorPreviewTarget(out var previewSource, out var previewTargetHead))
         {

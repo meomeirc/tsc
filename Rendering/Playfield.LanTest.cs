@@ -37,6 +37,7 @@ public sealed partial class Playfield
     private sealed record EditorLanTestSnapshot(
         byte[] MusicBytes,
         Dictionary<string, byte[]> Charts,
+        byte[]? MetadataPacket,
         long Revision,
         string ChartSummary);
 
@@ -227,8 +228,118 @@ public sealed partial class Playfield
             throw new InvalidOperationException("No enabled ARES charts are available to test.");
 
         var order = new[] { "easy", "normal", "hard", "expert", "sc" };
-        return new EditorLanTestSnapshot(music.ToArray(), charts, _editorLanTestChangeRevision,
+        var metadataPacket = CaptureEditorLanTestMetadataPacket();
+        return new EditorLanTestSnapshot(music.ToArray(), charts, metadataPacket, _editorLanTestChangeRevision,
             string.Join(" · ", charts.Keys.OrderBy(name => Array.IndexOf(order, name))));
+    }
+
+    private byte[]? CaptureEditorLanTestMetadataPacket()
+    {
+        if (_chart is null)
+            return null;
+
+        var title = _chart.Name;
+        var artist = _chart.Artist;
+        var bpm = _chart.MetadataBpm;
+        if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(artist) ||
+            !double.IsFinite(bpm) || bpm <= 0)
+            return null;
+
+        var coverCandidates = new List<byte[]>();
+        if (_editorSharedAlbumBytes is { Length: > 0 })
+            coverCandidates.Add(_editorSharedAlbumBytes);
+        if (_editorSharedAlbumBigBytes is { Length: > 0 })
+            coverCandidates.Add(_editorSharedAlbumBigBytes);
+
+        // Prefer the shared in-memory artwork. For charts opened from disk or a
+        // TSTS working directory, try the original asset first (especially WebP),
+        // then Song Select's usable/cached artwork path. This avoids needlessly
+        // converting a compact WebP into a larger PNG for the metadata packet.
+        try
+        {
+            var roots = new List<string>();
+            void AddRoot(string? directory)
+            {
+                if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+                {
+                    var full = Path.GetFullPath(directory);
+                    if (!roots.Contains(full, StringComparer.OrdinalIgnoreCase))
+                        roots.Add(full);
+                }
+            }
+
+            AddRoot(_tstsWorkingDirectory);
+            if (!string.IsNullOrWhiteSpace(_loadedSourcePath))
+            {
+                var sourcePath = Path.GetFullPath(_loadedSourcePath);
+                AddRoot(Directory.Exists(sourcePath) ? sourcePath : Path.GetDirectoryName(sourcePath));
+                AddRoot(GetSongAssetDirectoryForChartPath(sourcePath));
+            }
+
+            void AddCoverFile(string path)
+            {
+                if (!File.Exists(path))
+                    return;
+                var info = new FileInfo(path);
+                if (info.Length is > 0 and <= LanEditorTestMetadataPacket.MaxImageBytes)
+                    coverCandidates.Add(File.ReadAllBytes(path));
+            }
+
+            foreach (var reference in new[] { _chart.AlbumPath, _chart.AlbumBigPath })
+            {
+                if (string.IsNullOrWhiteSpace(reference))
+                    continue;
+                if (Path.IsPathRooted(reference))
+                    AddCoverFile(reference);
+                else
+                    foreach (var root in roots)
+                        AddCoverFile(Path.Combine(root, reference));
+            }
+
+            foreach (var root in roots)
+            {
+                foreach (var name in new[] { "cover.webp", "cover.png", "cover.jpg", "cover.jpeg", "album.png", "album.jpg", "album.jpeg", "album.webp", "album_big.png", "album_big.jpg", "album_big.jpeg", "album_big.webp" })
+                    AddCoverFile(Path.Combine(root, name));
+            }
+
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or InvalidOperationException)
+        {
+            // A missing/unreadable cover only disables live metadata; chart and
+            // music Local Test remain available.
+        }
+
+        foreach (var cover in coverCandidates)
+        {
+            try
+            {
+                return LanEditorTestMetadataPacket.Encode(9999992, title, artist, bpm, cover);
+            }
+            catch (InvalidDataException)
+            {
+                // Try the next available cover candidate. An invalid or oversized
+                // image must not prevent Local Test from serving charts and music.
+            }
+        }
+
+        // Only run Song Select's conversion/cache fallback when the original bytes
+        // were missing or unsuitable. Most bundles take the fast path above.
+        try
+        {
+            var artworkPath = ResolveResultArtworkPath(preferBig: false);
+            if (!string.IsNullOrWhiteSpace(artworkPath) && File.Exists(artworkPath))
+            {
+                var info = new FileInfo(artworkPath);
+                if (info.Length is > 0 and <= LanEditorTestMetadataPacket.MaxImageBytes)
+                    return LanEditorTestMetadataPacket.Encode(9999992, title, artist, bpm, File.ReadAllBytes(artworkPath));
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or InvalidOperationException or InvalidDataException)
+        {
+            // A missing/unreadable/unsupported cover only disables live metadata.
+        }
+
+        return null;
     }
 
     private void StartEditorLanTest()
@@ -812,6 +923,12 @@ public sealed partial class Playfield
                 if (!expectedFiles.Contains(Path.GetFileName(stale)))
                     File.Delete(stale);
             }
+
+            var metadataPath = Path.Combine(workspace, "metadata.bin");
+            if (snapshot.MetadataPacket is { Length: > 0 } metadataPacket)
+                AtomicWriteEditorLanTestFile(metadataPath, metadataPacket);
+            else if (File.Exists(metadataPath))
+                File.Delete(metadataPath);
 
             EnsureEditorLanTestGeneration(generation);
         }
