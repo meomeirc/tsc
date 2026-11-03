@@ -74,6 +74,20 @@ public static class AresWriter
 
     /// <summary>Builds and validates an ARES file in memory.</summary>
     public static byte[] BuildBytes(AresChart chart, byte[]? sourceHeader = null)
+        => BuildBytesCore(chart, sourceHeader, muteNativeVolumeTracks: false);
+
+    /// <summary>
+    /// Builds a Local Test copy with all native audio tracks muted at tick zero.
+    /// This is intentionally separate from normal export so the editor chart and
+    /// files saved by the user retain their authored Volume events.
+    /// </summary>
+    public static byte[] BuildBytesForLocalTest(AresChart chart, byte[]? sourceHeader = null)
+        => BuildBytesCore(chart, sourceHeader, muteNativeVolumeTracks: true);
+
+    private static byte[] BuildBytesCore(
+        AresChart chart,
+        byte[]? sourceHeader,
+        bool muteNativeVolumeTracks)
     {
         ArgumentNullException.ThrowIfNull(chart);
         _ = sourceHeader; // Source headers are intentionally not preserved anymore.
@@ -90,7 +104,10 @@ public static class AresWriter
         }
         var chartTracksByIndex = chart.Tracks.GroupBy(t => t.TrackIndex)
             .ToDictionary(g => g.Key, g => g.First());
-        var noteGroupMetadataEvents = NoteGroupMetadataCodec.CreateMetadataEvents(chart, forAresExport: true);
+        var noteGroupMetadataEvents = NoteGroupMetadataCodec.CreateMetadataEvents(
+            chart,
+            forAresExport: true,
+            muteNativeVolumeTracks: muteNativeVolumeTracks);
         var highestChartTrackCount = chartTracksByIndex.Keys
             .Select(index => checked(index + 1)).DefaultIfEmpty(0).Max();
         var disabledTempoBackups = chart.Tracks.SelectMany(track => track.Events)
@@ -106,6 +123,11 @@ public static class AresWriter
         // kind-1 metadata notes on track 30, which is reserved for editor data.
         if (disabledTempoBackups.Count > 0)
             outputTrackCount = Math.Max(outputTrackCount, 31);
+        // Native ARES charts use Volume events on the 32 standard audio tracks
+        // (0..31). Tracks above 31 are auxiliary/reserved records, not volume
+        // channels. Ensure all native audio tracks exist in the Local Test copy.
+        if (muteNativeVolumeTracks)
+            outputTrackCount = Math.Max(outputTrackCount, 32);
         if (outputTrackCount > byte.MaxValue)
             throw new InvalidDataException($"ARES supports at most 255 track records; requested {outputTrackCount}.");
 
@@ -177,6 +199,9 @@ public static class AresWriter
                     ? a.Tick.CompareTo(b.Tick)
                     : a.EventIndex.CompareTo(b.EventIndex));
             }
+
+            if (muteNativeVolumeTracks && trackIndex < 32)
+                VolumeEventTools.ReplaceTrackVolumeWithSilence(trackEvents, trackIndex);
 
             var track = new TrackDefinition
             {

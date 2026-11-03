@@ -4919,10 +4919,14 @@ public sealed class Game1 : Game
             if (ShowNativeDialog(dialog) != System.Windows.Forms.DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
                 return;
 
+            // Retain the original selected file bytes for the whole editor session.
+            // Volume changes are re-rendered from these bytes instead of repeatedly
+            // processing the previously baked Opus output.
+            var originalAudioBytes = File.ReadAllBytes(dialog.FileName);
             var opusBytes = string.Equals(Path.GetExtension(dialog.FileName), ".opus", StringComparison.OrdinalIgnoreCase)
-                ? File.ReadAllBytes(dialog.FileName)
+                ? originalAudioBytes.ToArray()
                 : ConvertAudioFileToOpus(dialog.FileName);
-            _playfield.SetEditorSongAudio(opusBytes, dialog.FileName);
+            _playfield.SetEditorSongAudio(opusBytes, dialog.FileName, originalAudioBytes);
             _errorMessage = null;
         }
         catch (FfmpegNotFoundException ex)

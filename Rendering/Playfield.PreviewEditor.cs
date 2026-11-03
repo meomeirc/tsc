@@ -431,7 +431,7 @@ public sealed partial class Playfield
             }
             _editorPreviewPlayer = new OpusAudioPlayer();
             _editorPreviewPlayer.LoadOpus(bytes);
-            _editorPreviewPlayer.Volume = _skin.GameConfig.MusicVolume;
+            _editorPreviewPlayer.Volume = GetEditorMusicPlaybackVolume();
             _editorPreviewPlayer.PrepareInitialPlayback(retainPcmForSeeking: true);
             _editorPreviewPlayer.SyncToChartTime(0.0, 0.0);
             _editorPreviewPlaybackDurationSeconds = _editorPreviewPlayer.DurationSeconds;
@@ -524,7 +524,7 @@ public sealed partial class Playfield
         StopEditorPreviewPlayback();
         _editorPreviewPlayer = new OpusAudioPlayer();
         _editorPreviewPlayer.LoadOpus(bakedBytes);
-        _editorPreviewPlayer.Volume = _skin.GameConfig.MusicVolume;
+        _editorPreviewPlayer.Volume = GetEditorMusicPlaybackVolume();
         _editorPreviewPlayer.PrepareInitialPlayback(retainPcmForSeeking: true);
         _editorPreviewPlayer.SyncToChartTime(0.0, 0.0);
         _editorPreviewPlaybackDurationSeconds = _editorPreviewPlayer.DurationSeconds;
@@ -933,8 +933,25 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var y = content.Y + (int)MathF.Round(66f * unit);
+        var y = content.Y + (int)MathF.Round(131f * unit);
         return new Rectangle(content.X, y, content.Width, Math.Max(1, (int)MathF.Round(20f * unit)));
+    }
+
+    private Rectangle GetEditorMediaVolumeLabelBounds(int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var y = content.Y + (int)MathF.Round(79f * unit);
+        return new Rectangle(content.X, y, content.Width, Math.Max(1, (int)MathF.Round(20f * unit)));
+    }
+
+    private Rectangle GetEditorMediaVolumeSliderBounds(int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var y = content.Y + (int)MathF.Round(102f * unit);
+        var height = Math.Max(1, (int)MathF.Round(28f * unit));
+        return new Rectangle(content.X, y, content.Width, height);
     }
 
     private Rectangle GetEditorMediaPreviewEditButtonBounds(int virtualWidth, int virtualHeight)
@@ -970,7 +987,7 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var top = content.Y + (int)MathF.Round(139f * unit);
+        var top = content.Y + (int)MathF.Round(210f * unit);
         var gap = Math.Max(8, (int)MathF.Round(16f * unit));
         var supportsAlbumBig = _editorBundleTemplate != ChartBundleTemplate.Tsts;
         var cardWidth = supportsAlbumBig
@@ -1019,6 +1036,13 @@ public sealed partial class Playfield
             HasEditorMediaResource("music") ? "CHANGE" : "IMPORT",
             new Color(28, 28, 30, 250), Active);
 
+        var volumeLabel = _editorOriginalMusicSourceBytes is { Length: > 0 }
+            ? $"MUSIC VOLUME  {_editorMusicVolumePendingPercent}%"
+            : "MUSIC VOLUME  IMPORT AUDIO FIRST";
+        DrawEditorPreviewLabel(volumeLabel, GetEditorMediaVolumeLabelBounds(virtualWidth, virtualHeight), Muted, unit);
+        DrawEditorMediaVolumeSlider(GetEditorMediaVolumeSliderBounds(virtualWidth, virtualHeight), unit,
+            _editorOriginalMusicSourceBytes is { Length: > 0 });
+
         DrawEditorPreviewLabel("PREVIEW", GetEditorMediaPreviewLabelBounds(virtualWidth, virtualHeight), Muted, unit);
         DrawEditorMetaButton(GetEditorMediaPreviewEditButtonBounds(virtualWidth, virtualHeight), "EDIT",
             new Color(28, 28, 30, 250), Active);
@@ -1030,6 +1054,75 @@ public sealed partial class Playfield
         DrawEditorMediaArtworkCard("album", virtualWidth, virtualHeight, unit);
         if (_editorBundleTemplate != ChartBundleTemplate.Tsts)
             DrawEditorMediaArtworkCard("album_big", virtualWidth, virtualHeight, unit);
+    }
+
+    private void DrawEditorMediaVolumeSlider(Rectangle bounds, float unit, bool enabled)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return;
+        var barHeight = Math.Max(5, (int)MathF.Round(6f * unit));
+        var barY = bounds.Y + (bounds.Height - barHeight) / 2;
+        var bar = new Rectangle(bounds.X, barY, bounds.Width, barHeight);
+        _spriteBatch.Draw(_pixel, bar, new Color(58, 58, 60, 245));
+        if (!enabled)
+            return;
+
+        var ratio = Math.Clamp(_editorMusicVolumePendingPercent / 100f, 0f, 1f);
+        var fillWidth = Math.Clamp((int)MathF.Round(bar.Width * ratio), 0, bar.Width);
+        if (fillWidth > 0)
+            _spriteBatch.Draw(_pixel, new Rectangle(bar.X, bar.Y, fillWidth, bar.Height), Active);
+
+        var thumbWidth = Math.Max(10, (int)MathF.Round(14f * unit));
+        var thumbHeight = Math.Max(16, (int)MathF.Round(22f * unit));
+        var thumbX = Math.Clamp(bar.X + fillWidth - thumbWidth / 2,
+            bounds.X, Math.Max(bounds.X, bounds.Right - thumbWidth));
+        var thumb = new Rectangle(thumbX, bounds.Y + (bounds.Height - thumbHeight) / 2,
+            thumbWidth, thumbHeight);
+        _spriteBatch.Draw(_pixel, thumb, Color.White);
+    }
+
+    private bool HandleEditorMusicVolumeFallbackPointer(
+        Microsoft.Xna.Framework.Point point, bool leftPressed, bool leftDown, bool leftReleased,
+        int virtualWidth, int virtualHeight)
+    {
+        if (_editorMusicVolumeSliderDragging)
+        {
+            if (leftDown || leftReleased)
+                UpdateEditorMusicVolumePendingFromPointer(point, virtualWidth, virtualHeight);
+            if (leftReleased)
+            {
+                _editorMusicVolumeSliderDragging = false;
+                try { ApplyEditorMusicVolumePendingPercent(); }
+                catch (Exception ex)
+                {
+                    _editorMusicVolumePendingPercent = _editorMusicVolumePercent;
+                    ApplyEditorMusicPlaybackVolume();
+                    _statusMessage = $"Could not change song volume: {ex.Message}";
+                }
+                return true;
+            }
+            return leftDown;
+        }
+
+        if (!leftPressed || !_editorMetaPanelOpen ||
+            !string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase) ||
+            _editorOriginalMusicSourceBytes is not { Length: > 0 } ||
+            !GetEditorMediaVolumeSliderBounds(virtualWidth, virtualHeight).Contains(point))
+            return false;
+
+        _editorMusicVolumeSliderDragging = true;
+        UpdateEditorMusicVolumePendingFromPointer(point, virtualWidth, virtualHeight);
+        return true;
+    }
+
+    private void UpdateEditorMusicVolumePendingFromPointer(
+        Microsoft.Xna.Framework.Point point, int virtualWidth, int virtualHeight)
+    {
+        var bounds = GetEditorMediaVolumeSliderBounds(virtualWidth, virtualHeight);
+        if (bounds.Width <= 0)
+            return;
+        var ratio = Math.Clamp((point.X - bounds.X) / (double)bounds.Width, 0.0, 1.0);
+        SetEditorMusicVolumePendingPercent(ratio * 100.0);
     }
 
     private void DrawEditorMediaPreviewProgress(Rectangle bounds, float unit)

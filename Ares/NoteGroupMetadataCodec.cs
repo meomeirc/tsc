@@ -120,7 +120,10 @@ internal static class NoteGroupMetadataCodec
             ev.Attr is HeaderAttribute or DataAttribute or FooterAttribute;
     }
 
-    public static List<ChartEvent> CreateMetadataEvents(AresChart chart, bool forAresExport)
+    public static List<ChartEvent> CreateMetadataEvents(
+        AresChart chart,
+        bool forAresExport,
+        bool muteNativeVolumeTracks = false)
     {
         ArgumentNullException.ThrowIfNull(chart);
         if (chart.NoteGroups.Count == 0)
@@ -134,6 +137,15 @@ internal static class NoteGroupMetadataCodec
                 .OrderBy(ev => ev.Tick)
                 .ThenBy(ev => ev.EventIndex)
                 .ToList();
+
+            // Local Test replaces all existing Volume automation with one tick-zero
+            // silence event. Apply that exact transformation before assigning the
+            // note-group bindings' per-track event indices; otherwise the added or
+            // removed Volume records shift those indices and the reserved metadata
+            // fails its own round-trip validation.
+            if (muteNativeVolumeTracks && gameplayTrack.TrackIndex < 32)
+                VolumeEventTools.ReplaceTrackVolumeWithSilence(serialized, gameplayTrack.TrackIndex);
+
             for (var index = 0; index < serialized.Count; index++)
             {
                 var ev = serialized[index];

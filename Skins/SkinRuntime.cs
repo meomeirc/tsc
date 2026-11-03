@@ -2038,6 +2038,7 @@ public sealed class SkinRuntime : IDisposable
         public double Max { get; }
         public double Step { get; }
         public string Action { get; }
+        public string? ReleaseAction { get; }
         public bool Vertical { get; }
         public bool Reverse { get; }
 
@@ -2052,6 +2053,7 @@ public sealed class SkinRuntime : IDisposable
             double max,
             double step,
             string action,
+            string? releaseAction,
             bool vertical,
             bool reverse)
         {
@@ -2065,6 +2067,7 @@ public sealed class SkinRuntime : IDisposable
             Max = max;
             Step = step;
             Action = action;
+            ReleaseAction = releaseAction;
             Vertical = vertical;
             Reverse = reverse;
         }
@@ -5365,6 +5368,8 @@ public sealed class SkinRuntime : IDisposable
         var vertical = string.Equals(GetOptionalString(options, "axis"), "vertical", StringComparison.OrdinalIgnoreCase);
         var reverse = GetOptionalNumber(options, "reverse", 0.0) != 0.0;
         var action = GetOptionalString(options, "action")?.Trim();
+        var releaseAction = GetOptionalString(options, "release_action")?.Trim();
+        if (string.IsNullOrWhiteSpace(releaseAction)) releaseAction = null;
         if (string.IsNullOrWhiteSpace(action))
             throw new ScriptRuntimeException($"ui.slider '{id}' requires an action");
         if (!double.IsFinite(min) || !double.IsFinite(max) || min >= max)
@@ -5383,6 +5388,7 @@ public sealed class SkinRuntime : IDisposable
             max,
             step,
             action,
+            releaseAction,
             vertical,
             reverse);
         _uiSliders[id] = slider;
@@ -5482,11 +5488,22 @@ public sealed class SkinRuntime : IDisposable
     /// </summary>
     public void UpdateUiPointer(float x, float y, bool leftDown)
     {
+        var wasLeftDown = _uiPointerLeftDown;
         _uiPointerX = x;
         _uiPointerY = y;
         _uiPointerLeftDown = leftDown;
         if (!leftDown)
         {
+            // Sliders may need one final action when their drag is committed. This
+            // keeps expensive operations (such as baking audio) from running on
+            // every pointer-move event.
+            if (wasLeftDown && _uiPressedSliderId is not null &&
+                _uiSliders.TryGetValue(_uiPressedSliderId, out var releasedSlider) &&
+                !string.IsNullOrWhiteSpace(releasedSlider.ReleaseAction))
+            {
+                EmitUiAction(releasedSlider.ReleaseAction!, releasedSlider.ValueFromPointer(x, y));
+            }
+
             _uiPressedButtonId = null;
             _uiPressedSliderId = null;
             _uiPressedSliderValue = null;

@@ -451,6 +451,15 @@ public sealed partial class Playfield
     private bool _loadingTstsBundleChart;
     private string? _loadedFpkChartName;
     private byte[]? _loadedMusicBytes;
+    // Keep the untouched session source separately from any file produced by a
+    // save/export. Media-volume edits affect the live playback gain only; exported
+    // Opus is always rendered from these original bytes.
+    private byte[]? _editorOriginalMusicSourceBytes;
+    private byte[]? _editorOriginalMusicOpusBytes;
+    private string _editorOriginalMusicSourceExtension = ".opus";
+    private int _editorMusicVolumePercent = 100;
+    private int _editorMusicVolumePendingPercent = 100;
+    private bool _editorMusicVolumeSliderDragging;
     private bool _editorImportedSongAudio;
     private byte[]? _loadedAresHeaderTemplate;
     private string? _statusMessage;
@@ -1470,6 +1479,15 @@ public sealed partial class Playfield
         // During the fade-out, DrawTransitionFrame still draws the editor as its
         // outgoing screen. Keep both the built-in editor view and the Lua
         // editor-mode flag until the transition commits and disposes this object.
+        // The editor session is ending. Release the pristine source audio now;
+        // saved/exported copies have already been written separately.
+        _editorOriginalMusicSourceBytes = null;
+        _editorOriginalMusicOpusBytes = null;
+        _editorOriginalMusicSourceExtension = ".opus";
+        _editorMusicVolumePercent = 100;
+        _editorMusicVolumePendingPercent = 100;
+        _editorMusicVolumeSliderDragging = false;
+
         if (!preserveEditorModeForTransition)
         {
             ReleaseTstsWorkingDirectory();
@@ -1480,6 +1498,11 @@ public sealed partial class Playfield
             _chartEditorMode = false;
             SyncEditorConstantScrollMode();
         }
+
+        // The editor-only attenuation must not leak into the next gameplay
+        // session. The pending percentage was reset above, so this restores the
+        // user's normal Music Volume setting even when this Playfield is reused.
+        ApplyEditorMusicPlaybackVolume();
     }
 
     /// <summary>Notifies the skin that gameplay is preparing.</summary>
@@ -2154,6 +2177,12 @@ public sealed partial class Playfield
         _loadedFpkChartName = null;
         _loadedAresHeaderTemplate = null;
         _loadedMusicBytes = null;
+        _editorOriginalMusicSourceBytes = null;
+        _editorOriginalMusicOpusBytes = null;
+        _editorOriginalMusicSourceExtension = ".opus";
+        _editorMusicVolumePercent = 100;
+        _editorMusicVolumePendingPercent = 100;
+        _editorMusicVolumeSliderDragging = false;
         _editorImportedSongAudio = false;
         _editorSharedMusicBytes = null;
         _editorSharedSongImportedAudio = false;
@@ -3033,7 +3062,7 @@ public sealed partial class Playfield
         }
     }
 
-    public void SetEditorSongAudio(byte[] opusBytes, string importedFilePath)
+    public void SetEditorSongAudio(byte[] opusBytes, string importedFilePath, byte[]? originalSourceBytes = null)
     {
         ArgumentNullException.ThrowIfNull(opusBytes);
         if (!_chartEditorMode || _chart is null)
@@ -3045,6 +3074,18 @@ public sealed partial class Playfield
         _audio.LoadOpus(opusBytes);
         _audio.PrepareInitialPlayback(retainPcmForSeeking: true);
         _loadedMusicBytes = opusBytes.ToArray();
+        _editorOriginalMusicOpusBytes = opusBytes.ToArray();
+        var hasOriginalSourceFileBytes = originalSourceBytes is { Length: > 0 };
+        _editorOriginalMusicSourceBytes = hasOriginalSourceFileBytes
+            ? originalSourceBytes!.ToArray()
+            : opusBytes.ToArray();
+        _editorOriginalMusicSourceExtension = hasOriginalSourceFileBytes
+            ? NormalizeEditorAudioSourceExtension(importedFilePath)
+            : ".opus";
+        _editorMusicVolumePercent = 100;
+        _editorMusicVolumePendingPercent = 100;
+        _editorMusicVolumeSliderDragging = false;
+        ApplyEditorMusicPlaybackVolume();
         _editorImportedSongAudio = true;
         ApplyFixedMediaPaths(_chart, _editorBundleTemplate);
         _editorSharedMusicBytes = opusBytes.ToArray();
@@ -4191,6 +4232,17 @@ public sealed partial class Playfield
             _editorSharedMusicBytes = musicBytes is null ? null : musicBytes.ToArray();
             _editorSharedSongImportedAudio = false;
             _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
+            _editorOriginalMusicOpusBytes = _chartEditorMode && musicBytes is { Length: > 0 }
+                ? musicBytes.ToArray() : null;
+            _editorOriginalMusicSourceBytes = _editorOriginalMusicOpusBytes?.ToArray();
+            _editorOriginalMusicSourceExtension = ".opus";
+            _editorMusicVolumePercent = 100;
+            _editorMusicVolumePendingPercent = 100;
+            _editorMusicVolumeSliderDragging = false;
+            // Loading a different chart resets the editor-only attenuation. Apply
+            // it immediately because OpusAudioPlayer retains its Volume property
+            // when a new stream is loaded into the same player instance.
+            ApplyEditorMusicPlaybackVolume();
         }
         _loadedFpkChartName = null;
         _lastLoadedSourceName = sourceName;
@@ -4350,11 +4402,13 @@ public sealed partial class Playfield
         // For a standalone TSC, preserve its relative music resource when saving
         // into another directory. For an FPK, export the already-extracted audio
         // beside the new TSC so the result is independently loadable.
-        if (_loadedMusicBytes is { Length: > 0 })
+        if (_loadedMusicBytes is { Length: > 0 } || _editorMusicVolumePercent < 100)
         {
+            var musicBytesForExport = GetEditorMusicBytesForExport()
+                ?? throw new InvalidOperationException("Song audio is unavailable for export.");
             const string musicFileName = "music.opus";
             var musicDestination = Path.Combine(targetDirectory, musicFileName);
-            File.WriteAllBytes(musicDestination, _loadedMusicBytes);
+            File.WriteAllBytes(musicDestination, musicBytesForExport);
             musicPathOverride = musicFileName;
         }
         else if (!string.IsNullOrWhiteSpace(_chart.MusicPath) && !string.IsNullOrWhiteSpace(_loadedSourcePath) &&
@@ -4505,7 +4559,7 @@ public sealed partial class Playfield
             // tab is only an unsupplied blank placeholder, its chart file and its
             // temporary metadata are removed below before the bundle is finalized.
             SaveEditorChartAsTsc(chartPath, adoptOutputAsSource: false, writeSongJsonSidecar: true);
-            var bundleMusicPath = _loadedMusicBytes is { Length: > 0 }
+            var bundleMusicPath = (_loadedMusicBytes is { Length: > 0 } || _editorMusicVolumePercent < 100)
                 ? "music.opus"
                 : (string.IsNullOrWhiteSpace(_chart.MusicPath) ? "music.opus" : _chart.MusicPath.Replace('\\', '/'));
 
@@ -4689,9 +4743,11 @@ public sealed partial class Playfield
         string? musicPathOverride = _chart.MusicPath;
         if (_editorBundleTemplate == ChartBundleTemplate.Bold)
         {
-            if (_loadedMusicBytes is { Length: > 0 })
+            if (_loadedMusicBytes is { Length: > 0 } || _editorMusicVolumePercent < 100)
             {
-                File.WriteAllBytes(Path.Combine(targetDirectory, "music.opus"), _loadedMusicBytes);
+                var musicBytesForExport = GetEditorMusicBytesForExport()
+                    ?? throw new InvalidOperationException("Song audio is unavailable for export.");
+                File.WriteAllBytes(Path.Combine(targetDirectory, "music.opus"), musicBytesForExport);
                 musicPathOverride = "music.opus";
             }
             else if (!string.IsNullOrWhiteSpace(_loadedSourcePath))
@@ -4728,15 +4784,17 @@ public sealed partial class Playfield
         }
         else if (_editorBundleTemplate == ChartBundleTemplate.Tsts)
         {
-            if (_loadedMusicBytes is { Length: > 0 })
+            if (_loadedMusicBytes is { Length: > 0 } || _editorMusicVolumePercent < 100)
             {
                 // song.json is shared by all difficulty charts, so its music path
                 // must remain stable when the user saves a second difficulty.
+                var musicBytesForExport = GetEditorMusicBytesForExport()
+                    ?? throw new InvalidOperationException("Song audio is unavailable for export.");
                 var musicName = "song.opus";
                 var musicDirectory = string.Equals(Path.GetFileName(targetDirectory), "charts", StringComparison.OrdinalIgnoreCase)
                     ? (Directory.GetParent(targetDirectory)?.FullName ?? targetDirectory) : targetDirectory;
                 var musicPath = Path.Combine(musicDirectory, musicName);
-                File.WriteAllBytes(musicPath, _loadedMusicBytes);
+                File.WriteAllBytes(musicPath, musicBytesForExport);
                 musicPathOverride = musicName;
             }
             else if (!string.IsNullOrWhiteSpace(_chart.MusicPath) && !string.IsNullOrWhiteSpace(_loadedSourcePath))
@@ -4849,7 +4907,7 @@ public sealed partial class Playfield
         var chartBytes = AresWriter.BuildBytes(_chart, _loadedAresHeaderTemplate);
         FpkPackage? sourcePackage = null;
         var entries = new List<FpkWriteEntry>();
-        var musicBytesForExport = _editorSharedMusicBytes ?? _loadedMusicBytes;
+        var musicBytesForExport = GetEditorMusicBytesForExport();
         var isFpkSource = !string.IsNullOrWhiteSpace(_loadedSourcePath) &&
                           string.Equals(Path.GetExtension(_loadedSourcePath), ".fpk", StringComparison.OrdinalIgnoreCase) &&
                           File.Exists(_loadedSourcePath);
@@ -4906,8 +4964,6 @@ public sealed partial class Playfield
             if (IsEditorDifficultyEnabled(activeCode))
                 entries.Add(new FpkWriteEntry(chartEntryName, chartBytes));
 
-            musicBytesForExport ??= GetEditorMusicBytesForFpkExport();
-
             // Preserve well-known song artwork sidecars when exporting a standalone
             // ARES file from a folder, without pulling unrelated files into the bundle.
             if (!string.IsNullOrWhiteSpace(sourcePath))
@@ -4932,7 +4988,6 @@ public sealed partial class Playfield
         // copying entries, because shared music bytes are present even when the
         // audio was not changed. Always add those bytes back exactly once, using
         // the root-level name that the generated song.json references.
-        musicBytesForExport ??= GetEditorMusicBytesForFpkExport();
         if (musicBytesForExport is { Length: > 0 })
         {
             entries.RemoveAll(entry => string.Equals(Path.GetFileName(entry.Name), "music.opus", StringComparison.OrdinalIgnoreCase));
@@ -5058,7 +5113,8 @@ public sealed partial class Playfield
             }
         }
 
-        var musicBytes = _editorSharedMusicBytes ?? _loadedMusicBytes;
+        var musicBytes = GetEditorMusicBytesForExport();
+        var sessionMusicBytes = GetEditorSessionOriginalMusicBytes();
         if (musicBytes is { Length: > 0 })
             AddEntry("music.opus", musicBytes.ToArray());
 
@@ -5135,7 +5191,7 @@ public sealed partial class Playfield
                 state.Value.HasSourceChart = true;
                 state.Value.FpkChartName = GetFpkExportChartEntryName(state.Key);
                 state.Value.SourceName = state.Value.FpkChartName;
-                state.Value.MusicBytes = musicBytes?.ToArray();
+                state.Value.MusicBytes = sessionMusicBytes?.ToArray();
                 state.Value.ImportedSongAudio = false;
                 state.Value.AresHeaderTemplate = AresWriter.BuildBytes(state.Value.Chart, state.Value.AresHeaderTemplate)
                     .AsSpan(0, 28).ToArray();
@@ -5146,7 +5202,7 @@ public sealed partial class Playfield
             _loadedFpkChartName = exportableCodes.Contains(activeCode) ? GetFpkExportChartEntryName(activeCode) : null;
             _sourceName = _loadedFpkChartName is null ? GetFpkExportChartEntryName(activeCode) : Path.GetFileName(_loadedFpkChartName);
             _lastLoadedSourceName = _sourceName;
-            _editorSharedMusicBytes = musicBytes?.ToArray();
+            _editorSharedMusicBytes = sessionMusicBytes?.ToArray();
             _editorSharedSongImportedAudio = false;
             _editorImportedSongAudio = false;
         }
@@ -5327,9 +5383,10 @@ public sealed partial class Playfield
                 throw new InvalidOperationException("There are no supplied or authored difficulty charts to export.");
             var exportableCodes = exportableStates.Select(pair => pair.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-            var musicBytes = _editorSharedMusicBytes ?? _loadedMusicBytes;
-            if (musicBytes is not { Length: > 0 })
+            var musicBytes = GetEditorMusicBytesForExport();
+            if (musicBytes is not { Length: > 0 } && _editorMusicVolumePercent == 100)
                 musicBytes = exportableStates.Select(pair => pair.Value.MusicBytes).FirstOrDefault(bytes => bytes is { Length: > 0 });
+            var sessionMusicBytes = GetEditorSessionOriginalMusicBytes();
             var hasBundledMusic = musicBytes is { Length: > 0 };
             var sourceDirectory = GetTstsAssetSourceDirectory();
             var previewHint = exportableStates.Select(pair => pair.Value.Chart.PreviewPath).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
@@ -5423,8 +5480,8 @@ public sealed partial class Playfield
                 _sourceName = Path.GetFileName(activeChartWasExported ? activeChartOutputPath : GetTstsExportChartFileName(activeCode));
                 _lastLoadedSourceName = _sourceName;
                 _editorActiveDifficultyCode = activeCode;
-                _loadedMusicBytes = hasBundledMusic ? musicBytes!.ToArray() : null;
-                _editorSharedMusicBytes = hasBundledMusic ? musicBytes!.ToArray() : null;
+                _loadedMusicBytes = hasBundledMusic ? sessionMusicBytes?.ToArray() : null;
+                _editorSharedMusicBytes = hasBundledMusic ? sessionMusicBytes?.ToArray() : null;
                 _editorSharedSongImportedAudio = false;
                 _editorImportedSongAudio = false;
                 _bundleSeries = null;
@@ -5441,7 +5498,7 @@ public sealed partial class Playfield
                     pair.Value.SourceName = chartFile;
                     pair.Value.FpkChartName = null;
                     pair.Value.HasSourceChart = true;
-                    pair.Value.MusicBytes = hasBundledMusic ? musicBytes!.ToArray() : null;
+                    pair.Value.MusicBytes = hasBundledMusic ? sessionMusicBytes?.ToArray() : null;
                     pair.Value.ImportedSongAudio = false;
                     _editorDifficultyStates[pair.Key] = pair.Value;
                     _bundleJudgementWindows[pair.Key] = GetJudgementWindows(pair.Value.Chart);
@@ -5920,29 +5977,6 @@ public sealed partial class Playfield
             "xt" or "extra" => "pattern_xt.ares",
             _ => stem + ".ares"
         };
-    }
-
-    private byte[]? GetEditorMusicBytesForFpkExport()
-    {
-        if (_loadedMusicBytes is { Length: > 0 })
-            return _loadedMusicBytes.ToArray();
-
-        if (string.IsNullOrWhiteSpace(_loadedSourcePath))
-            return null;
-
-        var sourceDirectory = Path.GetDirectoryName(_loadedSourcePath);
-        if (string.IsNullOrWhiteSpace(sourceDirectory) || !Directory.Exists(sourceDirectory))
-            return null;
-
-        if (!string.IsNullOrWhiteSpace(_chart?.MusicPath))
-        {
-            var candidate = Path.GetFullPath(Path.Combine(sourceDirectory, _chart.MusicPath));
-            if (File.Exists(candidate))
-                return File.ReadAllBytes(candidate);
-        }
-
-        var standardMusicPath = Path.Combine(sourceDirectory, "music.opus");
-        return File.Exists(standardMusicPath) ? File.ReadAllBytes(standardMusicPath) : null;
     }
 
     private double GetEditorInitialChartBpm()
@@ -11529,9 +11563,7 @@ public sealed partial class Playfield
     }
     private void ApplyLiveGameConfigSettings()
     {
-        _audio.Volume = _skin.GameConfig.MusicVolume;
-        if (_editorPreviewPlayer is not null)
-            _editorPreviewPlayer.Volume = _skin.GameConfig.MusicVolume;
+        ApplyEditorMusicPlaybackVolume();
         _skin.GameConfig.Gauge = GameConfig.NormalizeGaugeType(_skin.GameConfig.Gauge);
         _skin.GameConfig.ScrollMode = GameConfig.NormalizeScrollMode(_skin.GameConfig.ScrollMode);
         SyncEditorConstantScrollMode();
@@ -11964,6 +11996,8 @@ public sealed partial class Playfield
 
     public void Dispose()
     {
+        _editorOriginalMusicSourceBytes = null;
+        _editorOriginalMusicOpusBytes = null;
         StopEditorLanTest();
         StopEditorPreviewPlayback();
         ReleaseTstsWorkingDirectory();

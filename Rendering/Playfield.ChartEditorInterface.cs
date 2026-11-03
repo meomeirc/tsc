@@ -717,6 +717,9 @@ public sealed partial class Playfield
             ["meta_categories"] = metaCategories,
             ["meta_difficulties"] = difficulties,
             ["meta_rows"] = metaRows,
+            ["meta_music_audio_available"] = _editorOriginalMusicSourceBytes is { Length: > 0 },
+            ["meta_music_volume"] = _editorMusicVolumePercent,
+            ["meta_music_volume_pending"] = _editorMusicVolumePendingPercent,
             ["meta_visible_rows"] = GetEditorMetaVisibleRowCount(rows, width, height),
             ["meta_scroll"] = _editorMetaScrollOffset,
             ["meta_scroll_max"] = GetEditorMetaMaxScrollOffset(rows, width, height),
@@ -1141,6 +1144,24 @@ public sealed partial class Playfield
             case "editor.preview.scrub":
                 UpdateEditorPreviewRangeFromValue(value is double scrubValue ? scrubValue : 0.0); return true;
             case "editor.meta.media_music": ImportEditorSongRequested?.Invoke(); return true;
+            case "editor.meta.music_volume.change":
+                if (value is double pendingMusicVolume)
+                    SetEditorMusicVolumePendingPercent(pendingMusicVolume);
+                return true;
+            case "editor.meta.music_volume.apply":
+                if (value is double finalMusicVolume)
+                    SetEditorMusicVolumePendingPercent(finalMusicVolume);
+                try
+                {
+                    ApplyEditorMusicVolumePendingPercent();
+                }
+                catch (Exception ex)
+                {
+                    _editorMusicVolumePendingPercent = _editorMusicVolumePercent;
+                    ApplyEditorMusicPlaybackVolume();
+                    _statusMessage = $"Could not change song volume: {ex.Message}";
+                }
+                return true;
             case "editor.lan_test.start": StartEditorLanTest(); return true;
             case "editor.lan_test.refresh": RefreshEditorLanTest(); return true;
             case "editor.lan_test.stop": StopEditorLanTest(); return true;

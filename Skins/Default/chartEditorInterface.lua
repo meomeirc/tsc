@@ -1432,19 +1432,52 @@ local function drawMeta(state, w, h, layer)
                 variant = "success", font = F.medium, text_size = fontSize("body"), layer = (layer or 100) + 7 })
         end
     elseif state.meta_category == "MEDIA" then
-        -- Keep music and preview controls at the top and give album artwork its own
-        -- square-card area, matching the C# fallback Info panel. The native renderer
-        -- draws the loaded textures over these frames without cropping them.
+        -- Keep music import first, add a session-safe baked-volume slider beneath it,
+        -- then move preview/artwork down so all media controls remain in one view.
         if rows[1] then drawMetaRow(rows[1], contentTop) end
-        if rows[2] then drawMetaRow(rows[2], contentTop + rowPitch) end
+
+        local innerWidth = math.max(1, panelW - padding * 2)
+        local volumeBlockHeight = 52 * scale
+        local volumeLabelY = contentTop + rowPitch
+        local audioAvailable = state.meta_music_audio_available == true
+        local volume = clamp(num(state.meta_music_volume_pending,
+            num(state.meta_music_volume, 100)), 0, 100)
+        local volumeLabel = audioAvailable
+            and ("MUSIC VOLUME  " .. tostring(math.floor(volume + 0.5)) .. "%")
+            or "MUSIC VOLUME  IMPORT AUDIO FIRST"
+        label(volumeLabel, x + padding, volumeLabelY, fontSize("small"), C.muted, nil, (layer or 100) + 4)
+
+        local volumeSliderY = volumeLabelY + 22 * scale
+        local volumeSliderH = 26 * scale
+        local volumeRatio = volume / 100
+        local volumeBarY = volumeSliderY + volumeSliderH * 0.5 - 3 * scale
+        draw.rect({ x = x + padding, y = volumeBarY, width = innerWidth,
+            height = 6 * scale, color = C.hover, layer = (layer or 100) + 5 })
+        if audioAvailable then
+            if volumeRatio > 0 then
+                draw.rect({ x = x + padding, y = volumeBarY, width = innerWidth * volumeRatio,
+                    height = 6 * scale, color = C.accent, layer = (layer or 100) + 6 })
+            end
+            local thumbX = clamp(x + padding + innerWidth * volumeRatio - 7 * scale,
+                x + padding, x + padding + innerWidth - 14 * scale)
+            draw.rect({ x = thumbX, y = volumeSliderY + 2 * scale,
+                width = 14 * scale, height = 22 * scale,
+                color = C.text, layer = (layer or 100) + 7 })
+            ui.slider({ id = "editor_meta_music_volume_slider",
+                x = x + padding, y = volumeSliderY, width = innerWidth, height = volumeSliderH,
+                min = 0, max = 100, step = 1,
+                action = "editor.meta.music_volume.change",
+                release_action = "editor.meta.music_volume.apply" })
+        end
+
+        if rows[2] then drawMetaRow(rows[2], contentTop + rowPitch + volumeBlockHeight) end
 
         local album = rows[3]
         local albumBig = rows[4]
         local hasBigAlbum = albumBig ~= nil
         local cardGap = hasBigAlbum and (16 * scale) or 0
-        local innerWidth = math.max(1, panelW - padding * 2)
         local cardWidth = hasBigAlbum and math.max(1, (innerWidth - cardGap) / 2) or innerWidth
-        local cardTop = contentTop + 2 * rowPitch
+        local cardTop = contentTop + 2 * rowPitch + volumeBlockHeight
         local cardHeight = math.max(1, contentBottom - cardTop)
 
         local function drawAlbumCard(item, cardX, cardW, buttonId, action)

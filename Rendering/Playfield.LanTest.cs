@@ -126,12 +126,14 @@ public sealed partial class Playfield
         SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
 
-        byte[]? music = _editorSharedMusicBytes is { Length: > 0 }
-            ? _editorSharedMusicBytes
-            : _loadedMusicBytes is { Length: > 0 }
-                ? _loadedMusicBytes
-                : _editorDifficultyStates.Values.Select(state => state.MusicBytes)
-                    .FirstOrDefault(bytes => bytes is { Length: > 0 });
+        // Local Test materializes an export copy, so apply the committed media
+        // volume here while preserving the untouched bytes in the editor session.
+        byte[]? music;
+        try { music = GetEditorMusicBytesForExport(); }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
+        {
+            throw new InvalidOperationException($"Could not prepare the song audio for Local Test: {ex.Message}", ex);
+        }
 
         if (music is not { Length: > 0 } && !string.IsNullOrWhiteSpace(_tstsWorkingDirectory))
         {
@@ -147,15 +149,6 @@ public sealed partial class Playfield
                     }
                     break;
                 }
-            }
-        }
-
-        if (music is not { Length: > 0 })
-        {
-            try { music = GetEditorMusicBytesForFpkExport(); }
-            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
-            {
-                throw new InvalidOperationException($"Could not read the song music: {ex.Message}", ex);
             }
         }
 

@@ -627,6 +627,7 @@ public sealed partial class Playfield
         var mouse = GlobalInput.Mouse;
         var leftDown = mouse.LeftButton == Microsoft.Xna.Framework.Input.ButtonState.Pressed;
         var leftPressed = leftDown && GlobalInput.PreviousMouse.LeftButton != Microsoft.Xna.Framework.Input.ButtonState.Pressed;
+        var leftReleased = !leftDown && GlobalInput.PreviousMouse.LeftButton == Microsoft.Xna.Framework.Input.ButtonState.Pressed;
         var rightPressed = mouse.RightButton == Microsoft.Xna.Framework.Input.ButtonState.Pressed && GlobalInput.PreviousMouse.RightButton != Microsoft.Xna.Framework.Input.ButtonState.Pressed;
         var mouseMoved = mouse.X != GlobalInput.PreviousMouse.X || mouse.Y != GlobalInput.PreviousMouse.Y;
 
@@ -689,6 +690,10 @@ public sealed partial class Playfield
         var pointerPixel = new Microsoft.Xna.Framework.Point((int)MathF.Round(point.X), (int)MathF.Round(point.Y));
         var editorLuaUiActive = _chartEditorMode && _chartEditorInterfaceRuntime.IsLoaded &&
                                 _chartEditorInterfaceRuntime.LastError is null;
+        if (!editorLuaUiActive && HandleEditorMusicVolumeFallbackPointer(
+                pointerPixel, leftPressed, leftDown, leftReleased, virtualWidth, virtualHeight))
+            return;
+
         // Once a gesture belongs to the chart canvas, keep pointer ownership there
         // until release. Lua buttons/sliders may still show hover, but they must not
         // capture or interrupt a note drag, marquee, SELECT line, or timeline scrub.
@@ -702,10 +707,25 @@ public sealed partial class Playfield
             {
                 // Clear any stale UI capture while retaining live hover feedback.
                 _chartEditorInterfaceRuntime.UpdateUiPointer(point.X, point.Y, leftDown: false);
+                var releasedUiAction = _chartEditorInterfaceRuntime.ConsumeUiAction();
+                if (releasedUiAction is not null)
+                {
+                    DispatchChartEditorInterfaceAction(releasedUiAction, virtualWidth, virtualHeight);
+                    return;
+                }
             }
             else
             {
                 UpdateChartEditorInterfacePointer(point, leftDown || touchActive);
+                // A slider's release_action is emitted when pointer capture ends.
+                // Consume it for mouse and touch release alike before processing
+                // any chart-canvas gesture at the same position.
+                var pointerReleaseAction = _chartEditorInterfaceRuntime.ConsumeUiAction();
+                if (pointerReleaseAction is not null)
+                {
+                    DispatchChartEditorInterfaceAction(pointerReleaseAction, virtualWidth, virtualHeight);
+                    return;
+                }
                 if (leftPressed || touchPressed)
                 {
                     var hitLuaControl = _chartEditorInterfaceRuntime.HandleUiPointerPressed(point.X, point.Y);
