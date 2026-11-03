@@ -6877,6 +6877,12 @@ public sealed partial class Playfield
                 // source tick. Its duration reaches the next lane-run endpoint.
                 var tail = CloneEditorLinkNote(destinationRun[0], sourceTick, destinationRun[0].Track,
                     Math.Max(6, destinationEndTick - sourceTick));
+                // Preserve the originating note identity only in preview output.
+                // The commit path assigns a fresh per-track EventIndex below, while
+                // the preview uses this identity to mark the point created from a
+                // synthetic connector tap.
+                if (previewNodesOut is not null)
+                    tail.EventIndex = destinationRun[0].EventIndex;
                 generated.Add(tail);
                 points.Add(tail);
 
@@ -10040,6 +10046,38 @@ public sealed partial class Playfield
                                 : EditorEndingColor;
                             DrawEditorMarker(endCenter, endRadius * 0.5f, endColor, 0.13f);
                         }
+                    }
+                }
+            }
+        }
+
+        // Mark the point produced by the connector split preview. It uses the same
+        // compact half-size ring as a LinkTail selection marker, and is drawn after
+        // the preview geometry so it remains easy to spot over the preview texture.
+        if (!_editorPanelsViewEnabled && _editorConnectorMode &&
+            _editorConnectorSplitPreviewRoot is { } splitPreviewRoot &&
+            ShouldRenderInCurrentBank(splitPreviewRoot, currentState) &&
+            _editorConnectorSplitPreviewNodes is { Count: > 1 } splitPreviewNodes)
+        {
+            var markerNode = _editorConnectorSplitPreviewMarkerNode;
+            if (markerNode is not null && !ShouldRenderInCurrentBank(markerNode, currentState))
+                markerNode = null;
+            var markerStyleNode = markerNode ??
+                splitPreviewNodes.FirstOrDefault(node => node.NoteType == NoteType.LinkTail);
+            var markerTick = markerNode?.Tick ?? _hoverBeatTick ?? -1;
+            var markerTrack = markerNode?.Track ?? _hoverTrack ?? -1;
+            if (markerTick >= 0 && markerTrack is >= 0 and <= 15)
+            {
+                var markerTravel = (float)_projection.ScrollPixelsAtTicks(markerTick, currentTick);
+                if (_projection.WithinRenderDistance(markerTravel))
+                {
+                    var markerPoint = _projection.ProjectAtTicks(markerTrack, markerTick, currentTick, currentState);
+                    if (!OutsideNoteView(markerPoint, markerPoint))
+                    {
+                        var markerRadius = GetEditorMarkerRadius(
+                            markerTrack, markerTick, currentTick, currentState,
+                            out var markerCenter, markerStyleNode, markerPoint, markerTravel);
+                        DrawEditorMarker(markerCenter, markerRadius * 0.5f, EditorFamilyColor, 0.17f);
                     }
                 }
             }

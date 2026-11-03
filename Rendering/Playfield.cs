@@ -589,6 +589,13 @@ public sealed partial class Playfield
     private ChartEvent? _editorConnectorPreviewAbsorbedTargetBody;
     private ChartEvent? _editorConnectorSplitPreviewRoot;
     private List<ChartEvent>? _editorConnectorSplitPreviewNodes;
+    private ChartEvent? _editorConnectorSplitPreviewMarkerNode;
+    // The normal connector-extension preview has its own proposed route/point so
+    // its marker and route overlay can be drawn just like the split preview.
+    private ChartEvent? _editorConnectorExtensionPreviewRoot;
+    private readonly List<ChartEvent> _editorConnectorExtensionPreviewNodes = new(2);
+    private readonly ChartEvent _editorConnectorExtensionPreviewPoint = new();
+    private ChartEvent? _editorConnectorExtensionPreviewMarkerNode;
     private AresChart? _editorConnectorSplitPreviewCacheChart;
     private ChartEvent? _editorConnectorSplitPreviewCacheRoot;
     private int _editorConnectorSplitPreviewCacheRootTick = int.MinValue;
@@ -596,6 +603,7 @@ public sealed partial class Playfield
     private int _editorConnectorSplitPreviewCacheRootEventIndex = -1;
     private int _editorConnectorSplitPreviewCacheTick = int.MinValue;
     private int _editorConnectorSplitPreviewCacheTrack = -1;
+    private int _editorConnectorSplitPreviewCacheInsertedEventIndex = int.MinValue;
     private bool _editorConnectorSplitPreviewCacheHorizontalFirst;
     private bool _editorConnectorSplitPreviewCacheGroupEditMode;
     private int? _editorConnectorSplitPreviewCacheGroupId;
@@ -9316,6 +9324,7 @@ public sealed partial class Playfield
     {
         _editorConnectorSplitPreviewRoot = null;
         _editorConnectorSplitPreviewNodes = null;
+        _editorConnectorSplitPreviewMarkerNode = null;
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
             _chart is null || !_selectedEventKey.HasValue || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || _editorDraggedEvent is not null || _editorRectSelecting)
@@ -9362,11 +9371,13 @@ public sealed partial class Playfield
             _editorConnectorSplitPreviewCacheInstanceId = _editorEditingNoteGroupInstanceId;
             _editorConnectorSplitPreviewCacheResolved = true;
             _editorConnectorSplitPreviewCacheValid = false;
+            _editorConnectorSplitPreviewCacheInsertedEventIndex = int.MinValue;
             _editorConnectorSplitPreviewCacheNodes.Clear();
 
             if (TryCreateEditorConnectorSplitPath(root, targetTick, targetTrack,
-                    out var selectedNotes, out _, out var error) && error is null)
+                    out var selectedNotes, out var virtualTap, out var error) && error is null)
             {
+                _editorConnectorSplitPreviewCacheInsertedEventIndex = virtualTap.EventIndex;
                 var priorStatus = _statusMessage;
                 try
                 {
@@ -9392,6 +9403,11 @@ public sealed partial class Playfield
 
         _editorConnectorSplitPreviewRoot = root;
         _editorConnectorSplitPreviewNodes = _editorConnectorSplitPreviewCacheNodes;
+        if (_editorConnectorSplitPreviewCacheInsertedEventIndex != int.MinValue)
+        {
+            _editorConnectorSplitPreviewMarkerNode = _editorConnectorSplitPreviewCacheNodes.FirstOrDefault(
+                node => node.EventIndex == _editorConnectorSplitPreviewCacheInsertedEventIndex);
+        }
         return true;
     }
 
@@ -9404,6 +9420,7 @@ public sealed partial class Playfield
         _editorConnectorSplitPreviewCacheRootEventIndex = -1;
         _editorConnectorSplitPreviewCacheTick = int.MinValue;
         _editorConnectorSplitPreviewCacheTrack = -1;
+        _editorConnectorSplitPreviewCacheInsertedEventIndex = int.MinValue;
         _editorConnectorSplitPreviewCacheHorizontalFirst = false;
         _editorConnectorSplitPreviewCacheGroupEditMode = false;
         _editorConnectorSplitPreviewCacheGroupId = null;

@@ -186,8 +186,14 @@ public sealed partial class Playfield
         }
         if (editorGroupInactiveBanks && laneState is not null)
         {
-            CompositeEditorInactiveBankLayer(virtualWidth, virtualHeight,
-                Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f));
+            var inactiveBankOpacity = Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f);
+            CompositeEditorInactiveBankLayer(virtualWidth, virtualHeight, inactiveBankOpacity);
+            // Draw inactive-bank connector textures only after the bank layer is
+            // blended into the scene. This avoids applying inactiveBankOpacity to
+            // the whole preview target a second time. Its route lines and placement
+            // ring are then drawn as a full-opacity overlay, like the selection
+            // highlighter, while only the body/head texture receives preview fade.
+            DrawEditorInactiveBankConnectorPreview(laneTick, laneState, inactiveBankOpacity);
         }
         if (_chart is null || _tempo is null || _gear is null)
         {

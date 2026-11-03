@@ -30,6 +30,10 @@ public sealed partial class Playfield
         _editorConnectorPreviewHeadCommands.Clear();
         _editorConnectorSplitPreviewRoot = null;
         _editorConnectorSplitPreviewNodes = null;
+        _editorConnectorSplitPreviewMarkerNode = null;
+        _editorConnectorExtensionPreviewRoot = null;
+        _editorConnectorExtensionPreviewNodes.Clear();
+        _editorConnectorExtensionPreviewMarkerNode = null;
         if (!_editorNoteGroupPlacementPreviewRendering)
             TryPrepareEditorConnectorSplitPreview();
         // The standard extension preview and source/target replacements are
@@ -845,6 +849,8 @@ public sealed partial class Playfield
             DrawEditorConnectorPreviewComposite();
         }
 
+        DrawEditorConnectorPreviewLines(currentTick, currentState);
+
         // Texture fallbacks for machines missing part of the external texture
         // set. These retain the previous geometry instead of silently hiding a
         // chart element.
@@ -1275,6 +1281,13 @@ public sealed partial class Playfield
         _spriteBatch.End();
     }
 
+    // Connector previews describe a proposed connector gesture, not a note-move
+    // gesture. Once a note drag or marquee selection owns the pointer, suppress all
+    // extension preview work so moving a tap down or sideways cannot look like a
+    // connector is being extended underneath it.
+    private bool IsEditorConnectorPreviewGestureBlocked()
+        => _editorDraggedEvent is not null || _editorRectSelecting;
+
     // A connector preview replaces the existing duration body of a selected
     // terminal LinkTail (or a standalone long LinkHead). Leaving the authored body
     // underneath makes that part of the translucent preview visibly more opaque.
@@ -1288,6 +1301,7 @@ public sealed partial class Playfield
             return false;
 
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
+            IsEditorConnectorPreviewGestureBlocked() ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
             return false;
@@ -1358,6 +1372,7 @@ public sealed partial class Playfield
         source = null!;
         targetHead = null;
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
+            IsEditorConnectorPreviewGestureBlocked() ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
             return false;
@@ -1466,7 +1481,8 @@ public sealed partial class Playfield
         GearState currentState,
         Dictionary<int, int> counts)
     {
-        if (_editorInactiveBankLayerPass || !_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
+        if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
+            IsEditorConnectorPreviewGestureBlocked() ||
             _chart is null || _tempo is null || !_hoverBeatTick.HasValue ||
             !_hoverTrack.HasValue || !_selectedEventKey.HasValue)
             return;
@@ -1581,6 +1597,44 @@ public sealed partial class Playfield
         }
 
         var root = GetEditorLinkRoot(source) ?? source;
+
+        // Build a lightweight representation of the proposed extension. The
+        // extension preview texture is rendered below; this route feeds the orange
+        // path overlay and LinkTail-sized placement marker drawn above it.
+        var extensionPointTick = horizontalFirst ? connectionTick : sameTrack ? previewEndTick : targetTick;
+        var extensionPointDuration = sameTrack
+            ? 6
+            : horizontalFirst
+                ? Math.Max(6, previewEndTick - connectionTick)
+                : hoveredExistingNote is { NoteType: NoteType.SingleLong } targetHold
+                    ? Math.Max(6, targetHold.Duration)
+                    : hoveredExistingNote is null ? _editorDuration : 6;
+        var extensionPoint = _editorConnectorExtensionPreviewPoint;
+        extensionPoint.Tick = extensionPointTick;
+        extensionPoint.Track = targetTrack;
+        extensionPoint.Attr = source.NoteType == NoteType.LinkHead &&
+                              (source.LinePair is 1 or 3 or 5 or 7)
+            ? source.LinePair + 1
+            : source.Attr;
+        extensionPoint.RawType = 1;
+        extensionPoint.TypeIndex = -1;
+        extensionPoint.Duration = extensionPointDuration;
+        extensionPoint.NoteType = NoteType.LinkTail;
+        extensionPoint.EventIndex = int.MaxValue;
+        extensionPoint.LinePair = (source.LinePair is 1 or 3 or 5 or 7) ? source.LinePair : -1;
+        extensionPoint.TwinPairId = null;
+        extensionPoint.NoteGroupId = source.NoteGroupId;
+        extensionPoint.NoteGroupInstanceId = source.NoteGroupInstanceId;
+        extensionPoint.NoteGroupMemberId = source.NoteGroupMemberId;
+        extensionPoint.Kind = "Note";
+        extensionPoint.Instrument = source.Instrument;
+        extensionPoint.Velocity = source.Velocity;
+        extensionPoint.Pan = source.Pan;
+        _editorConnectorExtensionPreviewRoot = source;
+        _editorConnectorExtensionPreviewNodes.Add(source);
+        _editorConnectorExtensionPreviewNodes.Add(extensionPoint);
+        _editorConnectorExtensionPreviewMarkerNode = extensionPoint;
+
         var activeLeft = GearTimeline.ActiveBankForSide(currentState, "left");
         var activeRight = GearTimeline.ActiveBankForSide(currentState, "right");
         var sourceIsActive = sourcePosition.Value.Side == "left"
@@ -1765,9 +1819,13 @@ public sealed partial class Playfield
         }
     }
 
-    private void DrawEditorConnectorPreviewComposite()
+    private void DrawEditorConnectorPreviewComposite(float bankOpacity = 1f)
     {
         const float previewOpacity = 0.42f;
+        // The inactive bank is first rendered into its own layer, then composited
+        // into the main target. Keep connector preview commands pending during that
+        // pass so their translucent textures can be composited directly over the
+        // finished bank layer instead of being faded together with the entire lane.
         if (_editorInactiveBankLayerPass || _editorNoteGroupPlacementPreviewRendering ||
             (_editorConnectorPreviewBody3DCommands.Count == 0 &&
              _editorConnectorPreviewHeadCommands.Count == 0))
@@ -1827,9 +1885,175 @@ public sealed partial class Playfield
         // Composite only the transparent preview layer, applying its opacity once.
         // This leaves lane and track pixels in the original frame exactly unchanged.
         _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        var compositeOpacity = previewOpacity * Math.Clamp(bankOpacity, 0f, 1f);
         _spriteBatch.Draw(_editorConnectorPreviewRenderTarget,
-            new Rectangle(0, 0, width, height), Color.White * previewOpacity);
+            new Rectangle(0, 0, width, height), Color.White * compositeOpacity);
         _spriteBatch.End();
+    }
+
+    // Called after the inactive-bank layer has been composited into the main
+    // target. Its body/head textures retain their normal preview transparency,
+    // while its route lines and endpoint marker are drawn separately at full
+    // opacity so they remain as bright as the ordinary editor selection marker.
+    private void DrawEditorInactiveBankConnectorPreview(
+        double currentTick, GearState currentState, float inactiveBankOpacity)
+    {
+        if (!_chartEditorMode || !_editorConnectorMode || _editorNoteGroupPlacementPreviewRendering)
+            return;
+
+        DrawEditorConnectorPreviewComposite(inactiveBankOpacity);
+        DrawEditorConnectorPreviewLines(currentTick, currentState);
+    }
+
+    private void DrawEditorConnectorPreviewLines(double currentTick, GearState currentState)
+    {
+        if (!_chartEditorMode || !_editorConnectorMode || _editorNoteGroupPlacementPreviewRendering ||
+            _editorInactiveBankLayerPass || _tempo is null)
+            return;
+
+        var hasSplitRoute = _editorConnectorSplitPreviewRoot is not null &&
+            _editorConnectorSplitPreviewNodes is { Count: > 1 } &&
+            ShouldRenderTrackInCurrentEditorPass(_editorConnectorSplitPreviewRoot.Track, currentState);
+        var hasExtensionRoute = _editorConnectorExtensionPreviewRoot is not null &&
+            _editorConnectorExtensionPreviewNodes.Count > 1 &&
+            ShouldRenderTrackInCurrentEditorPass(_editorConnectorExtensionPreviewRoot.Track, currentState);
+        if (!hasSplitRoute && !hasExtensionRoute)
+            return;
+
+        // The brighter/wider route remains legible over translucent split and
+        // extension textures and visually separates the proposed path from notes.
+        const float lineWidth = 4.0f;
+        _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        try
+        {
+            if (hasSplitRoute)
+                DrawEditorConnectorPreviewRouteLines(
+                    _editorConnectorSplitPreviewNodes!, currentTick, currentState, lineWidth);
+            if (hasExtensionRoute)
+            {
+                DrawEditorConnectorPreviewRouteLines(
+                    _editorConnectorExtensionPreviewNodes, currentTick, currentState, lineWidth);
+
+                // Draw the extension placement ring in the same bank pass as its
+                // translucent preview. This ensures inactive-bank extensions are
+                // composited with the bank's opacity instead of losing the marker
+                // when the main (active-bank) pass rebuilds preview state.
+                var markerNode = _editorConnectorExtensionPreviewMarkerNode ??
+                    _editorConnectorExtensionPreviewNodes[^1];
+                var markerTick = markerNode.Tick;
+                var markerTrack = markerNode.Track;
+                if (markerTick >= 0 && markerTrack is >= 0 and <= 15)
+                {
+                    var markerTravel = (float)_projection.ScrollPixelsAtTicks(markerTick, currentTick);
+                    if (_projection.WithinRenderDistance(markerTravel))
+                    {
+                        var markerPoint = _projection.ProjectAtTicks(
+                            markerTrack, markerTick, currentTick, currentState);
+                        if (!OutsideNoteView(markerPoint, markerPoint))
+                        {
+                            var markerRadius = GetEditorMarkerRadius(
+                                markerTrack, markerTick, currentTick, currentState,
+                                out var markerCenter, markerNode, markerPoint, markerTravel);
+                            DrawEditorMarker(markerCenter, markerRadius * 0.5f, EditorFamilyColor, 0.17f);
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _spriteBatch.End();
+        }
+    }
+
+    private void DrawEditorConnectorPreviewRouteLines(
+        IReadOnlyList<ChartEvent> nodes, double currentTick, GearState currentState, float lineWidth)
+    {
+        for (var i = 0; i + 1 < nodes.Count; i++)
+        {
+            var head = nodes[i];
+            var tail = nodes[i + 1];
+            if (!ShouldIncludeLink(new LinkSegment(head, tail), currentState) ||
+                (tail.Tick > head.Tick && currentTick >= tail.Tick))
+                continue;
+
+            var headTravel = (float)_projection.ScrollPixelsAtTicks(head.Tick, currentTick);
+            var tailTravel = (float)_projection.ScrollPixelsAtTicks(tail.Tick, currentTick);
+            var intervalVisible = _projection.RenderIntervalIntersects(headTravel, tailTravel);
+            var connectorVisible = head.Track != tail.Track && _projection.WithinRenderDistance(tailTravel);
+            if (!intervalVisible && !connectorVisible)
+                continue;
+
+            // Match the renderer's visible body start: once the source point has
+            // crossed the judgement line, begin at the current scroll position.
+            if (intervalVisible && tail.Tick > head.Tick)
+            {
+                var visibleBodyStartTick = Math.Max((double)head.Tick, currentTick);
+                DrawEditorConnectorPreviewLaneStroke(
+                    head.Track, visibleBodyStartTick, tail.Tick, currentTick, currentState, lineWidth);
+            }
+
+            // At the destination tick the link crosses from the source lane to the
+            // next LinkTail. Trace that turn directly over the connector texture,
+            // including horizontal-first links whose two points share a tick.
+            if (connectorVisible)
+            {
+                var connectorStart = _projection.ProjectAtTravel(
+                    head.Track, tailTravel, currentState).Position;
+                var connectorEnd = _projection.ProjectAtTravel(
+                    tail.Track, tailTravel, currentState).Position;
+                DrawEditorConnectorPreviewStroke(connectorStart, connectorEnd, lineWidth);
+            }
+        }
+
+        // A terminal LinkTail can continue as a regular hold body beyond its point.
+        var terminal = nodes[^1];
+        if (terminal.Duration > 6 && currentTick < terminal.EndTick)
+        {
+            DrawEditorConnectorPreviewLaneStroke(
+                terminal.Track, Math.Max((double)terminal.Tick, currentTick), terminal.EndTick,
+                currentTick, currentState, lineWidth);
+        }
+    }
+
+    private void DrawEditorConnectorPreviewLaneStroke(
+        int track, double startTick, double endTick, double currentTick, GearState currentState, float width)
+    {
+        if (endTick <= startTick)
+            return;
+
+        var startTravel = (float)_projection.ScrollPixelsAtTicks(startTick, currentTick);
+        var endTravel = (float)_projection.ScrollPixelsAtTicks(endTick, currentTick);
+        if (!_projection.RenderIntervalIntersects(startTravel, endTravel))
+            return;
+
+        var tickSpan = endTick - startTick;
+        var steps = Math.Clamp((int)Math.Ceiling(tickSpan / 192.0), 2, 10);
+        var previous = _projection.ProjectAtTravel(track, startTravel, currentState).Position;
+        for (var step = 1; step <= steps; step++)
+        {
+            var sampleTick = step == steps
+                ? endTick
+                : startTick + tickSpan * (step / (double)steps);
+            var sampleTravel = (float)_projection.ScrollPixelsAtTicks(sampleTick, currentTick);
+            var next = _projection.ProjectAtTravel(track, sampleTravel, currentState).Position;
+            DrawEditorConnectorPreviewStroke(previous, next, width);
+            previous = next;
+        }
+    }
+
+    private void DrawEditorConnectorPreviewStroke(Vector2 start, Vector2 end, float width)
+    {
+        if (!float.IsFinite(start.X) || !float.IsFinite(start.Y) ||
+            !float.IsFinite(end.X) || !float.IsFinite(end.Y) ||
+            Vector2.DistanceSquared(start, end) <= 0.01f)
+            return;
+
+        // Use a wide dark outline and saturated orange center so the proposed
+        // route reads clearly over both bright and dark preview textures.
+        DrawLine(_spriteBatch, start, end, width + 3.5f, new Color(54, 22, 0, 255));
+        DrawLine(_spriteBatch, start, end, width, new Color(255, 118, 0, 255));
+        DrawLine(_spriteBatch, start, end, 1.25f, new Color(255, 211, 126, 255));
     }
 
     private void AddFlickNoteCommands(
