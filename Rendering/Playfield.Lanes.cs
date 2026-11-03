@@ -693,12 +693,70 @@ public sealed partial class Playfield
     }
 
     /// <summary>
+    /// Draw the Local Test segment boundaries across every complete bank.
+    /// This intentionally uses the same line and label treatment as PLAY END.
+    /// </summary>
+    private void DrawEditorLanTestSegmentMarkers(double currentTick)
+    {
+        if (!_chartEditorMode || _chart is null || _tempo is null ||
+            _editorPreviewMode || !IsEditorLanTestSegmentActive)
+            return;
+
+        var projectedEdges = _projectedBankLineEdges;
+        var markerColor = new Color(255, 225, 0);
+        _spriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+        DrawEditorLanTestSegmentMarker(
+            GetEditorLanTestSegmentDisplayTick(isStart: true), "START POS",
+            currentTick, markerColor, projectedEdges);
+        DrawEditorLanTestSegmentMarker(
+            GetEditorLanTestSegmentDisplayTick(isStart: false), "END POS",
+            currentTick, markerColor, projectedEdges);
+        _spriteBatch.End();
+    }
+
+    private void DrawEditorLanTestSegmentMarker(
+        int tick, string labelText, double currentTick, Color markerColor,
+        List<Vector2> projectedEdges)
+    {
+        var travelPixels = (float)_projection.ScrollPixelsAtTicks(tick, currentTick);
+        if (!_projection.WithinRenderDistance(travelPixels))
+            return;
+
+        projectedEdges.Clear();
+        foreach (var side in Sides)
+        foreach (var bank in Banks)
+        {
+            var slice = _projection.ProjectBankSliceAtTravel(travelPixels, side, bank);
+            if (Math.Max(slice.Inner.Y, slice.Outer.Y) < -40f ||
+                Math.Min(slice.Inner.Y, slice.Outer.Y) > _graphics.Viewport.Height + 150f)
+                continue;
+            projectedEdges.Add(slice.Inner);
+            projectedEdges.Add(slice.Outer);
+        }
+        projectedEdges.Sort(static (a, b) => a.X.CompareTo(b.X));
+        if (projectedEdges.Count < 2)
+            return;
+
+        DrawConnectedBankLine(projectedEdges, 3f, markerColor);
+
+        var label = FontSafeText(_font, labelText);
+        var labelSize = UnicodeTextRenderer.MeasureString(_font, label);
+        var leftEndpoint = projectedEdges[0];
+        var labelY = tick == 0
+            ? leftEndpoint.Y + 2f
+            : leftEndpoint.Y - labelSize.Y - 2f;
+        UnicodeTextRenderer.DrawString(_spriteBatch, _font, label,
+            new Vector2(leftEndpoint.X + 2f, labelY), markerColor);
+    }
+
+    /// <summary>
     /// Draw the native track-16 ending marker. It mirrors PlayTick rather than
     /// being an independently editable note, so the guide line follows the
     /// current play-time-derived tick automatically.
     /// </summary>
     private void DrawPlayTickMarker(double currentTick, GearState state)
     {
+        DrawEditorLanTestSegmentMarkers(currentTick);
         if (!_chartEditorMode || _chart is null || _chart.PlayTick < 0)
             return;
 

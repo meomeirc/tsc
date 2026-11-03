@@ -31,9 +31,11 @@ public sealed partial class Playfield
     private static Color GetEditorSelectedNoteHighlightColor(ChartEvent note)
         => note.NoteGroupId.HasValue ? EditorGroupSelectedColor : EditorSelectedColor;
     private static readonly Color EditorEndingColor = Color.Cyan;
-    // Two selection quads, each with a filled face and four 3D border strips.
-    // Reused each frame to avoid creating short-lived geometry arrays.
-    private readonly VertexPositionColor[] _editorSelection3DVertices = new VertexPositionColor[60];
+    // Selection and Local Test segment geometry is drawn on the real 3D lane surfaces.
+    // Reuse the vertex buffer each frame rather than creating short-lived arrays.
+    private static readonly (int First, int Last)[] EditorLanTestSegmentBanks =
+    { (0, 2), (3, 5), (6, 8), (9, 11), (12, 13), (14, 15) };
+    private readonly VertexPositionColor[] _editorSelection3DVertices = new VertexPositionColor[2048];
     // All multi-selection highlights are accumulated into one reusable 2D mesh.
     // The capacity grows only when a denser-than-before visible frame requires it.
     private VertexPositionColor[] _editorMultiSelectionMarkerVertices = new VertexPositionColor[8192];
@@ -695,12 +697,13 @@ public sealed partial class Playfield
             return;
 
         // Once a gesture belongs to the chart canvas, keep pointer ownership there
-        // until release. Lua buttons/sliders may still show hover, but they must not
-        // capture or interrupt a note drag, marquee, SELECT line, or timeline scrub.
+        // until release. Lua buttons/sliders must not capture or interrupt note drags,
+        // marquees, or the SELECT line. Timeline scrubbing is different: its Lua
+        // slider owns pointer capture so it can continue receiving drag updates.
         var editorCanvasGestureActive = _chartEditorMode &&
             (_editorRectSelectionArmed || _editorRectSelecting || _editorDraggedEvent is not null ||
              _editorPanelsMarqueeArmed || _editorPanelsMarqueeSelecting || _editorPanelUsingSharedDrag ||
-             _editorTimelineScrubbing || _editorSelectLineDragging);
+             _editorSelectLineDragging);
         if (editorLuaUiActive)
         {
             if (editorCanvasGestureActive)
@@ -754,29 +757,15 @@ public sealed partial class Playfield
             return;
         }
 
-        // The Lua timeline slider already maps pointer Y to the complete slider
-        // bounds and dispatches seek values while captured. Do not also remap
-        // held frames through the legacy C# track insets: frames with no new Lua
-        // slider value would otherwise jump to a slightly different position.
-        if (editorLuaUiActive && _editorTimelineScrubbing)
-        {
-            if (leftDown || touchActive)
-                return;
-
-            _editorTimelineScrubbing = false;
-            if (_editorTimelineResumeAfterScrub)
-            {
-                _playing = true;
-                _audioResyncPending = true;
-            }
-            _editorTimelineResumeAfterScrub = false;
-            return;
-        }
+        // The timeline is intentionally handled by one C# press/drag/release
+        // path below. The skin only draws it; a parallel Lua slider would compete
+        // for pointer capture and could leave click-only scrubbing.
 
         if ((leftPressed || touchPressed) && _editorMetaEditingField is not null)
             CommitEditorMetaFieldOnBlur();
         var pointerOverToolbar = editorLuaUiActive
-            ? _chartEditorInterfaceRuntime.IsUiPointOverControl(point.X, point.Y)
+            ? _chartEditorInterfaceRuntime.IsUiPointOverControl(point.X, point.Y) ||
+              GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel)
             : IsEditorToolbarPanelContains(pointerPixel, virtualWidth, virtualHeight) ||
               IsEditorBankIndicatorArea(point, virtualWidth, virtualHeight);
 
@@ -819,6 +808,7 @@ public sealed partial class Playfield
             _editorMenuSection != EditorMenuSection.Bpm &&
             !_editorPreviewMode && !_editorSuperFlickPlacementPending && !_editorBpmPlacementPending &&
             !_editorStutterStartPlacementPending && !_editorStutterEndPlacementPending &&
+            !_editorLanTestSegmentStartPlacementPending && !_editorLanTestSegmentEndPlacementPending &&
             !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
             KeybindSettings.IsModifierBindingHeld("editor_delete_click_modifier"))
         {
@@ -852,6 +842,7 @@ public sealed partial class Playfield
             _editorMenuSection is not (EditorMenuSection.Select or EditorMenuSection.Bpm) && !_editorPreviewMode &&
             !_editorSuperFlickPlacementPending && !_editorBpmPlacementPending &&
             !_editorStutterStartPlacementPending && !_editorStutterEndPlacementPending &&
+            !_editorLanTestSegmentStartPlacementPending && !_editorLanTestSegmentEndPlacementPending &&
             !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
             !KeybindSettings.IsDown("editor_connect_modifier") &&
             TryHandleEditorNoteGroupDoubleClick(point, currentTick, currentState))
@@ -1078,6 +1069,25 @@ public sealed partial class Playfield
         }
         if (_chartEditorMode && TryHandleEditorBankIndicatorClick(point, virtualWidth, virtualHeight))
             return;
+
+        // Segment placement is a one-shot chart gesture. Handle it before the
+        // exclusive SELECT/BPM/STUTTER modes so the INFO → TEST controls work
+        // regardless of which editor tool was previously open.
+        if (_chartEditorMode &&
+            (_editorLanTestSegmentStartPlacementPending || _editorLanTestSegmentEndPlacementPending))
+        {
+            var chosenTick = FindClickedQuarterBeat(point, currentTick, currentState, out _);
+            if (chosenTick is not int snappedTick)
+            {
+                _statusMessage = _editorLanTestSegmentStartPlacementPending
+                    ? "Tap inside a visible lane to set the test start."
+                    : "Tap inside a visible lane to set the test end.";
+                return;
+            }
+
+            SetEditorLanTestSegmentPosition(_editorLanTestSegmentStartPlacementPending, snappedTick);
+            return;
+        }
 
         // A placement tool normally gets first chance at lane clicks, but an
         // outside-lane press cannot place anything. Arm the canvas gesture before
@@ -9932,6 +9942,76 @@ public sealed partial class Playfield
         }
     }
 
+    private int AppendEditorLanTestSegmentOverlay(int offset, double currentTick, GearState currentState)
+    {
+        if (_chart is null || _tempo is null)
+            return offset;
+        var startTick = GetEditorLanTestSegmentDisplayTick(isStart: true);
+        var endTick = GetEditorLanTestSegmentDisplayTick(isStart: false);
+        if (endTick <= startTick)
+            return offset;
+
+        // Keep geometry near the current camera view. Scrolling the chart reveals
+        // the next part of a longer segment without creating a huge far plane.
+        var visibleStart = Math.Max(startTick, currentTick - 2000.0);
+        var visibleEnd = Math.Min(endTick, currentTick + 2000.0);
+        if (visibleEnd <= visibleStart)
+            return offset;
+
+        if (_compact)
+        {
+            // Collapsed lanes display only the banks active at the current editor
+            // playhead. All three banks on each side share the same screen-space
+            // position, so drawing the hidden banks would stack the translucent
+            // fill and make it more opaque. Reuse the exact state passed to the lane
+            // renderer and draw one bank per side.
+            foreach (var side in Sides)
+            {
+                var bank = GearTimeline.ActiveBankForSide(currentState, side);
+                if (string.Equals(bank, "Inactive", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                offset = AppendEditorLanTestSegmentBank(
+                    offset, side, bank, visibleStart, visibleEnd, currentTick);
+            }
+            return offset;
+        }
+
+        // Expanded mode gives each bank its own physical lane space, so all banks
+        // remain highlighted as before.
+        foreach (var (firstTrack, _) in EditorLanTestSegmentBanks)
+        {
+            var firstPosition = GearState.Position(firstTrack);
+            if (firstPosition is null)
+                continue;
+
+            offset = AppendEditorLanTestSegmentBank(
+                offset, firstPosition.Value.Side, firstPosition.Value.Bank,
+                visibleStart, visibleEnd, currentTick);
+        }
+        return offset;
+    }
+
+    private int AppendEditorLanTestSegmentBank(
+        int offset, string side, string bank,
+        double startTick, double endTick, double currentTick)
+    {
+        // Track centers leave half a track-width unhighlighted at either edge.
+        // Use the canonical bank edges instead, so the segment overlay covers
+        // the complete physical bank surface, including its outer margins.
+        var bankEdges = _projection.LaneBankEdgesNormalized(side, bank);
+        var p0 = GetEditorSelectionPoint3D(bankEdges.Left, startTick, currentTick, side, bank);
+        var p1 = GetEditorSelectionPoint3D(bankEdges.Right, startTick, currentTick, side, bank);
+        var p2 = GetEditorSelectionPoint3D(bankEdges.Right, endTick, currentTick, side, bank);
+        var p3 = GetEditorSelectionPoint3D(bankEdges.Left, endTick, currentTick, side, bank);
+        if (!IsFiniteEditorSelectionPoint(p0) || !IsFiniteEditorSelectionPoint(p1) ||
+            !IsFiniteEditorSelectionPoint(p2) || !IsFiniteEditorSelectionPoint(p3))
+            return offset;
+
+        return AppendEditorSelectionQuad3D(offset, p0, p1, p2, p3,
+            new Color(255, 215, 0, 30), new Color(255, 225, 35, 220));
+    }
+
     private void DrawSelectionOverlay(double currentTick, GearState currentState)
     {
         if (_chart is null || _tempo is null)
@@ -10202,7 +10282,11 @@ public sealed partial class Playfield
         var hasSelectionGeometry = !_editorPanelsViewEnabled &&
             _editorMenuSection != EditorMenuSection.Select &&
             (_editorRectSelecting && _editorRectStartTrack >= 0 && _editorRectCurrentTrack >= 0);
-        if (hasSelectionGeometry)
+        var hasTestSegmentGeometry = _chartEditorMode && _chart is not null && _tempo is not null &&
+            !_editorPanelsViewEnabled && !_editorPreviewMode && IsEditorLanTestSegmentActive &&
+            GetEditorLanTestSegmentDisplayTick(isStart: true) < currentTick + 2000.0 &&
+            GetEditorLanTestSegmentDisplayTick(isStart: false) > currentTick - 2000.0;
+        if (hasSelectionGeometry || hasTestSegmentGeometry)
         {
             // Flush the already queued 2D markers before drawing the selection quads
             // with the real perspective 3D renderer. Re-enter SpriteBatch afterward for
@@ -10234,6 +10318,10 @@ public sealed partial class Playfield
                         new Color(255, 165, 0, 64), EditorSelectedColor);
                 }
             }
+
+            if (hasTestSegmentGeometry && _chart is not null && _tempo is not null)
+                selectionVertexCount = AppendEditorLanTestSegmentOverlay(
+                    selectionVertexCount, currentTick, currentState);
 
             DrawEditorSelectionGeometry3D(selectionVertexCount);
             _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);

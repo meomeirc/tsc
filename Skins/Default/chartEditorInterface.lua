@@ -310,10 +310,10 @@ local function panel(id, x, y, width, height, title, layer)
     end
 end
 
-local function label(text, x, y, size, color, parent, layer)
+local function label(text, x, y, size, color, parent, layer, font)
     draw.text(tostring(text or ""), {
         parent = parent, x = x, y = y, size = size or fontSize("body"),
-        color = color or C.text, font = F.regular, anchor = "top-left",
+        color = color or C.text, font = font or F.regular, anchor = "top-left",
         layer = layer or 10,
     })
 end
@@ -966,8 +966,9 @@ local function drawTimeline(state, x, y, width, height, layer)
     local playY = timeY(currentSeconds)
     draw.rect({ x = x, y = playY - 2 * ACTIVE_SCALE, width = width,
         height = 4 * ACTIVE_SCALE, color = "#34D399", alpha = 0.65, layer = (layer or 3) + 8 })
-    ui.slider({ id = "editor_timeline", x = x, y = y, width = width, height = height,
-        min = 0, max = duration, step = 0, axis = "vertical", reverse = 1, action = "editor.seek" })
+    -- Pointer input is owned by the C# timeline handler. Keeping a second Lua
+    -- slider here caused its capture to compete with the C# drag path, so the
+    -- visual timeline deliberately has no separate interactive control.
 end
 
 local function bottomActionSlots(items, cols)
@@ -1355,7 +1356,37 @@ local function drawMeta(state, w, h, layer)
             action = "editor.lan_test.adb.toggle", enabled = state.meta_test_busy ~= true,
             variant = adbEnabled and "primary" or "secondary",
             font = F.medium, text_size = fontSize("small"), layer = bodyLayer + 2 })
-        textY = adbControlY + 44 * scale
+        textY = adbControlY + 40 * scale
+
+        label("TEST SEGMENT", textX, textY, smallSize, C.muted, nil, labelLayer, F.medium)
+        textY = textY + 27 * scale
+        drawWrappedValue("START  " .. tostring(state.meta_test_segment_start_label or "0 ticks · 0.000s"),
+            smallSize, C.text, F.regular, smallLineHeight, bodyLayer)
+        drawWrappedValue("END  " .. tostring(state.meta_test_segment_end_label or "0 ticks · 0.000s"),
+            smallSize, C.text, F.regular, smallLineHeight, bodyLayer)
+        drawWrappedValue("LENGTH  " .. tostring(state.meta_test_segment_length or "Full chart · 0 ticks · 0.000s"),
+            smallSize, C.accent, F.medium, smallLineHeight, bodyLayer)
+        local segmentGap = 5 * scale
+        local segmentButtonW = (textWidth - segmentGap * 2) / 3
+        local segmentButtonY = textY
+        local segmentEnabled = state.meta_test_segment_controls_enabled == true
+        UI.draw_button({ id = "editor_lan_test_segment_start", x = textX, y = segmentButtonY,
+            width = segmentButtonW, height = 29 * scale,
+            label = state.meta_test_segment_start_pending and "PICK START" or "SET START",
+            action = "editor.lan_test.segment.set_start", enabled = segmentEnabled,
+            variant = state.meta_test_segment_start_pending and "primary" or "secondary",
+            font = F.medium, text_size = fontSize("small"), layer = bodyLayer + 2 })
+        UI.draw_button({ id = "editor_lan_test_segment_end", x = textX + segmentButtonW + segmentGap, y = segmentButtonY,
+            width = segmentButtonW, height = 29 * scale,
+            label = state.meta_test_segment_end_pending and "PICK END" or "SET END",
+            action = "editor.lan_test.segment.set_end", enabled = segmentEnabled,
+            variant = state.meta_test_segment_end_pending and "primary" or "secondary",
+            font = F.medium, text_size = fontSize("small"), layer = bodyLayer + 2 })
+        UI.draw_button({ id = "editor_lan_test_segment_clear", x = textX + (segmentButtonW + segmentGap) * 2, y = segmentButtonY,
+            width = segmentButtonW, height = 29 * scale, label = "CLEAR",
+            action = "editor.lan_test.segment.clear", enabled = segmentEnabled and state.meta_test_segment_clear_enabled == true,
+            variant = "danger", font = F.medium, text_size = fontSize("small"), layer = bodyLayer + 2 })
+        textY = segmentButtonY + 37 * scale
 
         drawTestField("STATUS", state.meta_test_status or "Not running",
             state.meta_test_running and C.accent or C.text, F.medium)

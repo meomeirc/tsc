@@ -74,20 +74,6 @@ public static class AresWriter
 
     /// <summary>Builds and validates an ARES file in memory.</summary>
     public static byte[] BuildBytes(AresChart chart, byte[]? sourceHeader = null)
-        => BuildBytesCore(chart, sourceHeader, muteNativeVolumeTracks: false);
-
-    /// <summary>
-    /// Builds a Local Test copy with all native audio tracks muted at tick zero.
-    /// This is intentionally separate from normal export so the editor chart and
-    /// files saved by the user retain their authored Volume events.
-    /// </summary>
-    public static byte[] BuildBytesForLocalTest(AresChart chart, byte[]? sourceHeader = null)
-        => BuildBytesCore(chart, sourceHeader, muteNativeVolumeTracks: true);
-
-    private static byte[] BuildBytesCore(
-        AresChart chart,
-        byte[]? sourceHeader,
-        bool muteNativeVolumeTracks)
     {
         ArgumentNullException.ThrowIfNull(chart);
         _ = sourceHeader; // Source headers are intentionally not preserved anymore.
@@ -104,10 +90,7 @@ public static class AresWriter
         }
         var chartTracksByIndex = chart.Tracks.GroupBy(t => t.TrackIndex)
             .ToDictionary(g => g.Key, g => g.First());
-        var noteGroupMetadataEvents = NoteGroupMetadataCodec.CreateMetadataEvents(
-            chart,
-            forAresExport: true,
-            muteNativeVolumeTracks: muteNativeVolumeTracks);
+        var noteGroupMetadataEvents = NoteGroupMetadataCodec.CreateMetadataEvents(chart, forAresExport: true);
         var highestChartTrackCount = chartTracksByIndex.Keys
             .Select(index => checked(index + 1)).DefaultIfEmpty(0).Max();
         var disabledTempoBackups = chart.Tracks.SelectMany(track => track.Events)
@@ -123,11 +106,6 @@ public static class AresWriter
         // kind-1 metadata notes on track 30, which is reserved for editor data.
         if (disabledTempoBackups.Count > 0)
             outputTrackCount = Math.Max(outputTrackCount, 31);
-        // Native ARES charts use Volume events on the 32 standard audio tracks
-        // (0..31). Tracks above 31 are auxiliary/reserved records, not volume
-        // channels. Ensure all native audio tracks exist in the Local Test copy.
-        if (muteNativeVolumeTracks)
-            outputTrackCount = Math.Max(outputTrackCount, 32);
         if (outputTrackCount > byte.MaxValue)
             throw new InvalidDataException($"ARES supports at most 255 track records; requested {outputTrackCount}.");
 
@@ -199,9 +177,6 @@ public static class AresWriter
                     ? a.Tick.CompareTo(b.Tick)
                     : a.EventIndex.CompareTo(b.EventIndex));
             }
-
-            if (muteNativeVolumeTracks && trackIndex < 32)
-                VolumeEventTools.ReplaceTrackVolumeWithSilence(trackEvents, trackIndex);
 
             var track = new TrackDefinition
             {
@@ -302,6 +277,27 @@ public static class AresWriter
         if (validatedChart.PlayTick != chart.PlayTick)
             throw new InvalidDataException(
                 $"ARES export validation failed: play tick changed from {chart.PlayTick} to {validatedChart.PlayTick}.");
+
+        // Verify the active tempo stream itself, not just the duration derived
+        // from the ARES header. A file can retain the expected InitialTempo and
+        // still lose a required tick-zero tempo event during slicing/serialization.
+        static IEnumerable<(int Track, int Tick, int BpmBits)> GetActiveTempoEvents(AresChart value)
+            => value.Tracks
+                .SelectMany(track => track.Events
+                    .Where(ev => !ev.LoopReconstructed && ev.RawType == 3 &&
+                        !NoteGroupMetadataCodec.IsMetadataEvent(ev) &&
+                        (track.TrackIndex != 16 || ev.Tick <= value.PlayTick))
+                    .Select(ev => (Track: track.TrackIndex, ev.Tick,
+                        BpmBits: BitConverter.SingleToInt32Bits((float)ev.Value))))
+                .OrderBy(ev => ev.Track).ThenBy(ev => ev.Tick).ThenBy(ev => ev.BpmBits);
+
+        var expectedTempoEvents = GetActiveTempoEvents(chart).ToArray();
+        var actualTempoEvents = GetActiveTempoEvents(validatedChart).ToArray();
+        if (!expectedTempoEvents.SequenceEqual(actualTempoEvents))
+            throw new InvalidDataException(
+                "ARES export validation failed: active tempo events did not round-trip intact " +
+                $"(expected {expectedTempoEvents.Length}, got {actualTempoEvents.Length}).");
+
         var validatedTimelineDuration = new TempoMap(validatedChart).TickToSeconds(validatedChart.PlayTick);
         if (Math.Abs(validatedChart.PlayTime - validatedTimelineDuration) > 0.002)
             throw new InvalidDataException(

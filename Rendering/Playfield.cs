@@ -4224,6 +4224,7 @@ public sealed partial class Playfield
 
         if (!_switchingEditorDifficulty)
         {
+            ClearEditorLanTestSegmentState();
             _editorDifficultyStates.Clear();
             _editorDeletedDifficultyCodes.Clear();
             _editorCommittedDeletedDifficultyCodes.Clear();
@@ -6558,6 +6559,16 @@ public sealed partial class Playfield
         }
 
         if (KeybindSettings.IsPressed("editor_cancel") &&
+            (_editorLanTestSegmentStartPlacementPending || _editorLanTestSegmentEndPlacementPending))
+        {
+            var wasStart = _editorLanTestSegmentStartPlacementPending;
+            _editorLanTestSegmentStartPlacementPending = false;
+            _editorLanTestSegmentEndPlacementPending = false;
+            _statusMessage = wasStart ? "Test segment start placement cancelled." : "Test segment end placement cancelled.";
+            return;
+        }
+
+        if (KeybindSettings.IsPressed("editor_cancel") &&
             (_editorNoteGroupPlacementArmed || _editorNoteGroupEditMode))
         {
             if (_editorNoteGroupEditMode)
@@ -6573,7 +6584,6 @@ public sealed partial class Playfield
         }
         if (HandleEditorDebugKeybinds())
             return;
-
         if (KeybindSettings.IsPressed("editor_cancel") && (_editorStutterStartPlacementPending || _editorStutterEndPlacementPending))
         {
             var wasStart = _editorStutterStartPlacementPending;

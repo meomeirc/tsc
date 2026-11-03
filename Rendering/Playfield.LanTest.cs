@@ -10,6 +10,7 @@ namespace TSC.Rendering;
 public sealed partial class Playfield
 {
     private const int EditorLanTestPort = 8765;
+    private const int EditorLanTestSegmentPaddingBeats = 5;
     private readonly object _editorLanTestSync = new();
     private LanEditorTestService? _editorLanTestService;
     private string? _editorLanTestWorkspace;
@@ -31,6 +32,16 @@ public sealed partial class Playfield
     private readonly HashSet<string> _editorLanTestAdbWirelessSerials = new(StringComparer.Ordinal);
     private bool _editorLanTestAdbWizardOpen;
     private string _editorLanTestAdbWizardMode = "USB";
+    // Segment markers are session-only and store time relative to the music origin,
+    // not raw ticks, so they stay aligned when the active difficulty changes.
+    private double? _editorLanTestSegmentStartAudioOffsetSeconds;
+    private double? _editorLanTestSegmentEndAudioOffsetSeconds;
+    private bool _editorLanTestSegmentStartPlacementPending;
+    private bool _editorLanTestSegmentEndPlacementPending;
+
+    private bool IsEditorLanTestSegmentActive =>
+        _editorLanTestSegmentStartAudioOffsetSeconds.HasValue ||
+        _editorLanTestSegmentEndAudioOffsetSeconds.HasValue;
     private string _editorLanTestAdbPairAddress = string.Empty;
     private string _editorLanTestAdbPairCode = string.Empty;
 
@@ -126,11 +137,44 @@ public sealed partial class Playfield
         SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
 
-        // Local Test materializes an export copy, so apply the committed media
-        // volume here while preserving the untouched bytes in the editor session.
+        // The active difficulty defines the time window. Segment bounds are
+        // stored relative to its audio origin so the same music interval can be
+        // mapped into every enabled difficulty's own tempo map.
+        var segmentActive = IsEditorLanTestSegmentActive;
+        double segmentStartOffset = 0;
+        double segmentEndOffset = 0;
+        double segmentPaddingSeconds = 0;
+        if (segmentActive)
+        {
+            var activeTempo = new TempoMap(_chart);
+            var activeOriginSeconds = activeTempo.TickToSeconds(_chart.AudioOriginTick);
+            var activeEndTick = GetEditorLanTestChartEndTick();
+            segmentStartOffset = _editorLanTestSegmentStartAudioOffsetSeconds ??
+                (activeTempo.TickToSeconds(0) - activeOriginSeconds);
+            segmentEndOffset = _editorLanTestSegmentEndAudioOffsetSeconds ??
+                (activeTempo.TickToSeconds(activeEndTick) - activeOriginSeconds);
+            if (segmentEndOffset <= segmentStartOffset)
+                throw new InvalidOperationException("The test segment end must be after its start.");
+
+            // Five beats of count-in before the selected chart position. It is
+            // measured using the BPM at the selected start so all difficulties
+            // receive the same real-time audio lead-in.
+            var selectedStartTick = activeTempo.SecondsToTick(activeOriginSeconds + segmentStartOffset);
+            var selectedStartBpm = activeTempo.BpmAt(selectedStartTick);
+            segmentPaddingSeconds = EditorLanTestSegmentPaddingBeats * 60.0 / selectedStartBpm;
+        }
+
+        // Segment audio is encoded once from the untouched source, with trimming
+        // and the committed volume filter in the same FFmpeg pass. Full-chart
+        // testing continues to use the existing export path.
         byte[]? music;
-        try { music = GetEditorMusicBytesForExport(); }
-        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException)
+        try
+        {
+            music = segmentActive
+                ? CreateEditorLanTestSegmentMusicBytes(segmentStartOffset, segmentEndOffset, segmentPaddingSeconds)
+                : GetEditorMusicBytesForExport();
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException)
         {
             throw new InvalidOperationException($"Could not prepare the song audio for Local Test: {ex.Message}", ex);
         }
@@ -214,7 +258,15 @@ public sealed partial class Playfield
             }
 
             var serverDifficulty = GetEditorLanTestServiceDifficulty(code);
-            charts[serverDifficulty] = AresWriter.BuildBytes(chart, headerTemplate);
+            var exportChart = segmentActive
+                ? LocalTestSegmentBuilder.CreateSegment(
+                    chart,
+                    segmentStartOffset,
+                    segmentEndOffset,
+                    segmentPaddingSeconds,
+                    clampEndToChartEnd: !_editorLanTestSegmentEndAudioOffsetSeconds.HasValue)
+                : chart;
+            charts[serverDifficulty] = AresWriter.BuildBytes(exportChart, headerTemplate);
         }
 
         if (charts.Count == 0)
@@ -224,6 +276,285 @@ public sealed partial class Playfield
         var metadataPacket = CaptureEditorLanTestMetadataPacket();
         return new EditorLanTestSnapshot(music.ToArray(), charts, metadataPacket, _editorLanTestChangeRevision,
             string.Join(" · ", charts.Keys.OrderBy(name => Array.IndexOf(order, name))));
+    }
+
+    private byte[] CreateEditorLanTestSegmentMusicBytes(
+        double startAudioOffsetSeconds, double endAudioOffsetSeconds, double leadingPaddingSeconds)
+    {
+        var (sourceBytes, sourceExtension) = GetEditorLanTestSegmentMusicSource();
+        if (sourceBytes is not { Length: > 0 })
+            throw new InvalidOperationException("The original session audio is unavailable, so a safe segment copy cannot be created.");
+
+        // Start the music up to five beats before the selected chart position.
+        // If that would precede the source file, prepend the missing part as
+        // silence so the temporary audio and chart both begin at tick zero.
+        var requestedSourceStart = startAudioOffsetSeconds - leadingPaddingSeconds;
+        var startSeconds = Math.Max(0, requestedSourceStart);
+        var leadingSilenceSeconds = Math.Max(0, -requestedSourceStart);
+        var endSeconds = Math.Max(0, endAudioOffsetSeconds);
+        var sourceDurationSeconds = endSeconds - startSeconds;
+        var durationSeconds = sourceDurationSeconds + leadingSilenceSeconds;
+        if (!double.IsFinite(durationSeconds) || sourceDurationSeconds <= 0.001 || durationSeconds <= 0.001)
+            throw new InvalidOperationException("The selected segment contains no music. Move the end marker later.");
+
+        var ffmpeg = FindTstsFfmpegExecutable();
+        if (ffmpeg is null)
+            throw ExternalDependencyPrompts.CreateFfmpegNotFoundException("trim a Local Test segment");
+
+        var temporaryDirectory = Path.Combine(Path.GetTempPath(), "TSC-local-test-segment-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        var extension = NormalizeEditorAudioSourceExtension("source" + sourceExtension);
+        var inputPath = Path.Combine(temporaryDirectory, "source" + extension);
+        var outputPath = Path.Combine(temporaryDirectory, "segment.opus");
+        try
+        {
+            File.WriteAllBytes(inputPath, sourceBytes);
+            var arguments = new List<string>
+            {
+                "-hide_banner", "-loglevel", "error", "-y", "-i", inputPath,
+                "-ss", startSeconds.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture),
+                "-t", durationSeconds.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture),
+                "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000"
+            };
+            var audioFilters = new List<string>();
+            if (leadingSilenceSeconds > 0.001)
+            {
+                var delayMilliseconds = checked((long)Math.Round(
+                    leadingSilenceSeconds * 1000.0, MidpointRounding.AwayFromZero));
+                audioFilters.Add($"adelay={delayMilliseconds}:all=1");
+            }
+            if (_editorMusicVolumePercent < 100)
+            {
+                var gain = Math.Clamp(_editorMusicVolumePercent, 0, 100) / 100.0;
+                audioFilters.Add("volume=" + gain.ToString("0.####", System.Globalization.CultureInfo.InvariantCulture) + ":precision=double");
+            }
+            if (audioFilters.Count > 0)
+            {
+                arguments.Add("-af");
+                arguments.Add(string.Join(",", audioFilters));
+            }
+            arguments.AddRange(new[]
+            {
+                "-c:a", "libopus", "-b:a", "160k", "-application", "audio",
+                "-vbr", "on", "-f", "opus", outputPath
+            });
+            RunEditorPreviewFfmpeg(ffmpeg, arguments);
+            if (!File.Exists(outputPath) || new FileInfo(outputPath).Length == 0)
+                throw new InvalidDataException("FFmpeg produced an empty audio segment.");
+            return File.ReadAllBytes(outputPath);
+        }
+        finally
+        {
+            try { Directory.Delete(temporaryDirectory, recursive: true); } catch { }
+        }
+    }
+
+    private (byte[]? Bytes, string Extension) GetEditorLanTestSegmentMusicSource()
+    {
+        if (_editorOriginalMusicSourceBytes is { Length: > 0 } source)
+            return (source.ToArray(), _editorOriginalMusicSourceExtension);
+        if (_editorOriginalMusicOpusBytes is { Length: > 0 } originalOpus)
+            return (originalOpus.ToArray(), ".opus");
+        if (_editorSharedMusicBytes is { Length: > 0 } shared)
+            return (shared.ToArray(), ".opus");
+        if (_loadedMusicBytes is { Length: > 0 } loaded)
+            return (loaded.ToArray(), ".opus");
+        var stateMusic = _editorDifficultyStates.Values
+            .Select(state => state.MusicBytes)
+            .FirstOrDefault(bytes => bytes is { Length: > 0 });
+        if (stateMusic is { Length: > 0 })
+            return (stateMusic.ToArray(), ".opus");
+
+        if (!string.IsNullOrWhiteSpace(_tstsWorkingDirectory))
+        {
+            foreach (var name in new[] { "song.opus", "music.opus" })
+            {
+                var path = Path.Combine(_tstsWorkingDirectory, name);
+                if (File.Exists(path))
+                    return (File.ReadAllBytes(path), ".opus");
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(_loadedSourcePath))
+        {
+            var sourcePath = Path.GetFullPath(_loadedSourcePath);
+            var directory = Directory.Exists(sourcePath) ? sourcePath : Path.GetDirectoryName(sourcePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                var candidates = new List<string>();
+                if (!string.IsNullOrWhiteSpace(_chart?.MusicPath))
+                    candidates.Add(Path.Combine(directory, _chart.MusicPath));
+                candidates.AddRange(new[]
+                {
+                    Path.Combine(directory, "music.opus"),
+                    Path.Combine(directory, "song.opus"),
+                    Path.Combine(directory, "..", "music.opus"),
+                    Path.Combine(directory, "..", "song.opus")
+                });
+                foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (!File.Exists(candidate))
+                        continue;
+                    return (File.ReadAllBytes(candidate), Path.GetExtension(candidate));
+                }
+            }
+        }
+
+        return (null, ".opus");
+    }
+
+    private void ArmEditorLanTestSegmentPlacement(bool isStart)
+    {
+        if (!_chartEditorMode || _chart is null || _tempo is null)
+        {
+            _statusMessage = "Open a chart before placing a Local Test segment marker.";
+            return;
+        }
+        if (_editorPanelsViewEnabled || _editorPreviewMode)
+        {
+            _statusMessage = "Switch to the main chart view before placing a test segment marker.";
+            return;
+        }
+
+        var alreadyPending = isStart
+            ? _editorLanTestSegmentStartPlacementPending
+            : _editorLanTestSegmentEndPlacementPending;
+        _editorLanTestSegmentStartPlacementPending = !alreadyPending && isStart;
+        _editorLanTestSegmentEndPlacementPending = !alreadyPending && !isStart;
+        _statusMessage = alreadyPending
+            ? "Test segment marker placement cancelled."
+            : isStart
+                ? "Tap a visible lane to set the Local Test start position. Escape cancels."
+                : "Tap a visible lane to set the Local Test end position. Escape cancels.";
+    }
+
+    private void SetEditorLanTestSegmentPosition(bool isStart, int tick)
+    {
+        if (_chart is null || _tempo is null)
+            return;
+        var offset = _tempo.TickToSeconds(tick) - _tempo.TickToSeconds(_chart.AudioOriginTick);
+        var defaultStart = _tempo.TickToSeconds(0) - _tempo.TickToSeconds(_chart.AudioOriginTick);
+        var defaultEndTick = GetEditorLanTestChartEndTick();
+        if (tick < 0 || tick > defaultEndTick)
+        {
+            _statusMessage = $"Choose a position between tick 0 and the chart ending at tick {defaultEndTick:N0}.";
+            return;
+        }
+        var defaultEnd = _tempo.TickToSeconds(defaultEndTick) - _tempo.TickToSeconds(_chart.AudioOriginTick);
+        var start = isStart ? offset : _editorLanTestSegmentStartAudioOffsetSeconds ?? defaultStart;
+        var end = isStart ? _editorLanTestSegmentEndAudioOffsetSeconds ?? defaultEnd : offset;
+        if (end <= start)
+        {
+            _statusMessage = isStart
+                ? "The start must be before the current end marker. Choose an earlier tick or clear the end."
+                : "The end must be after the current start marker. Choose a later tick.";
+            return;
+        }
+
+        if (isStart)
+        {
+            _editorLanTestSegmentStartAudioOffsetSeconds = offset;
+            _editorLanTestSegmentStartPlacementPending = false;
+            _statusMessage = $"Local Test start set to tick {tick:N0}.";
+        }
+        else
+        {
+            _editorLanTestSegmentEndAudioOffsetSeconds = offset;
+            _editorLanTestSegmentEndPlacementPending = false;
+            _statusMessage = $"Local Test end set to tick {tick:N0}.";
+        }
+        MarkEditorLanTestSegmentChanged();
+    }
+
+    private void ClearEditorLanTestSegment()
+    {
+        _editorLanTestSegmentStartAudioOffsetSeconds = null;
+        _editorLanTestSegmentEndAudioOffsetSeconds = null;
+        _editorLanTestSegmentStartPlacementPending = false;
+        _editorLanTestSegmentEndPlacementPending = false;
+        MarkEditorLanTestSegmentChanged();
+        _statusMessage = "Local Test segment cleared. The full chart will be tested.";
+    }
+
+    private void ClearEditorLanTestSegmentState()
+    {
+        _editorLanTestSegmentStartAudioOffsetSeconds = null;
+        _editorLanTestSegmentEndAudioOffsetSeconds = null;
+        _editorLanTestSegmentStartPlacementPending = false;
+        _editorLanTestSegmentEndPlacementPending = false;
+    }
+
+    private void MarkEditorLanTestSegmentChanged()
+    {
+        lock (_editorLanTestSync)
+        {
+            _editorLanTestChangeRevision++;
+            if (_editorLanTestRunning || _editorLanTestBusy)
+                _editorLanTestDataStale = true;
+        }
+    }
+
+    private int GetEditorLanTestChartEndTick()
+    {
+        if (_chart is null || _tempo is null)
+            return 0;
+
+        // When the chart has a music duration, use the same absolute chart-clock
+        // end that drives the timeline scrubber and HUD. Charts without a saved
+        // music duration fall back to their explicit PlayTick/event extent.
+        if (_chart.PlayTime > 0)
+        {
+            var chartEndTick = _tempo.SecondsToTick(ChartDuration());
+            if (double.IsFinite(chartEndTick))
+                return (int)Math.Clamp(Math.Round(chartEndTick, MidpointRounding.ToEven), 0, int.MaxValue);
+        }
+
+        return Math.Max(0, _chart.PlayTick > 0
+            ? _chart.PlayTick
+            : _chart.Events.Select(ev => ev.EndTick).DefaultIfEmpty(0).Max());
+    }
+
+    private int GetEditorLanTestSegmentDisplayTick(bool isStart)
+    {
+        if (_chart is null || _tempo is null)
+            return 0;
+        var offset = isStart
+            ? _editorLanTestSegmentStartAudioOffsetSeconds
+            : _editorLanTestSegmentEndAudioOffsetSeconds;
+        if (!offset.HasValue)
+            return isStart ? 0 : GetEditorLanTestChartEndTick();
+
+        var absoluteSeconds = _tempo.TickToSeconds(_chart.AudioOriginTick) + offset.Value;
+        var tick = _tempo.SecondsToTick(absoluteSeconds);
+        if (!double.IsFinite(tick))
+            return 0;
+        return (int)Math.Clamp(Math.Round(tick, MidpointRounding.ToEven), 0, int.MaxValue);
+    }
+
+    private string GetEditorLanTestSegmentPositionLabel(bool isStart)
+    {
+        if (_chart is null || _tempo is null)
+            return FormatEditorLanTestSegmentValue(0, 0);
+
+        var tick = GetEditorLanTestSegmentDisplayTick(isStart);
+        // Match the editor timeline and HUD: display chart-clock time from tick
+        // zero. AudioOriginTick is only used when building the temporary music
+        // slice; it must not make the editor-facing START label negative.
+        var chartSeconds = _tempo.TickToSeconds(Math.Max(0, tick));
+        return FormatEditorLanTestSegmentValue(tick, chartSeconds);
+    }
+
+    private static string FormatEditorLanTestSegmentValue(int ticks, double seconds)
+    {
+        var tickLabel = Math.Max(0, ticks).ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+        return $"{tickLabel} ticks · {FormatEditorLanTestSegmentSeconds(seconds)}";
+    }
+
+    private static string FormatEditorLanTestSegmentSeconds(double seconds)
+    {
+        if (!double.IsFinite(seconds))
+            return "0.000s";
+        return Math.Max(0.0, seconds).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture) + "s";
     }
 
     private byte[]? CaptureEditorLanTestMetadataPacket()
@@ -1156,6 +1487,22 @@ public sealed partial class Playfield
         state["meta_test_data_stale"] = running && stale;
         state["meta_test_music_available"] = musicAvailable;
         state["meta_test_chart_summary"] = chartSummary;
+        var segmentStartTick = GetEditorLanTestSegmentDisplayTick(isStart: true);
+        var segmentEndTick = GetEditorLanTestSegmentDisplayTick(isStart: false);
+        var segmentLengthTicks = Math.Max(0, segmentEndTick - segmentStartTick);
+        var segmentLengthSeconds = _tempo is null ? 0.0 : Math.Max(0,
+            _tempo.TickToSeconds(segmentEndTick) - _tempo.TickToSeconds(segmentStartTick));
+        var segmentLengthLabel = FormatEditorLanTestSegmentValue(segmentLengthTicks, segmentLengthSeconds);
+        state["meta_test_segment_active"] = IsEditorLanTestSegmentActive;
+        state["meta_test_segment_start_label"] = GetEditorLanTestSegmentPositionLabel(isStart: true);
+        state["meta_test_segment_end_label"] = GetEditorLanTestSegmentPositionLabel(isStart: false);
+        state["meta_test_segment_length"] = IsEditorLanTestSegmentActive
+            ? segmentLengthLabel : $"Full chart · {segmentLengthLabel}";
+        state["meta_test_segment_start_pending"] = _editorLanTestSegmentStartPlacementPending;
+        state["meta_test_segment_end_pending"] = _editorLanTestSegmentEndPlacementPending;
+        state["meta_test_segment_clear_enabled"] = IsEditorLanTestSegmentActive;
+        state["meta_test_segment_controls_enabled"] = _chartEditorMode && _chart is not null && !busy &&
+            !_editorPanelsViewEnabled && !_editorPreviewMode;
         state["meta_test_start_enabled"] = !busy && !running && _chartEditorMode && _chart is not null &&
             musicAvailable && chartSummary is not ("No enabled charts" or "Open a chart first");
         state["meta_test_refresh_enabled"] = running && !busy;
