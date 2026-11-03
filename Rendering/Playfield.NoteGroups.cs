@@ -2181,12 +2181,11 @@ public sealed partial class Playfield
         return true;
     }
 
-    private bool TryHandleEditorNoteGroupDoubleClick(Vector2 point, double currentTick, GearState currentState)
+    private bool TryHandleEditorNoteGroupDoubleClick(Vector2 point, ChartEvent? clicked)
     {
-        var clicked = FindClickedLinkHeadMarker(point, currentTick, currentState) ??
-                      FindClickedHoldEnd(point, currentTick, currentState) ??
-                      FindClickedNote(point, currentTick, currentState, out _) ??
-                      FindClickedLinkChainBody(point, currentTick, currentState);
+        // Mouse clicks pass the same resolved target used by the visible hover
+        // marker. This prevents a broad secondary hitbox from entering EDIT GROUP
+        // for a note other than the one the user was shown.
         if (clicked?.NoteGroupId is not int groupId ||
             clicked.NoteGroupInstanceId is not int instanceId ||
             clicked.NoteGroupMemberId is not int memberId)

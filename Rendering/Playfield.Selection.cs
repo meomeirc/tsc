@@ -18,10 +18,25 @@ public sealed partial class Playfield
 {
     // Mouse/chart selection and editor selection overlays.
 
-    // Mouse hover is intentionally disabled until a real mouse movement is seen.
+    // Mouse hover becomes active on movement or the first chart press.
     // Touch presses still edit the chart, but never drive the hover preview.
     private bool _editorMouseHoverActive;
     private Vector2 _editorPointerPosition;
+    private enum EditorHoverHitKind : byte
+    {
+        LinkHeadMarker,
+        HoldEndMarker,
+        NoteCard,
+        GridCellNote,
+        LinkBody
+    }
+
+    private readonly record struct EditorHoverHit(
+        ChartEvent Event, EditorHoverHitKind Kind, int Tick, int Track);
+
+    private EditorHoverHit? _editorHoverHit;
+    private static readonly Color EditorHoverEmptyColor = new(255, 255, 255, 88);
+    private static readonly Color EditorHoverOverNoteColor = new(255, 220, 0, 170);
     private bool _editorTimelineScrubbing;
     private bool _editorTimelineResumeAfterScrub;
     private static readonly Color EditorSelectedColor = new(255, 165, 0);
@@ -673,7 +688,8 @@ public sealed partial class Playfield
         // briefly mirror the finger position through mouse input.
         if (touchInputThisFrame)
             _editorMouseHoverActive = false;
-        else if (mouseMoved || (_chartEditorMode && (_editorNoteGroupPlacementArmed || _editorPlacementEnabled)))
+        else if (mouseMoved || leftPressed ||
+                 (_chartEditorMode && (_editorNoteGroupPlacementArmed || _editorPlacementEnabled)))
             _editorMouseHoverActive = true;
 
         var (virtualWidth, virtualHeight) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
@@ -764,11 +780,12 @@ public sealed partial class Playfield
 
         if ((leftPressed || touchPressed) && _editorMetaEditingField is not null)
             CommitEditorMetaFieldOnBlur();
-        var pointerOverToolbar = editorLuaUiActive
-            ? _chartEditorInterfaceRuntime.IsUiPointOverControl(point.X, point.Y) ||
-              GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel)
-            : IsEditorToolbarPanelContains(pointerPixel, virtualWidth, virtualHeight) ||
-              IsEditorBankIndicatorArea(point, virtualWidth, virtualHeight);
+        var pointerOverToolbar = (editorLuaUiActive &&
+                                  _chartEditorInterfaceRuntime.IsUiPointOverControl(point.X, point.Y)) ||
+                                 GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) ||
+                                 (!editorLuaUiActive &&
+                                  (IsEditorToolbarPanelContains(pointerPixel, virtualWidth, virtualHeight) ||
+                                   IsEditorBankIndicatorArea(point, virtualWidth, virtualHeight)));
 
         // SELECT is an exclusive range-filter mode. The cyan range-line gesture is
         // handled separately; ordinary note hit-testing and the orange marquee are
@@ -781,6 +798,7 @@ public sealed partial class Playfield
             _editorHoverCacheValid = false;
             _hoverBeatTick = null;
             _hoverTrack = null;
+            _editorHoverHit = null;
         }
 
         // The cyan SELECT line has its own drag path in gameplay view. Process it
@@ -801,6 +819,93 @@ public sealed partial class Playfield
                 mouseMoved, touchInputThisFrame, pointerOverToolbar, virtualWidth, virtualHeight))
             return;
 
+        var hoverModeAllowsLaneTarget = _chartEditorMode && !_editorPanelsViewEnabled &&
+            !_editorPreviewMode && !_editorTimelineScrubbing && _editorDraggedEvent is null &&
+            !_editorRectSelecting && !_editorRectSelectionArmed &&
+            _editorMenuSection is not (EditorMenuSection.Select or EditorMenuSection.Bpm or EditorMenuSection.Stutter) &&
+            !_editorLanTestSegmentStartPlacementPending && !_editorLanTestSegmentEndPlacementPending;
+        if (hoverModeAllowsLaneTarget && _editorMouseHoverActive && !touchInputThisFrame && !pointerOverToolbar)
+        {
+            var signatureHash = new HashCode();
+            signatureHash.Add(ComputeLaneMeshCacheSignature(currentState));
+            signatureHash.Add(_projection.ScrollSpeedScale);
+            signatureHash.Add(_projection.BaseScrollSpeed);
+            signatureHash.Add(_projection.GetRenderDistanceAhead());
+            signatureHash.Add(_projection.GetRenderDistanceBehind());
+            signatureHash.Add(_projection.NoteStandAngleDegrees);
+            signatureHash.Add(_topDownViewEnabled);
+            signatureHash.Add(_compact);
+            signatureHash.Add(GetEditorSnapTicks());
+            signatureHash.Add(_editorNoteType);
+            signatureHash.Add(_editorSuperFlickTool);
+            signatureHash.Add(_editorAttr);
+            signatureHash.Add(_editorMenuSection);
+            signatureHash.Add(_editorPlacementEnabled);
+            signatureHash.Add(_editorConnectorMode);
+            signatureHash.Add(_editorNoteGroupPlacementArmed);
+            signatureHash.Add(_editorNoteGroupEditMode);
+            signatureHash.Add(KeybindSettings.IsDown("editor_place_inactive_bank_modifier"));
+            var hoverSignature = signatureHash.ToHashCode();
+            var pointerMoved = Vector2.DistanceSquared(mousePoint, _lastEditorHoverPointer) > 1f;
+            var clockMoved = double.IsNaN(_lastEditorHoverCurrentTick) || Math.Abs(currentTick - _lastEditorHoverCurrentTick) > 0.001;
+            if (!_editorHoverCacheValid || pointerMoved || clockMoved || hoverSignature != _lastEditorHoverSignature)
+            {
+                var hoverTick = FindClickedQuarterBeat(mousePoint, currentTick, currentState, out var hoverTrack);
+                var resolvedHoverTrack = hoverTick.HasValue
+                    ? GetEditorHoverMarkerTrack(hoverTrack)
+                    : -1;
+                _hoverBeatTick = hoverTick;
+                _hoverTrack = hoverTick.HasValue ? hoverTrack : null;
+                _editorHoverHit = ResolveEditorHoverHit(
+                    mousePoint, hoverTick, resolvedHoverTrack, currentTick, currentState);
+                _lastEditorHoverPointer = mousePoint;
+                _lastEditorHoverCurrentTick = currentTick;
+                _lastEditorHoverSignature = hoverSignature;
+                _editorHoverCacheValid = true;
+            }
+        }
+        else
+        {
+            _hoverBeatTick = null;
+            _hoverTrack = null;
+            _editorHoverHit = null;
+            _lastEditorHoverCurrentTick = double.NaN;
+            _editorHoverCacheValid = false;
+        }
+
+        // Mouse clicks use the target resolved for the visible hover marker. Touch
+        // remains direct-hit based because touch has no persistent hover preview.
+        var resolvedMouseHoverHit = !touchInputThisFrame && _editorHoverCacheValid
+            ? _editorHoverHit
+            : null;
+        ChartEvent? ClickLinkHeadTarget() => touchInputThisFrame
+            ? FindClickedLinkHeadMarker(point, currentTick, currentState)
+            : resolvedMouseHoverHit is { } hit && hit.Kind == EditorHoverHitKind.LinkHeadMarker
+                ? hit.Event : null;
+        ChartEvent? ClickHoldEndTarget() => touchInputThisFrame
+            ? FindClickedHoldEnd(point, currentTick, currentState)
+            : resolvedMouseHoverHit is { } hit && hit.Kind == EditorHoverHitKind.HoldEndMarker
+                ? hit.Event : null;
+        ChartEvent? ClickNoteTarget() => touchInputThisFrame
+            ? FindClickedNote(point, currentTick, currentState, out _)
+            : resolvedMouseHoverHit is { } hit &&
+              hit.Kind is EditorHoverHitKind.NoteCard or EditorHoverHitKind.GridCellNote
+                ? hit.Event : null;
+        ChartEvent? ClickLinkBodyTarget() => touchInputThisFrame
+            ? FindClickedLinkChainBody(point, currentTick, currentState)
+            : resolvedMouseHoverHit is { } hit && hit.Kind == EditorHoverHitKind.LinkBody
+                ? hit.Event : null;
+        int? ClickGridTick(out int track)
+        {
+            if (!touchInputThisFrame && _editorHoverCacheValid)
+            {
+                track = _hoverTrack ?? -1;
+                return _hoverBeatTick;
+            }
+            return FindClickedQuarterBeat(point, currentTick, currentState, out track);
+        }
+
+
         // Ctrl+click deletes the note under the pointer instead of selecting,
         // dragging, or placing. Holding the DELETE FAMILY modifier as well (Shift
         // by default) removes the whole link chain or complete long note.
@@ -813,10 +918,10 @@ public sealed partial class Playfield
             !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
             KeybindSettings.IsModifierBindingHeld("editor_delete_click_modifier"))
         {
-            var clickedNote = FindClickedLinkHeadMarker(point, currentTick, currentState);
-            clickedNote ??= FindClickedHoldEnd(point, currentTick, currentState);
-            clickedNote ??= FindClickedNote(point, currentTick, currentState, out _);
-            clickedNote ??= FindClickedLinkChainBody(point, currentTick, currentState);
+            var clickedNote = ClickLinkHeadTarget();
+            clickedNote ??= ClickHoldEndTarget();
+            clickedNote ??= ClickNoteTarget();
+            clickedNote ??= ClickLinkBodyTarget();
             if (clickedNote is not null)
             {
                 DeleteEditorNoteAtPointer(clickedNote,
@@ -826,7 +931,7 @@ public sealed partial class Playfield
 
             // Don't accidentally place a new note when the delete-click modifier
             // is held but the pointer lands on an empty lane cell.
-            if (FindClickedQuarterBeat(point, currentTick, currentState, out _) is not null)
+            if (ClickGridTick(out _) is not null)
                 return;
         }
 
@@ -846,13 +951,14 @@ public sealed partial class Playfield
             !_editorLanTestSegmentStartPlacementPending && !_editorLanTestSegmentEndPlacementPending &&
             !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
             !KeybindSettings.IsDown("editor_connect_modifier") &&
-            TryHandleEditorNoteGroupDoubleClick(point, currentTick, currentState))
+            TryHandleEditorNoteGroupDoubleClick(point, resolvedMouseHoverHit?.Event))
             return;
 
         // The left timeline is a continuous scrub surface. Its five timestamps
         // are landmarks only; mouse and touch can seek to any vertical position.
         if (_chartEditorMode && !_editorTimelineScrubbing &&
-            ((leftPressed || touchPressed) || (_editorRectSelecting && leftDown && !touchInputThisFrame)) &&
+            !_editorRectSelectionArmed && !_editorRectSelecting &&
+            (leftPressed || touchPressed) &&
             GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel))
         {
             _editorTimelineScrubbing = true;
@@ -975,43 +1081,6 @@ public sealed partial class Playfield
             return;
         }
 
-        var tempoBoundaryPicking = _chartEditorMode && _editorMenuSection == EditorMenuSection.Stutter &&
-                                   (_editorStutterStartPlacementPending || _editorStutterEndPlacementPending);
-        if (_chartEditorMode && (_editorPlacementEnabled || _editorNoteGroupPlacementArmed ||
-                                  tempoBoundaryPicking || _editorMenuSection == EditorMenuSection.Bpm ||
-                                  _editorBpmPlacementPending || _editorSuperFlickPlacementPending) &&
-            _editorMouseHoverActive && !touchInputThisFrame && !pointerOverToolbar)
-        {
-            var signatureHash = new HashCode();
-            signatureHash.Add(ComputeLaneMeshCacheSignature(currentState));
-            signatureHash.Add(_projection.ScrollSpeedScale);
-            signatureHash.Add(_projection.BaseScrollSpeed);
-            signatureHash.Add(_projection.GetRenderDistanceAhead());
-            signatureHash.Add(_projection.GetRenderDistanceBehind());
-            signatureHash.Add(_projection.NoteStandAngleDegrees);
-            signatureHash.Add(_topDownViewEnabled);
-            var hoverSignature = signatureHash.ToHashCode();
-            var pointerMoved = Vector2.DistanceSquared(mousePoint, _lastEditorHoverPointer) > 1f;
-            var clockMoved = double.IsNaN(_lastEditorHoverCurrentTick) || Math.Abs(currentTick - _lastEditorHoverCurrentTick) > 0.001;
-            if (!_editorHoverCacheValid || pointerMoved || clockMoved || hoverSignature != _lastEditorHoverSignature)
-            {
-                var hoverTick = FindClickedQuarterBeat(mousePoint, currentTick, currentState, out var hoverTrack);
-                _hoverBeatTick = hoverTick;
-                _hoverTrack = hoverTick.HasValue ? hoverTrack : null;
-                _lastEditorHoverPointer = mousePoint;
-                _lastEditorHoverCurrentTick = currentTick;
-                _lastEditorHoverSignature = hoverSignature;
-                _editorHoverCacheValid = true;
-            }
-        }
-        else
-        {
-            _hoverBeatTick = null;
-            _hoverTrack = null;
-            _lastEditorHoverCurrentTick = double.NaN;
-            _editorHoverCacheValid = false;
-        }
-
         if (rightPressed && !touchPressed &&
             !(_chartEditorMode && _editorMenuSection == EditorMenuSection.Select))
         {
@@ -1099,11 +1168,11 @@ public sealed partial class Playfield
             _editorMenuSection is not (EditorMenuSection.Select or EditorMenuSection.Bpm or EditorMenuSection.Stutter) &&
             !_editorPreviewMode &&
             !GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) &&
-            FindClickedQuarterBeat(point, currentTick, currentState, out _) is null &&
-            FindClickedLinkHeadMarker(point, currentTick, currentState) is null &&
-            FindClickedHoldEnd(point, currentTick, currentState) is null &&
-            FindClickedNote(point, currentTick, currentState, out _) is null &&
-            FindClickedLinkChainBody(point, currentTick, currentState) is null &&
+            ClickGridTick(out _) is null &&
+            ClickLinkHeadTarget() is null &&
+            ClickHoldEndTarget() is null &&
+            ClickNoteTarget() is null &&
+            ClickLinkBodyTarget() is null &&
             !_editorRectSelectionArmed && !_editorRectSelecting)
         {
             ArmEditorRectangleSelection(point, currentTick, currentState);
@@ -1241,11 +1310,9 @@ public sealed partial class Playfield
             // Link heads get first refusal when hit regions overlap. This is especially
             // important for horizontal links where the hold-end marker can sit directly
             // on top of the connected head.
-            var existingLinkHead = FindClickedLinkHeadMarker(point, currentTick, currentState);
-            var existingHoldEnd = existingLinkHead is null
-                ? FindClickedHoldEnd(point, currentTick, currentState)
-                : null;
-            var existingNote = existingLinkHead ?? existingHoldEnd ?? FindClickedNote(point, currentTick, currentState, out _);
+            var existingLinkHead = ClickLinkHeadTarget();
+            var existingHoldEnd = existingLinkHead is null ? ClickHoldEndTarget() : null;
+            var existingNote = existingLinkHead ?? existingHoldEnd ?? ClickNoteTarget();
             if (existingNote is not null)
             {
                 if (!_editorConnectorMode && KeybindSettings.IsDown("editor_connect_modifier"))
@@ -1310,7 +1377,7 @@ public sealed partial class Playfield
                 return;
             }
 
-            var clickedChain = FindClickedLinkChainBody(point, currentTick, currentState);
+            var clickedChain = ClickLinkBodyTarget();
             if (clickedChain is not null)
             {
                 if (!_editorConnectorMode && KeybindSettings.IsDown("editor_connect_modifier"))
@@ -1353,19 +1420,22 @@ public sealed partial class Playfield
                 return;
             }
 
-            if (FindClickedQuarterBeat(point, currentTick, currentState, out var placementTrack) is int placementTick)
+            if (ClickGridTick(out var placementTrack) is int placementTick)
             {
                 // Clicking an outer 1K lane with a regular note tool places it on
                 // that side's legal middle lane. Connector mode is kept separate so
                 // its target can use L1/L3/R1/R3 as a link tail.
                 if (!_editorConnectorMode && !_editorNoteGroupPlacementArmed)
-                    placementTrack = GetEditorAllowedTrackForNoteType(placementTrack,
-                        _editorSuperFlickTool == EditorSuperFlickTool.Place ? NoteType.Single : _editorNoteType);
+                    placementTrack = GetEditorHoverMarkerTrack(placementTrack);
 
                 // The projected quad hit test can miss a note when the pointer is
                 // near its edge or inside a hold body. Check the snapped cell as a
                 // final guard before either placing a note or adding a connector.
-                var occupiedNote = FindEditorNoteAtGridCell(placementTick, placementTrack);
+                var occupiedNote = touchInputThisFrame
+                    ? FindEditorNoteAtGridCell(placementTick, placementTrack)
+                    : resolvedMouseHoverHit is { Kind: EditorHoverHitKind.GridCellNote } cellHit
+                        ? cellHit.Event
+                        : null;
                 if (occupiedNote is not null)
                 {
                     if (!_editorConnectorMode && KeybindSettings.IsDown("editor_connect_modifier"))
@@ -1443,11 +1513,9 @@ public sealed partial class Playfield
 
         // Prefer a head marker over any overlapping duration-end marker so a
         // horizontally connected LinkHead remains easy to grab and drag.
-        var linkHeadNote = FindClickedLinkHeadMarker(point, currentTick, currentState);
-        var holdEndNote = linkHeadNote is null
-            ? FindClickedHoldEnd(point, currentTick, currentState)
-            : null;
-        var note = linkHeadNote ?? holdEndNote ?? FindClickedNote(point, currentTick, currentState, out _);
+        var linkHeadNote = ClickLinkHeadTarget();
+        var holdEndNote = linkHeadNote is null ? ClickHoldEndTarget() : null;
+        var note = linkHeadNote ?? holdEndNote ?? ClickNoteTarget();
         if (note is not null)
         {
             if (_chartEditorMode && !_editorConnectorMode && KeybindSettings.IsDown("editor_connect_modifier"))
@@ -1487,7 +1555,7 @@ public sealed partial class Playfield
             if (_chartEditorMode && IsEditorDraggableNote(note))
                 BeginEditorDrag(note, holdEndNote is not null, touchPressed, point, currentTick, currentState);
         }
-        else if (FindClickedLinkChainBody(point, currentTick, currentState) is ChartEvent chainPoint)
+        else if (ClickLinkBodyTarget() is ChartEvent chainPoint)
         {
             if (_chartEditorMode && !_editorConnectorMode && KeybindSettings.IsDown("editor_connect_modifier"))
             {
@@ -1518,7 +1586,7 @@ public sealed partial class Playfield
                 _editorSelectReferenceLineTick = null;
             _statusMessage = "Selected link chain. Tap a head/tail/end point to drag that point.";
         }
-        else if (FindClickedQuarterBeat(point, currentTick, currentState, out var selectedTrack) is int beatTick)
+        else if (ClickGridTick(out var selectedTrack) is int beatTick)
         {
             _editorDurationInputValuePending = false;
             ClearEditorMultiSelection();
@@ -7956,16 +8024,101 @@ public sealed partial class Playfield
         if (_chart is null)
             return null;
 
-        return _chart.Events
-            .Where(ev => ev.Kind == "Note" && ev.Track == track &&
-                         (ev.Tick == tick ||
-                          ((ev.IsHoldNote || (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail)) &&
-                           ev.Tick <= tick && tick <= (GetEditorNextLinkPoint(ev)?.Tick ?? ev.EndTick))))
-            .OrderBy(ev => ev.Tick == tick ? 0 : 1)
-            .ThenBy(ev => ev.RawType == 1 ? 0 : 1)
-            .ThenBy(ev => ev.Tick)
-            .ThenBy(ev => ev.EventIndex)
-            .FirstOrDefault();
+        // Hover resolution calls this while the playhead is moving. Keep the
+        // occupied-cell search allocation-free rather than building an ordered
+        // LINQ pipeline every frame.
+        ChartEvent? best = null;
+        var bestExactTick = false;
+        var bestRawNote = false;
+        foreach (var ev in _chart.Events)
+        {
+            if (ev.Kind != "Note" || ev.Track != track)
+                continue;
+
+            var exactTick = ev.Tick == tick;
+            var occupiesCell = exactTick ||
+                ((ev.IsHoldNote || ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
+                 ev.Tick <= tick && tick <= (GetEditorNextLinkPoint(ev)?.Tick ?? ev.EndTick));
+            if (!occupiesCell)
+                continue;
+
+            var rawNote = ev.RawType == 1;
+            if (best is null ||
+                (exactTick && !bestExactTick) ||
+                (exactTick == bestExactTick && rawNote && !bestRawNote) ||
+                (exactTick == bestExactTick && rawNote == bestRawNote &&
+                 (ev.Tick < best.Tick || (ev.Tick == best.Tick && ev.EventIndex < best.EventIndex))))
+            {
+                best = ev;
+                bestExactTick = exactTick;
+                bestRawNote = rawNote;
+            }
+        }
+        return best;
+    }
+
+    private int GetEditorHoverMarkerTrack(int track)
+    {
+        // Keep the hover point, occupied-cell lookup, and placement destination
+        // identical. Connector and group placement retain the literal lane because
+        // their target layouts are resolved by their own tools.
+        if (_editorConnectorMode || _editorNoteGroupPlacementArmed || _editorNoteGroupEditMode ||
+            !_editorPlacementEnabled)
+            return track;
+        return GetEditorAllowedTrackForNoteType(track,
+            _editorSuperFlickTool == EditorSuperFlickTool.Place ? NoteType.Single : _editorNoteType);
+    }
+
+    private EditorHoverHit? ResolveEditorHoverHit(
+        Vector2 pointer, int? gridTick, int gridTrack,
+        double currentTick, GearState currentState)
+    {
+        // Share the renderer's spatially culled event window across all hover
+        // hit-tests. The marker is refreshed while playback scrolls, so scanning
+        // the complete chart independently for each hit type would be wasteful.
+        var candidateCount = BuildRenderEventIndexScratch(currentTick);
+        var candidates = _renderEventIndexScratch;
+        var linkHead = FindClickedLinkHeadMarker(
+            pointer, currentTick, currentState, candidates, candidateCount);
+        if (linkHead is not null)
+            return new EditorHoverHit(linkHead, EditorHoverHitKind.LinkHeadMarker,
+                linkHead.Tick, linkHead.Track);
+
+        var holdEnd = FindClickedHoldEnd(pointer, currentTick, currentState, candidates, candidateCount);
+        if (holdEnd is not null)
+        {
+            var endpointTick = GetEditorNextLinkPoint(holdEnd)?.Tick ?? holdEnd.EndTick;
+            return new EditorHoverHit(holdEnd, EditorHoverHitKind.HoldEndMarker,
+                endpointTick, holdEnd.Track);
+        }
+
+        var noteCard = FindClickedNote(pointer, currentTick, currentState, out _, candidates, candidateCount);
+        if (noteCard is not null)
+            return new EditorHoverHit(noteCard, EditorHoverHitKind.NoteCard,
+                noteCard.Tick, noteCard.Track);
+
+        if (gridTick is int tick && gridTrack is >= 0 and <= 15)
+        {
+            // Placement already refuses to put a note into an occupied snapped
+            // cell. Resolve that exact same occupancy before rendering the hover
+            // marker, so the marker turns yellow instead of promising a placement.
+            var occupied = FindEditorNoteAtGridCell(tick, gridTrack);
+            if (occupied is not null && ShouldRenderInCurrentBank(occupied, currentState))
+                return new EditorHoverHit(occupied, EditorHoverHitKind.GridCellNote, tick, gridTrack);
+
+            // Link connector bodies are selectable only where the visible grid
+            // hover marker itself lands on the connector, not merely where the raw
+            // pointer enters a generous invisible halo around it.
+            var gridPoint = _projection.ProjectAtTicks(gridTrack, tick, currentTick, currentState);
+            if (!OutsideNoteView(gridPoint, gridPoint))
+            {
+                var linkBody = FindClickedLinkChainBody(gridPoint.Position, currentTick, currentState);
+                if (linkBody is not null)
+                    return new EditorHoverHit(linkBody, EditorHoverHitKind.LinkBody, tick, gridTrack);
+            }
+        }
+
+        return null;
     }
 
     private ChartEvent? FindClickedLinkChainBody(Vector2 point, double currentTick, GearState currentState)
@@ -8001,19 +8154,35 @@ public sealed partial class Playfield
                 continue;
 
             var head = _projection.ProjectAtTicks(link.Head.Track, link.Head.Tick, currentTick, currentState);
+            var bodyEnd = _projection.ProjectAtTicks(
+                link.Head.Track, link.Tail.Tick, currentTick, currentState);
             var tail = _projection.ProjectAtTicks(link.Tail.Track, link.Tail.Tick, currentTick, currentState);
-            if (OutsideNoteView(head, head) || OutsideNoteView(tail, tail))
+            if (OutsideNoteView(head, bodyEnd) && OutsideNoteView(bodyEnd, tail))
                 continue;
 
-            var distance = PointToSegmentDistance(point, head.Position, tail.Position);
+            // DrawLinkChainUnified does not render a straight diagonal from one
+            // note point to the next. It draws the segment body down the source
+            // lane, then a separate connector across the lanes at the destination
+            // tick. Hit-test those same two pieces; the old endpoint-to-endpoint
+            // diagonal could make an empty middle cell appear occupied (notably at
+            // the midpoint of a zig-zag chain).
+            var bodyDistance = OutsideNoteView(head, bodyEnd)
+                ? float.MaxValue
+                : PointToSegmentDistance(point, head.Position, bodyEnd.Position);
+            var connectorDistance = OutsideNoteView(bodyEnd, tail)
+                ? float.MaxValue
+                : PointToSegmentDistance(point, bodyEnd.Position, tail.Position);
+            var distance = Math.Min(bodyDistance, connectorDistance);
             if (distance > hitDistance || distance >= bestDistance)
                 continue;
 
-            // Selecting a connector body selects its nearest endpoint for deletion
-            // and later dragging, while the whole chain is highlighted.
-            bestNode = Vector2.DistanceSquared(point, head.Position) <= Vector2.DistanceSquared(point, tail.Position)
+            // The lane body belongs to its source note. The cross-lane connector
+            // selects its nearest endpoint, while the whole chain remains selected.
+            bestNode = bodyDistance <= connectorDistance
                 ? link.Head
-                : link.Tail;
+                : Vector2.DistanceSquared(point, head.Position) <= Vector2.DistanceSquared(point, tail.Position)
+                    ? link.Head
+                    : link.Tail;
             bestDistance = distance;
         }
         return bestNode;
@@ -8112,15 +8281,22 @@ public sealed partial class Playfield
         }
     }
 
-    private ChartEvent? FindClickedLinkHeadMarker(Vector2 point, double currentTick, GearState currentState)
+    private ChartEvent? FindClickedLinkHeadMarker(
+        Vector2 point, double currentTick, GearState currentState,
+        IReadOnlyList<int>? candidateIndices = null, int candidateCount = -1)
     {
         if (!_chartEditorMode || _chart is null || _tempo is null)
             return null;
 
         ChartEvent? best = null;
         var bestDistance = float.MaxValue;
-        foreach (var ev in _orderedRenderableEvents)
+        var count = candidateIndices is null
+            ? _orderedRenderableEvents.Count
+            : Math.Clamp(candidateCount, 0, candidateIndices.Count);
+        for (var candidateIndex = 0; candidateIndex < count; candidateIndex++)
         {
+            var eventIndex = candidateIndices is null ? candidateIndex : candidateIndices[candidateIndex];
+            var ev = _orderedRenderableEvents[eventIndex];
             if (ev.NoteType != NoteType.LinkHead || !IsEditorDraggableNote(ev) ||
                 !ShouldRenderInCurrentBank(ev, currentState))
                 continue;
@@ -8130,7 +8306,8 @@ public sealed partial class Playfield
                 continue;
             var radius = GetEditorMarkerRadius(ev.Track, ev.Tick, currentTick, currentState, out var center, ev);
             var distance = Vector2.Distance(point, center);
-            if (distance <= Math.Max(7f, radius * 1.45f) && distance < bestDistance)
+            var visibleOutline = Math.Clamp(radius * 0.16f, 1f, 2.25f);
+            if (distance <= radius + visibleOutline + 1f && distance < bestDistance)
             {
                 best = ev;
                 bestDistance = distance;
@@ -8139,15 +8316,22 @@ public sealed partial class Playfield
         return best;
     }
 
-    private ChartEvent? FindClickedHoldEnd(Vector2 point, double currentTick, GearState currentState)
+    private ChartEvent? FindClickedHoldEnd(
+        Vector2 point, double currentTick, GearState currentState,
+        IReadOnlyList<int>? candidateIndices = null, int candidateCount = -1)
     {
         if (!_chartEditorMode || _chart is null || _tempo is null)
             return null;
 
         ChartEvent? best = null;
         var bestDistance = float.MaxValue;
-        foreach (var ev in _orderedRenderableEvents)
+        var count = candidateIndices is null
+            ? _orderedRenderableEvents.Count
+            : Math.Clamp(candidateCount, 0, candidateIndices.Count);
+        for (var candidateIndex = 0; candidateIndex < count; candidateIndex++)
         {
+            var eventIndex = candidateIndices is null ? candidateIndex : candidateIndices[candidateIndex];
+            var ev = _orderedRenderableEvents[eventIndex];
             if (!IsEditorDraggableNote(ev) || !ShouldRenderInCurrentBank(ev, currentState))
                 continue;
             if (ev.NoteType is not (NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail))
@@ -9039,15 +9223,22 @@ public sealed partial class Playfield
         return removed.Contains(preferredSelection) ? root : preferredSelection;
     }
 
-    private ChartEvent? FindClickedNote(Vector2 point, double currentTick, GearState currentState, out float bestDistance)
+    private ChartEvent? FindClickedNote(
+        Vector2 point, double currentTick, GearState currentState, out float bestDistance,
+        IReadOnlyList<int>? candidateIndices = null, int candidateCount = -1)
     {
         bestDistance = float.MaxValue;
         if (_chart is null || _tempo is null)
             return null;
 
         ChartEvent? best = null;
-        foreach (var ev in _orderedRenderableEvents)
+        var count = candidateIndices is null
+            ? _orderedRenderableEvents.Count
+            : Math.Clamp(candidateCount, 0, candidateIndices.Count);
+        for (var candidateIndex = 0; candidateIndex < count; candidateIndex++)
         {
+            var eventIndex = candidateIndices is null ? candidateIndex : candidateIndices[candidateIndex];
+            var ev = _orderedRenderableEvents[eventIndex];
             if (!IsRenderableNoteEvent(ev))
                 continue;
             if (_compact && _gameplayMode && !IsActiveEvent(ev, currentState))
@@ -9699,13 +9890,16 @@ public sealed partial class Playfield
         _statusMessage = $"Rectangle selected {_editorMultiSelectedEvents.Count} note(s) across {selectedTracks.Count} track(s); empty cells ignored.";
     }
 
-    private void DrawEditorMarker(Vector2 position, float radius, Color color, float fillOpacity = 0.12f)
+    private void DrawEditorMarker(
+        Vector2 position, float radius, Color color,
+        float fillOpacity = 0.12f, float outlineOpacity = 1f)
     {
-        // Keep the established single-marker appearance. Multi-selection uses the
-        // reusable triangle batch below instead of this per-marker path.
+        // Keep fill and outline opacity independent so empty-cell hover can remain
+        // visible without drawing a strong white ring over the lane.
+        // Multi-selection uses the reusable triangle batch below instead of this path.
         DrawCircle(_spriteBatch, position, radius, color * fillOpacity);
         DrawCircleOutline(_spriteBatch, position, radius,
-            Math.Clamp(radius * 0.16f, 1f, 2.25f), color);
+            Math.Clamp(radius * 0.16f, 1f, 2.25f), color * outlineOpacity);
     }
 
     private static Vector2[] CreateEditorMultiSelectionMarkerUnitCircle()
@@ -9784,13 +9978,22 @@ public sealed partial class Playfield
         }
     }
 
-    // Selection markers only need a rough circular size. Building the full note
-    // card here repeated the renderer's most expensive per-note geometry work for
-    // every selected note, even though the highlight itself is just a circle.
-    private float GetEditorSelectionMarkerRadius(ChartEvent note, ProjectedPoint projected)
+    // Event-backed selection markers always use the exact same card projection as
+    // the single-selection marker. Keep group and ordinary-note selection on one
+    // path so perspective, lane rotation, standing angle, and flick orientation
+    // cannot drift between the two renderers.
+    private float GetEditorSelectionHighlightRadius(
+        int track, int tick, ChartEvent note, double currentTick, GearState currentState,
+        ProjectedPoint projected, float travel, out Vector2 markerCenter)
+        => GetEditorMarkerRadius(
+            track, tick, currentTick, currentState, out markerCenter, note, projected, travel);
+
+    // Used only when there is no authored event/3D basis yet (the group-placement
+    // hover target). Event-backed selection highlights use the exact projected
+    // card geometry above.
+    private float GetEditorPlacementPreviewMarkerRadius(float noteWidth, ProjectedPoint projected)
     {
-        var noteWidth = note.IsFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
-        var projectedRadius = noteWidth * projected.Scale * MathF.Abs(projected.LaneRotationDepthScale) * 0.5f;
+        var projectedRadius = noteWidth * projected.Scale * projected.LaneRotationDepthScale * 0.5f;
         return float.IsFinite(projectedRadius) ? Math.Max(1.25f, projectedRadius) : 1.25f;
     }
 
@@ -10109,9 +10312,9 @@ public sealed partial class Playfield
                         var nodePoint = _projection.ProjectAtTravel(node.Track, nodeTravel, currentState);
                         if (!OutsideNoteView(nodePoint, nodePoint))
                         {
-                            var nodeRadius = GetEditorMarkerRadius(
-                                node.Track, node.Tick, currentTick, currentState, out var nodeCenter, node,
-                                nodePoint, nodeTravel);
+                            var nodeRadius = GetEditorSelectionHighlightRadius(
+                                node.Track, node.Tick, node, currentTick, currentState,
+                                nodePoint, nodeTravel, out var nodeCenter);
                             var selectedHoldEndNode = _editorSelectedHoldEnd && selectedEvent is not null &&
                                 ReferenceEquals(node, GetEditorNextLinkPoint(selectedEvent));
                             var draggedHoldEndNode = _editorDragIsHoldEnd && _editorDraggedEvent is not null &&
@@ -10142,9 +10345,9 @@ public sealed partial class Playfield
                             var endPoint = _projection.ProjectAtTravel(node.Track, endDepth, currentState);
                             if (!OutsideNoteView(endPoint, endPoint))
                             {
-                                var endRadius = GetEditorMarkerRadius(
-                                    node.Track, endpointTick, currentTick, currentState, out var endCenter, node,
-                                    endPoint, endDepth);
+                                var endRadius = GetEditorSelectionHighlightRadius(
+                                    node.Track, endpointTick, node, currentTick, currentState,
+                                    endPoint, endDepth, out var endCenter);
                                 var directEndSelected =
                                     (ReferenceEquals(node, selectedEvent) && _editorSelectedHoldEnd) ||
                                     (ReferenceEquals(node, _editorDraggedEvent) && _editorDragIsHoldEnd);
@@ -10169,9 +10372,9 @@ public sealed partial class Playfield
                     var point = _projection.ProjectAtTravel(selectedEvent.Track, selectedTravel, currentState);
                     if (!OutsideNoteView(point, point))
                     {
-                        var radius = GetEditorMarkerRadius(
-                            selectedEvent.Track, selectedEvent.Tick, currentTick, currentState,
-                            out var markerCenter, selectedEvent, point, selectedTravel);
+                        var radius = GetEditorSelectionHighlightRadius(
+                            selectedEvent.Track, selectedEvent.Tick, selectedEvent, currentTick, currentState,
+                            point, selectedTravel, out var markerCenter);
                         DrawEditorMarker(markerCenter,
                             selectedEvent.NoteType == NoteType.LinkTail ? radius * 0.5f : radius,
                             GetEditorSelectedNoteHighlightColor(selectedEvent), 0.10f);
@@ -10193,9 +10396,9 @@ public sealed partial class Playfield
                         var endPoint = _projection.ProjectAtTravel(endpointTrack, endDepth, currentState);
                         if (!OutsideNoteView(endPoint, endPoint))
                         {
-                            var endRadius = GetEditorMarkerRadius(
-                                endpointTrack, endpointTick, currentTick, currentState, out var endCenter, selectedEvent,
-                                endPoint, endDepth);
+                            var endRadius = GetEditorSelectionHighlightRadius(
+                                endpointTrack, endpointTick, selectedEvent, currentTick, currentState,
+                                endPoint, endDepth, out var endCenter);
                             var endColor = _editorSelectedHoldEnd || _editorDragIsHoldEnd
                                 ? GetEditorSelectedNoteHighlightColor(selectedEvent)
                                 : EditorEndingColor;
@@ -10275,11 +10478,13 @@ public sealed partial class Playfield
                     var projected = _projection.ProjectAtTravel(note.Track, (float)travel, currentState);
                     if (!OutsideNoteView(projected, projected))
                     {
-                        var radius = GetEditorSelectionMarkerRadius(note, projected);
+                        var radius = GetEditorMarkerRadius(
+                            note.Track, note.Tick, currentTick, currentState,
+                            out var markerCenter, note, projected, (float)travel);
                         var color = isDirectlySelected
                             ? GetEditorSelectedNoteHighlightColor(note)
                             : isChainEnd ? EditorEndingColor : EditorFamilyColor;
-                        AddEditorMultiSelectionMarker(projected.Position,
+                        AddEditorMultiSelectionMarker(markerCenter,
                             note.NoteType == NoteType.LinkTail ? radius * 0.5f : radius,
                             color, 0.14f);
                     }
@@ -10290,11 +10495,13 @@ public sealed partial class Playfield
                     var endPoint = _projection.ProjectAtTravel(note.Track, (float)endTravel, currentState);
                     if (!OutsideNoteView(endPoint, endPoint))
                     {
-                        var endRadius = GetEditorSelectionMarkerRadius(note, endPoint);
+                        var endRadius = GetEditorMarkerRadius(
+                            note.Track, note.Tick, currentTick, currentState,
+                            out var endCenter, note, endPoint, (float)endTravel);
                         var endColor = _editorSelectedHoldEnd
                             ? GetEditorSelectedNoteHighlightColor(note)
                             : EditorEndingColor;
-                        AddEditorMultiSelectionMarker(endPoint.Position,
+                        AddEditorMultiSelectionMarker(endCenter,
                             endRadius * 0.5f, endColor, 0.13f);
                     }
                 }
@@ -10437,7 +10644,8 @@ public sealed partial class Playfield
         // Once a SuperFlick source is selected, hovering another bank on the
         // same side previews the actual strip texture and direction at the source.
         // Target hover works on the submenu buttons, bank indicators, or lane itself.
-        if (_editorSuperFlickPlacementPending && _tempo is not null && _editorMouseHoverActive &&
+        if (_editorSuperFlickPlacementPending && _editorHoverHit is null &&
+            _tempo is not null && _editorMouseHoverActive &&
             !_editorPanelsViewEnabled && _editorSuperFlickPendingTick >= 0 &&
             _editorSuperFlickPendingTrack is >= 0 and <= 15 &&
             !string.IsNullOrEmpty(_editorSuperFlickSourceBank) &&
@@ -10523,46 +10731,50 @@ public sealed partial class Playfield
             }
         }
 
-        // Hover previews are only active while a note-placement tool is active.
-        // In EDIT GROUP this is a placement indicator across the entire lane grid,
-        // including empty ticks and notes outside the current group instance.
-        if (!_editorPanelsViewEnabled && _chartEditorMode &&
-            _editorPlacementEnabled && !_editorConnectorMode &&
-            _hoverBeatTick.HasValue && _hoverTrack is >= 0 and <= 15)
+        // The hover marker is also the interaction preview: yellow means the
+        // click will select an existing note; an empty cell keeps the active tool
+        // preview, or uses a neutral white marker when no note tool is armed.
+        if (!_editorPanelsViewEnabled && _chartEditorMode && _editorMouseHoverActive &&
+            _editorHoverCacheValid)
         {
-            var groupPlacementHover = _editorNoteGroupEditMode;
-            var hoverMatchesSelection = _selectedBeatTick == _hoverBeatTick && _selectedBeatTrack == _hoverTrack;
-            if (_selectedEventKey.HasValue)
+            if (_editorHoverHit is { } hoverHit)
             {
-                var selectedEvent = _chart.Events.FirstOrDefault(e => KeyOf(e) == _selectedEventKey.Value);
-                hoverMatchesSelection |= selectedEvent is not null &&
-                    selectedEvent.Tick == _hoverBeatTick.Value && selectedEvent.Track == _hoverTrack.Value;
+                var hitPoint = _projection.ProjectAtTicks(
+                    hoverHit.Track, hoverHit.Tick, currentTick, currentState);
+                if (!OutsideNoteView(hitPoint, hitPoint))
+                {
+                    var hitTravel = (float)_projection.ScrollPixelsAtTicks(hoverHit.Tick, currentTick);
+                    var hitRadius = GetEditorMarkerRadius(
+                        hoverHit.Track, hoverHit.Tick, currentTick, currentState,
+                        out var hitCenter, hoverHit.Event, hitPoint, hitTravel);
+                    if (hoverHit.Kind == EditorHoverHitKind.HoldEndMarker ||
+                        hoverHit.Event.NoteType == NoteType.LinkTail)
+                        hitRadius *= 0.5f;
+                    DrawEditorMarker(hitCenter, hitRadius, EditorHoverOverNoteColor, 0.24f);
+                }
             }
-
-            // In EDIT GROUP the marker means "place a new member here", so it
-            // remains visible even when the cursor is over a selected note.
-            if (!hoverMatchesSelection || groupPlacementHover)
+            else if (_hoverBeatTick.HasValue && _hoverTrack is >= 0 and <= 15)
             {
-                // Normal note placement may redirect an outer 1K lane to its
-                // legal middle lane. Show the highlight at the actual destination.
-                var markerTrack = groupPlacementHover
-                    ? GetEditorAllowedTrackForNoteType(_hoverTrack.Value,
-                        _editorSuperFlickTool == EditorSuperFlickTool.Place ? NoteType.Single : _editorNoteType)
-                    : _hoverTrack.Value;
+                // EDIT GROUP is not itself a placement state. Lime is reserved
+                // for an armed group-placement tool, not ordinary group editing.
+                var groupPlacementHover = _editorNoteGroupPlacementArmed;
+                var markerTrack = GetEditorHoverMarkerTrack(_hoverTrack.Value);
                 var point = _projection.ProjectAtTicks(markerTrack, _hoverBeatTick.Value, currentTick, currentState);
                 if (!OutsideNoteView(point, point))
                 {
                     var radius = GetEditorMarkerRadius(markerTrack, _hoverBeatTick.Value,
                         currentTick, currentState, out var markerCenter);
-                    if (_editorSuperFlickTool == EditorSuperFlickTool.Place && !groupPlacementHover)
+                    if (_editorSuperFlickTool == EditorSuperFlickTool.Place &&
+                        _editorPlacementEnabled && !groupPlacementHover)
                     {
                         var position = GearState.Position(markerTrack);
-                        // Any authored bank is a valid source in the editor, even if
-                        // the chart's current route has that bank inactive. In collapsed
-                        // view the configured inactive-bank modifier identifies the overlapping bank explicitly.
                         var validSource = position is not null;
-                        DrawEditorMarker(markerCenter, radius, validSource ? OuterSuperFlick : new Color(255, 78, 88), 0.20f);
-                        var mode = position?.Bank switch { "Forward" => "1K", "Center" => "2K", "Backward" => "3K", _ => "?K" };
+                        DrawEditorMarker(markerCenter, radius,
+                            validSource ? OuterSuperFlick : new Color(255, 78, 88), 0.20f);
+                        var mode = position?.Bank switch
+                        {
+                            "Forward" => "1K", "Center" => "2K", "Backward" => "3K", _ => "?K"
+                        };
                         var previewText = validSource
                             ? $"SUPERFLICK SOURCE {position!.Value.Side.ToUpperInvariant()} {mode} — CLICK, THEN CHOOSE TARGET"
                             : "SUPERFLICK SOURCE MUST BE ON A LANE";
@@ -10570,11 +10782,21 @@ public sealed partial class Playfield
                         DrawEditorHoverIndicator(previewText, markerCenter, radius, border,
                             validSource ? Color.White : new Color(255, 137, 143));
                     }
+                    else if (groupPlacementHover)
+                    {
+                        DrawEditorMarker(markerCenter, radius, EditorGroupSelectedColor, 0.20f);
+                    }
+                    else if (_editorPlacementEnabled && !_editorConnectorMode &&
+                             !_editorNoteGroupEditMode)
+                    {
+                        DrawEditorMarker(markerCenter, radius, EditorSelectedColor, 0.16f);
+                    }
                     else
                     {
-                        DrawEditorMarker(markerCenter, radius,
-                            groupPlacementHover ? EditorGroupSelectedColor : EditorSelectedColor,
-                            groupPlacementHover ? 0.20f : 0.16f);
+                        // EDIT GROUP uses the neutral empty-cell marker. Keep the
+                        // faint fill and set the outline's effective alpha to 30.
+                        DrawEditorMarker(markerCenter, radius, EditorHoverEmptyColor,
+                            0.16f, 30f / EditorHoverEmptyColor.A);
                     }
                 }
             }
