@@ -25,6 +25,7 @@ public sealed partial class Playfield
     private bool _editorTimelineScrubbing;
     private bool _editorTimelineResumeAfterScrub;
     private static readonly Color EditorSelectedColor = new(255, 165, 0);
+    private const float EditorSelection3DNearPlane = 0.05f;
     private static readonly Color EditorGroupSelectedColor = new(174, 255, 0);
     private static readonly Color EditorFamilyColor = Color.White;
 
@@ -9852,7 +9853,7 @@ public sealed partial class Playfield
     }
 
     private static bool IsFiniteEditorSelectionPoint(Vector3 point)
-        => float.IsFinite(point.X) && float.IsFinite(point.Y) && float.IsFinite(point.Z) && point.Z < -0.0001f;
+        => float.IsFinite(point.X) && float.IsFinite(point.Y) && float.IsFinite(point.Z);
 
     private static void AddEditorSelectionTriangle(
         VertexPositionColor[] vertices, ref int offset,
@@ -9867,18 +9868,58 @@ public sealed partial class Playfield
         int offset, Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3,
         Color fill, Color outline)
     {
+        // The selection surface can scroll past the judge row and approach the
+        // camera while a drag is held. Clip the polygon against the same near plane
+        // used by the 3D projection instead of rejecting the entire quad when only
+        // one corner crosses it. This also keeps the other editor quad overlays
+        // visible for as long as any part of their surface remains in front of it.
+        Span<Vector3> source = stackalloc Vector3[4] { p0, p1, p2, p3 };
+        Span<Vector3> clipped = stackalloc Vector3[8];
+        var clippedCount = 0;
+
+        for (var edgeIndex = 0; edgeIndex < source.Length; edgeIndex++)
+        {
+            var a = source[edgeIndex];
+            var b = source[(edgeIndex + 1) % source.Length];
+            var aInside = a.Z <= -EditorSelection3DNearPlane;
+            var bInside = b.Z <= -EditorSelection3DNearPlane;
+
+            if (aInside)
+                clipped[clippedCount++] = a;
+
+            if (aInside == bInside)
+                continue;
+
+            var denominator = b.Z - a.Z;
+            if (MathF.Abs(denominator) < 0.000001f)
+                continue;
+
+            var t = Math.Clamp((-EditorSelection3DNearPlane - a.Z) / denominator, 0f, 1f);
+            clipped[clippedCount++] = Vector3.Lerp(a, b, t);
+        }
+
+        if (clippedCount < 3)
+            return offset;
+
         var vertices = _editorSelection3DVertices;
-        var center = (p0 + p1 + p2 + p3) * 0.25f;
-        AddEditorSelectionTriangle(vertices, ref offset, p0, p1, p2, fill);
-        AddEditorSelectionTriangle(vertices, ref offset, p0, p2, p3, fill);
+        var center = Vector3.Zero;
+        for (var i = 0; i < clippedCount; i++)
+            center += clipped[i];
+        center /= clippedCount;
+
+        // A clipped quad can become a triangle or pentagon. Fan triangulation keeps
+        // the fill continuous without adding a camera-facing billboard.
+        for (var i = 1; i < clippedCount - 1; i++)
+            AddEditorSelectionTriangle(vertices, ref offset,
+                clipped[0], clipped[i], clipped[i + 1], fill);
 
         // A border is a narrow strip that lies in the same 3D face, not a
-        // camera-facing SpriteBatch line. Its width is kept close to 1.5 screen px
-        // at every depth by converting pixels to local camera-space units.
-        for (var edgeIndex = 0; edgeIndex < 4; edgeIndex++)
+        // camera-facing SpriteBatch line. Its width stays near 1.5 screen px at
+        // every depth by converting pixels to local camera-space units.
+        for (var edgeIndex = 0; edgeIndex < clippedCount; edgeIndex++)
         {
-            var a = edgeIndex switch { 0 => p0, 1 => p1, 2 => p2, _ => p3 };
-            var b = edgeIndex switch { 0 => p1, 1 => p2, 2 => p3, _ => p0 };
+            var a = clipped[edgeIndex];
+            var b = clipped[(edgeIndex + 1) % clippedCount];
             var edge = b - a;
             var edgeLengthSquared = edge.LengthSquared();
             if (edgeLengthSquared < 0.000001f)
@@ -9922,16 +9963,24 @@ public sealed partial class Playfield
         var halfWidth = viewportWidth * 0.5f;
         var halfHeight = viewportHeight * 0.5f;
         var focalLength = _projection.FocalLength;
+        var nearPlane = EditorSelection3DNearPlane;
+        var nearHalfWidth = halfWidth * nearPlane / focalLength;
+        var nearHalfHeight = halfHeight * nearPlane / focalLength;
         var maxCameraDistance = 1024f;
         for (var i = 0; i < vertexCount; i++)
             maxCameraDistance = Math.Max(maxCameraDistance, -_editorSelection3DVertices[i].Position.Z * 1.25f);
 
+        // CreatePerspectiveOffCenter expects its bounds at the near plane. Scale
+        // them with nearPlane so the camera-space projection remains identical to
+        // ScreenPositionFromCameraSpace when the near plane is brought closer.
+        // Leaving these bounds at the old one-unit scale makes the frustum too
+        // narrow by 1 / nearPlane and causes every editor quad to disappear.
         _primitiveEffect.Projection = Matrix.CreatePerspectiveOffCenter(
-            -halfWidth / focalLength,
-            halfWidth / focalLength,
-            -halfHeight / focalLength,
-            halfHeight / focalLength,
-            1f,
+            -nearHalfWidth,
+            nearHalfWidth,
+            -nearHalfHeight,
+            nearHalfHeight,
+            nearPlane,
             Math.Max(maxCameraDistance, _projection.StandingNoteRenderFarClip()));
 
         foreach (var pass in _primitiveEffect.CurrentTechnique.Passes)
@@ -10298,24 +10347,67 @@ public sealed partial class Playfield
 
             if (_editorRectSelecting && _editorRectStartTrack >= 0 && _editorRectCurrentTrack >= 0)
             {
-                // Keep the drag marquee's freeform chart-coordinate corners, but place
-                // them directly on their physical 3D bank surfaces rather than drawing
-                // a screen-space/billboard polygon between projected points.
-                var p0 = GetEditorSelectionPoint3D(_editorRectStartLaneX, _editorRectStartTick,
-                    currentTick, _editorRectStartSide, _editorRectStartBank);
-                var p1 = GetEditorSelectionPoint3D(_editorRectCurrentLaneX, _editorRectStartTick,
-                    currentTick, _editorRectCurrentSide, _editorRectCurrentBank);
-                var p2 = GetEditorSelectionPoint3D(_editorRectCurrentLaneX, _editorRectCurrentTick,
-                    currentTick, _editorRectCurrentSide, _editorRectCurrentBank);
-                var p3 = GetEditorSelectionPoint3D(_editorRectStartLaneX, _editorRectCurrentTick,
-                    currentTick, _editorRectStartSide, _editorRectStartBank);
-
-                if (IsFiniteEditorSelectionPoint(p0) && IsFiniteEditorSelectionPoint(p1) &&
-                    IsFiniteEditorSelectionPoint(p2) && IsFiniteEditorSelectionPoint(p3))
+                if (_topDownViewEnabled)
                 {
-                    selectionVertexCount = AppendEditorSelectionQuad3D(
-                        selectionVertexCount, p0, p1, p2, p3,
-                        new Color(255, 165, 0, 64), EditorSelectedColor);
+                    // Preserve the original continuous rectangle in top-down 2D.
+                    // In this view the banks are laid out side-by-side, so one quad
+                    // naturally covers the selected range across the flat surface.
+                    var p0 = GetEditorSelectionPoint3D(_editorRectStartLaneX, _editorRectStartTick,
+                        currentTick, _editorRectStartSide, _editorRectStartBank);
+                    var p1 = GetEditorSelectionPoint3D(_editorRectCurrentLaneX, _editorRectStartTick,
+                        currentTick, _editorRectCurrentSide, _editorRectCurrentBank);
+                    var p2 = GetEditorSelectionPoint3D(_editorRectCurrentLaneX, _editorRectCurrentTick,
+                        currentTick, _editorRectCurrentSide, _editorRectCurrentBank);
+                    var p3 = GetEditorSelectionPoint3D(_editorRectStartLaneX, _editorRectCurrentTick,
+                        currentTick, _editorRectStartSide, _editorRectStartBank);
+
+                    if (IsFiniteEditorSelectionPoint(p0) && IsFiniteEditorSelectionPoint(p1) &&
+                        IsFiniteEditorSelectionPoint(p2) && IsFiniteEditorSelectionPoint(p3))
+                    {
+                        selectionVertexCount = AppendEditorSelectionQuad3D(
+                            selectionVertexCount, p0, p1, p2, p3,
+                            new Color(255, 165, 0, 64), EditorSelectedColor);
+                    }
+                }
+                else
+                {
+                    // In 3D, each side is its own hinged bank surface. Draw a
+                    // separate quad per active side so the marquee follows the
+                    // V-shaped lane instead of bridging the hinge as one plank.
+                    var selectionLowX = Math.Min(_editorRectStartLaneX, _editorRectCurrentLaneX);
+                    var selectionHighX = Math.Max(_editorRectStartLaneX, _editorRectCurrentLaneX);
+                    var selectionLowTick = Math.Min(_editorRectStartTick, _editorRectCurrentTick);
+                    var selectionHighTick = Math.Max(_editorRectStartTick, _editorRectCurrentTick);
+
+                    foreach (var side in Sides)
+                    {
+                        var bank = GearTimeline.ActiveBankForSide(currentState, side);
+                        if (string.Equals(bank, "Inactive", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        var bankEdges = _projection.LaneBankEdgesNormalized(side, bank);
+                        var leftX = Math.Max(selectionLowX, bankEdges.Left);
+                        var rightX = Math.Min(selectionHighX, bankEdges.Right);
+                        if (rightX - leftX < 0.00001f)
+                            continue;
+
+                        var p0 = GetEditorSelectionPoint3D(leftX, selectionLowTick,
+                            currentTick, side, bank);
+                        var p1 = GetEditorSelectionPoint3D(rightX, selectionLowTick,
+                            currentTick, side, bank);
+                        var p2 = GetEditorSelectionPoint3D(rightX, selectionHighTick,
+                            currentTick, side, bank);
+                        var p3 = GetEditorSelectionPoint3D(leftX, selectionHighTick,
+                            currentTick, side, bank);
+
+                        if (IsFiniteEditorSelectionPoint(p0) && IsFiniteEditorSelectionPoint(p1) &&
+                            IsFiniteEditorSelectionPoint(p2) && IsFiniteEditorSelectionPoint(p3))
+                        {
+                            selectionVertexCount = AppendEditorSelectionQuad3D(
+                                selectionVertexCount, p0, p1, p2, p3,
+                                new Color(255, 165, 0, 64), EditorSelectedColor);
+                        }
+                    }
                 }
             }
 
