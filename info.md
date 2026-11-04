@@ -1,5 +1,16 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.34
+
+- added music volume baker to the media tab in editor
+- added custom segment for local test
+- added empty cell hover marker and yellow marker when hovering over a note
+- fixed selection highlights from disappearing when getting closer to the camera
+- made selection highlights use two rectangles in 3d view
+- improved selection/placement hit
+- fixed marker perspective scale in 3d view
+- other fixes
+
 # 0.0.30
 
 - added note groups
