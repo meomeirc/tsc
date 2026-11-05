@@ -1083,14 +1083,14 @@ public sealed partial class Playfield
                 ? new Color(43, 43, 45, 238)
                 : id == EditorActionPlay && _playing
                     ? new Color(83, 35, 40, 238)
-                    : id == EditorActionQuickSave && _editorHasUnsavedChanges
+                    : id == EditorActionQuickSave && HasUnsavedEditorChanges
                         ? new Color(148, 91, 24, 238)
                     : active ? new Color(58, 58, 60, 245) : new Color(28, 28, 30, 238);
             var accent = lockedCollapsed3D ? new Color(125, 125, 127) : id switch
             {
                 EditorActionPlay when _playing => new Color(230, 93, 104),
                 EditorActionPlay => Active,
-                EditorActionQuickSave when _editorHasUnsavedChanges => new Color(255, 177, 66),
+                EditorActionQuickSave when HasUnsavedEditorChanges => new Color(255, 177, 66),
                 EditorActionEditorPreview when _editorPreviewMode => interfaceUi.AccentColor,
                 EditorActionGameplayMode when !_gameplayMode => new Color(52, 211, 153),
                 EditorActionMeta when _editorMetaPanelOpen => new Color(52, 211, 153),

@@ -570,7 +570,7 @@ public sealed partial class Playfield
 
         SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
-        MarkEditorDirty();
+        MarkEditorDirty(auxiliaryChange: true);
         _editorPreviewStartSeconds = startSeconds;
         _editorPreviewEndSeconds = endSeconds;
         SyncEditorPreviewTimeTexts();

@@ -69,7 +69,7 @@ public sealed partial class Playfield
         _editorMusicVolumePercent = targetPercent;
         _editorMusicVolumePendingPercent = targetPercent;
         ApplyEditorMusicPlaybackVolume();
-        MarkEditorDirty();
+        MarkEditorDirty(auxiliaryChange: true);
         _statusMessage = targetPercent == 100
             ? "Editor music volume restored to 100%. Original audio is unchanged."
             : $"Editor music volume set to {targetPercent}%. It will be baked when saving/exporting.";

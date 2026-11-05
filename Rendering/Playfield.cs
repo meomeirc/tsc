@@ -486,6 +486,10 @@ public sealed partial class Playfield
     private bool _editorPreviewPreviousTempoLines;
     private bool _editorPreviewPreviousTopDownViewEnabled;
     private bool _editorHasUnsavedChanges;
+    // Changes to bundle/session assets that are not part of the active ARES chart
+    // (audio, artwork, preview, difficulty enablement, etc.) are tracked separately
+    // from the chart snapshot comparison.
+    private bool _editorHasAuxiliaryUnsavedChanges;
     // The preview bank buttons show the current active bank. These separate
     // seed values preserve the user's chosen starting route when a preview is
     // restarted or the playhead is repositioned.
@@ -1199,7 +1203,7 @@ public sealed partial class Playfield
         _editorDeletedDifficultyCodes.Add(code);
         _editorMetaDeleteConfirmOpen = false;
         _editorMetaScrollOffset = 0;
-        MarkEditorDirty();
+        MarkEditorDirty(auxiliaryChange: true);
         _statusMessage = $"{GetEditorDifficultyName(code)} difficulty marked for deletion. The file will be deleted when you save.";
     }
 
@@ -1252,6 +1256,8 @@ public sealed partial class Playfield
         if (enteringEditor)
         {
             _editorHasUnsavedChanges = false;
+            _editorHasAuxiliaryUnsavedChanges = false;
+            _editorSavedChartBaselines.Clear();
             // Always open the editor in its dedicated top-down 2D view. The
             // editor starts expanded and remembers this preference while 3D
             // temporarily forces the actual layout to collapsed.
@@ -1409,11 +1415,16 @@ public sealed partial class Playfield
         }
     }
 
-    private void MarkEditorDirty()
+    private void MarkEditorDirty(bool auxiliaryChange = false)
     {
         if (_chartEditorMode)
         {
-            _editorHasUnsavedChanges = true;
+            if (auxiliaryChange)
+                _editorHasAuxiliaryUnsavedChanges = true;
+            // A dirty flag should describe the current chart, not whether an edit
+            // happened at some point. Comparing with the saved baseline lets an
+            // undo (or an edit that is later removed) return the editor to clean.
+            RefreshEditorDirtyState();
             _editorDiagnosticsDirty = true;
             lock (_editorLanTestSync)
             {
@@ -1447,7 +1458,7 @@ public sealed partial class Playfield
             RebuildRenderEventCache();
     }
 
-    private void MarkEditorSaved() => _editorHasUnsavedChanges = false;
+    private void MarkEditorSaved() => EditorChartBaselineSaved();
 
     public void PausePlaybackForEditorSettings()
     {
@@ -2224,7 +2235,7 @@ public sealed partial class Playfield
         _editorDifficultyDiscoverySourcePath = null;
         StoreActiveEditorDifficulty();
         _editorMetaPanelOpen = true;
-        MarkEditorDirty();
+        MarkEditorDirty(auxiliaryChange: true);
         _statusMessage = $"Empty {GetEditorDifficultyName(difficultyCode)} chart created. Use META → MEDIA → MUSIC to choose audio.";
     }
 
@@ -3021,7 +3032,7 @@ public sealed partial class Playfield
         ApplyFixedMediaPaths(_chart, _editorBundleTemplate);
         SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
-        MarkEditorDirty();
+        MarkEditorDirty(auxiliaryChange: true);
         _statusMessage = $"Set {field.Replace('_', ' ')} from {Path.GetFileName(importedFilePath)}.";
     }
 
@@ -3125,7 +3136,7 @@ public sealed partial class Playfield
             state.ImportedSongAudio = true;
         }
         StoreActiveEditorDifficulty();
-        MarkEditorDirty();
+        MarkEditorDirty(auxiliaryChange: true);
         _playSeconds = 0;
         _playing = false;
         _playbackStartPending = false;
@@ -3945,6 +3956,11 @@ public sealed partial class Playfield
             RefreshResultSongInfo();
         }
         InitializeEditorDifficultySession();
+        // FPK metadata is applied after the ARES payload is decoded. Refresh the
+        // saved baseline only after those bundle-level fields and media paths have
+        // been applied, so they are treated as part of the opened file.
+        if (_chartEditorMode)
+            MarkEditorSaved();
         _statusMessage = $"FPK: {Path.GetFileName(prepared.SourcePath)}";
 
         // Main-menu Play is an actual gameplay session, so start immediately
@@ -4249,9 +4265,16 @@ public sealed partial class Playfield
         _lastLoadedSourceName = sourceName;
         _loadedMusicBytes = musicBytes is null ? null : musicBytes.ToArray();
         _editorImportedSongAudio = false;
-        _loadedAresHeaderTemplate = chartBytes is { Length: >= 28 } && chartBytes.AsSpan(0, 4).SequenceEqual("ARES"u8)
-            ? chartBytes.AsSpan(0, 28).ToArray()
-            : null;
+        if (chartBytes is not null)
+        {
+            _loadedAresHeaderTemplate = chartBytes.Length >= 28 && chartBytes.AsSpan(0, 4).SequenceEqual("ARES"u8)
+                ? chartBytes.AsSpan(0, 28).ToArray()
+                : null;
+        }
+        else if (!_switchingEditorDifficulty)
+        {
+            _loadedAresHeaderTemplate = null;
+        }
         _gameplayPaused = false;
         _pauseBackRequested = false;
         _pauseSelection = 0;
@@ -4290,8 +4313,6 @@ public sealed partial class Playfield
         _chart = chart;
         if (_chartEditorMode)
             _projection.SongBaseBpm = _chart.MetadataBpm;
-        if (_chartEditorMode && !_switchingEditorDifficulty)
-            MarkEditorSaved();
         _scoreSavedForCurrentRun = false;
         if (_chartEditorMode)
         {
@@ -4368,6 +4389,11 @@ public sealed partial class Playfield
         _playbackStartPending = preservePlayback && preservedPlaybackStartPending;
         _audioResyncPending = preservePlayback ? (!reuseCurrentAudio || preservedAudioResyncPending) : true;
         _audioStartedForCurrentRun = preservePlayback && reuseCurrentAudio && preservedAudioStartedForCurrentRun;
+        // ARES/TSC opening can materialize reconstructed notes, reconcile the play
+        // endpoint, and synchronize the native Play End marker. Those are part of
+        // the opened chart's starting state, not unsaved user edits.
+        if (_chartEditorMode)
+            EstablishEditorDirtyBaselineAfterChartLoad();
     }
 
     private static bool AudioBytesEqual(byte[]? left, byte[]? right)

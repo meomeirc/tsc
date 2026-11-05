@@ -37,13 +37,45 @@ public sealed partial class Playfield
         public AresChart? SourceChart { get; init; }
         public List<EditorTrackSnapshot> Tracks { get; init; } = new();
         public List<EditorEventSnapshot> Events { get; init; } = new();
+        public string? Name { get; init; }
+        public string? Artist { get; init; }
+        public string? Series { get; init; }
+        public string? Mapper { get; init; }
+        public string? Description { get; init; }
+        public string? Element { get; init; }
+        public string? Version { get; init; }
+        public string? ScPasscode { get; init; }
+        public string? Difficulty { get; init; }
+        public double PerfectPlusWindowMs { get; init; }
+        public double PerfectWindowMs { get; init; }
+        public double GoodWindowMs { get; init; }
+        public int? Level { get; init; }
+        public string? MusicPath { get; init; }
+        public string? PreviewPath { get; init; }
+        public string? AlbumPath { get; init; }
+        public string? AlbumBigPath { get; init; }
         public double MetadataBpm { get; init; }
         public double InitialTempo { get; init; }
+        public int TicksPerMeasure { get; init; }
         public int PlayTick { get; init; }
         public double PlayTime { get; init; }
         public int AudioOriginTick { get; init; }
+        public int InitialGearAttr { get; init; }
         public uint RawMagic { get; init; }
         public int AresTrackCount { get; init; }
+        public bool MainLoopGenerated { get; init; }
+        public int MainLoopGeneratedEvents { get; init; }
+        public int MainLoopLateGeneratedEvents { get; init; }
+        public int MainLoopBridgeGeneratedEvents { get; init; }
+        public int? MainLoopEndTargetTick { get; init; }
+        public bool LateCallbackDetected { get; init; }
+        public int? LateCallbackRawSeed { get; init; }
+        public int? LateCallbackTargetSeed { get; init; }
+        public int LateCallbackPeriod { get; init; }
+        public int LateCallbackTargetStep { get; init; }
+        public bool MainLoopDetected { get; init; }
+        public int? MainLoopSourceTick { get; init; }
+        public int? MainLoopTargetTick { get; init; }
         public byte[]? AresHeaderTemplate { get; init; }
         public byte[]? LoadedAresHeaderTemplate { get; init; }
         public List<string> InstrumentNames { get; init; } = new();
@@ -115,6 +147,9 @@ public sealed partial class Playfield
 
     private readonly List<EditorChartSnapshot> _editorUndoStack = new();
     private readonly List<EditorChartSnapshot> _editorRedoStack = new();
+    // Keep one saved baseline per chart object so switching difficulties does not
+    // lose the original comparison point for a chart that already has edits.
+    private readonly Dictionary<AresChart, EditorChartSnapshot> _editorSavedChartBaselines = new();
     private const int EditorHistoryLimit = 100;
     private EditorChartSnapshot? _editorDragUndoSnapshot;
     private EditorChartSnapshot? _editorPendingRectangleUndoSnapshot;
@@ -217,13 +252,45 @@ public sealed partial class Playfield
             SourceChart = _chart,
             Tracks = tracks,
             Events = events,
+            Name = _chart.Name,
+            Artist = _chart.Artist,
+            Series = _chart.Series,
+            Mapper = _chart.Mapper,
+            Description = _chart.Description,
+            Element = _chart.Element,
+            Version = _chart.Version,
+            ScPasscode = _chart.ScPasscode,
+            Difficulty = _chart.Difficulty,
+            PerfectPlusWindowMs = _chart.PerfectPlusWindowMs,
+            PerfectWindowMs = _chart.PerfectWindowMs,
+            GoodWindowMs = _chart.GoodWindowMs,
+            Level = _chart.Level,
+            MusicPath = _chart.MusicPath,
+            PreviewPath = _chart.PreviewPath,
+            AlbumPath = _chart.AlbumPath,
+            AlbumBigPath = _chart.AlbumBigPath,
             MetadataBpm = _chart.MetadataBpm,
             InitialTempo = _chart.InitialTempo,
+            TicksPerMeasure = _chart.TicksPerMeasure,
             PlayTick = _chart.PlayTick,
             PlayTime = _chart.PlayTime,
             AudioOriginTick = _chart.AudioOriginTick,
+            InitialGearAttr = _chart.InitialGearAttr,
             RawMagic = _chart.RawMagic,
             AresTrackCount = _chart.AresTrackCount,
+            MainLoopGenerated = _chart.MainLoopGenerated,
+            MainLoopGeneratedEvents = _chart.MainLoopGeneratedEvents,
+            MainLoopLateGeneratedEvents = _chart.MainLoopLateGeneratedEvents,
+            MainLoopBridgeGeneratedEvents = _chart.MainLoopBridgeGeneratedEvents,
+            MainLoopEndTargetTick = _chart.MainLoopEndTargetTick,
+            LateCallbackDetected = _chart.LateCallbackDetected,
+            LateCallbackRawSeed = _chart.LateCallbackRawSeed,
+            LateCallbackTargetSeed = _chart.LateCallbackTargetSeed,
+            LateCallbackPeriod = _chart.LateCallbackPeriod,
+            LateCallbackTargetStep = _chart.LateCallbackTargetStep,
+            MainLoopDetected = _chart.MainLoopDetected,
+            MainLoopSourceTick = _chart.MainLoopSourceTick,
+            MainLoopTargetTick = _chart.MainLoopTargetTick,
             AresHeaderTemplate = _chart.AresHeaderTemplate?.ToArray(),
             LoadedAresHeaderTemplate = _loadedAresHeaderTemplate?.ToArray(),
             InstrumentNames = _chart.InstrumentNames.ToList(),
@@ -231,7 +298,7 @@ public sealed partial class Playfield
             InstrumentNameReferences = _chart.InstrumentNameReferences.ToList(),
             Instruments = _chart.Instruments.ToList(),
             NoteGroups = CloneEditorNoteGroups(_chart.NoteGroups),
-            NoteGroupInstances = _chart.NoteGroupInstances.ToList(),
+            NoteGroupInstances = CloneEditorNoteGroupInstances(_chart.NoteGroupInstances),
             SelectionOnly = false,
             SelectedEvent = _selectedEventKey.HasValue
                 ? _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
@@ -316,6 +383,58 @@ public sealed partial class Playfield
             Members = group.Members.ToList()
         }).ToList();
 
+    private static List<NoteGroupInstance> CloneEditorNoteGroupInstances(IEnumerable<NoteGroupInstance> instances)
+        => instances.Select(instance => instance with
+        {
+            TrackMap = instance.TrackMap?.ToList()
+        }).ToList();
+
+    private static bool EditorNoteGroupInstancesEqual(
+        IReadOnlyList<NoteGroupInstance> left,
+        IReadOnlyList<NoteGroupInstance> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+        for (var i = 0; i < left.Count; i++)
+        {
+            var a = left[i];
+            var b = right[i];
+            if (a.GroupId != b.GroupId || a.InstanceId != b.InstanceId ||
+                a.StartTick != b.StartTick || a.StartTrack != b.StartTrack || a.IsMirrored != b.IsMirrored)
+                return false;
+            if (a.TrackMap is null || b.TrackMap is null)
+            {
+                if (a.TrackMap is not null || b.TrackMap is not null)
+                    return false;
+            }
+            else if (!a.TrackMap.SequenceEqual(b.TrackMap))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool EditorEventMatchesSnapshot(ChartEvent ev, EditorEventSnapshot state)
+        => ev.Tick == state.Tick && ev.Track == state.Track && ev.Attr == state.Attr &&
+           ev.Duration == state.Duration && ev.RawType == state.RawType &&
+           ev.TypeIndex == state.TypeIndex && ev.Kind == state.Kind && ev.NoteType == state.NoteType &&
+           ev.EventIndex == state.EventIndex && ev.LinePair == state.LinePair &&
+           ev.Value == state.Value && ev.Instrument == state.Instrument &&
+           ev.Velocity == state.Velocity && ev.Pan == state.Pan && ev.TwinPairId == state.TwinPairId &&
+           ev.LoopReconstructed == state.LoopReconstructed && ev.LoopPhase == state.LoopPhase &&
+           ev.NoteGroupId == state.NoteGroupId && ev.NoteGroupInstanceId == state.NoteGroupInstanceId &&
+           ev.NoteGroupMemberId == state.NoteGroupMemberId;
+
+    private static bool EditorByteArraysEqual(byte[]? left, byte[]? right)
+    {
+        if (ReferenceEquals(left, right))
+            return true;
+        if (left is null || right is null)
+            return false;
+        return left.AsSpan().SequenceEqual(right);
+    }
+
     private static bool EditorNoteGroupsEqual(
         IReadOnlyList<NoteGroupDefinition> left,
         IReadOnlyList<NoteGroupDefinition> right)
@@ -332,17 +451,18 @@ public sealed partial class Playfield
         return true;
     }
 
-    private bool EditorChartMatchesSnapshot(EditorChartSnapshot snapshot)
+    private bool EditorChartMatchesSnapshot(EditorChartSnapshot snapshot, AresChart? chartOverride = null)
     {
+        var chart = chartOverride ?? _chart;
         if (snapshot.SelectionOnly)
-            return _chart is not null && ReferenceEquals(_chart, snapshot.SourceChart);
+            return chart is not null && ReferenceEquals(chart, snapshot.SourceChart);
 
         if (snapshot.PanelEventOnly)
         {
-            if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart) ||
+            if (chart is null || !ReferenceEquals(chart, snapshot.SourceChart) ||
                 snapshot.PanelTrack is null || snapshot.PanelEvent is null)
                 return false;
-            var currentTrack = _chart.FindTrack(snapshot.PanelTrackIndex);
+            var currentTrack = chart.FindTrack(snapshot.PanelTrackIndex);
             var trackExists = ReferenceEquals(currentTrack, snapshot.PanelTrack);
             if (trackExists != snapshot.PanelTrackShouldExist)
                 return false;
@@ -350,45 +470,125 @@ public sealed partial class Playfield
             return eventPresent == snapshot.PanelEventPresent;
         }
 
-        if (_chart is null || !ReferenceEquals(_chart, snapshot.SourceChart) || _chart.MetadataBpm != snapshot.MetadataBpm || _chart.InitialTempo != snapshot.InitialTempo ||
-            _chart.PlayTick != snapshot.PlayTick || _chart.PlayTime != snapshot.PlayTime || _chart.AudioOriginTick != snapshot.AudioOriginTick ||
-            _chart.RawMagic != snapshot.RawMagic || _chart.AresTrackCount != snapshot.AresTrackCount ||
-            _chart.Tracks.Count != snapshot.Tracks.Count)
+        if (chart is null || !ReferenceEquals(chart, snapshot.SourceChart) ||
+            !string.Equals(chart.Name, snapshot.Name, StringComparison.Ordinal) ||
+            !string.Equals(chart.Artist, snapshot.Artist, StringComparison.Ordinal) ||
+            !string.Equals(chart.Series, snapshot.Series, StringComparison.Ordinal) ||
+            !string.Equals(chart.Mapper, snapshot.Mapper, StringComparison.Ordinal) ||
+            !string.Equals(chart.Description, snapshot.Description, StringComparison.Ordinal) ||
+            !string.Equals(chart.Element, snapshot.Element, StringComparison.Ordinal) ||
+            !string.Equals(chart.Version, snapshot.Version, StringComparison.Ordinal) ||
+            !string.Equals(chart.ScPasscode, snapshot.ScPasscode, StringComparison.Ordinal) ||
+            !string.Equals(chart.Difficulty, snapshot.Difficulty, StringComparison.Ordinal) ||
+            chart.PerfectPlusWindowMs != snapshot.PerfectPlusWindowMs ||
+            chart.PerfectWindowMs != snapshot.PerfectWindowMs ||
+            chart.GoodWindowMs != snapshot.GoodWindowMs ||
+            chart.Level != snapshot.Level ||
+            !string.Equals(chart.MusicPath, snapshot.MusicPath, StringComparison.Ordinal) ||
+            !string.Equals(chart.PreviewPath, snapshot.PreviewPath, StringComparison.Ordinal) ||
+            !string.Equals(chart.AlbumPath, snapshot.AlbumPath, StringComparison.Ordinal) ||
+            !string.Equals(chart.AlbumBigPath, snapshot.AlbumBigPath, StringComparison.Ordinal) ||
+            chart.MetadataBpm != snapshot.MetadataBpm || chart.InitialTempo != snapshot.InitialTempo ||
+            chart.TicksPerMeasure != snapshot.TicksPerMeasure ||
+            chart.PlayTick != snapshot.PlayTick || chart.PlayTime != snapshot.PlayTime ||
+            chart.AudioOriginTick != snapshot.AudioOriginTick || chart.InitialGearAttr != snapshot.InitialGearAttr ||
+            chart.RawMagic != snapshot.RawMagic || chart.AresTrackCount != snapshot.AresTrackCount ||
+            chart.MainLoopGenerated != snapshot.MainLoopGenerated ||
+            chart.MainLoopGeneratedEvents != snapshot.MainLoopGeneratedEvents ||
+            chart.MainLoopLateGeneratedEvents != snapshot.MainLoopLateGeneratedEvents ||
+            chart.MainLoopBridgeGeneratedEvents != snapshot.MainLoopBridgeGeneratedEvents ||
+            chart.MainLoopEndTargetTick != snapshot.MainLoopEndTargetTick ||
+            chart.LateCallbackDetected != snapshot.LateCallbackDetected ||
+            chart.LateCallbackRawSeed != snapshot.LateCallbackRawSeed ||
+            chart.LateCallbackTargetSeed != snapshot.LateCallbackTargetSeed ||
+            chart.LateCallbackPeriod != snapshot.LateCallbackPeriod ||
+            chart.LateCallbackTargetStep != snapshot.LateCallbackTargetStep ||
+            chart.MainLoopDetected != snapshot.MainLoopDetected ||
+            chart.MainLoopSourceTick != snapshot.MainLoopSourceTick ||
+            chart.MainLoopTargetTick != snapshot.MainLoopTargetTick ||
+            !EditorByteArraysEqual(chart.AresHeaderTemplate, snapshot.AresHeaderTemplate))
             return false;
 
-        for (var i = 0; i < snapshot.Tracks.Count; i++)
+        // Tracks below AresTrackCount are already represented by the file's fixed
+        // track table. Creating an empty in-memory ChartTrack for placement and
+        // leaving it empty after deletion does not change the chart that gets saved.
+        // Ignore those empty placeholders while still comparing every populated
+        // track and any empty track that would extend the serialized track table.
+        var savedTracks = snapshot.Tracks
+            .Where(track => track.Events.Count > 0 || track.Track.TrackIndex >= snapshot.AresTrackCount)
+            .OrderBy(track => track.Track.TrackIndex)
+            .ToList();
+        var currentTracks = chart.Tracks
+            .Where(track => track.Events.Count > 0 || track.TrackIndex >= chart.AresTrackCount)
+            .OrderBy(track => track.TrackIndex)
+            .ToList();
+        if (savedTracks.Count != currentTracks.Count)
+            return false;
+        var savedEventStates = snapshot.Events.ToDictionary(state => state.Event);
+        for (var i = 0; i < savedTracks.Count; i++)
         {
-            var savedTrack = snapshot.Tracks[i];
-            var currentTrack = _chart.Tracks[i];
-            if (!ReferenceEquals(savedTrack.Track, currentTrack) ||
+            var savedTrack = savedTracks[i];
+            var currentTrack = currentTracks[i];
+            if (savedTrack.Track.TrackIndex != currentTrack.TrackIndex ||
                 savedTrack.Events.Count != currentTrack.Events.Count)
                 return false;
             for (var j = 0; j < savedTrack.Events.Count; j++)
-                if (!ReferenceEquals(savedTrack.Events[j], currentTrack.Events[j]))
+            {
+                if (!savedEventStates.TryGetValue(savedTrack.Events[j], out var eventState) ||
+                    !EditorEventMatchesSnapshot(currentTrack.Events[j], eventState))
                     return false;
+            }
         }
 
-        foreach (var state in snapshot.Events)
+        return chart.InstrumentNames.SequenceEqual(snapshot.InstrumentNames) &&
+               chart.InstrumentNameHuffmanFrequencies.SequenceEqual(snapshot.InstrumentNameHuffmanFrequencies) &&
+               chart.InstrumentNameReferences.SequenceEqual(snapshot.InstrumentNameReferences) &&
+               chart.Instruments.SequenceEqual(snapshot.Instruments) &&
+               EditorNoteGroupsEqual(chart.NoteGroups, snapshot.NoteGroups) &&
+               EditorNoteGroupInstancesEqual(chart.NoteGroupInstances, snapshot.NoteGroupInstances);
+    }
+
+    private void EstablishEditorDirtyBaselineAfterChartLoad()
+    {
+        if (!_chartEditorMode || _chart is null)
         {
-            var ev = state.Event;
-            if (ev.Tick != state.Tick || ev.Track != state.Track || ev.Attr != state.Attr ||
-                ev.Duration != state.Duration || ev.RawType != state.RawType ||
-                ev.TypeIndex != state.TypeIndex || ev.Kind != state.Kind || ev.NoteType != state.NoteType ||
-                ev.EventIndex != state.EventIndex || ev.LinePair != state.LinePair ||
-                ev.Value != state.Value || ev.Instrument != state.Instrument ||
-                ev.Velocity != state.Velocity || ev.Pan != state.Pan || ev.TwinPairId != state.TwinPairId ||
-                ev.LoopReconstructed != state.LoopReconstructed || ev.LoopPhase != state.LoopPhase ||
-                ev.NoteGroupId != state.NoteGroupId || ev.NoteGroupInstanceId != state.NoteGroupInstanceId ||
-                ev.NoteGroupMemberId != state.NoteGroupMemberId)
-                return false;
+            _editorHasUnsavedChanges = false;
+            return;
         }
 
-        return _chart.InstrumentNames.SequenceEqual(snapshot.InstrumentNames) &&
-               _chart.InstrumentNameHuffmanFrequencies.SequenceEqual(snapshot.InstrumentNameHuffmanFrequencies) &&
-               _chart.InstrumentNameReferences.SequenceEqual(snapshot.InstrumentNameReferences) &&
-               _chart.Instruments.SequenceEqual(snapshot.Instruments) &&
-               EditorNoteGroupsEqual(_chart.NoteGroups, snapshot.NoteGroups) &&
-               _chart.NoteGroupInstances.SequenceEqual(snapshot.NoteGroupInstances);
+        if (!_switchingEditorDifficulty)
+        {
+            _editorSavedChartBaselines.Clear();
+            _editorHasAuxiliaryUnsavedChanges = false;
+        }
+
+        if (!_editorSavedChartBaselines.ContainsKey(_chart))
+        {
+            var baseline = CaptureEditorChartSnapshot();
+            if (baseline is not null)
+                _editorSavedChartBaselines[_chart] = baseline;
+        }
+
+        RefreshEditorDirtyState();
+    }
+
+    private void RefreshEditorDirtyState()
+    {
+        // A difficulty can remain edited after the user switches to another one.
+        // Check every chart that has acquired a baseline, not only the active tab.
+        var chartDiffersFromSavedBaseline = _chartEditorMode &&
+            _editorSavedChartBaselines.Any(pair => !EditorChartMatchesSnapshot(pair.Value, pair.Key));
+        _editorHasUnsavedChanges = _chartEditorMode &&
+            (_editorHasAuxiliaryUnsavedChanges || chartDiffersFromSavedBaseline);
+    }
+
+    private void EditorChartBaselineSaved()
+    {
+        _editorSavedChartBaselines.Clear();
+        if (_chartEditorMode && _chart is not null && CaptureEditorChartSnapshot() is { } baseline)
+            _editorSavedChartBaselines[_chart] = baseline;
+        _editorHasAuxiliaryUnsavedChanges = false;
+        RefreshEditorDirtyState();
     }
 
     private bool EditorSelectionMatchesSnapshot(EditorChartSnapshot snapshot)

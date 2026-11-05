@@ -300,7 +300,7 @@ public sealed partial class Playfield
                 EditorActionMetronome or EditorActionMeta or EditorActionEditorPreview or EditorActionGameplayMode;
             var leftAction = EditorUiItem($"left_{id}", label, "editor.action", id, selected,
                 enabled: !(id == EditorActionExpand && !_topDownViewEnabled && _editorPanelsViewEnabled), toggle: toggle);
-            if (id == EditorActionQuickSave && _editorHasUnsavedChanges)
+            if (id == EditorActionQuickSave && HasUnsavedEditorChanges)
                 leftAction["variant"] = "warning";
             leftActions.Add(leftAction);
         }
@@ -774,7 +774,7 @@ public sealed partial class Playfield
             ["problems"] = problems,
             ["banks"] = banks,
             ["status"] = _statusMessage ?? string.Empty,
-            ["dirty"] = _editorHasUnsavedChanges,
+            ["dirty"] = HasUnsavedEditorChanges,
             ["preview_mode"] = _editorPreviewMode
         };
         AddEditorLanTestUiState(state);
@@ -1018,7 +1018,7 @@ public sealed partial class Playfield
                         var difficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
                         if (!HasEditorDifficultyChart(difficultyCode)) return true;
                         ToggleEditorDifficultyEnabled(difficultyCode);
-                        MarkEditorDirty();
+                        MarkEditorDirty(auxiliaryChange: true);
                         _editorElementDropdownOpen = false;
                         _statusMessage = IsEditorDifficultyEnabled(difficultyCode)
                             ? $"{GetEditorDifficultyName(difficultyCode)} difficulty enabled."
@@ -1027,7 +1027,7 @@ public sealed partial class Playfield
                     else if (rowLabel == "CUSTOM JUDGEMENT WINDOWS")
                     {
                         _editorCustomJudgementWindowsEnabled = !_editorCustomJudgementWindowsEnabled;
-                        MarkEditorDirty();
+                        MarkEditorDirty(auxiliaryChange: true);
                         if (_editorCustomJudgementWindowsEnabled && _chart is not null)
                         {
                             var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
@@ -1062,7 +1062,7 @@ public sealed partial class Playfield
                 var toggleCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
                 if (!HasEditorDifficultyChart(toggleCode)) return true;
                 ToggleEditorDifficultyEnabled(toggleCode);
-                MarkEditorDirty();
+                MarkEditorDirty(auxiliaryChange: true);
                 _statusMessage = IsEditorDifficultyEnabled(toggleCode)
                     ? $"{GetEditorDifficultyName(toggleCode)} difficulty enabled."
                     : $"{GetEditorDifficultyName(toggleCode)} difficulty disabled; this chart will be omitted from exports.";

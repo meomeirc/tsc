@@ -3638,7 +3638,7 @@ public sealed partial class Playfield
             var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
             if (!HasEditorDifficultyChart(code)) return true;
             ToggleEditorDifficultyEnabled(code);
-            MarkEditorDirty();
+            MarkEditorDirty(auxiliaryChange: true);
             return true;
         }
         var metaContent = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
@@ -3672,7 +3672,7 @@ public sealed partial class Playfield
                     var difficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
                     if (!HasEditorDifficultyChart(difficultyCode)) return true;
                     ToggleEditorDifficultyEnabled(difficultyCode);
-                    MarkEditorDirty();
+                    MarkEditorDirty(auxiliaryChange: true);
                     _editorElementDropdownOpen = false;
                     _statusMessage = IsEditorDifficultyEnabled(difficultyCode)
                         ? $"{GetEditorDifficultyName(difficultyCode)} difficulty enabled."
@@ -3716,7 +3716,7 @@ public sealed partial class Playfield
                 {
                     CancelEditorMetaField();
                     _editorCustomJudgementWindowsEnabled = !_editorCustomJudgementWindowsEnabled;
-                    MarkEditorDirty();
+                    MarkEditorDirty(auxiliaryChange: true);
                     if (_editorCustomJudgementWindowsEnabled && _chart is not null)
                     {
                         var code = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
