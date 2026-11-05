@@ -9086,11 +9086,13 @@ public sealed partial class Playfield
                      nextPoint.Track != previousPoint.Track)
                 previousPoint.Duration = 6;
             else
-                // Preserve the removed tail's actual end tick, not just its
-                // local duration. The merged hold begins at previousPoint.Tick,
-                // so its duration must include the entire link span plus any
-                // authored duration on the terminal LinkTail.
-                previousPoint.Duration = Math.Max(1, ev.EndTick - previousPoint.Tick);
+            {
+                // A six-tick LinkTail duration is the synthetic tap-sized
+                // endpoint marker, not an authored hold beyond the connector.
+                // Only preserve its EndTick when it carries a real long duration.
+                var mergedTailEndTick = ev.Duration > 6 ? ev.EndTick : ev.Tick;
+                previousPoint.Duration = Math.Max(1, mergedTailEndTick - previousPoint.Tick);
+            }
 
             finalSelection = previousPoint;
             mergedSameLane = true;
@@ -9118,10 +9120,12 @@ public sealed partial class Playfield
             }
             else
             {
-                // No connection remains after removing the horizontal tail. Keep
-                // the tail's authored duration instead of fabricating a minimum
-                // long-note duration; conversion chooses tap vs hold from that value.
-                ev.Duration = Math.Max(1, nextPoint.Duration);
+                // No connection remains after removing the horizontal tail. Its
+                // six-tick duration is only the synthetic endpoint marker; the
+                // standalone body spans from this head to the removed tail's tick.
+                // Preserve an extension beyond that tick only for a real long tail.
+                var mergedTailEndTick = nextPoint.Duration > 6 ? nextPoint.EndTick : nextPoint.Tick;
+                ev.Duration = Math.Max(1, mergedTailEndTick - ev.Tick);
                 ConvertEditorLinkPointToStandaloneNote(ev);
             }
 
@@ -9178,10 +9182,21 @@ public sealed partial class Playfield
             return preferredSelection;
 
         // RefreshAfterEditorMutation has just rebuilt _chart.Links, so this list
-        // describes only the surviving chain nodes.
+        // describes only the surviving chain nodes. If a same-track merge removed
+        // the final tail, the old head is now a standalone body, not an orphan head.
         var nodes = GetEditorLinkChainNodes(root);
         if (nodes.Count < 2)
+        {
+            var hasIncidentLink = _chart.Links.Any(link =>
+                ReferenceEquals(link.Head, root) || ReferenceEquals(link.Tail, root));
+            if (!_ambiguousNextLinkHeadKeys.Contains(KeyOf(root)) && !hasIncidentLink)
+            {
+                ConvertEditorLinkPointToStandaloneNote(root);
+                changed = true;
+                return root;
+            }
             return preferredSelection;
+        }
 
         // Collapse each consecutive same-track run independently. A chain may
         // still leave that lane later (for example 7 -> 7 -> 8); in that case
@@ -9199,9 +9214,11 @@ public sealed partial class Playfield
             if (runEnd - runStart > 1)
             {
                 var runHead = nodes[runStart];
+                var terminal = nodes[^1];
+                var terminalEndTick = terminal.Duration > 6 ? terminal.EndTick : terminal.Tick;
                 var runEndTick = runEnd < nodes.Count
                     ? nodes[runEnd].Tick
-                    : Math.Max(nodes[^1].Tick, nodes[^1].EndTick);
+                    : terminalEndTick;
                 runHead.Duration = Math.Max(1, runEndTick - runHead.Tick);
                 for (var i = runStart + 1; i < runEnd; i++)
                     removed.Add(nodes[i]);
@@ -9220,6 +9237,17 @@ public sealed partial class Playfield
         }
 
         changed = true;
+        var hasSurvivingIncidentLink = _chart.Links.Any(link =>
+            (ReferenceEquals(link.Head, root) && !removed.Contains(link.Tail)) ||
+            (ReferenceEquals(link.Tail, root) && !removed.Contains(link.Head)));
+        if (nodes.Count - removed.Count == 1 && root.NoteType == NoteType.LinkHead &&
+            !_ambiguousNextLinkHeadKeys.Contains(KeyOf(root)) && !hasSurvivingIncidentLink)
+        {
+            // Collapsing the last same-track tail leaves only the original head.
+            // Convert it now while the merged body duration is already normalized.
+            ConvertEditorLinkPointToStandaloneNote(root);
+            return root;
+        }
         return removed.Contains(preferredSelection) ? root : preferredSelection;
     }
 
