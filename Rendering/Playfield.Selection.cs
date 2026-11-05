@@ -891,10 +891,15 @@ public sealed partial class Playfield
             : resolvedMouseHoverHit is { } hit &&
               hit.Kind is EditorHoverHitKind.NoteCard or EditorHoverHitKind.GridCellNote
                 ? hit.Event : null;
-        ChartEvent? ClickLinkBodyTarget() => touchInputThisFrame
-            ? FindClickedLinkChainBody(point, currentTick, currentState)
-            : resolvedMouseHoverHit is { } hit && hit.Kind == EditorHoverHitKind.LinkBody
-                ? hit.Event : null;
+        ChartEvent? ClickLinkBodyTarget()
+        {
+            if (!touchInputThisFrame)
+                return resolvedMouseHoverHit is { } hit && hit.Kind == EditorHoverHitKind.LinkBody
+                    ? hit.Event : null;
+
+            var snappedTick = FindClickedQuarterBeat(point, currentTick, currentState, out _);
+            return FindClickedLinkChainBody(point, currentTick, currentState, snappedTick);
+        }
         int? ClickGridTick(out int track)
         {
             if (!touchInputThisFrame && _editorHoverCacheValid)
@@ -8016,9 +8021,30 @@ public sealed partial class Playfield
         }
     }
 
+    // Returns the last tick occupied by a note's visible body for editor hit-testing.
+    // In the chart format, duration 6 is the default metadata value for a point with
+    // no hold body. This matters especially for a terminal LinkTail: it has an
+    // incoming horizontal connector, but it does not occupy the next six ticks on
+    // its own lane unless its duration is greater than 6. Non-terminal link points
+    // instead own the source-lane body up to their next connected point.
+    private int GetEditorNoteHitEndTick(ChartEvent ev)
+    {
+        if (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail)
+        {
+            var nextPoint = GetEditorNextLinkPoint(ev);
+            if (nextPoint is not null)
+                return Math.Max(ev.Tick, nextPoint.Tick);
+
+            return ev.Duration > 6 ? ev.EndTick : ev.Tick;
+        }
+
+        return ev.IsHoldNote && ev.Duration > 6 ? ev.EndTick : ev.Tick;
+    }
+
     // Returns a note already occupying the snapped editor cell. Long notes and
-    // link segments occupy the source lane through their endpoint, not just their
-    // note-head tick, so placement cannot accidentally stack a new note on them.
+    // link segments occupy the source lane through their visible endpoint, not
+    // just their note-head tick, so placement cannot stack on their actual body.
+    // The default six-tick duration on a terminal LinkTail is not a body.
     private ChartEvent? FindEditorNoteAtGridCell(int tick, int track)
     {
         if (_chart is null)
@@ -8036,9 +8062,9 @@ public sealed partial class Playfield
                 continue;
 
             var exactTick = ev.Tick == tick;
+            var hitEndTick = GetEditorNoteHitEndTick(ev);
             var occupiesCell = exactTick ||
-                ((ev.IsHoldNote || ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
-                 ev.Tick <= tick && tick <= (GetEditorNextLinkPoint(ev)?.Tick ?? ev.EndTick));
+                (hitEndTick > ev.Tick && ev.Tick <= tick && tick <= hitEndTick);
             if (!occupiesCell)
                 continue;
 
@@ -8112,7 +8138,7 @@ public sealed partial class Playfield
             var gridPoint = _projection.ProjectAtTicks(gridTrack, tick, currentTick, currentState);
             if (!OutsideNoteView(gridPoint, gridPoint))
             {
-                var linkBody = FindClickedLinkChainBody(gridPoint.Position, currentTick, currentState);
+                var linkBody = FindClickedLinkChainBody(gridPoint.Position, currentTick, currentState, tick);
                 if (linkBody is not null)
                     return new EditorHoverHit(linkBody, EditorHoverHitKind.LinkBody, tick, gridTrack);
             }
@@ -8121,7 +8147,8 @@ public sealed partial class Playfield
         return null;
     }
 
-    private ChartEvent? FindClickedLinkChainBody(Vector2 point, double currentTick, GearState currentState)
+    private ChartEvent? FindClickedLinkChainBody(
+        Vector2 point, double currentTick, GearState currentState, int? snappedHoverTick = null)
     {
         if (_chart is null || (_chart.Links.Count == 0 && !_editorNoteGroupEditMode))
             return null;
@@ -8151,6 +8178,15 @@ public sealed partial class Playfield
             if (link.Head.NoteType != NoteType.LinkHead && link.Head.NoteType != NoteType.LinkTail)
                 continue;
             if (link.Tail.NoteType != NoteType.LinkTail)
+                continue;
+
+            // A same-tick edge is a horizontal connector only. It has no body
+            // extending into later ticks on the terminal LinkTail's lane. Keep the
+            // screen-space connector radius from bleeding into the next snapped
+            // cell (especially +6 ticks, where a default-duration LinkTail must be
+            // treated as a point rather than a six-tick hold).
+            if (snappedHoverTick.HasValue && link.Head.Tick == link.Tail.Tick &&
+                snappedHoverTick.Value != link.Tail.Tick)
                 continue;
 
             var head = _projection.ProjectAtTicks(link.Head.Track, link.Head.Tick, currentTick, currentState);
@@ -9275,7 +9311,11 @@ public sealed partial class Playfield
                 continue;
 
             var startTravel = _projection.ScrollPixelsAtTicks(ev.Tick, currentTick);
-            var endTick = ev.EndTick;
+            // Hit-test the same visible extent that DrawNotes renders. A terminal
+            // LinkTail with Duration == 6 is a point marker only; using EndTick
+            // here creates an invisible six-tick card that falsely turns the next
+            // snapped cells yellow even though no body is drawn there.
+            var endTick = GetEditorNoteHitEndTick(ev);
             var endTravel = _projection.ScrollPixelsAtTicks(endTick, currentTick);
             if (!_projection.RenderIntervalIntersects((float)startTravel, (float)endTravel))
                 continue;

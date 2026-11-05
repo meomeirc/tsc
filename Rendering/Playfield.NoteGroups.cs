@@ -281,8 +281,8 @@ public sealed partial class Playfield
             _editorNoteGroupPlacementPreviewOccupiedCells.Add((ev.Tick, ev.Track));
             if (ev.IsHoldNote || ev.NoteType is NoteType.LinkHead or NoteType.LinkTail)
             {
-                var endTick = GetEditorNextLinkPoint(ev)?.Tick ?? ev.EndTick;
-                if (endTick >= ev.Tick)
+                var endTick = GetEditorNoteHitEndTick(ev);
+                if (endTick > ev.Tick)
                     _editorNoteGroupPlacementPreviewOccupiedIntervals[ev.Track].Add((ev.Tick, endTick));
             }
         }
