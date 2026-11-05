@@ -20,6 +20,18 @@ public sealed class Game1 : Game
 {
     private static Game1? _currentInstance;
 
+    private const uint WmClose = 0x0010;
+    private static readonly UIntPtr WindowCloseSubclassId = new UIntPtr(0x545343u); // "TSC"
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate IntPtr WindowSubclassProc(
+        IntPtr hWnd,
+        uint message,
+        IntPtr wParam,
+        IntPtr lParam,
+        UIntPtr subclassId,
+        UIntPtr referenceData);
+
     private enum StartupScreen
     {
         Menu,
@@ -147,6 +159,10 @@ public sealed class Game1 : Game
     private bool _chartEditorMode;
     private bool _returnToSongSelectAfterEditor;
     private bool _editorExitConfirmOpen;
+    private bool _closeApplicationAfterEditorExitConfirmation;
+    private int _pendingNativeWindowCloseRequest;
+    private readonly WindowSubclassProc _windowCloseSubclassProc;
+    private IntPtr _windowCloseSubclassHandle;
     private bool _chartPickerIsTscFolder;
     private bool _chartPickerLoadsIntoExistingPlayfield;
     private string? _chartPickerTitle;
@@ -179,6 +195,7 @@ public sealed class Game1 : Game
 
     public Game1(string? chartArgument)
     {
+        _windowCloseSubclassProc = HandleWindowCloseSubclassMessage;
         _currentInstance = this;
         _ = chartArgument;
         _graphics = new GraphicsDeviceManager(this)
@@ -217,6 +234,7 @@ public sealed class Game1 : Game
         // Read the saved display mode before the first menu frame is shown.
         _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
         ApplyDisplayMode(_skin.GameConfig.DisplayMode, persistConfiguration: false);
+        EnsureWindowCloseHook();
         // Only published installations offer updates. The updater runs from the same
         // TSC.exe, using a temporary copy so the installed executable can be replaced.
 #if TSC_PUBLISH
@@ -257,6 +275,7 @@ public sealed class Game1 : Game
     private void UpdateFrameCore(GameTime gameTime)
     {
         ApplyMaxFrameRateConfig();
+        ProcessPendingNativeWindowCloseRequest();
 
         // Device loss is detected by the background monitor, but all SoundEffect
         // disposal/recreation and MonoGame audio-context lifecycle work must run
@@ -503,6 +522,7 @@ public sealed class Game1 : Game
             _graphics.ApplyChanges();
             InvalidateWindowsWindowHandle();
             RefreshBorderlessTopmostAfterGraphicsChange();
+            EnsureWindowCloseHook();
         }
     }
 
@@ -529,6 +549,8 @@ public sealed class Game1 : Game
         }
 
         DrawScreen(_startupScreen);
+        if (_editorExitConfirmOpen)
+            DrawEditorExitConfirmationOverlay();
         base.Draw(gameTime);
     }
 
@@ -542,8 +564,6 @@ public sealed class Game1 : Game
                     _playfield.Draw();
                 else
                     DrawStartupFallback();
-                if (_editorExitConfirmOpen)
-                    DrawEditorExitConfirmationOverlay();
                 return;
 
             case StartupScreen.SongSelect:
@@ -569,7 +589,7 @@ public sealed class Game1 : Game
         var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
         GraphicsDevice.Viewport = new Viewport(0, 0, width, height);
 
-        _editorMenuRuntime.UpdateEditorExitConfirmation(true);
+        _editorMenuRuntime.UpdateEditorExitConfirmation(true, _closeApplicationAfterEditorExitConfirmation);
         _editorMenuRuntime.UpdateScreen(width, height);
         var mouse = GlobalInput.Mouse;
         _editorMenuRuntime.UpdateUiPointer(
@@ -602,7 +622,7 @@ public sealed class Game1 : Game
 
         var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
         var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
-        _editorMenuRuntime.UpdateEditorExitConfirmation(true);
+        _editorMenuRuntime.UpdateEditorExitConfirmation(true, _closeApplicationAfterEditorExitConfirmation);
         _editorMenuRuntime.UpdateScreen(width, height);
         var mouse = GlobalInput.Mouse;
         _editorMenuRuntime.UpdateUiPointer(
@@ -632,6 +652,113 @@ public sealed class Game1 : Game
         }
     }
 
+    private void ProcessPendingNativeWindowCloseRequest()
+    {
+        if (Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 0) == 0)
+            return;
+
+        if (_playfield is { ChartEditorMode: true, HasUnsavedEditorChanges: true })
+        {
+            _closeApplicationAfterEditorExitConfirmation = true;
+            _editorExitConfirmOpen = true;
+            _editorMenuRuntime?.UpdateEditorExitConfirmation(true, closeApplication: true);
+            Program.LogRuntime("WINDOW_CLOSE_DEFERRED_FOR_UNSAVED_EDITOR_CHANGES");
+            return;
+        }
+
+        // The chart may have been saved between the native close message and this
+        // game-thread update. In that case there is no reason to keep the window open.
+        Program.LogRuntime("WINDOW_CLOSE_CONFIRMED_WITHOUT_UNSAVED_EDITOR_CHANGES");
+        Exit();
+    }
+
+    private IntPtr HandleWindowCloseSubclassMessage(
+        IntPtr hWnd,
+        uint message,
+        IntPtr wParam,
+        IntPtr lParam,
+        UIntPtr subclassId,
+        UIntPtr referenceData)
+    {
+        if (message == WmClose)
+        {
+            try
+            {
+                if (_playfield is { ChartEditorMode: true, HasUnsavedEditorChanges: true })
+                {
+                    // SDL normally translates WM_CLOSE into SDL_WINDOWEVENT_CLOSE,
+                    // which MonoGame handles by calling Game.Exit immediately. Swallow
+                    // that native message only while the editor has unsaved changes;
+                    // the game thread will open the existing editor-exit confirmation.
+                    Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 1);
+                    return IntPtr.Zero;
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.LogRuntime($"WINDOW_CLOSE_INTERCEPT_FAILED {ex}");
+                // If inspection fails, let SDL perform its normal close behavior.
+            }
+        }
+
+        return DefSubclassProc(hWnd, message, wParam, lParam);
+    }
+
+    private void EnsureWindowCloseHook()
+    {
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        try
+        {
+            var hwnd = GetWindowsNativeHandle(Window.Handle);
+            EnsureWindowCloseHookForHandle(hwnd);
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"WINDOW_CLOSE_HOOK_INSTALL_FAILED {ex}");
+        }
+    }
+
+    private void RemoveWindowCloseHook()
+    {
+        var hwnd = _windowCloseSubclassHandle;
+        _windowCloseSubclassHandle = IntPtr.Zero;
+        if (hwnd == IntPtr.Zero)
+            return;
+
+        try
+        {
+            RemoveWindowSubclass(hwnd, _windowCloseSubclassProc, WindowCloseSubclassId);
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"WINDOW_CLOSE_HOOK_REMOVE_FAILED {ex}");
+        }
+    }
+
+    [DllImport("comctl32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowSubclass(
+        IntPtr hWnd,
+        WindowSubclassProc subclassProc,
+        UIntPtr subclassId,
+        UIntPtr referenceData);
+
+    [DllImport("comctl32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RemoveWindowSubclass(
+        IntPtr hWnd,
+        WindowSubclassProc subclassProc,
+        UIntPtr subclassId);
+
+    [DllImport("comctl32.dll")]
+    private static extern IntPtr DefSubclassProc(
+        IntPtr hWnd,
+        uint message,
+        IntPtr wParam,
+        IntPtr lParam);
+
     private void HandleEditorSettingsRequested()
     {
         if (_playfield is null || !_playfield.ChartEditorMode)
@@ -655,16 +782,28 @@ public sealed class Game1 : Game
     private void CancelEditorExitConfirmation()
     {
         _editorExitConfirmOpen = false;
+        _closeApplicationAfterEditorExitConfirmation = false;
         _editorMenuRuntime?.UpdateEditorExitConfirmation(false);
         _playfield?.SetStatusMessage("Editor exit cancelled. Your chart is still open.");
     }
 
     private void CompleteEditorExit()
     {
+        var closeApplication = _closeApplicationAfterEditorExitConfirmation;
         _editorExitConfirmOpen = false;
+        _closeApplicationAfterEditorExitConfirmation = false;
         _editorMenuRuntime?.UpdateEditorExitConfirmation(false);
-        _playfield?.StopPlaybackForEditorExit(preserveEditorModeForTransition: _returnToSongSelectAfterEditor);
+        _playfield?.StopPlaybackForEditorExit(
+            preserveEditorModeForTransition: !closeApplication && _returnToSongSelectAfterEditor);
         _errorMessage = null;
+
+        if (closeApplication)
+        {
+            _returnToSongSelectAfterEditor = false;
+            _chartEditorMode = false;
+            Exit();
+            return;
+        }
 
         if (_returnToSongSelectAfterEditor)
         {
@@ -1142,6 +1281,7 @@ public sealed class Game1 : Game
 
     private void InvalidateWindowsWindowHandle()
     {
+        RemoveWindowCloseHook();
         _cachedSdlWindowHandle = IntPtr.Zero;
         _cachedWindowsWindowHandle = IntPtr.Zero;
     }
@@ -1154,7 +1294,26 @@ public sealed class Game1 : Game
             _cachedSdlWindowHandle = sdlWindow;
             _cachedWindowsWindowHandle = GetWindowsNativeHandle(sdlWindow);
         }
+
+        EnsureWindowCloseHookForHandle(_cachedWindowsWindowHandle);
         return _cachedWindowsWindowHandle;
+    }
+
+    private void EnsureWindowCloseHookForHandle(IntPtr hwnd)
+    {
+        if (!OperatingSystem.IsWindows() || hwnd == IntPtr.Zero || hwnd == _windowCloseSubclassHandle)
+            return;
+
+        RemoveWindowCloseHook();
+        if (SetWindowSubclass(hwnd, _windowCloseSubclassProc, WindowCloseSubclassId, UIntPtr.Zero))
+        {
+            _windowCloseSubclassHandle = hwnd;
+            Program.LogRuntime("WINDOW_CLOSE_HOOK_INSTALLED");
+        }
+        else
+        {
+            Program.LogRuntime($"WINDOW_CLOSE_HOOK_INSTALL_FAILED win32={Marshal.GetLastWin32Error()}");
+        }
     }
 
     private bool IsWindowInputActive()
@@ -1205,6 +1364,8 @@ public sealed class Game1 : Game
     {
         if (disposing)
         {
+            RemoveWindowCloseHook();
+            Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 0);
             if (ReferenceEquals(_currentInstance, this))
                 _currentInstance = null;
             OpenALAudioDeviceRecovery.Stop();
@@ -5999,6 +6160,10 @@ public sealed class Game1 : Game
         {
             _errorMessage = $"Could not change display mode: {ex.Message}";
             Program.LogFatal("DISPLAY_MODE_APPLY", ex);
+        }
+        finally
+        {
+            EnsureWindowCloseHook();
         }
     }
 

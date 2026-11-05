@@ -127,9 +127,11 @@ function render()
             layer = 150,
             style = "editor_exit",
             title = "UNSAVED CHANGES",
-            message = "Exit the editor and discard these changes?",
+            message = menu.exit_confirm_close_application
+                and "Close TSC and discard these changes?"
+                or "Exit the editor and discard these changes?",
             cancel_label = "CANCEL",
-            confirm_label = "EXIT EDITOR",
+            confirm_label = menu.exit_confirm_close_application and "CLOSE TSC" or "EXIT EDITOR",
             cancel_action = "cancel_editor_exit",
             confirm_action = "confirm_editor_exit",
         })

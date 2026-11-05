@@ -2492,9 +2492,10 @@ public sealed class SkinRuntime : IDisposable
     }
 
     /// <summary>Shows or hides the shared in-game editor-exit confirmation modal.</summary>
-    public void UpdateEditorExitConfirmation(bool open)
+    public void UpdateEditorExitConfirmation(bool open, bool closeApplication = false)
     {
         _mainMenu?.Set("exit_confirm_open", DynValue.NewBoolean(open));
+        _mainMenu?.Set("exit_confirm_close_application", DynValue.NewBoolean(open && closeApplication));
     }
 
     /// <summary>Supplies the current page and selectable rows to chartEditorMenu.lua.</summary>
