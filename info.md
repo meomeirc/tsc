@@ -1,5 +1,13 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.40
+
+- made the skin modular and some adjustments to the default skin
+- added unsaved changes warning when exiting from window x button
+- fixed loading ares chart from marking the save state as dirty
+- fixed hitbox bleed on horizontal link end
+- fixed merging horizontal link end from giving extra 12 ticks duration
+
 # 0.0.34
 
 - added music volume baker to the media tab in editor
