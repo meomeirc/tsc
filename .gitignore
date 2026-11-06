@@ -20,3 +20,8 @@ tools/
 songs/
 
 release-assets/
+
+/Skins/*
+!/Skins/*.cs
+!/Skins/Default/
+!/Skins/Default/**

@@ -14,6 +14,7 @@ float2 ScreenBottomLeft;
 float3 DiffuseColor;
 float Alpha;
 float MaskEnabled;
+float ForceWhiteColor;
 float UseBilinearMapping;
 float ClipEnabled;
 float4 ClipRect;
@@ -110,6 +111,14 @@ float4 MainPS(VSOutput input) : COLOR0
         ? BilinearQuadUv(input.Position.xy)
         : input.TexCoord;
     float4 texel = tex2D(TextureSampler, uv);
+
+    // Optional flash treatment: preserve the source alpha as a silhouette,
+    // but output white RGB so the overlay can use ordinary alpha blending
+    // instead of additive blending.
+    if (ForceWhiteColor > 0.5f)
+    {
+        texel.rgb = float3(1.0f, 1.0f, 1.0f);
+    }
 
     if (MaskEnabled > 0.5f)
     {

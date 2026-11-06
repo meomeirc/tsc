@@ -1,17 +1,24 @@
 -- Seamless horizontally scrolling background.
 
 local texture = nil
+local stage_window = nil
 local gradient = nil
 local scroll_x = 0
 
 -- Pixels per second at the skin's current render resolution.
-local SCROLL_SPEED = 50
+local SCROLL_SPEED = 25
 
 -- Reuse draw option tables across frames.
 local tile_draw_options = {
     x = 0, y = 0, width = 0, height = 0,
     anchor = "top-left",
     layer = -1000,
+}
+
+local stage_window_draw_options = {
+    x = 0, y = 0, width = 0, height = 0,
+    anchor = "top-left",
+    layer = -950,
 }
 
 local shadow_rect_options = {
@@ -86,6 +93,7 @@ end
 function init()
     gradient = assets.load("gradient.png")
     texture = assets.load("background.png")
+    stage_window = assets.load("stage-window.png")
     scroll_x = 0
 end
 
@@ -103,20 +111,14 @@ end
 function render(display)
     display = display or {}
     local draw_tiles = display.background_tiles ~= false
+    local draw_stage_window = display.background_stage_window ~= false
     local draw_shadow = display.background_shadow ~= false
     local draw_shadow_gradient = display.background_shadow_gradient ~= false
     local draw_sparkles = display.background_sparkles ~= false
     local draw_bottom_gradient = display.background_bottom_gradient ~= false
     local draw_top_gradient = display.background_top_gradient ~= false
 
-    if draw_tiles and texture == nil then
-        return
-    end
-
     local texture_width, texture_height = get_texture_size(texture)
-    if draw_tiles and (texture_width <= 0 or texture_height <= 0) then
-        return
-    end
 
     local screen_width = screen.width or 0
     local screen_height = screen.height or 0
@@ -125,7 +127,7 @@ function render(display)
         return
     end
 
-    if draw_tiles then
+    if draw_tiles and texture ~= nil and texture_width > 0 and texture_height > 0 then
 -- Match the image to the screen height while preserving its aspect ratio.
         local tile_height = screen_height
         local tile_width = tile_height * texture_width / texture_height
@@ -145,6 +147,12 @@ function render(display)
                 draw.sprite(texture, tile_draw_options)
             end
         end
+    end
+
+    if draw_stage_window and stage_window ~= nil then
+        stage_window_draw_options.width = screen_width
+        stage_window_draw_options.height = screen_height
+        draw.sprite(stage_window, stage_window_draw_options)
     end
 
     if draw_shadow then

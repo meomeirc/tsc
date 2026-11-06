@@ -2791,7 +2791,7 @@ public sealed class Game1 : Game
         if (string.IsNullOrWhiteSpace(root))
             return new[] { "Default" };
 
-        var directory = Path.Combine(root, "skins");
+        var directory = SkinScriptPathResolver.SkinsDirectory(root);
         try
         {
             var names = Directory.Exists(directory)
@@ -2843,13 +2843,26 @@ public sealed class Game1 : Game
         _transitionRuntime?.Dispose();
         _transitionRuntime = null;
 
-        _skin = SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
+        var activeSkin = SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
+        _skin = activeSkin;
         _availableSettingsSkins = GetAvailableSkinNames();
         _appliedMaxFrameRate = int.MinValue;
         _appliedVSync = null;
         ApplyMaxFrameRateConfig();
+
+        // The editor remains alive underneath Settings. Its scripts, Lua asset
+        // caches, note textures, fonts, and hit sounds all belong to the old skin,
+        // so replace those resources without discarding the open chart or edits.
+        var playfieldSkinReloadOk = _playfield?.ApplySkinContext(activeSkin) ?? true;
+        var loadingPlayfieldSkinReloadOk = true;
+        if (_chartEditorLoadPlayfield is not null && !ReferenceEquals(_chartEditorLoadPlayfield, _playfield))
+            loadingPlayfieldSkinReloadOk = _chartEditorLoadPlayfield.ApplySkinContext(activeSkin);
+        var songSelectSkinReloadOk = _songSelect?.ApplySkinContext(activeSkin.SkinDirectory, activeSkin.GameConfig) ?? true;
+
         _mainMenuRuntime = null;
-        _errorMessage = null;
+        _errorMessage = !playfieldSkinReloadOk || !loadingPlayfieldSkinReloadOk || !songSelectSkinReloadOk
+            ? $"Skin '{activeSkin.SkinName}' was selected, but one or more skin components failed to load. Check the runtime log for details."
+            : null;
     }
 
     private bool EnsureEditorMenuRuntime()

@@ -228,7 +228,7 @@ function Assert-PatchZipMatchesManifest([string]$ZipPath, $Manifest) {
 }
 
 try {
-    foreach ($required in @('TSC.exe', 'data/TSC.exe', 'data/TSC.dll', 'data/TSC.deps.json', 'data/TSC.runtimeconfig.json', 'data/coreclr.dll', 'Skins/Default/skin.lua')) {
+    foreach ($required in @('TSC.exe', 'data/TSC.exe', 'data/TSC.dll', 'data/TSC.deps.json', 'data/TSC.runtimeconfig.json', 'data/coreclr.dll', 'Skins/Default/scripts/skin.lua')) {
         $requiredPath = Join-Path $publish ($required.Replace('/', [IO.Path]::DirectorySeparatorChar))
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
             throw "Publish output is incomplete; missing '$requiredPath'. Run the TSC-Publish profile successfully before packaging."

@@ -114,7 +114,7 @@ public sealed class SongSelectMenu : IDisposable
     private readonly string _songsRoot;
     private readonly HashSet<string> _importedBundlePaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _songSelectStateDirectory;
-    private readonly string _skinDirectory;
+    private string _skinDirectory;
     private readonly ScoreSaveStore _scoreSaves = ScoreSaveStore.Shared;
     private string LastSongSelectionPath => Path.Combine(_songSelectStateDirectory, "last-selected-song.json");
     private LastSongSelection? _lastSongSelection;
@@ -310,7 +310,7 @@ public sealed class SongSelectMenu : IDisposable
         "ez", "nm", "hd", "ex", "xt"
     };
 
-    private readonly GameConfig _gameConfig;
+    private GameConfig _gameConfig;
     private readonly Effect? _skinSparklesEffect;
     private readonly Effect? _skinQuad3DEffect;
 
@@ -334,15 +334,9 @@ public sealed class SongSelectMenu : IDisposable
         MigrateLegacySongSelectStateFiles();
 #endif
         Program.LogRuntime($"SONG_SELECT_CONSTRUCTOR songsRoot={_songsRoot}");
-#if TSC_PUBLISH
         _skinDirectory = string.IsNullOrWhiteSpace(skinDirectory)
-            ? Path.Combine(UserDataPaths.GameRootDirectory, "Skins", "Default")
+            ? SkinScriptPathResolver.DefaultSkinDirectory(UserDataPaths.GameRootDirectory)
             : Path.GetFullPath(skinDirectory);
-#else
-        _skinDirectory = string.IsNullOrWhiteSpace(skinDirectory)
-            ? Path.Combine(Directory.GetCurrentDirectory(), "skins", "Default")
-            : Path.GetFullPath(skinDirectory);
-#endif
         Directory.CreateDirectory(_skinDirectory);
     }
 
@@ -4749,6 +4743,50 @@ public sealed class SongSelectMenu : IDisposable
         var current = new DirectoryInfo(start);
         for (var i = 0; i < 12 && current is not null; i++, current = current.Parent)
             candidates.Add(current.FullName);
+    }
+
+    public bool ApplySkinContext(string skinDirectory, GameConfig gameConfig)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(skinDirectory);
+        ArgumentNullException.ThrowIfNull(gameConfig);
+
+        try
+        {
+            var normalizedDirectory = Path.GetFullPath(skinDirectory);
+            Directory.CreateDirectory(normalizedDirectory);
+            var replacement = new SkinRuntime(
+                normalizedDirectory,
+                _graphics,
+                "songSelect.lua",
+                gameConfig,
+                _gameConfigPath,
+                _graphics.Viewport.Width,
+                _graphics.Viewport.Height,
+                skinSparklesEffect: _skinSparklesEffect,
+                skinQuad3DEffect: _skinQuad3DEffect);
+
+            var previous = _skinRuntime;
+            _skinDirectory = normalizedDirectory;
+            _gameConfig = gameConfig;
+            _skinRuntime = replacement;
+            _skinDrawDisabled = false;
+            InvalidateGalleryLayoutMetrics();
+            previous?.Dispose();
+            if (replacement.LastError is null &&
+                (_errorMessage?.StartsWith("Song-select skin failed:", StringComparison.OrdinalIgnoreCase) == true ||
+                 _errorMessage?.StartsWith("Song-select skin could not load:", StringComparison.OrdinalIgnoreCase) == true))
+                _errorMessage = null;
+            Program.LogRuntime(
+                $"SONG_SELECT_SKIN_SWITCH_DONE skinDirectory={_skinDirectory} loaded={replacement.IsLoaded} " +
+                $"error={replacement.LastError ?? "none"}");
+            return replacement.LastError is null;
+        }
+        catch (Exception ex)
+        {
+            Program.LogFatal("SONG_SELECT_SKIN_SWITCH", ex);
+            _errorMessage = $"Song-select skin could not load: {ex.Message}";
+            return false;
+        }
     }
 
     private bool EnsureSkinRuntime()

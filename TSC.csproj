@@ -122,6 +122,12 @@
     <Error Condition="!Exists('$(TSCAdbDestination)\adb.exe')" Text="Android Debug Bridge was not bundled. Check the Platform-Tools download and checksum in build/Prepare-Adb.ps1." />
   </Target>
 
+  <Target Name="VerifyDefaultSkinBuildOutput" AfterTargets="Build"
+          Condition="'$(Configuration)' != 'Publish'">
+    <Error Condition="!Exists('$(OutDir)Skins\Default\scripts\skin.lua')"
+           Text="The Default skin entry point was not copied to the build output. Expected: $(OutDir)Skins\Default\scripts\skin.lua. Check the Skins\Default content items in TSC.csproj." />
+  </Target>
+
   <Target Name="RemoveLegacyLanEditorHelperOutput" AfterTargets="Build"
           Condition="'$(Configuration)' != 'Publish'">
     <RemoveDir Directories="$(OutDir)LanEditorServer" />
@@ -132,7 +138,10 @@
   </ItemGroup>
   <ItemGroup>
     <None Update="Samples\**\*" CopyToOutputDirectory="PreserveNewest" />
-    <!-- Developer builds keep the editable root-level Lua scripts beside the executable. -->
+    <!-- Developer builds run from either the project root or bin/. Keep the full Default skin
+         beside the executable so launches from bin/ can resolve scripts/skin.lua and its modules. -->
+    <None Update="Skins\Default\**\*" Condition="'$(Configuration)' != 'Publish'" CopyToOutputDirectory="PreserveNewest" />
+    <!-- Preserve compatibility for old developer-only root-level Lua files. -->
     <None Update="*.lua" Condition="'$(Configuration)' != 'Publish'" CopyToOutputDirectory="PreserveNewest" />
     <None Update="*.lua" Condition="'$(Configuration)' == 'Publish'" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
     <!-- Publish the shipped Default skin tree. Use the directory's actual casing,

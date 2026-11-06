@@ -114,6 +114,40 @@ public sealed class WavSoundEffect : IDisposable
         }
     }
 
+    /// <summary>
+    /// Loads a WAV from the first directory that contains a usable copy. An
+    /// unreadable file in an earlier directory does not block later fallbacks.
+    /// </summary>
+    public static WavSoundEffect? TryLoadFromDirectories(string relativePath, params string?[] directories)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) || Path.IsPathRooted(relativePath))
+            return null;
+
+        foreach (var directory in directories)
+        {
+            if (string.IsNullOrWhiteSpace(directory))
+                continue;
+
+            try
+            {
+                var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var path = Path.GetFullPath(Path.Combine(root, relativePath));
+                if (!path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var sound = TryLoad(path);
+                if (sound is not null)
+                    return sound;
+            }
+            catch
+            {
+                // Continue to the next fallback directory.
+            }
+        }
+
+        return null;
+    }
+
     public void Play(float volume)
     {
         if (_disposed || OpenALAudioDeviceRecovery.IsRecoveryPending)
@@ -276,10 +310,10 @@ public sealed class HitSoundPlayer : IDisposable
     private readonly WavSoundEffect? _note;
     private readonly WavSoundEffect? _change;
 
-    public HitSoundPlayer(string audioDirectory)
+    public HitSoundPlayer(string audioDirectory, string? fallbackAudioDirectory = null)
     {
-        _note = WavSoundEffect.TryLoad(Path.Combine(audioDirectory, "note.wav"));
-        _change = WavSoundEffect.TryLoad(Path.Combine(audioDirectory, "change.wav"));
+        _note = WavSoundEffect.TryLoadFromDirectories("note.wav", audioDirectory, fallbackAudioDirectory);
+        _change = WavSoundEffect.TryLoadFromDirectories("change.wav", audioDirectory, fallbackAudioDirectory);
     }
 
     public bool HasAny => _note is not null || _change is not null;

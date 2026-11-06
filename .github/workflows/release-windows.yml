@@ -62,7 +62,7 @@ jobs:
           $dataDir = Join-Path $publishRoot 'data'
           $requiredFiles = @(
             (Join-Path $publishRoot 'TSC.exe'),
-            (Join-Path $publishRoot 'Skins/Default/skin.lua'),
+            (Join-Path $publishRoot 'Skins/Default/scripts/skin.lua'),
             (Join-Path $dataDir 'TSC.exe'),
             (Join-Path $dataDir 'TSC.dll'),
             (Join-Path $dataDir 'TSC.deps.json'),

@@ -491,12 +491,14 @@ internal sealed class SkinAssetStore : IDisposable
 {
     private readonly GraphicsDevice _graphics;
     private readonly string _skinDirectory;
+    private readonly string? _fallbackSkinDirectory;
     private readonly Dictionary<string, SkinAssetHandle?> _assets = new(StringComparer.OrdinalIgnoreCase);
 
-    public SkinAssetStore(GraphicsDevice graphics, string skinDirectory)
+    public SkinAssetStore(GraphicsDevice graphics, string skinDirectory, string? fallbackSkinDirectory = null)
     {
         _graphics = graphics;
         _skinDirectory = Path.GetFullPath(skinDirectory);
+        _fallbackSkinDirectory = NormalizeFallbackDirectory(_skinDirectory, fallbackSkinDirectory);
     }
 
     public SkinAssetHandle? Load(string requestedPath, bool skinOnly = false)
@@ -516,56 +518,85 @@ internal sealed class SkinAssetStore : IDisposable
         if (_assets.TryGetValue(key, out var cached))
             return cached;
 
-        var fullPath = ResolvePath(normalized);
-        if (fullPath is null || !File.Exists(fullPath))
+        // Prefer the selected skin for every asset. Missing or unreadable assets
+        // then fall back to the bundled Default skin, independently of which Lua
+        // script is currently active.
+        var skinDirectories = _fallbackSkinDirectory is null
+            ? new[] { _skinDirectory }
+            : new[] { _skinDirectory, _fallbackSkinDirectory };
+        foreach (var directory in skinDirectories)
         {
-            // Most skin assets live under textures/, so allow both:
-            // assets.load("combo/0.png") and assets.load("textures/combo/0.png").
-            var textureCandidate = ResolvePath(Path.Combine("textures", normalized));
-            if (textureCandidate is not null && File.Exists(textureCandidate))
-                fullPath = textureCandidate;
-        }
-
-        if (!skinOnly && (fullPath is null || !File.Exists(fullPath)))
-        {
-            // Shared project/executable-root assets are permitted for fallback Lua
-            // menus, unless the caller explicitly requires a skin-owned asset.
-            foreach (var directory in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
+            foreach (var relative in new[] { normalized, Path.Combine("textures", normalized) })
             {
-                if (string.IsNullOrWhiteSpace(directory)) continue;
-                var candidate = ResolveWithinRoot(directory, normalized);
-                if (candidate is not null && File.Exists(candidate))
+                var candidate = ResolveWithinRoot(directory, relative);
+                if (candidate is null || !File.Exists(candidate))
+                    continue;
+
+                var handlePath = string.Equals(directory, _fallbackSkinDirectory, StringComparison.OrdinalIgnoreCase)
+                    ? relativeKey
+                    : Path.GetRelativePath(_skinDirectory, candidate);
+                if (TryLoadTexture(candidate, handlePath, out var handle))
                 {
-                    fullPath = candidate;
-                    break;
-                }
-                candidate = ResolveWithinRoot(directory, Path.Combine("textures", normalized));
-                if (candidate is not null && File.Exists(candidate))
-                {
-                    fullPath = candidate;
-                    break;
+                    _assets[key] = handle;
+                    return handle;
                 }
             }
         }
 
-        if (fullPath is null || !File.Exists(fullPath))
+        if (!skinOnly)
         {
-            _assets[key] = null;
-            return null;
+            // Shared project/executable-root assets remain available for legacy
+            // menus, but only after both skin asset locations have been checked.
+            foreach (var directory in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
+            {
+                if (string.IsNullOrWhiteSpace(directory)) continue;
+                foreach (var relative in new[] { normalized, Path.Combine("textures", normalized) })
+                {
+                    var candidate = ResolveWithinRoot(directory, relative);
+                    if (candidate is null || !File.Exists(candidate))
+                        continue;
+                    if (TryLoadTexture(candidate, relativeKey, out var handle))
+                    {
+                        _assets[key] = handle;
+                        return handle;
+                    }
+                }
+            }
         }
 
+        _assets[key] = null;
+        return null;
+    }
+
+    private bool TryLoadTexture(string fullPath, string relativePath, out SkinAssetHandle? handle)
+    {
         try
         {
             using var stream = File.OpenRead(fullPath);
             var texture = Texture2D.FromStream(_graphics, stream);
-            var relative = Path.GetRelativePath(_skinDirectory, fullPath);
-            var handle = new SkinAssetHandle(texture, fullPath, relative);
-            _assets[key] = handle;
-            return handle;
+            handle = new SkinAssetHandle(texture, fullPath, relativePath);
+            return true;
         }
         catch
         {
-            _assets[key] = null;
+            // A corrupt custom asset should not block the matching Default asset.
+            handle = null;
+            return false;
+        }
+    }
+
+    private static string? NormalizeFallbackDirectory(string primaryDirectory, string? fallbackDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(fallbackDirectory))
+            return null;
+
+        try
+        {
+            var full = Path.GetFullPath(fallbackDirectory);
+            return string.Equals(full, primaryDirectory, StringComparison.OrdinalIgnoreCase) ? null : full;
+        }
+        catch
+        {
             return null;
         }
     }
@@ -738,23 +769,6 @@ internal sealed class SkinAssetStore : IDisposable
         }
     }
 
-    private string? ResolvePath(string relative)
-    {
-        try
-        {
-            var full = Path.GetFullPath(Path.Combine(_skinDirectory, relative));
-            var root = _skinDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                       + Path.DirectorySeparatorChar;
-            if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase))
-                return null;
-            return full;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
     public void Dispose()
     {
         foreach (var handle in _assets.Values)
@@ -805,6 +819,7 @@ internal sealed class SkinFontStore : IDisposable
 {
     private readonly GraphicsDevice _graphics;
     private readonly string _fontsDirectory;
+    private readonly string? _fallbackFontsDirectory;
     private readonly Dictionary<string, SkinFontHandle?> _fonts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<FontRequestKey, SkinFontHandle?> _fontRequestCache = new();
     private readonly Dictionary<ShadowFontKey, SkinShadowFontHandle?> _shadowFonts = new();
@@ -824,10 +839,22 @@ internal sealed class SkinFontStore : IDisposable
     private const string DefaultSupportedChars =
         " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
 
-    public SkinFontStore(GraphicsDevice graphics, string skinDirectory)
+    public SkinFontStore(GraphicsDevice graphics, string skinDirectory, string? fallbackSkinDirectory = null)
     {
         _graphics = graphics;
         _fontsDirectory = Path.Combine(Path.GetFullPath(skinDirectory), "fonts");
+        if (string.IsNullOrWhiteSpace(fallbackSkinDirectory))
+        {
+            _fallbackFontsDirectory = null;
+        }
+        else
+        {
+            var fallbackRoot = Path.GetFullPath(fallbackSkinDirectory);
+            var primaryRoot = Path.GetFullPath(skinDirectory);
+            _fallbackFontsDirectory = string.Equals(fallbackRoot, primaryRoot, StringComparison.OrdinalIgnoreCase)
+                ? null
+                : Path.Combine(fallbackRoot, "fonts");
+        }
     }
 
     public SkinFontHandle? Load(
@@ -873,36 +900,50 @@ internal sealed class SkinFontStore : IDisposable
             return cached;
         }
 
-        var fullPath = Path.GetFullPath(Path.Combine(_fontsDirectory, normalized));
-        var root = _fontsDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(fullPath))
+        var fontDirectories = _fallbackFontsDirectory is null
+            ? new[] { _fontsDirectory }
+            : new[] { _fontsDirectory, _fallbackFontsDirectory };
+        foreach (var directory in fontDirectories)
         {
-            Console.WriteLine(
-                $"[skin] fonts.raster failed: font file not found or path rejected. " +
-                $"path=\"{pathKey}\", fullPath=\"{fullPath}\", " +
-                $"rasterSize={rasterSize}, chars=\"{characters}\"");
-            _fonts[key] = null;
-            _fontRequestCache[requestKey] = null;
-            return null;
+            string fullPath;
+            try
+            {
+                fullPath = Path.GetFullPath(Path.Combine(directory, normalized));
+            }
+            catch
+            {
+                continue;
+            }
+
+            var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                       + Path.DirectorySeparatorChar;
+            if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(fullPath))
+                continue;
+
+            try
+            {
+                var handle = BuildFont(fullPath, pathKey, rasterSize, characters);
+                _fonts[key] = handle;
+                _fontRequestCache[requestKey] = handle;
+                return handle;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine(
+                    $"[skin] fonts.raster FAILED: path=\"{pathKey}\", " +
+                    $"fullPath=\"{fullPath}\", rasterSize={rasterSize}, " +
+                    $"chars=\"{characters}\"\n{ex}");
+                // Try the matching Default font when the custom font exists but
+                // cannot be opened or rasterized.
+            }
         }
 
-        try
-        {
-            var handle = BuildFont(fullPath, pathKey, rasterSize, characters);
-            _fonts[key] = handle;
-            _fontRequestCache[requestKey] = handle;
-            return handle;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine(
-                $"[skin] fonts.raster FAILED: path=\"{pathKey}\", " +
-                $"fullPath=\"{fullPath}\", rasterSize={rasterSize}, " +
-                $"chars=\"{characters}\"\n{ex}");
-            _fonts[key] = null;
-            _fontRequestCache[requestKey] = null;
-            return null;
-        }
+        Console.WriteLine(
+            $"[skin] fonts.raster failed: font file not found or readable. " +
+            $"path=\"{pathKey}\", rasterSize={rasterSize}, chars=\"{characters}\"");
+        _fonts[key] = null;
+        _fontRequestCache[requestKey] = null;
+        return null;
     }
 
     public SkinShadowFontHandle? LoadShadow(SkinFontHandle baseFont, float blurRadius, float expand = 0f)
@@ -1598,6 +1639,8 @@ public sealed class SkinDrawCommand
     internal long Order { get; set; }
     public SpriteEffects SpriteEffects { get; internal set; } = SpriteEffects.None;
     public bool AdditiveBlend { get; internal set; }
+    /// <summary>Renders the sampled texture as a white silhouette while preserving its alpha.</summary>
+    public bool ForceWhiteColor { get; internal set; }
     public bool CropCover { get; internal set; }
     /// <summary>Optional normalized UV rectangle: left, top, right, bottom.
     /// When present it takes precedence over crop="cover".
@@ -1646,6 +1689,7 @@ public sealed class SkinDrawCommand
         Order = 0L;
         SpriteEffects = SpriteEffects.None;
         AdditiveBlend = false;
+        ForceWhiteColor = false;
         CropCover = false;
         CropUv = null;
         ScreenSpaceSizing = false;
@@ -1773,8 +1817,8 @@ public struct SkinQuad3DMaskedVertex : IVertexType
 public sealed class SkinRuntime : IDisposable
 {
     private readonly string _scriptPath;
-    private readonly string? _fallbackScriptPath;
     private readonly string _skinDirectory;
+    private readonly string _defaultSkinDirectory;
     private readonly bool _useLegacyUiTextSizing;
     // The main gameplay skin is also used by the chart editor. Use the older
     // logical-size basis while editor_mode is active, without changing gameplay
@@ -1848,6 +1892,8 @@ public sealed class SkinRuntime : IDisposable
     };
     private readonly Dictionary<string, DynValue> _importCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _importsLoading = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _failedImports = new(StringComparer.OrdinalIgnoreCase);
+    private string? _activeImportPath;
     private readonly Dictionary<int, List<SkinPanelEventData>> _panelTrackEvents = new();
     private readonly Dictionary<string, SkinUiButton> _uiButtons = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SkinUiSlider> _uiSliders = new(StringComparer.OrdinalIgnoreCase);
@@ -1885,6 +1931,7 @@ public sealed class SkinRuntime : IDisposable
         public int Layer;
         public SpriteEffects SpriteEffects;
         public bool AdditiveBlend;
+        public bool ForceWhiteColor;
         public bool CropCover;
         public bool ScreenSpaceSizing;
     }
@@ -2142,6 +2189,7 @@ public sealed class SkinRuntime : IDisposable
 
     public bool IsLoaded => _script is not null && LastError is null;
     public string ScriptPath => _scriptPath;
+    internal string? ActiveScriptPath => _script is not null ? _activeScriptPath : null;
     public string? LastError { get; private set; }
     public string LastCallback { get; private set; } = "none";
     public long CallbackCount { get; private set; }
@@ -2207,7 +2255,12 @@ public sealed class SkinRuntime : IDisposable
         _gameConfigPath = gameConfigPath ?? UserDataPaths.GameConfigPath;
         _game = new SkinGameView(_gameConfig, SaveGameConfig);
         _skinDirectory = Path.GetFullPath(skinDirectory);
-        _scriptPath = Path.Combine(_skinDirectory, scriptFileName);
+        var normalizedScriptFileName = Path.GetFileName(scriptFileName);
+        // All Lua files, including the gameplay entry point, live under scripts/.
+        // SkinScriptPathResolver still accepts older skins that kept scripts at root.
+        _scriptPath = SkinScriptPathResolver.Preferred(_skinDirectory, normalizedScriptFileName);
+        var skinParentDirectory = Directory.GetParent(_skinDirectory)?.FullName ?? UserDataPaths.GameRootDirectory;
+        _defaultSkinDirectory = Path.GetFullPath(Path.Combine(skinParentDirectory, "Default"));
         var screenScriptName = Path.GetFileName(scriptFileName);
         // Keep the pre-resolution-change sizing for menu-style screens. Their fonts
         // are rasterized at each requested display size, so using rasterSize as the
@@ -2221,9 +2274,6 @@ public sealed class SkinRuntime : IDisposable
             string.Equals(screenScriptName, "chartEditorInterface.lua", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(screenScriptName, "gameplayPause.lua", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(screenScriptName, "transition.lua", StringComparison.OrdinalIgnoreCase);
-        _fallbackScriptPath = string.Equals(scriptFileName, "skin.lua", StringComparison.OrdinalIgnoreCase)
-            ? null
-            : FindFallbackScript(scriptFileName);
         _graphics = graphics;
         _skinSparklesEffect = skinSparklesEffect;
         _skinQuad3DEffect = skinQuad3DEffect;
@@ -2236,8 +2286,8 @@ public sealed class SkinRuntime : IDisposable
             LightingEnabled = false,
             FogEnabled = false
         };
-        _assets = new SkinAssetStore(graphics, skinDirectory);
-        _fonts = new SkinFontStore(graphics, skinDirectory);
+        _assets = new SkinAssetStore(graphics, _skinDirectory, _defaultSkinDirectory);
+        _fonts = new SkinFontStore(graphics, _skinDirectory, _defaultSkinDirectory);
 
         // Make the screen API valid before executing the script and any imported
         // modules. Otherwise a module that captures screen.width/height at load
@@ -2266,6 +2316,89 @@ public sealed class SkinRuntime : IDisposable
         LastError = null;
         LastCallback = "none";
         CallbackCount = 0;
+        _assets.Dispose();
+        _fonts.Dispose();
+        _fonts = new SkinFontStore(_graphics, _skinDirectory, _defaultSkinDirectory);
+        UIConfig = SkinUIConfig.CreateDefault();
+
+        var candidates = GetScriptCandidatePaths();
+        var existingCandidates = candidates.Where(File.Exists).ToArray();
+        if (existingCandidates.Length == 0)
+        {
+            ResetScriptAttemptState();
+            _activeScriptPath = null;
+            var searchedPaths = string.Join(Environment.NewLine, candidates.Select(path => $"  - {path}"));
+            LastError = $"No Lua script '{Path.GetFileName(_scriptPath)}' was found. Checked:{Environment.NewLine}{searchedPaths}";
+            WriteLog($"[skin] missing script; using the built-in C# implementation.{Environment.NewLine}{LastError}");
+            return false;
+        }
+
+        var failures = new List<string>();
+        foreach (var candidate in existingCandidates)
+        {
+            ResetScriptAttemptState();
+            _activeScriptPath = candidate;
+            if (TryLoadScriptAtPath(candidate, out var error))
+            {
+                LastError = null;
+                if (!PathEquals(candidate, _scriptPath))
+                    WriteLog($"[skin] using fallback script: {candidate}");
+                return true;
+            }
+
+            var detail = error ?? "unknown script error";
+            failures.Add($"{candidate}: {detail}");
+            WriteLog($"[skin] script failed: {candidate}\n{detail}");
+        }
+
+        ResetScriptAttemptState();
+        _activeScriptPath = null;
+        LastError = string.Join(Environment.NewLine + Environment.NewLine, failures);
+        WriteLog($"[skin] no working Lua script; using the built-in C# implementation. {LastError}");
+        return false;
+    }
+
+    private IReadOnlyList<string> GetScriptCandidatePaths()
+    {
+        var paths = new List<string>(2);
+        AddUniquePath(paths, _scriptPath);
+
+        // Every script uses the same preferred layout: scripts/<name>.lua first,
+        // then the old root-level location for compatibility. Preferred() only
+        // chooses the legacy path when the new-layout file is absent, so a broken
+        // scripts/ override cannot silently resurrect a stale root-level copy.
+        var scriptFileName = Path.GetFileName(_scriptPath);
+        var defaultPath = SkinScriptPathResolver.Preferred(_defaultSkinDirectory, scriptFileName);
+        AddUniquePath(paths, defaultPath);
+
+        // Each SkinRuntime owns one screen/component. If that component's custom
+        // script is missing or fails, only this runtime switches to Default; other
+        // working custom scripts remain active in their own runtimes.
+        return paths;
+    }
+
+    private static void AddUniquePath(List<string> paths, string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        if (!paths.Any(existing => PathEquals(existing, fullPath)))
+            paths.Add(fullPath);
+    }
+
+    private static bool PathEquals(string left, string right)
+    {
+        try
+        {
+            return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private void ResetScriptAttemptState()
+    {
+        _script = null;
         _skinEffectTime = 0.0;
         _drawCommands.Clear();
         _drawCommandPoolIndex = 0;
@@ -2276,38 +2409,39 @@ public sealed class SkinRuntime : IDisposable
         _uiPressedButtonId = null;
         _uiPressedSliderId = null;
         _uiPressedSliderValue = null;
+        _uiPointerLeftDown = false;
         _importCache.Clear();
         _importsLoading.Clear();
+        _failedImports.Clear();
+        _activeImportPath = null;
         _songSelect = null;
         _chartEditor = null;
         _mainMenu = null;
         _transition = null;
+        _skinPerfApi = null;
         DisposeSkin3DBackgroundTextures();
         DisposeSkinSparkleAnimations();
         _sparkleAssetSets.Clear();
         _quad3DCachedBatchEntries.Clear();
         _fallbackSparkleAssetSet = null;
-        foreach (var sound in _skinSounds.Values) sound?.Dispose();
+        foreach (var sound in _skinSounds.Values)
+            sound?.Dispose();
         _skinSounds.Clear();
-        _assets.Dispose();
-        _fonts.Dispose();
-        _fonts = new SkinFontStore(_graphics, _skinDirectory);
         UIConfig = SkinUIConfig.CreateDefault();
+        LastCallback = "none";
+        CallbackCount = 0;
+    }
 
-        var loadPath = File.Exists(_scriptPath)
-            ? _scriptPath
-            : (_fallbackScriptPath is not null && File.Exists(_fallbackScriptPath) ? _fallbackScriptPath : null);
+    private bool TryLoadScriptAtPath(string loadPath, out string? error)
+    {
+        error = null;
+        LastError = null;
         _activeScriptPath = loadPath;
-
-        if (loadPath is null)
-        {
-            _script = null;
-            return true;
-        }
 
         try
         {
-            var script = new Script(CoreModules.Preset_HardSandbox);
+            // pcall/xpcall support the skin's isolated fallback handling; retain the hard sandbox for all other APIs.
+            var script = new Script(CoreModules.Preset_HardSandbox | CoreModules.ErrorHandling);
             script.Options.DebugPrint = message => WriteLog(message);
 
             script.Globals["game"] = _game;
@@ -2335,21 +2469,78 @@ public sealed class SkinRuntime : IDisposable
                 return ImportModule(script, args[0].String ?? string.Empty);
             });
 
+            _script = script;
             var source = File.ReadAllText(loadPath);
             script.DoString(source, script.Globals, loadPath);
-            _script = script;
 
-            InvokeOptional("init", true);
+            var init = script.Globals.Get("init");
+            if (!init.IsNil() && init.Type == DataType.Function)
+            {
+                LastCallback = "init";
+                CallbackCount++;
+                script.Call(init);
+            }
+
+            if (LastError is not null)
+            {
+                error = LastError;
+                _script = null;
+                return false;
+            }
+
             WriteLog($"[skin] loaded: {Path.GetFullPath(loadPath)}");
-            return LastError is null;
+            return true;
         }
         catch (Exception ex)
         {
+            error = FormatError(ex);
             _script = null;
-            LastError = FormatError(ex);
-            WriteLog($"[skin] ERROR: {LastError}");
+            LastError = null;
             return false;
         }
+    }
+
+    private void HandleScriptRuntimeFailure(Exception ex, string context)
+    {
+        var originalError = FormatError(ex);
+        WriteLog($"[skin] ERROR in {context}: {originalError}");
+
+        var candidates = GetScriptCandidatePaths();
+        var currentIndex = -1;
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            if (PathEquals(candidates[i], _activeScriptPath ?? string.Empty))
+            {
+                currentIndex = i;
+                break;
+            }
+        }
+
+        var failures = new List<string> { $"{_activeScriptPath ?? _scriptPath}: {originalError}" };
+        for (var i = currentIndex + 1; i < candidates.Count; i++)
+        {
+            var candidate = candidates[i];
+            if (!File.Exists(candidate))
+                continue;
+
+            ResetScriptAttemptState();
+            _activeScriptPath = candidate;
+            if (TryLoadScriptAtPath(candidate, out var fallbackError))
+            {
+                LastError = null;
+                WriteLog($"[skin] switched to fallback script after {context} failed: {candidate}");
+                return;
+            }
+
+            var detail = fallbackError ?? "unknown script error";
+            failures.Add($"{candidate}: {detail}");
+            WriteLog($"[skin] fallback script failed: {candidate}\n{detail}");
+        }
+
+        ResetScriptAttemptState();
+        _activeScriptPath = null;
+        LastError = string.Join(Environment.NewLine + Environment.NewLine, failures);
+        WriteLog($"[skin] no working Lua fallback; using the built-in C# implementation. {LastError}");
     }
 
     public void UpdateMainMenuState(string? error, int selectedIndex = 0)
@@ -3255,10 +3446,9 @@ public sealed class SkinRuntime : IDisposable
 
             return metrics;
         }
-        catch
+        catch (Exception ex)
         {
-            // An optional skin callback must not take down normal song selection.
-            // The caller falls back to the established three-column layout.
+            HandleScriptRuntimeFailure(ex, "song_select_layout_metrics");
             return null;
         }
     }
@@ -3857,6 +4047,7 @@ public sealed class SkinRuntime : IDisposable
     {
         if (command.Kind != SkinDrawCommandKind.Quad3D ||
             command.Size.X <= 0f || command.Size.Y <= 0f ||
+            command.ForceWhiteColor ||
             command.MaskAsset is not null ||
             command.BackgroundColor.HasValue ||
             command.ClipRect.HasValue ||
@@ -4674,7 +4865,8 @@ public sealed class SkinRuntime : IDisposable
                                 (MathF.Abs(quadWidthValue.Top - quadWidthValue.Bottom) > 0.001f ||
                                  MathF.Abs(quadWidthValue.Left - quadWidthValue.Right) > 0.001f);
 
-            if ((maskTexture is not null || (command.ClipRect.HasValue && !irregularQuad)) &&
+            if ((command.ForceWhiteColor || maskTexture is not null ||
+                 (command.ClipRect.HasValue && !irregularQuad)) &&
                 _skinQuad3DEffect is not null)
             {
                 // By default the mask covers the drawn quad. An optional mask_uv
@@ -4701,6 +4893,7 @@ public sealed class SkinRuntime : IDisposable
                 _skinQuad3DEffect.Parameters["Texture"]?.SetValue(texture);
                 _skinQuad3DEffect.Parameters["MaskTexture"]?.SetValue(maskTexture ?? _skin3DWhiteTexture);
                 _skinQuad3DEffect.Parameters["MaskEnabled"]?.SetValue(maskTexture is not null ? 1f : 0f);
+                _skinQuad3DEffect.Parameters["ForceWhiteColor"]?.SetValue(command.ForceWhiteColor ? 1f : 0f);
                 _skinQuad3DEffect.Parameters["UseBilinearMapping"]?.SetValue(0f);
                 SetSkinQuadClip(_skinQuad3DEffect, command.ClipRect);
                 _skinQuad3DEffect.Parameters["DiffuseColor"]?.SetValue(Vector3.One);
@@ -4831,6 +5024,7 @@ public sealed class SkinRuntime : IDisposable
         effect.Parameters["DiffuseColor"]?.SetValue(Vector3.One);
         effect.Parameters["Alpha"]?.SetValue(Math.Clamp(alpha, 0f, 1f));
         effect.Parameters["MaskEnabled"]?.SetValue(0f);
+        effect.Parameters["ForceWhiteColor"]?.SetValue(0f);
         effect.Parameters["UseBilinearMapping"]?.SetValue(1f);
         SetSkinQuadClip(effect, clipRect);
 
@@ -4994,25 +5188,6 @@ public sealed class SkinRuntime : IDisposable
         return table;
     }
 
-    private static string? FindFallbackScript(string fileName)
-    {
-#if TSC_PUBLISH
-        // Publish fallback scripts come only from the bundled Default skin.
-        // Shared scripts beside the executable are deliberately not used.
-        var candidates = new[]
-        {
-            Path.Combine(UserDataPaths.GameRootDirectory, "Skins", "Default", fileName)
-        };
-#else
-        var candidates = new[]
-        {
-            Path.Combine(Directory.GetCurrentDirectory(), fileName),
-            Path.Combine(AppContext.BaseDirectory, fileName)
-        };
-#endif
-        return candidates.FirstOrDefault(File.Exists);
-    }
-
     private DynValue ImportModule(Script script, string requestedPath)
     {
         if (string.IsNullOrWhiteSpace(requestedPath))
@@ -5025,74 +5200,119 @@ public sealed class SkinRuntime : IDisposable
         if (!normalized.EndsWith(".lua", StringComparison.OrdinalIgnoreCase))
             normalized += ".lua";
 
-        var fullPath = Path.GetFullPath(Path.Combine(_skinDirectory, normalized));
-        var skinRoot = _skinDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                        + Path.DirectorySeparatorChar;
-        if (!fullPath.StartsWith(skinRoot, StringComparison.OrdinalIgnoreCase))
-            throw new ScriptRuntimeException("import(path): path must stay inside the skin directory");
+        // Partials belong to the selected skin, even when this component's main
+        // script has fallen back to Default. This lets a texture-only/UI-style
+        // skin override a shared module without having to duplicate the main Lua
+        // script. Each custom partial is tried in the context of the active main
+        // script; if it errors, the matching Default partial is tried instead.
+        var candidateDirectories = new List<string>();
+        // New modules live in scripts/. Search the selected skin first even when
+        // this runtime's main script has fallen back to Default, so partial
+        // overrides remain usable independently of the main script.
+        var selectedScriptsDirectory = Path.Combine(_skinDirectory, "scripts");
+        AddUniquePath(candidateDirectories, selectedScriptsDirectory);
+        var selectedScriptsCandidate = Path.Combine(selectedScriptsDirectory, normalized);
+        if (!File.Exists(selectedScriptsCandidate))
+            AddUniquePath(candidateDirectories, _skinDirectory); // legacy root-level module
 
-        // Skin-local modules always win. Developer builds may fall back to
-        // root-level Lua modules for backward compatibility; Publish only uses
-        // modules bundled inside the Default skin, never a shared ./scripts folder.
-        if (!File.Exists(fullPath))
+        // Imports may themselves import sibling modules. Keep sibling lookup
+        // available after the selected skin's scripts root.
+        if (!string.IsNullOrWhiteSpace(_activeImportPath))
         {
-#if TSC_PUBLISH
-            var fallbackDirectories = new[]
-            {
-                Path.Combine(UserDataPaths.GameRootDirectory, "Skins", "Default")
-            };
-#else
-            var fallbackDirectories = new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory };
+            var importDirectory = Path.GetDirectoryName(_activeImportPath);
+            if (!string.IsNullOrWhiteSpace(importDirectory))
+                AddUniquePath(candidateDirectories, importDirectory);
+        }
+
+        var activeScriptDirectory = Path.GetDirectoryName(_activeScriptPath ?? _scriptPath) ?? _skinDirectory;
+        AddUniquePath(candidateDirectories, activeScriptDirectory);
+        var defaultScriptsDirectory = Path.Combine(_defaultSkinDirectory, "scripts");
+        AddUniquePath(candidateDirectories, defaultScriptsDirectory);
+        if (!File.Exists(Path.Combine(defaultScriptsDirectory, normalized)))
+            AddUniquePath(candidateDirectories, _defaultSkinDirectory); // legacy Default module
+#if !TSC_PUBLISH
+        AddUniquePath(candidateDirectories, Directory.GetCurrentDirectory());
+        AddUniquePath(candidateDirectories, AppContext.BaseDirectory);
 #endif
-            foreach (var directory in fallbackDirectories)
+
+        var candidates = new List<string>();
+        foreach (var directory in candidateDirectories)
+        {
+            try
             {
-                if (string.IsNullOrWhiteSpace(directory)) continue;
-                var candidate = Path.GetFullPath(Path.Combine(directory, normalized));
-                var candidateRoot = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
-                                    + Path.DirectorySeparatorChar;
-                if (candidate.StartsWith(candidateRoot, StringComparison.OrdinalIgnoreCase) && File.Exists(candidate))
-                {
-                    fullPath = candidate;
-                    break;
-                }
+                var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var candidate = Path.GetFullPath(Path.Combine(root, normalized));
+                var rootPrefix = root + Path.DirectorySeparatorChar;
+                if (!candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(candidate))
+                    continue;
+                if (!candidates.Any(existing => PathEquals(existing, candidate)))
+                    candidates.Add(candidate);
+            }
+            catch
+            {
+                // Ignore invalid or inaccessible candidate roots and keep looking.
             }
         }
 
-        fullPath = Path.GetFullPath(fullPath);
-        if (!File.Exists(fullPath))
+        if (candidates.Count == 0)
             throw new ScriptRuntimeException($"import(path): file not found: {requestedPath}");
-        if (string.Equals(fullPath, _activeScriptPath ?? _scriptPath, StringComparison.OrdinalIgnoreCase))
-            throw new ScriptRuntimeException("import(path): skin.lua cannot import itself");
 
-        if (_importCache.TryGetValue(fullPath, out var cached))
-            return cached;
-
-        if (!_importsLoading.Add(fullPath))
-            throw new ScriptRuntimeException($"import(path): circular import detected for '{requestedPath}'");
-
-        try
+        var failures = new List<string>();
+        foreach (var fullPath in candidates)
         {
-            if (!File.Exists(fullPath))
-                throw new ScriptRuntimeException($"import(path): file not found: {requestedPath}");
+            if (PathEquals(fullPath, _activeScriptPath ?? _scriptPath))
+            {
+                failures.Add($"{fullPath}: a skin script cannot import itself");
+                _failedImports.Add(fullPath);
+                continue;
+            }
 
-            var source = File.ReadAllText(fullPath);
-            var result = script.DoString(source, script.Globals, fullPath);
-            if (result.IsNil())
-                result = DynValue.Nil;
+            if (_importCache.TryGetValue(fullPath, out var cached))
+                return cached;
 
-            _importCache[fullPath] = result;
-            WriteLog($"[skin] imported: {Path.GetRelativePath(_skinDirectory, fullPath).Replace(Path.DirectorySeparatorChar, '/')}");
-            return result;
+            // A failed custom partial is remembered for this script attempt so a
+            // repeated import does not execute the same broken module again.
+            if (_failedImports.Contains(fullPath))
+                continue;
+
+            if (!_importsLoading.Add(fullPath))
+            {
+                failures.Add($"{fullPath}: circular import detected for '{requestedPath}'");
+                _failedImports.Add(fullPath);
+                continue;
+            }
+
+            var previousImportPath = _activeImportPath;
+            try
+            {
+                _activeImportPath = fullPath;
+                var source = File.ReadAllText(fullPath);
+                var result = script.DoString(source, script.Globals, fullPath);
+                if (result.IsNil())
+                    result = DynValue.Nil;
+
+                _importCache[fullPath] = result;
+                WriteLog($"[skin] imported: {Path.GetRelativePath(_skinDirectory, fullPath).Replace(Path.DirectorySeparatorChar, '/')}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                _importCache.Remove(fullPath);
+                _failedImports.Add(fullPath);
+                var detail = FormatError(ex);
+                failures.Add($"{fullPath}: {detail}");
+                WriteLog($"[skin] partial import failed; trying the next skin fallback: {fullPath}\n{detail}");
+            }
+            finally
+            {
+                _activeImportPath = previousImportPath;
+                _importsLoading.Remove(fullPath);
+            }
         }
-        catch
-        {
-            _importCache.Remove(fullPath);
-            throw;
-        }
-        finally
-        {
-            _importsLoading.Remove(fullPath);
-        }
+
+        throw new ScriptRuntimeException(
+            $"import(path): no usable module found for '{requestedPath}'.{Environment.NewLine}" +
+            string.Join(Environment.NewLine + Environment.NewLine, failures));
     }
 
     private Table CreateFontsApi(Script script)
@@ -5687,8 +5907,7 @@ public sealed class SkinRuntime : IDisposable
             }
             catch (Exception ex)
             {
-                LastError = FormatError(ex);
-                WriteLog($"[skin] ERROR in ui.click:{hitButton.Id}: {LastError}");
+                HandleScriptRuntimeFailure(ex, $"ui.click:{hitButton.Id}");
                 return true;
             }
         }
@@ -5706,8 +5925,7 @@ public sealed class SkinRuntime : IDisposable
         }
         catch (Exception ex)
         {
-            LastError = FormatError(ex);
-            WriteLog($"[skin] ERROR in ui.slider:{hitSlider.Id}: {LastError}");
+            HandleScriptRuntimeFailure(ex, $"ui.slider:{hitSlider.Id}");
             return true;
         }
     }
@@ -5738,8 +5956,7 @@ public sealed class SkinRuntime : IDisposable
         }
         catch (Exception ex)
         {
-            LastError = FormatError(ex);
-            WriteLog($"[skin] ERROR in ui.slider:{slider.Id}: {LastError}");
+            HandleScriptRuntimeFailure(ex, $"ui.slider:{slider.Id}");
             return true;
         }
     }
@@ -5781,14 +5998,38 @@ public sealed class SkinRuntime : IDisposable
         // Do not cache a failed load while Windows is switching the output
         // device. A later play/preload call can retry after audio recovery.
         if (TSC.Rendering.OpenALAudioDeviceRecovery.IsRecoveryPending) return null;
-        var path = Path.GetFullPath(Path.Combine(_skinDirectory, "audio", normalized));
-        var root = Path.GetFullPath(Path.Combine(_skinDirectory, "audio"));
-        if (!path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) && !string.Equals(path, root, StringComparison.OrdinalIgnoreCase))
-            return null;
-        var loaded = TSC.Rendering.WavSoundEffect.TryLoad(path);
-        _skinSounds[normalized] = loaded;
-        if (loaded is null) WriteLog($"[skin] sound missing or unsupported: audio/{normalized}");
-        return loaded;
+
+        var audioDirectories = new[]
+        {
+            Path.Combine(_skinDirectory, "audio"),
+            Path.Combine(_defaultSkinDirectory, "audio")
+        };
+        foreach (var audioDirectory in audioDirectories.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            try
+            {
+                var root = Path.GetFullPath(audioDirectory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var path = Path.GetFullPath(Path.Combine(root, normalized.Replace('/', Path.DirectorySeparatorChar)));
+                if (!path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var loaded = TSC.Rendering.WavSoundEffect.TryLoad(path);
+                if (loaded is null)
+                    continue;
+
+                _skinSounds[normalized] = loaded;
+                return loaded;
+            }
+            catch
+            {
+                // An absent, inaccessible, or invalid custom file should not
+                // prevent the matching Default skin sound from being used.
+            }
+        }
+
+        _skinSounds[normalized] = null;
+        WriteLog($"[skin] sound missing or unsupported: audio/{normalized}");
+        return null;
     }
 
     public double GetIntroHoldSeconds() => InvokeDuration("intro_duration");
@@ -5797,7 +6038,7 @@ public sealed class SkinRuntime : IDisposable
     {
         if (_script is null || LastError is not null) return 0;
         try { var fn = _script.Globals.Get(functionName); if (fn.Type != DataType.Function) return 0; var v = _script.Call(fn); return v.Type == DataType.Number ? Math.Clamp(v.Number, 0, 30) : 0; }
-        catch (Exception ex) { LastError = FormatError(ex); WriteLog($"[skin] ERROR in {functionName}: {LastError}"); return 0; }
+        catch (Exception ex) { HandleScriptRuntimeFailure(ex, functionName); return 0; }
     }
     public void OnGameplayPreparing() => InvokeOptional("on_gameplay_preparing", true);
     public void OnIntroStart() => InvokeOptional("on_intro_start", true);
@@ -6183,6 +6424,7 @@ public sealed class SkinRuntime : IDisposable
                     (GetBool(options, "flip_x", false) ? SpriteEffects.FlipHorizontally : SpriteEffects.None) |
                     (GetBool(options, "flip_y", false) ? SpriteEffects.FlipVertically : SpriteEffects.None),
                 AdditiveBlend = string.Equals(blend, "add", StringComparison.OrdinalIgnoreCase),
+                ForceWhiteColor = GetBool(options, "force_white", false),
                 CropCover = string.Equals(GetString(options, "crop", string.Empty), "cover", StringComparison.OrdinalIgnoreCase),
                 ScreenSpaceSizing = GetBool(options, "screen_space", false),
             };
@@ -6282,6 +6524,7 @@ public sealed class SkinRuntime : IDisposable
         command.Layer = entry.Layer;
         command.SpriteEffects = entry.SpriteEffects;
         command.AdditiveBlend = entry.AdditiveBlend;
+        command.ForceWhiteColor = entry.ForceWhiteColor;
         command.CropCover = entry.CropCover;
         command.CropUv = cropUv;
         command.ScreenSpaceSizing = entry.ScreenSpaceSizing;
@@ -6486,6 +6729,7 @@ public sealed class SkinRuntime : IDisposable
             var flipY = GetBool(options, "flip_y", false);
             var blend = GetString(options, "blend", string.Empty);
             var additiveBlend = string.Equals(blend, "add", StringComparison.OrdinalIgnoreCase);
+            var forceWhiteColor = GetBool(options, "force_white", false);
             var cropCover = string.Equals(
                 GetString(options, "crop", string.Empty),
                 "cover",
@@ -6541,6 +6785,7 @@ public sealed class SkinRuntime : IDisposable
             command.SpriteEffects = (flipX ? SpriteEffects.FlipHorizontally : SpriteEffects.None) |
                                      (flipY ? SpriteEffects.FlipVertically : SpriteEffects.None);
             command.AdditiveBlend = additiveBlend;
+            command.ForceWhiteColor = forceWhiteColor;
             command.CropCover = cropCover;
             command.CropUv = cropUv;
             command.ScreenSpaceSizing = screenSpaceSizing;
@@ -7275,8 +7520,7 @@ public sealed class SkinRuntime : IDisposable
         }
         catch (Exception ex)
         {
-            LastError = FormatError(ex);
-            WriteLog($"[skin] ERROR in UI layout hierarchy: {LastError}");
+            HandleScriptRuntimeFailure(ex, "UI layout hierarchy");
             return false;
         }
     }
@@ -7608,8 +7852,7 @@ public sealed class SkinRuntime : IDisposable
         }
         catch (Exception ex)
         {
-            LastError = FormatError(ex);
-            WriteLog($"[skin] ERROR in {functionName}: {LastError}");
+            HandleScriptRuntimeFailure(ex, functionName);
         }
     }
 
@@ -7634,8 +7877,7 @@ public sealed class SkinRuntime : IDisposable
         }
         catch (Exception ex)
         {
-            LastError = FormatError(ex);
-            WriteLog($"[skin] ERROR in {functionName}: {LastError}");
+            HandleScriptRuntimeFailure(ex, functionName);
         }
     }
 

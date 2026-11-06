@@ -33,7 +33,7 @@ public static class RenderConfigLuaLoader
 
     /// <summary>
     /// Builds the built-in render configuration in memory for the current viewport.
-    /// Unlike LoadOrCreate, this does not read or write skins/Default/renderConfig.lua.
+    /// Unlike LoadOrCreate, this does not read or write skins/Default/scripts/renderConfig.lua.
     /// </summary>
     public static RenderConfig LoadBuiltInDefault(int outputWidth, int outputHeight)
     {
@@ -71,6 +71,55 @@ public static class RenderConfigLuaLoader
         config.Perspective.SpeedCompensation = defaults.Perspective.SpeedCompensation;
         config.Perspective.SizeCompensation = defaults.Perspective.SizeCompensation;
         return config;
+    }
+
+    /// <summary>
+    /// Loads a skin-specific render config first, then the matching Default skin
+    /// config. The in-code configuration is used only when both scripts fail.
+    /// If neither file exists, preserve the normal first-run behavior and create
+    /// the primary file from the built-in source.
+    /// </summary>
+    public static bool TryLoadWithFallback(
+        string primaryPath,
+        string fallbackPath,
+        int outputWidth,
+        int outputHeight,
+        out RenderConfig config,
+        out string? error)
+    {
+        var failures = new List<string>();
+        var candidates = new List<string>();
+        AddUniquePath(candidates, primaryPath);
+        AddUniquePath(candidates, fallbackPath);
+
+        var anyFileExists = candidates.Any(File.Exists);
+        if (!anyFileExists)
+            return TryLoadOrCreate(primaryPath, outputWidth, outputHeight, out config, out error);
+
+        foreach (var candidate in candidates)
+        {
+            if (!File.Exists(candidate))
+                continue;
+
+            if (TryLoadOrCreate(candidate, outputWidth, outputHeight, out config, out var candidateError))
+            {
+                error = null;
+                return true;
+            }
+
+            failures.Add($"{candidate}: {candidateError ?? "unknown render config error"}");
+        }
+
+        config = LoadBuiltInDefault(outputWidth, outputHeight);
+        error = string.Join(Environment.NewLine + Environment.NewLine, failures);
+        return false;
+    }
+
+    private static void AddUniquePath(List<string> paths, string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        if (!paths.Any(existing => string.Equals(existing, fullPath, StringComparison.OrdinalIgnoreCase)))
+            paths.Add(fullPath);
     }
 
     public static bool TryLoadOrCreate(
@@ -122,7 +171,8 @@ public static class RenderConfigLuaLoader
         int outputWidth,
         int outputHeight)
     {
-        var script = new Script(CoreModules.Preset_HardSandbox);
+        // pcall/xpcall support the skin's isolated fallback handling; retain the hard sandbox for all other APIs.
+        var script = new Script(CoreModules.Preset_HardSandbox | CoreModules.ErrorHandling);
 
         var screen = new Table(script);
         screen.Set("width", DynValue.NewNumber(Math.Max(1, virtualWidth)));

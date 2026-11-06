@@ -1,115 +1,71 @@
 -- Background panels and chart-driven character animations.
 
-local PANEL_BASE_PATH = "panel-base.png"
-local CHARACTER_PATHS = {
-    [1] = "character1.png",
-    [2] = "character2.png",
-    [3] = "character3.png",
-    [4] = "character4.png",
+local FALLBACK_THEME = {
+    assets = { panel_base = "panel-base.png", characters = { [1] = "character1.png", [2] = "character2.png", [3] = "character3.png", [4] = "character4.png" }, light = "light-cone.png" },
+    colors = { by_element = { DANCER = "#784649", VOCAL = "#435A73", SESSION = "#48664D" } },
+    geometry = { panel_layer = -100, width = 460, gap = 28, depths = { -220, -300, -300, -220 }, yaws_degrees = { 50, 10, -10, -50 }, character_layer_offset = 2, light_layer_offset = 3 },
+    animation = {
+        character = {
+            windowScale = 0.72,
+            flashOpacity = 0.80,
+            flashDuration = 1.0,
+            neutralBreathing = { maxZoom = 1.05, zoomInDuration = 3.0, zoomOutDuration = 3.0 },
+        },
+        light = { topY = -100, xOffset = 0.2, bottomOverhang = 0.20, wideWidth = 1000, narrowWidth = 240, presentation = { introDuration = 1.0, outroWidenDuration = 1.0, outroFadeDuration = 0.25 }, neutral = { opacity = 0.75, width = 240, swingLeftFrom = -14, swingLeftTo = 14, swingRightFrom = -14, swingRightTo = 14, swingDuration = 3.0, leftColor = "#7778E8", rightColor = "#FFE46A" } },
+        specialCycle = { [1] = { position = "topLeft", color = "#4DA6FF" }, [2] = { position = "topRight", color = "#FF4D55" }, [3] = { position = "bottomLeft", color = "#FF9A3C" }, [0] = { position = "bottomRight", color = "#62D84E" } },
+    },
 }
-local PANEL_COLOR_BY_ELEMENT = {
-    DANCER = "#784649",
-    VOCAL = "#435A73",
-    SESSION = "#48664D",
-}
-local LIGHT_PATH = "light-cone.png"
+local defaults_ok, imported_theme_defaults = pcall(import, "background/panelThemeDefaults")
+if not defaults_ok or type(imported_theme_defaults) ~= "table" then imported_theme_defaults = {} end
+local theme_ok, theme_overrides = pcall(import, "background/panelTheme")
+if not theme_ok or type(theme_overrides) ~= "table" then theme_overrides = {} end
 
-local function current_panel_color()
-    local element = game ~= nil and game.element or "DANCER"
-    return PANEL_COLOR_BY_ELEMENT[tostring(element):upper()] or PANEL_COLOR_BY_ELEMENT.DANCER
+local function merge_theme(defaults, overrides)
+    local merged = {}
+    for key, default_value in pairs(defaults or {}) do
+        local override_value = nil
+        if overrides ~= nil then override_value = overrides[key] end
+        if type(default_value) == "table" then
+            merged[key] = merge_theme(default_value, type(override_value) == "table" and override_value or {})
+        elseif override_value ~= nil then
+            merged[key] = override_value
+        else
+            merged[key] = default_value
+        end
+    end
+    for key, override_value in pairs(overrides or {}) do
+        if merged[key] == nil then merged[key] = override_value end
+    end
+    return merged
 end
 
-local PANEL_LAYER = -100
-local CHARACTER_LAYER = PANEL_LAYER + 2
-local LIGHT_LAYER = CHARACTER_LAYER + 1
-local PANEL_WIDTH = 460
-local PANEL_GAP = 28
-local PANEL_DEPTHS = { -220, -300, -300, -220 }
-local PANEL_YAWS = { math.rad(50), math.rad(10), math.rad(-10), math.rad(-50) }
+local PANEL_THEME = merge_theme(merge_theme(FALLBACK_THEME, imported_theme_defaults), theme_overrides)
+
+local PANEL_BASE_PATH = PANEL_THEME.assets.panel_base or FALLBACK_THEME.assets.panel_base
+local CHARACTER_PATHS = PANEL_THEME.assets.characters or FALLBACK_THEME.assets.characters
+local LIGHT_PATH = PANEL_THEME.assets.light or FALLBACK_THEME.assets.light
+local PANEL_COLOR_BY_ELEMENT = PANEL_THEME.colors.by_element or FALLBACK_THEME.colors.by_element
+local function current_panel_color()
+    local element = game ~= nil and game.element or "DANCER"
+    return PANEL_COLOR_BY_ELEMENT[tostring(element):upper()] or PANEL_COLOR_BY_ELEMENT.DANCER or "#784649"
+end
+
+local PANEL_LAYER = tonumber(PANEL_THEME.geometry.panel_layer) or -100
+local CHARACTER_LAYER = PANEL_LAYER + (tonumber(PANEL_THEME.geometry.character_layer_offset) or 2)
+local LIGHT_LAYER = PANEL_LAYER + (tonumber(PANEL_THEME.geometry.light_layer_offset) or 3)
+local PANEL_WIDTH = tonumber(PANEL_THEME.geometry.width) or 460
+local PANEL_GAP = tonumber(PANEL_THEME.geometry.gap) or 28
+local PANEL_DEPTHS = PANEL_THEME.geometry.depths or FALLBACK_THEME.geometry.depths
+local PANEL_YAWS = {}
+for index, degrees in ipairs(PANEL_THEME.geometry.yaws_degrees or FALLBACK_THEME.geometry.yaws_degrees) do
+    PANEL_YAWS[index] = math.rad(tonumber(degrees) or 0)
+end
 local PANEL_COS_YAWS, PANEL_SIN_YAWS = {}, {}
 for index, yaw in ipairs(PANEL_YAWS) do
     PANEL_COS_YAWS[index], PANEL_SIN_YAWS[index] = math.cos(yaw), math.sin(yaw)
 end
 
--- ANIMATION_CONFIG
-local ANIMATION_CONFIG = {
-    character = {
-        windowScale = 0.72,
-        flashOpacity = 0.70,
-        flashDuration = 1.0,
-
-        [101] = { kind = "vertical", from = { 0.50, 0.5 }, to = { 0.50, 0.9 }, zoom = 0.75, duration = 5.0, fadeOutDuration = 1 },
-
-        [102] = { kind = "vertical", from = { 0.50, 0.9 }, to = { 0.50, 0.5 }, zoom = 0.75, duration = 5.0, fadeOutDuration = 1 },
-
-        [103] = { kind = "cornerLoop", secondsPerCorner = 2.0, path = { "topLeft", "topRight", "bottomRight", "bottomLeft" } },
-
-        [104] = { kind = "cornerLoop", secondsPerCorner = 2.0, path = { "topRight", "topLeft", "bottomLeft", "bottomRight" } },
-
-        [105] = { kind = "horizontal", from = { 1, 0.75 }, to = { 0.0, 0.75 }, zoom = 0.75, duration = 5.0, fadeOutDuration = 0.1 },
-
-        [106] = { kind = "horizontal", from = { 0.0, 0.75 }, to = { 1, 0.75 }, zoom = 0.75, duration = 5.0, fadeOutDuration = 0.1 },
-
-        [107] = { kind = "specialSnap" },
-
-        [108] = {
-            kind = "specialZoom", movementDuration = 3.0, holdDuration = 1.0, pivotY = 0.2,
-            cycleScales = { [1] = { 0.40, 0.50 }, [2] = { 0.50, 0.60 }, [3] = { 0.60, 0.70 }, [0] = { 0.80, 0.90 } },
-        },
-    },
-
-    light = {
-        heightFraction = 0.9,
-        topY = -100,
-        xOffset = 0.2,
-
-        neutral = {
-            opacity = 0.75,
-            width = 240,
-            swingLeftFrom = -14,
-            swingLeftTo = 14,
-            swingRightFrom = -14,
-            swingRightTo = 14,
-            swingDuration = 3.0,
-            leftColor = "#7778E8",
-            rightColor = "#FFE46A",
-        },
-
-        wideWidth = 1000,
-        narrowWidth = 240,
-
-        [101] = { duration = 5.0, swingDuration = 5.0, swingLeftFrom = -14, swingLeftTo = 14,
-            swingRightFrom = 14, swingRightTo = -14, alphaFrom = 0.75, alphaTo = 0.00, widthFrom = "narrow", widthTo = "narrow" },
-
-        [102] = { duration = 5.0, swingDuration = 5.0, swingLeftFrom = 14, swingLeftTo = 0,
-            swingRightFrom = -14, swingRightTo = 0, alphaFrom = 0.75, alphaTo = 0.00, widthFrom = "wide", widthTo = "narrow" },
-
-        [103] = { duration = 8.0, swingDuration = 3.0, swingLeftFrom = -14, swingLeftTo = 14,
-            swingRightFrom = 14, swingRightTo = -14, swingLoop = true, alphaFrom = 0.75, alphaTo = 0.025, widthFrom = "wide", widthTo = "narrow" },
-
-        [104] = { duration = 8.0, swingDuration = 3.0, swingLeftFrom = -14, swingLeftTo = 14,
-            swingRightFrom = 14, swingRightTo = -14, swingLoop = true, alphaFrom = 0.75, alphaTo = 0.025, widthFrom = "wide", widthTo = "narrow" },
-
-        [105] = { duration = 5.0, swingDuration = 5.0, swingLeftFrom = -14, swingLeftTo = 14,
-            swingRightFrom = 14, swingRightTo = -14, alphaFrom = 0.75, alphaTo = 0.25, widthFrom = "wide", widthTo = "narrow" },
-
-        [106] = { duration = 5.0, swingDuration = 5.0, swingLeftFrom = -14, swingLeftTo = 14,
-            swingRightFrom = 14, swingRightTo = -14, alphaFrom = 0.75, alphaTo = 0.25, widthFrom = "wide", widthTo = "narrow" },
-
-        [107] = { peakOpacity = 0.75, fadeDuration = 1.0, movementDuration = 1.0,
-            swingDuration = 3.0, swingLeftFrom = 0, swingLeftTo = 0, swingRightFrom = 0, swingRightTo = 0 },
-
-        [108] = { peakOpacity = 0.75, fadeDuration = 1.0, movementDuration = 1.0,
-            swingDuration = 3.0, swingLeftFrom = 0, swingLeftTo = 0, swingRightFrom = 0, swingRightTo = 0 },
-    },
-
-    specialCycle = {
-        [1] = { position = "topLeft", color = "#4DA6FF" },
-        [2] = { position = "topRight", color = "#FF4D55" },
-        [3] = { position = "bottomLeft", color = "#FF9A3C" },
-        [0] = { position = "bottomRight", color = "#62D84E" },
-    },
-}
+local ANIMATION_CONFIG = PANEL_THEME.animation or FALLBACK_THEME.animation
 
 local panel_base = nil
 local character_assets = {}
@@ -162,7 +118,8 @@ for track = 17, 20 do
         x = 0, y = 0, z = 0, width = 0, height = 0,
         anchor = "bottom", rotation_y = 0,
         uv = nil, color = "#FFFFFF", alpha = 0,
-        layer = CHARACTER_LAYER + 1, blend = "add", mask = nil,
+        -- Any blend mode other than "add" uses the regular alpha blend path.
+        layer = CHARACTER_LAYER + 1, blend = "normal", force_white = true, mask = nil,
         debug_profile_group = 4,
     }
     character_mask_uv[track] = { left = 0, top = 0, right = 1, bottom = 1 }
@@ -238,6 +195,13 @@ local function get_character_visual_scale(zoom)
         return 1.0
     end
     return 1.0 / zoom
+end
+
+local function get_flash_opacity()
+    -- flashOpacity is the configurable peak alpha for character flash effects.
+    -- Keep it within the valid alpha range, but do not impose a lower hard cap.
+    local configured = tonumber(ANIMATION_CONFIG.character.flashOpacity) or 0.80
+    return clamp(configured, 0.0, 1.0)
 end
 
 local function position_character(
@@ -328,12 +292,53 @@ local function get_cover_uv(asset, destination_width, destination_height, output
     return output
 end
 
+local function window_from_position(base_uv, position_x, position_y, scale, padding, output)
+    output = output or base_uv_cache
+
+    local base_width = base_uv.right - base_uv.left
+    local base_height = base_uv.bottom - base_uv.top
+    scale = clamp(tonumber(scale) or 1.0, 0.001, 1.0)
+    padding = type(padding) == "table" and padding or {}
+
+    local width = base_width * scale
+    local height = base_height * scale
+
+    -- Padding is a 0..1 fraction of the maximum safe inset for that side.
+    -- A value of 1.0 therefore reaches the midpoint, rather than being cut off
+    -- by the old 0.45 limit or pushing the crop window outside the panel.
+    local available_x = math.max(0, 1.0 - width)
+    local available_y = math.max(0, 1.0 - height)
+    local max_horizontal_padding = available_x * 0.5
+    local max_vertical_padding = available_y * 0.5
+
+    local left_padding = clamp(tonumber(padding.left) or 0, 0, 1) * max_horizontal_padding
+    local right_padding = clamp(tonumber(padding.right) or 0, 0, 1) * max_horizontal_padding
+    local top_padding = clamp(tonumber(padding.top) or 0, 0, 1) * max_vertical_padding
+    local bottom_padding = clamp(tonumber(padding.bottom) or 0, 0, 1) * max_vertical_padding
+
+    -- Keep the original 0..1 travel limits used before padding was added.
+    -- Zero padding therefore still reaches the literal UV edges, including
+    -- when base_uv itself is cropped for the panel's aspect ratio.
+    local left_min = left_padding
+    local left_max = available_x - right_padding
+    local top_min = top_padding
+    local top_max = available_y - bottom_padding
+
+    local left = lerp(left_min, left_max, clamp(tonumber(position_x) or 0.5, 0, 1))
+    local top = lerp(top_min, top_max, clamp(tonumber(position_y) or 0.5, 0, 1))
+    output.left = left
+    output.top = top
+    output.right = left + width
+    output.bottom = top + height
+    return output
+end
+
+-- Center-based UV windows remain used by the snap and breathing animations.
 local function window_from_center(base_uv, center_x, center_y, scale, output)
     output = output or base_uv_cache
 
     local base_width = base_uv.right - base_uv.left
     local base_height = base_uv.bottom - base_uv.top
-
     local width = base_width * scale
     local height = base_height * scale
 
@@ -345,6 +350,17 @@ local function window_from_center(base_uv, center_x, center_y, scale, output)
     output.right = center_x + width * 0.5
     output.bottom = center_y + height * 0.5
     return output
+end
+
+local function corner_loop_position(name)
+    if name == "topLeft" then
+        return 0, 0
+    elseif name == "topRight" then
+        return 1, 0
+    elseif name == "bottomLeft" then
+        return 0, 1
+    end
+    return 1, 1
 end
 
 local function prepare_special_indices()
@@ -453,6 +469,15 @@ local function get_active_event(track, current_tick, current_time)
             local light_cfg = ANIMATION_CONFIG.light[event.attr]
             local movement = (cfg and cfg.movementDuration) or (light_cfg and light_cfg.movementDuration) or 0
             state.active_until = (event.start_time or 0) + movement + ((cfg and cfg.holdDuration) or 1.0)
+        elseif event ~= nil and (event.attr == 105 or event.attr == 106) then
+            local cfg = ANIMATION_CONFIG.character[event.attr]
+            local movement = math.max(0.001,
+                tonumber(cfg.movementDuration) or tonumber(cfg.duration) or 5.0)
+            local fade = math.max(0, tonumber(cfg.fadeOutDuration) or 0)
+            -- Keep the event alive through its post-movement fade. Otherwise it
+            -- is discarded at the five-second mark, just as it reaches the edge.
+            local animation_end = (event.start_time or 0) + movement + fade
+            state.active_until = math.max(state.active_until, animation_end)
         else
             local cfg = event ~= nil and ANIMATION_CONFIG.character[event.attr] or nil
             if cfg ~= nil and cfg.duration ~= nil then
@@ -560,6 +585,29 @@ local function get_special_position(base_uv, position, scale)
     return right_center, bottom_center
 end
 
+
+local function get_special_snap_position(base_uv, event)
+    local snap_config = ANIMATION_CONFIG.character[107] or {}
+    local positions = snap_config.snapPositions
+    local configured = type(positions) == "table"
+        and positions[event.special_index or 1]
+        or nil
+
+    -- Keep the legacy specialCycle corner names as the starting position so
+    -- existing custom panel themes retain their original snap behavior.
+    local cycle = get_special_cycle(event)
+    local center_x, center_y = get_special_position(
+        base_uv, cycle.position, ANIMATION_CONFIG.character.windowScale)
+
+    -- Optional x/y values independently override the normalized crop center.
+    -- This makes small adjustments possible without restating both axes.
+    if type(configured) == "table" then
+        center_x = tonumber(configured.x or configured[1]) or center_x
+        center_y = tonumber(configured.y or configured[2]) or center_y
+    end
+    return center_x, center_y
+end
+
 local function get_light_effect(track, side, event, current_time)
     local output = light_effect_cache[track][side]
     current_time = current_time or (game.time or 0)
@@ -659,72 +707,66 @@ local function get_character_view(track, base_uv, event, current_time)
         local position_x = lerp(from_x, to_x, t)
         local position_y = lerp(from_y, to_y, t)
         local visual_scale = get_character_visual_scale(cfg.zoom)
-        return base_uv, fade_out_alpha(elapsed, cfg.duration, cfg.fadeOutDuration), 0,
+        local flash_duration = math.max(0.001,
+            tonumber(cfg.flashFadeDuration) or ANIMATION_CONFIG.character.flashDuration or 1.0)
+        local flash_alpha = get_flash_opacity() *
+            (1.0 - smoothstep(animation_t(elapsed, flash_duration)))
+        return base_uv, fade_out_alpha(elapsed, cfg.duration, cfg.fadeOutDuration), flash_alpha,
             position_x, position_y, visual_scale
     end
 
     if attr == 103 or attr == 104 then
-        local segment_length = cfg.secondsPerCorner
+        local segment_length = math.max(0.001, tonumber(cfg.secondsPerCorner) or 2.0)
         local phase = math.max(0, elapsed) / segment_length
         local segment = math.floor(phase) % #cfg.path
         local segment_t = clamp((math.max(0, elapsed) % segment_length) / segment_length, 0, 1)
-        local animated_width = (base_uv.right - base_uv.left) * ANIMATION_CONFIG.character.windowScale
-        local animated_height = (base_uv.bottom - base_uv.top) * ANIMATION_CONFIG.character.windowScale
-        local left_center = animated_width * 0.5
-        local right_center = 1 - animated_width * 0.5
-        local top_center = animated_height * 0.5
-        local bottom_center = 1 - animated_height * 0.5
-
         local from_name = cfg.path[segment + 1]
         local to_name = cfg.path[(segment + 1) % #cfg.path + 1]
-        local from_x, from_y
-        local to_x, to_y
 
-        if from_name == "topLeft" then
-            from_x, from_y = left_center, top_center
-        elseif from_name == "topRight" then
-            from_x, from_y = right_center, top_center
-        elseif from_name == "bottomLeft" then
-            from_x, from_y = left_center, bottom_center
-        else
-            from_x, from_y = right_center, bottom_center
-        end
+        local from_x, from_y = corner_loop_position(from_name)
+        local to_x, to_y = corner_loop_position(to_name)
+        local position_x = lerp(from_x, to_x, segment_t)
+        local position_y = lerp(from_y, to_y, segment_t)
 
-        if to_name == "topLeft" then
-            to_x, to_y = left_center, top_center
-        elseif to_name == "topRight" then
-            to_x, to_y = right_center, top_center
-        elseif to_name == "bottomLeft" then
-            to_x, to_y = left_center, bottom_center
-        else
-            to_x, to_y = right_center, bottom_center
-        end
-
-        local center_x = lerp(from_x, to_x, segment_t)
-        local center_y = lerp(from_y, to_y, segment_t)
-
-        window_from_center(base_uv, center_x, center_y, ANIMATION_CONFIG.character.windowScale, output_uv)
+        local corner_loop_scale = clamp(
+            tonumber(cfg.scale) or tonumber(ANIMATION_CONFIG.character.windowScale) or 0.72,
+            0.001,
+            1.0
+        )
+        window_from_position(
+            base_uv, position_x, position_y,
+            corner_loop_scale, cfg.padding, output_uv)
         return output_uv, 1, 0
     end
 
     if attr == 105 or attr == 106 then
-        local t = animation_t(elapsed, cfg.duration)
+        -- from/to are normalized positions along the available crop-window
+        -- travel. 1 and 0 therefore land exactly on the far and near edges,
+        -- just like CornerLoop, without waiting for a clamped center to enter
+        -- its valid range.
+        local movement_duration = math.max(0.001,
+            tonumber(cfg.movementDuration) or tonumber(cfg.duration) or 5.0)
+        local t = clamp(elapsed / movement_duration, 0, 1)
         local from_x, from_y = cfg.from[1], cfg.from[2]
         local to_x, to_y = cfg.to[1], cfg.to[2]
         local position_x = lerp(from_x, to_x, t)
         local position_y = lerp(from_y, to_y, t)
-        local visual_scale = get_character_visual_scale(cfg.zoom)
-        return base_uv, fade_out_alpha(elapsed, cfg.duration, cfg.fadeOutDuration), 0,
-            position_x, position_y, visual_scale
+        local window_scale = tonumber(cfg.windowScale) or tonumber(cfg.scale)
+            or ANIMATION_CONFIG.character.windowScale
+
+        window_from_position(base_uv, position_x, position_y,
+            window_scale, cfg.padding, output_uv)
+
+        -- Complete the full five-second travel before fading out.
+        local fade_duration = math.max(0, tonumber(cfg.fadeOutDuration) or 0)
+        local alpha = fade_duration > 0
+            and fade_out_alpha(elapsed, movement_duration + fade_duration, fade_duration)
+            or 1
+        return output_uv, alpha, 0
     end
 
     if attr == 107 then
-        local cycle = get_special_cycle(event)
-        local center_x, center_y = get_special_position(
-            base_uv,
-            cycle.position,
-            ANIMATION_CONFIG.character.windowScale
-        )
+        local center_x, center_y = get_special_snap_position(base_uv, event)
         window_from_center(
             base_uv,
             center_x,
@@ -733,7 +775,7 @@ local function get_character_view(track, base_uv, event, current_time)
             output_uv
         )
         local flash_t = animation_t(elapsed, ANIMATION_CONFIG.character.flashDuration)
-        local flash_alpha = ANIMATION_CONFIG.character.flashOpacity * (1.0 - smoothstep(flash_t))
+        local flash_alpha = get_flash_opacity() * (1.0 - smoothstep(flash_t))
         return output_uv, 1, flash_alpha
     end
 
@@ -744,7 +786,7 @@ local function get_character_view(track, base_uv, event, current_time)
         local scale = lerp(scale_pair[1], scale_pair[2], smoothstep(zoom_t))
         window_from_center(base_uv, 0.5, cfg.pivotY, scale, output_uv)
         local flash_t = animation_t(elapsed, ANIMATION_CONFIG.character.flashDuration)
-        local flash_alpha = ANIMATION_CONFIG.character.flashOpacity * (1.0 - smoothstep(flash_t))
+        local flash_alpha = get_flash_opacity() * (1.0 - smoothstep(flash_t))
         return output_uv, 1, flash_alpha
     end
 
@@ -761,13 +803,84 @@ end
 
 local presentation_mode = "idle"
 local presentation_elapsed = 0
+local neutral_breath_elapsed = 0
 local PRESENTATION_PANEL_TIME = 1.0
 local PRESENTATION_CHARACTER_FADE_IN = 0.25
 local PRESENTATION_FLASH_DURATION = ANIMATION_CONFIG.character.flashDuration
-local PRESENTATION_FLASH_OPACITY = ANIMATION_CONFIG.character.flashOpacity
+local PRESENTATION_FLASH_OPACITY = get_flash_opacity()
 local PRESENTATION_OUTRO_CHARACTER_FADE = 0.45
 local PRESENTATION_OUTRO_PANEL_TIME = 0.85
+local PRESENTATION_LIGHT_CONFIG = ANIMATION_CONFIG.light.presentation or {}
+local PRESENTATION_LIGHT_INTRO_DURATION = math.max(
+    0.001, tonumber(PRESENTATION_LIGHT_CONFIG.introDuration) or PRESENTATION_PANEL_TIME)
+local PRESENTATION_LIGHT_OUTRO_WIDEN_DURATION = math.max(
+    0.001, tonumber(PRESENTATION_LIGHT_CONFIG.outroWidenDuration) or 1.0)
+local PRESENTATION_LIGHT_OUTRO_FADE_DURATION = math.max(
+    0.001, tonumber(PRESENTATION_LIGHT_CONFIG.outroFadeDuration) or 0.25)
 local presentation_clip_rect = { left = 0, top = 0, right = 0, bottom = 0 }
+
+local function set_light_geometry(
+    options, center_x, local_x, panel_depth, panel_y, panel_height, yaw, yaw_cos, yaw_sin,
+    camera_center_y, camera_distance, light_top_screen_y, light_front_offset, bottom_overhang
+)
+    local panel_edge_depth = panel_depth - local_x * yaw_sin
+    local light_depth = panel_edge_depth + light_front_offset
+    local panel_scale = camera_distance / math.max(1.0, camera_distance - panel_edge_depth)
+    local light_scale = camera_distance / math.max(1.0, camera_distance - light_depth)
+    local panel_bottom_screen_y = camera_center_y + (panel_y - camera_center_y) * panel_scale
+    local light_bottom_screen_y = panel_bottom_screen_y +
+        panel_height * panel_scale * math.max(0.0, bottom_overhang or 0.0)
+    local light_top_world_y = camera_center_y +
+        (light_top_screen_y - camera_center_y) / light_scale
+    local light_bottom_world_y = camera_center_y +
+        (light_bottom_screen_y - camera_center_y) / light_scale
+
+    options.x = center_x + local_x * yaw_cos
+    options.y = light_top_world_y
+    options.z = light_depth
+    options.rotation_y = yaw
+    options.height = math.max(1.0, light_bottom_world_y - light_top_world_y)
+    -- Lights deliberately do not inherit the panel wipe clipping.
+    options.clip = nil
+end
+
+local function apply_presentation_light_animation(track, neutral_left, neutral_right, current_mode, elapsed, ref)
+    if current_mode ~= "intro" and current_mode ~= "outro" then
+        return
+    end
+
+    local options = light_quad_options[track]
+    local neutral = ANIMATION_CONFIG.light.neutral
+    local wide_width = tonumber(ANIMATION_CONFIG.light.wideWidth) or 1000
+
+    if current_mode == "intro" then
+        local progress = smoothstep(animation_t(elapsed, PRESENTATION_LIGHT_INTRO_DURATION))
+        local neutral_left_angle = neutral_left.angle or 0
+        local neutral_right_angle = neutral_right.angle or 0
+        options.left.rotation_z = lerp(0, neutral_left_angle, progress)
+        options.right.rotation_z = lerp(0, neutral_right_angle, progress)
+        options.left.width = lerp(wide_width, neutral.width, progress) * ref
+        options.right.width = lerp(wide_width, neutral.width, progress) * ref
+        options.left.alpha = neutral.opacity
+        options.right.alpha = neutral.opacity
+        options.left.color = neutral_left.color or neutral.leftColor
+        options.right.color = neutral_right.color or neutral.rightColor
+        return
+    end
+
+    -- Outro lights are independent from the panel wipe: straighten first,
+    -- widen gradually, then fade quickly after the widening has completed.
+    local widen_progress = smoothstep(animation_t(elapsed, PRESENTATION_LIGHT_OUTRO_WIDEN_DURATION))
+    local fade_elapsed = elapsed - PRESENTATION_LIGHT_OUTRO_WIDEN_DURATION
+    local fade_progress = smoothstep(animation_t(fade_elapsed, PRESENTATION_LIGHT_OUTRO_FADE_DURATION))
+    local width = lerp(neutral.width, wide_width, widen_progress) * ref
+    local alpha = neutral.opacity * (1.0 - fade_progress)
+    options.left.rotation_z, options.right.rotation_z = 0, 0
+    options.left.width, options.right.width = width, width
+    options.left.alpha, options.right.alpha = alpha, alpha
+    options.left.color = neutral.color or neutral.leftColor
+    options.right.color = neutral.color or neutral.rightColor
+end
 
 local function wait_for_intro()
     presentation_mode = "waiting"
@@ -794,11 +907,21 @@ local function is_waiting_for_intro()
 end
 
 local function update_presentation(dt)
+    local frame_dt = math.max(0, tonumber(dt) or 0)
+    neutral_breath_elapsed = neutral_breath_elapsed + frame_dt
+
     if presentation_mode == "intro" or presentation_mode == "outro" then
-        presentation_elapsed = presentation_elapsed + (dt or 0)
-        local total = presentation_mode == "intro"
-            and (PRESENTATION_PANEL_TIME + PRESENTATION_FLASH_DURATION)
-            or (PRESENTATION_OUTRO_CHARACTER_FADE + PRESENTATION_OUTRO_PANEL_TIME)
+        presentation_elapsed = presentation_elapsed + frame_dt
+        local total
+        if presentation_mode == "intro" then
+            total = math.max(
+                PRESENTATION_PANEL_TIME + PRESENTATION_FLASH_DURATION,
+                PRESENTATION_LIGHT_INTRO_DURATION)
+        else
+            total = math.max(
+                PRESENTATION_OUTRO_CHARACTER_FADE + PRESENTATION_OUTRO_PANEL_TIME,
+                PRESENTATION_LIGHT_OUTRO_WIDEN_DURATION + PRESENTATION_LIGHT_OUTRO_FADE_DURATION)
+        end
         if presentation_elapsed >= total then
             local completed_mode = presentation_mode
             presentation_mode = completed_mode == "outro" and "waiting" or "idle"
@@ -885,8 +1008,15 @@ local function render(display)
     local panel_y = screen_height * 0.6
     local light_cfg = ANIMATION_CONFIG.light
     local neutral = light_cfg.neutral
-    local light_y = light_cfg.topY * ref
-    local light_height = screen_height * light_cfg.heightFraction
+    -- The 3D skin camera uses a 60-degree vertical field of view. Keep each
+    -- beam's top slightly offscreen, but end its lower edge exactly at the
+    -- corresponding panel's lower edge. Calculate per-side depth because the
+    -- panel yaw shifts the left and right lights along the depth axis.
+    local camera_distance = screen_height / (2.0 * math.tan(math.rad(30.0)))
+    local camera_center_y = screen_height * 0.5
+    local light_top_screen_y = (tonumber(light_cfg.topY) or -100) * ref
+    local light_front_offset = 0.5 * ref
+    local light_bottom_overhang = clamp(tonumber(light_cfg.bottomOverhang) or 0.20, 0.0, 1.0)
 
     for index = 1, 4 do
         local x = start_x + (index - 1) * (width + gap)
@@ -903,17 +1033,32 @@ local function render(display)
         panel_options.width, panel_options.rotation_y = width, yaw
         panel_options.color, panel_options.clip = panel_color, presentation_clip
 
+        -- Place each light on its own panel plane. The x offset is panel-local,
+        -- so rotate it into world space just like the panel and character. Keep
+        -- the beam just in front of the panel to avoid it appearing detached.
+        local light_local_offset = width * light_cfg.xOffset
+        local light_cos_yaw = PANEL_COS_YAWS[index]
+        local light_sin_yaw = PANEL_SIN_YAWS[index]
+
         local left_options = light_quad_options[track].left
-        left_options.x, left_options.y = center_x - width * light_cfg.xOffset, light_y
-        left_options.width, left_options.height = neutral.width * ref, light_height
+        local left_local_x = -light_local_offset
+        set_light_geometry(
+            left_options, center_x, left_local_x, depth, panel_y, base_height, yaw,
+            light_cos_yaw, light_sin_yaw, camera_center_y, camera_distance,
+            light_top_screen_y, light_front_offset, light_bottom_overhang
+        )
+        left_options.width = neutral.width * ref
         left_options.color, left_options.alpha = neutral.color or neutral.leftColor, neutral.opacity
-        left_options.clip = presentation_clip
 
         local right_options = light_quad_options[track].right
-        right_options.x, right_options.y = center_x + width * light_cfg.xOffset, light_y
-        right_options.width, right_options.height = neutral.width * ref, light_height
+        local right_local_x = light_local_offset
+        set_light_geometry(
+            right_options, center_x, right_local_x, depth, panel_y, base_height, yaw,
+            light_cos_yaw, light_sin_yaw, camera_center_y, camera_distance,
+            light_top_screen_y, light_front_offset, light_bottom_overhang
+        )
+        right_options.width = neutral.width * ref
         right_options.color, right_options.alpha = neutral.color or neutral.rightColor, neutral.opacity
-        right_options.clip = presentation_clip
 
         local character_asset = character_assets[index]
         if character_asset ~= nil then
@@ -964,6 +1109,14 @@ local function render(display)
             if profile then skinperf.begin(10) end
             draw_stage_lights(track, event,
                 neutral_light_frame_cache.left, neutral_light_frame_cache.right, current_time, ref)
+            apply_presentation_light_animation(
+                track,
+                neutral_light_frame_cache.left,
+                neutral_light_frame_cache.right,
+                presentation_mode,
+                presentation_elapsed,
+                ref
+            )
             if profile then skinperf.stop(10) end
         end
 
@@ -1025,7 +1178,32 @@ local function render(display)
                     character_options.x, character_options.y = center_x, panel_y
                     character_options.z = geometry.depth - (0.01 * ref)
                     character_options.width, character_options.height = current_width, geometry.height
-                    character_options.rotation_y, character_options.uv = yaw, base_uv
+                    character_options.rotation_y = yaw
+
+                    local breathing_cfg = ANIMATION_CONFIG.character.neutralBreathing or {}
+                    local breathing_zoom = 1.0
+                    if presentation_mode == "idle" then
+                        local zoom_in = math.max(0.001, tonumber(breathing_cfg.zoomInDuration) or 3.0)
+                        local zoom_out = math.max(0.001, tonumber(breathing_cfg.zoomOutDuration) or 3.0)
+                        local min_zoom = math.max(1.0, tonumber(breathing_cfg.minZoom) or 1.0)
+                        local max_zoom = math.max(min_zoom, tonumber(breathing_cfg.maxZoom) or 1.05)
+                        local cycle_duration = zoom_in + zoom_out
+                        local cycle_time = neutral_breath_elapsed % cycle_duration
+                        local breath_t
+                        if cycle_time < zoom_in then
+                            breath_t = smoothstep(cycle_time / zoom_in)
+                        else
+                            breath_t = smoothstep(1.0 - ((cycle_time - zoom_in) / zoom_out))
+                        end
+                        breathing_zoom = min_zoom + (max_zoom - min_zoom) * breath_t
+                    end
+
+                    if breathing_zoom > 1.00001 then
+                        character_options.uv = window_from_center(
+                            base_uv, 0.5, 0.5, 1.0 / breathing_zoom, character_uv_cache[track])
+                    else
+                        character_options.uv = base_uv
+                    end
                     character_options.alpha, character_options.mask = presentation_character_alpha, panel_base
                     local mask_uv = character_mask_uv[track]
                     mask_uv.left, mask_uv.top, mask_uv.right, mask_uv.bottom = 0, 0, 1, 1

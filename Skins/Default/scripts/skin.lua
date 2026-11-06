@@ -70,6 +70,7 @@ end
 local display = {
     background = true,          -- Master switch for background.lua visuals
     background_tiles = true,    -- Repeating background image
+    background_stage_window = true, -- Static full-screen overlay above the scrolling background
     background_shadow = true,   -- Solid dark band at the bottom
     background_shadow_gradient = true, -- Fade above the bottom shadow
     background_sparkles = true,        -- Animated sparkles effect

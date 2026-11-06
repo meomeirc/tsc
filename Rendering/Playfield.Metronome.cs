@@ -38,20 +38,15 @@ public sealed partial class Playfield
             return;
         _editorMetronomeSoundLoadAttempted = true;
 
-        var candidates = new[]
-        {
-            Path.Combine(_skin.AudioDirectory, "tick.wav"),
-            Path.Combine(_skin.SkinDirectory, "tick.wav")
-        };
-        foreach (var path in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            _editorMetronomeSound = WavSoundEffect.TryLoad(path);
-            if (_editorMetronomeSound is not null)
-            {
-                _editorMetronomeSound.Warmup();
-                return;
-            }
-        }
+        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(_skin.RootDirectory);
+        var defaultAudioDirectory = Path.Combine(defaultSkinDirectory, "audio");
+        _editorMetronomeSound = WavSoundEffect.TryLoadFromDirectories(
+            "tick.wav",
+            _skin.AudioDirectory,
+            _skin.SkinDirectory,
+            defaultAudioDirectory,
+            defaultSkinDirectory);
+        _editorMetronomeSound?.Warmup();
     }
 
     private void PlayEditorMetronomeTick()

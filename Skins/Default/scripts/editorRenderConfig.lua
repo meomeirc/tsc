@@ -29,7 +29,7 @@ return {
         depth = {
             farCameraDistance = 0,
             length = 100,
-            endLength = 400,
+            endLength = 300,
         },
         texture = { width = track },
         line = {
@@ -108,7 +108,7 @@ return {
 
     renderDistance = {
         ahead = 2900,
-        behind = 400,
+        behind = 300,
     },
 
     transitionFlash = {

@@ -234,15 +234,18 @@ public sealed partial class Playfield
     }
 
     private readonly GraphicsDevice _graphics;
-    private readonly SkinContext _skin;
-    private readonly SkinRuntime _skinRuntime;
-    private readonly SkinRuntime _pauseSkinRuntime;
-    private readonly SkinRuntime _resultSkinRuntime;
-    private readonly SkinRuntime _chartEditorInterfaceRuntime;
+    private SkinContext _skin;
+    private SkinRuntime _skinRuntime;
+    private SkinRuntime _pauseSkinRuntime;
+    private SkinRuntime _resultSkinRuntime;
+    private SkinRuntime _chartEditorInterfaceRuntime;
     private ChartEditorInterfaceLayout _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Default;
-    private readonly SkinFontStore _chartEditorFontStore;
-    private readonly SkinFontStore? _chartEditorDefaultFontStore;
-    private readonly HitSoundPlayer _hitSounds;
+    private string? _chartEditorInterfaceLayoutScriptPath;
+    private SkinFontStore _chartEditorFontStore;
+    private SkinFontStore? _chartEditorDefaultFontStore;
+    private HitSoundPlayer _hitSounds;
+    private readonly Effect? _skinSparklesEffect;
+    private readonly Effect? _skinQuad3DEffect;
     private readonly SpriteBatch _spriteBatch;
     private readonly BasicEffect _primitiveEffect;
     private readonly BasicEffect _textureEffect;
@@ -250,7 +253,7 @@ public sealed partial class Playfield
     private readonly Texture2D _pixel;
     private readonly Texture2D _circle;
     private readonly SpriteFont _font;
-    private readonly NoteTextures _textures;
+    private NoteTextures _textures;
     private RenderTarget2D? _gameplayRenderTarget;
     private bool _gameplayRenderTargetPreservesContents;
     private RenderTarget2D? _editorInactiveBankRenderTarget;
@@ -2069,9 +2072,10 @@ public sealed partial class Playfield
     {
         _graphics = graphics;
         _skin = skin;
-        _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Load(skin);
+        _skinSparklesEffect = skinSparklesEffect;
+        _skinQuad3DEffect = skinQuad3DEffect;
         _chartEditorFontStore = new SkinFontStore(graphics, skin.SkinDirectory);
-        var defaultSkinDirectory = Path.Combine(skin.RootDirectory, "skins", "Default");
+        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
         _chartEditorDefaultFontStore = string.Equals(
             Path.GetFullPath(defaultSkinDirectory), Path.GetFullPath(skin.SkinDirectory), StringComparison.OrdinalIgnoreCase)
             ? null
@@ -2119,8 +2123,10 @@ public sealed partial class Playfield
             initialVirtualHeight,
             skinSparklesEffect: skinSparklesEffect,
             skinQuad3DEffect: skinQuad3DEffect);
+        RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
         _skin.UIConfig = _skinRuntime.UIConfig;
-        _hitSounds = new HitSoundPlayer(skin.AudioDirectory);
+        var defaultAudioDirectory = Path.Combine(SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory), "audio");
+        _hitSounds = new HitSoundPlayer(skin.AudioDirectory, defaultAudioDirectory);
         _spriteBatch = new SpriteBatch(graphics);
         _primitiveEffect = new BasicEffect(graphics)
         {
@@ -2138,7 +2144,10 @@ public sealed partial class Playfield
         _pixel.SetData(new[] { Color.White });
         _circle = CreateCircleTexture(graphics, 64);
         _font = font;
-        _textures = new NoteTextures(graphics, skin.TextureDirectory);
+        _textures = new NoteTextures(
+            graphics,
+            skin.TextureDirectory,
+            Path.Combine(defaultSkinDirectory, "textures"));
         _textures.PreloadHitAnimations(
             ("regular", skin.RenderConfig.HitAnimation.Regular.FrameCount),
             ("multi", skin.RenderConfig.HitAnimation.Multi.FrameCount),
@@ -11134,16 +11143,35 @@ public sealed partial class Playfield
                 : "renderConfig.lua view restored (Tab switches to editorRenderConfig.lua)");
     }
 
+    private void RefreshChartEditorInterfaceLayoutForActiveScript(bool force = false)
+    {
+        var activeScriptPath = _chartEditorInterfaceRuntime.ActiveScriptPath;
+        if (!force && string.Equals(
+                _chartEditorInterfaceLayoutScriptPath,
+                activeScriptPath,
+                StringComparison.OrdinalIgnoreCase))
+            return;
+
+        _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Load(_skin, activeScriptPath);
+        _chartEditorInterfaceLayoutScriptPath = activeScriptPath;
+    }
+
     private bool ReloadEditorRenderConfig(out string? error)
     {
-        var path = Path.Combine(_skin.SkinDirectory, "editorRenderConfig.lua");
-        if (!RenderConfigLuaLoader.TryLoadOrCreate(
+        var path = SkinScriptPathResolver.Preferred(_skin.SkinDirectory, "editorRenderConfig.lua");
+        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(_skin.RootDirectory);
+        var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "editorRenderConfig.lua");
+        if (!RenderConfigLuaLoader.TryLoadWithFallback(
                 path,
+                defaultPath,
                 _graphics.Viewport.Width,
                 _graphics.Viewport.Height,
                 out var config,
                 out error))
+        {
+            _editorRenderConfig = config;
             return false;
+        }
 
         _editorRenderConfig = config;
         return true;
@@ -11186,7 +11214,6 @@ public sealed partial class Playfield
 
     private void RefreshSkinUiConfig()
     {
-        _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Load(_skin);
         var renderOk = SkinConfigStore.ReloadRenderConfig(
             _skin,
             _graphics.Viewport.Width,
@@ -11216,6 +11243,7 @@ public sealed partial class Playfield
         var resultScriptError = _resultSkinRuntime.LastError;
         var editorInterfaceScriptOk = _chartEditorInterfaceRuntime.Reload();
         var editorInterfaceScriptError = _chartEditorInterfaceRuntime.LastError;
+        RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
         if (scriptOk)
         {
             _skin.UIConfig = _skinRuntime.UIConfig;
@@ -11270,11 +11298,11 @@ public sealed partial class Playfield
         try
         {
             Program.LogRuntime("PLAYFIELD_SKIN_SCRIPTS_RELOAD_BEGIN");
-            _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Load(_skin);
             var scriptOk = _skinRuntime.Reload();
             var pauseOk = _pauseSkinRuntime.Reload();
             var resultOk = _resultSkinRuntime.Reload();
             var editorInterfaceOk = _chartEditorInterfaceRuntime.Reload();
+            RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
 
             if (scriptOk)
                 _skin.UIConfig = _skinRuntime.UIConfig;
@@ -11291,10 +11319,186 @@ public sealed partial class Playfield
         }
     }
 
+    private SkinRuntime CreateSkinRuntime(SkinContext skin, string scriptFileName, int width, int height)
+        => new(
+            skin.SkinDirectory,
+            _graphics,
+            scriptFileName,
+            skin.GameConfig,
+            UserDataPaths.GameConfigPath,
+            width,
+            height,
+            skinSparklesEffect: _skinSparklesEffect,
+            skinQuad3DEffect: _skinQuad3DEffect);
+
+    /// <summary>
+    /// Rebinds every skin-owned resource while keeping the currently open chart
+    /// and editor state alive. This is used when the selected skin changes from
+    /// the editor's Settings screen.
+    /// </summary>
+    public bool ApplySkinContext(SkinContext skin)
+    {
+        ArgumentNullException.ThrowIfNull(skin);
+
+        SkinRuntime? nextGameplayRuntime = null;
+        SkinRuntime? nextPauseRuntime = null;
+        SkinRuntime? nextResultRuntime = null;
+        SkinRuntime? nextEditorInterfaceRuntime = null;
+        SkinFontStore? nextEditorFontStore = null;
+        SkinFontStore? nextDefaultFontStore = null;
+        HitSoundPlayer? nextHitSounds = null;
+        NoteTextures? nextTextures = null;
+
+        try
+        {
+            var (virtualWidth, virtualHeight) = GetVirtualResolution(
+                _graphics.Viewport.Width, _graphics.Viewport.Height);
+            nextGameplayRuntime = CreateSkinRuntime(skin, "skin.lua", virtualWidth, virtualHeight);
+            nextPauseRuntime = CreateSkinRuntime(skin, "gameplayPause.lua", virtualWidth, virtualHeight);
+            nextResultRuntime = CreateSkinRuntime(skin, "gameplayResult.lua", virtualWidth, virtualHeight);
+            nextEditorInterfaceRuntime = CreateSkinRuntime(skin, "chartEditorInterface.lua", virtualWidth, virtualHeight);
+
+            var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
+            nextEditorFontStore = new SkinFontStore(_graphics, skin.SkinDirectory);
+            nextDefaultFontStore = string.Equals(
+                Path.GetFullPath(defaultSkinDirectory),
+                Path.GetFullPath(skin.SkinDirectory),
+                StringComparison.OrdinalIgnoreCase)
+                ? null
+                : new SkinFontStore(_graphics, defaultSkinDirectory);
+            var defaultAudioDirectory = Path.Combine(defaultSkinDirectory, "audio");
+            nextHitSounds = new HitSoundPlayer(skin.AudioDirectory, defaultAudioDirectory);
+            nextTextures = new NoteTextures(
+                _graphics,
+                skin.TextureDirectory,
+                Path.Combine(defaultSkinDirectory, "textures"));
+        }
+        catch (Exception ex)
+        {
+            nextGameplayRuntime?.Dispose();
+            nextPauseRuntime?.Dispose();
+            nextResultRuntime?.Dispose();
+            nextEditorInterfaceRuntime?.Dispose();
+            nextEditorFontStore?.Dispose();
+            nextDefaultFontStore?.Dispose();
+            nextHitSounds?.Dispose();
+            nextTextures?.Dispose();
+            Program.LogFatal("PLAYFIELD_SKIN_SWITCH_PREPARE", ex);
+            _statusMessage = $"Could not load skin '{skin.SkinName}': {ex.Message}";
+            return false;
+        }
+
+        // Build all replacement resources before releasing the active ones. This
+        // avoids leaving the editor without a usable skin if the new skin fails to
+        // initialize partway through.
+        _skinRuntime.Dispose();
+        _pauseSkinRuntime.Dispose();
+        _resultSkinRuntime.Dispose();
+        _chartEditorInterfaceRuntime.Dispose();
+        _chartEditorFontStore.Dispose();
+        _chartEditorDefaultFontStore?.Dispose();
+        _hitSounds.Dispose();
+        _textures.Dispose();
+        _editorMetronomeSound?.Dispose();
+        _editorMetronomeSound = null;
+        _editorMetronomeSoundLoadAttempted = false;
+        _editorMetronomeLastGridIndex = null;
+
+        _skin = skin;
+        _skinRuntime = nextGameplayRuntime!;
+        _pauseSkinRuntime = nextPauseRuntime!;
+        _resultSkinRuntime = nextResultRuntime!;
+        _chartEditorInterfaceRuntime = nextEditorInterfaceRuntime!;
+        _chartEditorFontStore = nextEditorFontStore!;
+        _chartEditorDefaultFontStore = nextDefaultFontStore;
+        _hitSounds = nextHitSounds!;
+        _textures = nextTextures!;
+
+        _skin.UIConfig = _skinRuntime.UIConfig;
+        var editorModeForGameplaySkin = _chartEditorMode && !_editorPreviewMode;
+        _skinRuntime.SetEditorMode(editorModeForGameplaySkin);
+        _pauseSkinRuntime.SetEditorMode(editorModeForGameplaySkin);
+        _resultSkinRuntime.SetEditorMode(editorModeForGameplaySkin);
+        _chartEditorInterfaceRuntime.SetEditorMode(_chartEditorMode);
+        _skinRuntime.SetEditorPreviewMode(_editorPreviewMode);
+
+        _activeGaugeType = GameConfig.NormalizeGaugeType(skin.GameConfig.Gauge);
+        _projection.ScrollSpeedScale = skin.GameConfig.ScrollSpeedScale;
+        if (_statusMessage?.StartsWith("Missing note textures:", StringComparison.OrdinalIgnoreCase) == true ||
+            _statusMessage?.StartsWith("editorRenderConfig.lua load failed:", StringComparison.OrdinalIgnoreCase) == true)
+            _statusMessage = null;
+        _editorRenderConfig = RenderConfigLuaLoader.LoadBuiltInDefault(
+            _graphics.Viewport.Width,
+            _graphics.Viewport.Height);
+        if (!ReloadEditorRenderConfig(out var editorRenderError))
+            _statusMessage = $"editorRenderConfig.lua load failed: {editorRenderError}";
+
+        if (_tempo is not null)
+            _projection.SetTempo(_tempo);
+        ApplyActiveViewRenderConfig();
+        _projection.InvalidateGeometryCaches();
+        InvalidateLaneMeshCache();
+        _editorHoverCacheValid = false;
+        _editorConnectorSplitPreviewCacheValid = false;
+        _hitAnimations.Clear();
+        _simultaneousCountsCache.Clear();
+        _skinDrawCommands = Array.Empty<SkinDrawCommand>();
+        _pauseSkinDrawCommands = Array.Empty<SkinDrawCommand>();
+        _resultSkinDrawCommands = Array.Empty<SkinDrawCommand>();
+        _skinLayerScratch.Clear();
+        _skinSpriteScratch.Clear();
+        _skinTextPrimitiveScratch.Clear();
+        _skinQuad3DScratch.Clear();
+        _gameplayRenderTarget?.Dispose();
+        _gameplayRenderTarget = null;
+        _gameplayRenderTargetPreservesContents = false;
+        _editorInactiveBankRenderTarget?.Dispose();
+        _editorInactiveBankRenderTarget = null;
+        _editorConnectorPreviewRenderTarget?.Dispose();
+        _editorConnectorPreviewRenderTarget = null;
+        _editorNoteGroupPlacementPreviewRenderTarget?.Dispose();
+        _editorNoteGroupPlacementPreviewRenderTarget = null;
+        _editorNoteGroupPlacementPreviewCacheValid = false;
+
+        RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
+        if (_chart is not null && _tempo is not null)
+        {
+            _skinRuntime.SetPanelTracks(_chart, _tempo);
+            _pauseSkinRuntime.SetPanelTracks(_chart, _tempo);
+            _resultSkinRuntime.SetPanelTracks(_chart, _tempo);
+            RefreshResultSongInfo();
+        }
+        RefreshSkinGameState();
+
+        var (currentVirtualWidth, currentVirtualHeight) = GetVirtualResolution(
+            _graphics.Viewport.Width,
+            _graphics.Viewport.Height);
+        _lastRenderConfigVirtualWidth = currentVirtualWidth;
+        _lastRenderConfigVirtualHeight = currentVirtualHeight;
+
+        var mainSkinError = _skinRuntime.LastError ?? "none";
+        var pauseSkinError = _pauseSkinRuntime.LastError ?? "none";
+        var resultSkinError = _resultSkinRuntime.LastError ?? "none";
+        var editorSkinError = _chartEditorInterfaceRuntime.LastError ?? "none";
+        Program.LogRuntime(
+            $"PLAYFIELD_SKIN_SWITCH_DONE skin={skin.SkinName} texturesMissing={_textures.MissingFiles.Count} " +
+            $"mainLoaded={_skinRuntime.IsLoaded} pauseLoaded={_pauseSkinRuntime.IsLoaded} " +
+            $"resultLoaded={_resultSkinRuntime.IsLoaded} editorLoaded={_chartEditorInterfaceRuntime.IsLoaded} " +
+            $"mainError={mainSkinError} pauseError={pauseSkinError} " +
+            $"resultError={resultSkinError} editorError={editorSkinError}");
+        if (_textures.MissingFiles.Count > 0)
+            _statusMessage = $"Missing note textures: {string.Join(", ", _textures.MissingFiles)}";
+        return _skinRuntime.LastError is null &&
+               _pauseSkinRuntime.LastError is null &&
+               _resultSkinRuntime.LastError is null &&
+               _chartEditorInterfaceRuntime.LastError is null;
+    }
+
     private void OpenFpkDialog() => OpenFpkRequested?.Invoke();
     private void OpenAresDialog() => OpenAresRequested?.Invoke();
     public void Update(GameTime gameTime)
     {
+        RefreshChartEditorInterfaceLayoutForActiveScript();
         ApplyLiveGameConfigSettings();
 
         if (_hardGaugeGameOverActive)

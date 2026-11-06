@@ -323,6 +323,7 @@ public sealed partial class Playfield
                 _chartEditorInterfaceRuntime.UpdateChartEditorInterfaceState(
                     BuildChartEditorInterfaceState(virtualWidth, virtualHeight));
                 var editorCommands = _chartEditorInterfaceRuntime.BuildDrawCommands(virtualWidth, virtualHeight);
+                RefreshChartEditorInterfaceLayoutForActiveScript();
                 if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
                 {
                     DrawSkinScriptUiLayers(editorCommands, false, _chartEditorInterfaceRuntime);

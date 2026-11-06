@@ -494,7 +494,15 @@ public static class SkinConfigStore
     {
         var root = FindRootDirectory();
         UserDataPaths.Initialize(root);
-        Directory.CreateDirectory(Path.Combine(root, "skins"));
+        var skinsDirectory = SkinScriptPathResolver.SkinsDirectory(root);
+        Directory.CreateDirectory(skinsDirectory);
+        var defaultSkinDirectory = Path.Combine(skinsDirectory, "Default");
+        var defaultEntryPoint = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "skin.lua");
+        if (!File.Exists(defaultEntryPoint))
+        {
+            Program.LogRuntime($"DEFAULT_SKIN_ENTRYPOINT_MISSING path={defaultEntryPoint} root={root} cwd={Environment.CurrentDirectory} appBase={AppContext.BaseDirectory}");
+        }
+
         var gameConfig = LoadOrCreateGameConfig(UserDataPaths.GameConfigPath);
 
         var requestedSkin = string.IsNullOrWhiteSpace(gameConfig.Skin) ? "Default" : gameConfig.Skin.Trim();
@@ -506,10 +514,11 @@ public static class SkinConfigStore
             !string.Equals(Path.GetFileName(requestedSkin), requestedSkin, StringComparison.Ordinal))
             requestedSkin = "Default";
 #endif
-        var skinDirectory = Path.Combine(root, "skins", requestedSkin);
+        var skinDirectory = Path.Combine(skinsDirectory, requestedSkin);
+        Program.LogRuntime($"SKIN_ROOT root={root} skins={skinsDirectory} selected={requestedSkin} skinDirectory={skinDirectory} defaultEntryPoint={defaultEntryPoint}");
         if (!Directory.Exists(skinDirectory) && !requestedSkin.Equals("Default", StringComparison.OrdinalIgnoreCase))
         {
-            var fallback = Path.Combine(root, "skins", "Default");
+            var fallback = defaultSkinDirectory;
             if (Directory.Exists(fallback))
             {
                 requestedSkin = "Default";
@@ -546,39 +555,36 @@ public static class SkinConfigStore
         int outputHeight,
         out string? error)
     {
-        if (!RenderConfigLuaLoader.TryLoadOrCreate(
-                Path.Combine(skin.SkinDirectory, "renderConfig.lua"),
-                outputWidth, outputHeight, out var config, out error))
+        var primaryPath = SkinScriptPathResolver.Preferred(skin.SkinDirectory, "renderConfig.lua");
+        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
+        var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "renderConfig.lua");
+        if (!RenderConfigLuaLoader.TryLoadWithFallback(
+                primaryPath, defaultPath, outputWidth, outputHeight, out var config, out error))
+        {
+            skin.RenderConfig = config;
             return false;
+        }
 
         skin.RenderConfig = config;
         return true;
     }
 
     private static string FindRootDirectory()
-    {
-#if TSC_PUBLISH
-        // The published game executable lives in data/, while skins are beside
-        // the tiny root launcher.
-        return UserDataPaths.GameRootDirectory;
-#else
-        var cwd = Directory.GetCurrentDirectory();
-        if (File.Exists(Path.Combine(cwd, "gameConfig.json")) || Directory.Exists(Path.Combine(cwd, "skins")))
-            return cwd;
-
-        var baseDirectory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        return baseDirectory;
-#endif
-    }
+        => UserDataPaths.GameRootDirectory;
 
     private static RenderConfig LoadOrCreateRenderConfig(
         string skinDirectory,
         int outputWidth,
         int outputHeight)
     {
-        return RenderConfigLuaLoader.LoadOrCreate(
-            Path.Combine(skinDirectory, "renderConfig.lua"),
-            outputWidth, outputHeight);
+        var primaryPath = SkinScriptPathResolver.Preferred(skinDirectory, "renderConfig.lua");
+        var skinParentDirectory = Directory.GetParent(Path.GetFullPath(skinDirectory))?.FullName
+                                  ?? UserDataPaths.GameRootDirectory;
+        var defaultSkinDirectory = Path.Combine(skinParentDirectory, "Default");
+        var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "renderConfig.lua");
+        _ = RenderConfigLuaLoader.TryLoadWithFallback(
+            primaryPath, defaultPath, outputWidth, outputHeight, out var config, out _);
+        return config;
     }
 
     private static GameConfig LoadOrCreateGameConfig(string path)

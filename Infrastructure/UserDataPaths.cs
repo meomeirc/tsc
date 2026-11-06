@@ -49,15 +49,9 @@ public static class UserDataPaths
                 return Directory.GetParent(Path.TrimEndingDirectorySeparator(appDirectory))?.FullName ?? appDirectory;
             return appDirectory;
 #else
-            var cwd = Environment.CurrentDirectory;
-            if (File.Exists(Path.Combine(cwd, "gameConfig.json")) || Directory.Exists(Path.Combine(cwd, "skins")))
-                return Path.GetFullPath(cwd);
-
-            var baseDirectory = Path.GetFullPath(AppContext.BaseDirectory);
-            if (File.Exists(Path.Combine(baseDirectory, "gameConfig.json")) || Directory.Exists(Path.Combine(baseDirectory, "skins")))
-                return baseDirectory;
-
-            return Path.GetFullPath(cwd);
+            return SkinScriptPathResolver.FindDeveloperRootDirectory(
+                Environment.CurrentDirectory,
+                AppContext.BaseDirectory);
 #endif
         }
     }

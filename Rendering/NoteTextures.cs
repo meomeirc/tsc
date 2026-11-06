@@ -7,6 +7,7 @@ public sealed class NoteTextures : IDisposable
     private readonly GraphicsDevice _graphics;
     private readonly Dictionary<string, Texture2D?> _textures = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _textureDirectory;
+    private readonly string? _fallbackTextureDirectory;
 
     private static readonly (string Key, string RelativePath)[] TextureFiles =
     {
@@ -58,11 +59,22 @@ public sealed class NoteTextures : IDisposable
         ("judgement-miss", "judgement/miss.png")
     };
 
-    public NoteTextures(GraphicsDevice graphics, string textureDirectory)
+    public NoteTextures(GraphicsDevice graphics, string textureDirectory, string? fallbackTextureDirectory = null)
     {
         _graphics = graphics;
-        _textureDirectory = textureDirectory;
-        Load(textureDirectory);
+        _textureDirectory = Path.GetFullPath(textureDirectory);
+        if (string.IsNullOrWhiteSpace(fallbackTextureDirectory))
+        {
+            _fallbackTextureDirectory = null;
+        }
+        else
+        {
+            var fallback = Path.GetFullPath(fallbackTextureDirectory);
+            _fallbackTextureDirectory = string.Equals(fallback, _textureDirectory, StringComparison.OrdinalIgnoreCase)
+                ? null
+                : fallback;
+        }
+        Load();
     }
 
     public IReadOnlyList<string> MissingFiles { get; private set; } = Array.Empty<string>();
@@ -82,25 +94,13 @@ public sealed class NoteTextures : IDisposable
             return cached;
 
         var relativePath = Path.Combine($"hit-{variant}", $"{frameNumber:0000}.png");
-        var path = Path.Combine(_textureDirectory, relativePath);
-        Texture2D? texture = null;
-        if (File.Exists(path))
+        var (texture, failedPath, lastError) = TryLoadTexture(relativePath);
+        if (texture is null)
         {
-            try
-            {
-                using var stream = File.OpenRead(path);
-                texture = Texture2D.FromStream(_graphics, stream);
-            }
-            catch (Exception ex)
-            {
-                texture?.Dispose();
-                texture = null;
-                Program.LogRuntime($"SKIN_TEXTURE_LOAD_FAILED path={path} error={ex.Message}");
-            }
-        }
-        else
-        {
-            Program.LogRuntime($"SKIN_TEXTURE_MISSING path={path}");
+            if (lastError is not null)
+                Program.LogRuntime($"SKIN_TEXTURE_LOAD_FAILED path={failedPath} error={lastError}");
+            else
+                Program.LogRuntime($"SKIN_TEXTURE_MISSING path={Path.Combine(_textureDirectory, relativePath)}");
         }
 
         _textures[key] = texture;
@@ -127,44 +127,73 @@ public sealed class NoteTextures : IDisposable
         return Get($"combo-{digit}");
     }
 
-    private void Load(string textureDirectory)
+    private void Load()
     {
         var missing = new List<string>();
 
         foreach (var (key, relativePath) in TextureFiles)
-            LoadOne(textureDirectory, key, relativePath, missing);
+            LoadOne(key, relativePath, missing);
 
         for (var digit = 0; digit <= 9; digit++)
-            LoadOne(textureDirectory, $"combo-{digit}", Path.Combine("combo", $"{digit}.png"), missing);
+            LoadOne($"combo-{digit}", Path.Combine("combo", $"{digit}.png"), missing);
 
         MissingFiles = missing;
     }
 
-    private void LoadOne(string textureDirectory, string key, string relativePath, List<string> missing)
+    private void LoadOne(string key, string relativePath, List<string> missing)
     {
-        Texture2D? texture = null;
-        var path = Path.Combine(textureDirectory, relativePath);
-        if (File.Exists(path))
-        {
-            try
-            {
-                using var stream = File.OpenRead(path);
-                texture = Texture2D.FromStream(_graphics, stream);
-            }
-            catch
-            {
-                texture?.Dispose();
-                texture = null;
-            }
-        }
-
+        var (texture, failedPath, lastError) = TryLoadTexture(relativePath);
         _textures[key] = texture;
         if (texture is null)
         {
             var normalized = relativePath.Replace(Path.DirectorySeparatorChar, '/');
             missing.Add(normalized);
-            Program.LogRuntime($"SKIN_TEXTURE_MISSING path={Path.Combine(textureDirectory, relativePath)}");
+            if (lastError is not null)
+                Program.LogRuntime($"SKIN_TEXTURE_LOAD_FAILED path={failedPath} error={lastError}");
+            else
+                Program.LogRuntime($"SKIN_TEXTURE_MISSING path={Path.Combine(_textureDirectory, relativePath)}");
         }
+    }
+
+    private (Texture2D? Texture, string? FailedPath, string? LastError) TryLoadTexture(string relativePath)
+    {
+        var directories = _fallbackTextureDirectory is null
+            ? new[] { _textureDirectory }
+            : new[] { _textureDirectory, _fallbackTextureDirectory };
+        string? failedPath = null;
+        string? lastError = null;
+
+        foreach (var directory in directories)
+        {
+            string path;
+            try
+            {
+                path = Path.GetFullPath(Path.Combine(directory, relativePath));
+                var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                           + Path.DirectorySeparatorChar;
+                if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(path))
+                    continue;
+            }
+            catch
+            {
+                continue;
+            }
+
+            try
+            {
+                using var stream = File.OpenRead(path);
+                return (Texture2D.FromStream(_graphics, stream), null, null);
+            }
+            catch (Exception ex)
+            {
+                failedPath = path;
+                lastError = ex.Message;
+                // Continue to the matching Default texture when a custom file is
+                // present but unreadable.
+            }
+        }
+
+        return (null, failedPath, lastError);
     }
 
     public void Dispose()

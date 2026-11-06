@@ -52,97 +52,131 @@ internal sealed record ChartEditorInterfaceLayout
     public string Label(string key, string fallback)
         => Labels.TryGetValue(key, out var label) && !string.IsNullOrWhiteSpace(label) ? label : fallback;
 
-    public static ChartEditorInterfaceLayout Load(SkinContext skin)
+    public static ChartEditorInterfaceLayout Load(SkinContext skin, string? activeScriptPath)
     {
-        var customPath = Path.Combine(skin.SkinDirectory, "chartEditorInterface.lua");
-        var defaultPath = Path.Combine(skin.RootDirectory, "skins", "Default", "chartEditorInterface.lua");
-        var path = File.Exists(customPath) ? customPath : defaultPath;
-        if (!File.Exists(path))
+        if (string.IsNullOrWhiteSpace(activeScriptPath) || !File.Exists(activeScriptPath))
             return Default;
 
+        var defaultRoot = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
         try
         {
-            var script = new Script(CoreModules.Preset_HardSandbox);
-            var moduleCache = new Dictionary<string, DynValue>(StringComparer.OrdinalIgnoreCase);
-            script.Globals["import"] = DynValue.NewCallback((_, args) =>
-            {
-                if (args.Count == 0 || args[0].Type != DataType.String)
-                    throw new InvalidDataException("import(path) expects a string path.");
-                var moduleName = args[0].String.Trim().Replace('\\', '/');
-                if (moduleName.Contains("..", StringComparison.Ordinal) || Path.IsPathRooted(moduleName))
-                    throw new InvalidDataException("Unsafe Lua module path.");
-                if (moduleCache.TryGetValue(moduleName, out var cached))
-                    return cached;
-                var relative = moduleName.EndsWith(".lua", StringComparison.OrdinalIgnoreCase)
-                    ? moduleName : moduleName + ".lua";
-                var customModule = Path.GetFullPath(Path.Combine(skin.SkinDirectory, relative.Replace('/', Path.DirectorySeparatorChar)));
-                var defaultRoot = Path.Combine(skin.RootDirectory, "skins", "Default");
-                var defaultModule = Path.GetFullPath(Path.Combine(defaultRoot, relative.Replace('/', Path.DirectorySeparatorChar)));
-                var modulePath = File.Exists(customModule) ? customModule : defaultModule;
-                if (!File.Exists(modulePath))
-                    throw new FileNotFoundException($"Lua module not found: {moduleName}");
-                var result = script.DoString(File.ReadAllText(modulePath), script.Globals, modulePath);
-                moduleCache[moduleName] = result;
-                return result;
-            });
-            var result = script.DoString(File.ReadAllText(path), null, path);
-            if (result.Type != DataType.Table)
-                throw new InvalidDataException("The script must return a table.");
-
-            var layout = result.Table.Get("layout");
-            if (layout.Type != DataType.Table)
-                throw new InvalidDataException("The returned table must contain a layout table.");
-            var styleValue = result.Table.Get("style");
-            var style = styleValue.Type == DataType.Table ? styleValue.Table : new Table(script);
-            var labelsValue = result.Table.Get("labels");
-            var labels = ReadLabels(labelsValue);
-
-            var defaults = Default;
-            return new ChartEditorInterfaceLayout
-            {
-                EdgeMargin = Read(layout.Table, "edge_margin", defaults.EdgeMargin, 0, 160),
-                PanelPadding = Read(layout.Table, "panel_padding", defaults.PanelPadding, 0, 64),
-                PanelGap = Read(layout.Table, "panel_gap", defaults.PanelGap, 0, 160),
-                ActionColumnWidth = Read(layout.Table, "action_column_width", defaults.ActionColumnWidth, 90, 420),
-                ActionButtonHeight = Read(layout.Table, "action_button_height", defaults.ActionButtonHeight, 28, 100),
-                ActionButtonGap = Read(layout.Table, "action_button_gap", defaults.ActionButtonGap, 0, 36),
-                ToolbarWidth = Read(layout.Table, "toolbar_width", defaults.ToolbarWidth, 220, 1000),
-                PanelsToolbarWidth = Read(layout.Table, "panels_toolbar_width", defaults.PanelsToolbarWidth, 160, 600),
-                LeftToolbarMaxWidth = Read(layout.Table, "left_toolbar_max_width", defaults.LeftToolbarMaxWidth, 360, 2200),
-                LeftToolbarButtonHeight = Read(layout.Table, "left_toolbar_button_height", defaults.LeftToolbarButtonHeight, 28, 100),
-                LeftToolbarButtonGap = Read(layout.Table, "left_toolbar_button_gap", defaults.LeftToolbarButtonGap, 0, 36),
-                MetadataPanelWidth = Read(layout.Table, "metadata_panel_width", defaults.MetadataPanelWidth, 420, 1400),
-                MetadataPanelMargin = Read(layout.Table, "metadata_panel_margin", defaults.MetadataPanelMargin, 0, 120),
-                ScrollButtonSize = Read(layout.Table, "scroll_button_size", defaults.ScrollButtonSize, 28, 100),
-                ScrollSpeedWidth = Read(layout.Table, "scroll_speed_width", defaults.ScrollSpeedWidth, 160, 500),
-                TimelineWidth = Read(layout.Table, "timeline_width", defaults.TimelineWidth, 64, 360),
-                ProblemsMaxWidth = Read(layout.Table, "problems_max_width", defaults.ProblemsMaxWidth, 300, 1800),
-                ProblemsMaxHeight = Read(layout.Table, "problems_max_height", defaults.ProblemsMaxHeight, 100, 700),
-                ButtonTextScale = Read(style, "button_text_scale", defaults.ButtonTextScale, 0.65, 1.8),
-                LabelTextScale = Read(style, "label_text_scale", defaults.LabelTextScale, 0.65, 1.8),
-                AccentWidth = Read(style, "accent_width", defaults.AccentWidth, 1, 12),
-                PanelColor = ReadColor(style, "panel", defaults.PanelColor),
-                HeaderColor = ReadColor(style, "header", defaults.HeaderColor),
-                ButtonColor = ReadColor(style, "button", defaults.ButtonColor),
-                HoverButtonColor = ReadColor(style, "hover", defaults.HoverButtonColor),
-                PressedButtonColor = ReadColor(style, "pressed", defaults.PressedButtonColor),
-                SelectedButtonColor = ReadColor(style, "selected_button", defaults.SelectedButtonColor),
-                ButtonTextColor = ReadColor(style, "text", defaults.ButtonTextColor),
-                PrimaryButtonTextColor = ReadColor(style, "primary_text", defaults.PrimaryButtonTextColor),
-                MutedTextColor = ReadColor(style, "muted_text", defaults.MutedTextColor),
-                AccentColor = ReadColor(style, "accent", defaults.AccentColor),
-                DangerColor = ReadColor(style, "danger", defaults.DangerColor),
-                ButtonFont = ReadFont(style, "button_font", defaults.ButtonFont),
-                LabelFont = ReadFont(style, "label_font", defaults.LabelFont),
-                HeaderFont = ReadFont(style, "header_font", defaults.HeaderFont),
-                Labels = labels,
-            };
+            var layout = TryLoadCandidate(activeScriptPath, skin.SkinDirectory, defaultRoot);
+            Program.LogRuntime($"[skin] loaded chart editor interface layout: {activeScriptPath}");
+            return layout;
         }
         catch (Exception ex)
         {
-            Program.LogRuntime($"CHART_EDITOR_INTERFACE_LUA_FAILED path={path} error={ex.Message}; using C# defaults");
+            Program.LogRuntime(
+                $"CHART_EDITOR_INTERFACE_LUA_FAILED path={activeScriptPath} error={ex}; using built-in C# defaults");
             return Default;
         }
+    }
+
+    private static ChartEditorInterfaceLayout TryLoadCandidate(string path, string skinRoot, string defaultRoot)
+    {
+        // pcall/xpcall support the skin's isolated fallback handling; retain the hard sandbox for all other APIs.
+        var script = new Script(CoreModules.Preset_HardSandbox | CoreModules.ErrorHandling);
+        var moduleCache = new Dictionary<string, DynValue>(StringComparer.OrdinalIgnoreCase);
+        var activeRoot = Path.GetDirectoryName(Path.GetFullPath(path)) ?? defaultRoot;
+        var moduleRoots = new List<string>();
+        AddUniquePath(moduleRoots, Path.Combine(skinRoot, "scripts"));
+        AddUniquePath(moduleRoots, activeRoot);
+        AddUniquePath(moduleRoots, skinRoot); // legacy root-level partials
+        AddUniquePath(moduleRoots, Path.Combine(defaultRoot, "scripts"));
+        AddUniquePath(moduleRoots, defaultRoot); // legacy Default partials
+
+        script.Globals["import"] = DynValue.NewCallback((_, args) =>
+        {
+            if (args.Count == 0 || args[0].Type != DataType.String)
+                throw new InvalidDataException("import(path) expects a string path.");
+            var moduleName = args[0].String.Trim().Replace('\\', '/');
+            if (moduleName.Contains("..", StringComparison.Ordinal) || Path.IsPathRooted(moduleName))
+                throw new InvalidDataException("Unsafe Lua module path.");
+            if (moduleCache.TryGetValue(moduleName, out var cached))
+                return cached;
+
+            var relative = moduleName.EndsWith(".lua", StringComparison.OrdinalIgnoreCase)
+                ? moduleName : moduleName + ".lua";
+            string? modulePath = null;
+            foreach (var root in moduleRoots)
+            {
+                var fullRoot = Path.GetFullPath(root);
+                var candidate = Path.GetFullPath(Path.Combine(fullRoot, relative.Replace('/', Path.DirectorySeparatorChar)));
+                var rootPrefix = fullRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                                 + Path.DirectorySeparatorChar;
+                if (!candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) || !File.Exists(candidate))
+                    continue;
+                modulePath = candidate;
+                break;
+            }
+
+            if (modulePath is null)
+                throw new FileNotFoundException($"Lua module not found: {moduleName}");
+
+            var result = script.DoString(File.ReadAllText(modulePath), script.Globals, modulePath);
+            moduleCache[moduleName] = result;
+            return result;
+        });
+
+        var result = script.DoString(File.ReadAllText(path), null, path);
+        if (result.Type != DataType.Table)
+            throw new InvalidDataException("The script must return a table.");
+
+        var layout = result.Table.Get("layout");
+        if (layout.Type != DataType.Table)
+            throw new InvalidDataException("The returned table must contain a layout table.");
+        var styleValue = result.Table.Get("style");
+        var style = styleValue.Type == DataType.Table ? styleValue.Table : new Table(script);
+        var labelsValue = result.Table.Get("labels");
+        var labels = ReadLabels(labelsValue);
+
+        var defaults = Default;
+        return new ChartEditorInterfaceLayout
+        {
+            EdgeMargin = Read(layout.Table, "edge_margin", defaults.EdgeMargin, 0, 160),
+            PanelPadding = Read(layout.Table, "panel_padding", defaults.PanelPadding, 0, 64),
+            PanelGap = Read(layout.Table, "panel_gap", defaults.PanelGap, 0, 160),
+            ActionColumnWidth = Read(layout.Table, "action_column_width", defaults.ActionColumnWidth, 90, 420),
+            ActionButtonHeight = Read(layout.Table, "action_button_height", defaults.ActionButtonHeight, 28, 100),
+            ActionButtonGap = Read(layout.Table, "action_button_gap", defaults.ActionButtonGap, 0, 36),
+            ToolbarWidth = Read(layout.Table, "toolbar_width", defaults.ToolbarWidth, 220, 1000),
+            PanelsToolbarWidth = Read(layout.Table, "panels_toolbar_width", defaults.PanelsToolbarWidth, 160, 600),
+            LeftToolbarMaxWidth = Read(layout.Table, "left_toolbar_max_width", defaults.LeftToolbarMaxWidth, 360, 2200),
+            LeftToolbarButtonHeight = Read(layout.Table, "left_toolbar_button_height", defaults.LeftToolbarButtonHeight, 28, 100),
+            LeftToolbarButtonGap = Read(layout.Table, "left_toolbar_button_gap", defaults.LeftToolbarButtonGap, 0, 36),
+            MetadataPanelWidth = Read(layout.Table, "metadata_panel_width", defaults.MetadataPanelWidth, 420, 1400),
+            MetadataPanelMargin = Read(layout.Table, "metadata_panel_margin", defaults.MetadataPanelMargin, 0, 120),
+            ScrollButtonSize = Read(layout.Table, "scroll_button_size", defaults.ScrollButtonSize, 28, 100),
+            ScrollSpeedWidth = Read(layout.Table, "scroll_speed_width", defaults.ScrollSpeedWidth, 160, 500),
+            TimelineWidth = Read(layout.Table, "timeline_width", defaults.TimelineWidth, 64, 360),
+            ProblemsMaxWidth = Read(layout.Table, "problems_max_width", defaults.ProblemsMaxWidth, 300, 1800),
+            ProblemsMaxHeight = Read(layout.Table, "problems_max_height", defaults.ProblemsMaxHeight, 100, 700),
+            ButtonTextScale = Read(style, "button_text_scale", defaults.ButtonTextScale, 0.65, 1.8),
+            LabelTextScale = Read(style, "label_text_scale", defaults.LabelTextScale, 0.65, 1.8),
+            AccentWidth = Read(style, "accent_width", defaults.AccentWidth, 1, 12),
+            PanelColor = ReadColor(style, "panel", defaults.PanelColor),
+            HeaderColor = ReadColor(style, "header", defaults.HeaderColor),
+            ButtonColor = ReadColor(style, "button", defaults.ButtonColor),
+            HoverButtonColor = ReadColor(style, "hover", defaults.HoverButtonColor),
+            PressedButtonColor = ReadColor(style, "pressed", defaults.PressedButtonColor),
+            SelectedButtonColor = ReadColor(style, "selected_button", defaults.SelectedButtonColor),
+            ButtonTextColor = ReadColor(style, "text", defaults.ButtonTextColor),
+            PrimaryButtonTextColor = ReadColor(style, "primary_text", defaults.PrimaryButtonTextColor),
+            MutedTextColor = ReadColor(style, "muted_text", defaults.MutedTextColor),
+            AccentColor = ReadColor(style, "accent", defaults.AccentColor),
+            DangerColor = ReadColor(style, "danger", defaults.DangerColor),
+            ButtonFont = ReadFont(style, "button_font", defaults.ButtonFont),
+            LabelFont = ReadFont(style, "label_font", defaults.LabelFont),
+            HeaderFont = ReadFont(style, "header_font", defaults.HeaderFont),
+            Labels = labels,
+        };
+    }
+
+    private static void AddUniquePath(List<string> paths, string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        if (!paths.Any(existing => string.Equals(existing, fullPath, StringComparison.OrdinalIgnoreCase)))
+            paths.Add(fullPath);
     }
 
     private static double Read(Table table, string key, double fallback, double minimum, double maximum)
