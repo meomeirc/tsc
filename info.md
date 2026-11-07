@@ -1,5 +1,10 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.41
+
+- added BBCode support. right click on text fields to show the options
+- some fixes to the fallback layout
+
 # 0.0.40
 
 - made the skin modular and some adjustments to the default skin
