@@ -353,6 +353,15 @@ local function fit_text_size(value, baseSize, maxWidth)
     return math.min(baseSize, math.max(0.01, maxWidth / units))
 end
 
+local function fit_user_text_size(value, baseSize, maxWidth, font)
+    local measured = draw.measure_user_text_width(tostring(value or ""), {
+        font = font or FONT_REGULAR,
+        size = baseSize,
+    })
+    if measured <= 0 or measured <= maxWidth then return baseSize end
+    return math.max(0.01, baseSize * maxWidth / measured)
+end
+
 local function score_text(score)
     score = math.floor(tonumber(score or 0) or 0)
     if score <= 0 then
@@ -493,11 +502,15 @@ local function draw_card(song, x, y, size, scale, absolute_index)
         layer = 3,
     })
 
-    draw.text(truncate(song.name, L.title.max_chars), {
+    local titleValue = tostring(song.name or "")
+    local titleX = px(L.title.x, scale)
+    local titleSize = fit_user_text_size(titleValue, px(L.title.size, scale),
+        math.max(1, size - titleX - px(14, scale)), FONT_BOLD)
+    draw.user_text(titleValue, {
         parent = card_id,
-        x = px(L.title.x, scale),
+        x = titleX,
         y = size - px(300 - L.title.y, scale),
-        size = px(L.title.size, scale),
+        size = titleSize,
         color = WHITE,
         font = FONT_BOLD,
         anchor = L.title.anchor or "left",
@@ -505,11 +518,15 @@ local function draw_card(song, x, y, size, scale, absolute_index)
         shadow = soft_shadow(FONT_BOLD, 1.5 * scale, 1.5 * scale, 0.75),
     })
 
-    draw.text(truncate(song.artist, L.artist.max_chars), {
+    local artistValue = tostring(song.artist or "")
+    local artistX = px(L.artist.x, scale)
+    local artistSize = fit_user_text_size(artistValue, px(L.artist.size, scale),
+        math.max(1, size - artistX - px(14, scale)), FONT_REGULAR)
+    draw.user_text(artistValue, {
         parent = card_id,
-        x = px(L.artist.x, scale),
+        x = artistX,
         y = size - px(300 - L.artist.y, scale),
-        size = px(L.artist.size, scale),
+        size = artistSize,
         color = SOFT,
         font = FONT_REGULAR,
         anchor = L.artist.anchor or "left",
@@ -519,11 +536,14 @@ local function draw_card(song, x, y, size, scale, absolute_index)
 
     local series = display_series(song.series)
     if series ~= "" then
-        draw.text(truncate(series, L.series.max_chars), {
+        local seriesX = px(L.series.x, scale)
+        local seriesSize = fit_user_text_size(series, px(L.series.size, scale),
+            math.max(1, size - seriesX - px(14, scale)), FONT_BOLD)
+        draw.user_text(series, {
             parent = card_id,
-            x = px(L.series.x, scale),
+            x = seriesX,
             y = px(L.series.y, scale),
-            size = px(L.series.size, scale),
+            size = seriesSize,
             color = WHITE,
             font = FONT_BOLD,
             anchor = "left",
@@ -651,11 +671,11 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
 
     local selected_title = tostring(selected.name or "")
     local selected_title_x = px(P.title.x, panelScale)
-    local selected_title_size = fit_text_size(
+    local selected_title_size = fit_user_text_size(
         selected_title,
         px(P.title.size, panelScale),
-        math.max(1, art_size - selected_title_x - px(16, panelScale)))
-    draw.text(selected_title, {
+        math.max(1, art_size - selected_title_x - px(16, panelScale)), FONT_BOLD)
+    draw.user_text(selected_title, {
         parent = "song_selected_panel",
         x = selected_title_x,
         y = frame_y + art_size - px(P.art_max_size - P.title.y, panelScale),
@@ -665,20 +685,27 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     })
     local series = display_series(selected.series)
     if series ~= "" then
-        draw.text(truncate(series, P.series.max_chars), {
+        local seriesX = px(P.series.x, panelScale)
+        local seriesSize = fit_user_text_size(series, px(P.artist.size, panelScale),
+            math.max(1, art_size - seriesX - px(16, panelScale)), FONT_REGULAR)
+        draw.user_text(series, {
             parent = "song_selected_panel",
-            x = px(P.series.x, panelScale),
+            x = seriesX,
             y = frame_y + art_size - px(P.art_max_size - P.series.y, panelScale),
-            size = px(P.artist.size, panelScale),
+            size = seriesSize,
             color = SOFT, font = FONT_REGULAR, anchor = P.series.anchor or "left", layer = 28,
             shadow = soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8),
         })
     end
-    draw.text(truncate(selected.artist, P.artist.max_chars), {
+    local selected_artist = tostring(selected.artist or "")
+    local selected_artist_x = px(P.artist.x, panelScale)
+    local selected_artist_size = fit_user_text_size(selected_artist, px(P.artist.size, panelScale),
+        math.max(1, art_size - selected_artist_x - px(16, panelScale)), FONT_REGULAR)
+    draw.user_text(selected_artist, {
         parent = "song_selected_panel",
-        x = px(P.artist.x, panelScale),
+        x = selected_artist_x,
         y = frame_y + art_size - px(P.art_max_size - P.artist.y, panelScale),
-        size = px(P.artist.size, panelScale),
+        size = selected_artist_size,
         color = WHITE, font = FONT_REGULAR, anchor = P.artist.anchor or "left", layer = 28,
         shadow = soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8),
     })

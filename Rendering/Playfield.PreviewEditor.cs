@@ -1611,9 +1611,10 @@ public sealed partial class Playfield
     private void DrawEditorPreviewEditorOverlay(int virtualWidth, int virtualHeight)
     {
         var interfaceUi = _chartEditorInterfaceLayout;
-        var headerFont = GetChartEditorFont(interfaceUi.HeaderFont);
-        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
+        var headerFont = _font;
+        var labelFont = _font;
         var unit = _projection.ScalePixels(1f);
+        var headerScale = GetEditorDefaultFontScale("MUSIC PREVIEW", 24f * unit);
         var panel = GetEditorPreviewEditorDialogBounds(virtualWidth, virtualHeight);
         _spriteBatch.Draw(_pixel, new Rectangle(0, 0, virtualWidth, virtualHeight), new Color(0, 0, 0, 185));
         _spriteBatch.Draw(_pixel, panel, interfaceUi.PanelColor);
@@ -1624,7 +1625,9 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(panel.Right - edge, panel.Y, edge, panel.Height), interfaceUi.HeaderColor);
 
         var title = FontSafeText(headerFont, "MUSIC PREVIEW");
-        UnicodeTextRenderer.DrawString(_spriteBatch, headerFont, title, new Vector2(panel.X + 28f * unit, panel.Y + 22f * unit), interfaceUi.ButtonTextColor);
+        UnicodeTextRenderer.DrawString(_spriteBatch, headerFont, title,
+            new Vector2(panel.X + 28f * unit, panel.Y + 22f * unit), interfaceUi.ButtonTextColor,
+            0f, Vector2.Zero, headerScale, SpriteEffects.None, 0f);
         var sourceDuration = EditorPreviewSourceDurationSeconds;
         var subtitle = sourceDuration > 0
             ? $"Choose a section of the full song. Length: {FormatEditorPreviewTimestamp(sourceDuration)}. A subtle fade is added at each end."
@@ -1646,9 +1649,15 @@ public sealed partial class Playfield
 
         var minLabel = FontSafeText(labelFont, "00:00.000");
         var maxLabel = FontSafeText(labelFont, FormatEditorPreviewTimestamp(sourceDuration));
-        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, minLabel, new Vector2(slider.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor);
-        var maxSize = UnicodeTextRenderer.MeasureString(labelFont, maxLabel);
-        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, maxLabel, new Vector2(slider.Right - maxSize.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor);
+        var minLabelScale = GetEditorDefaultFontScale(minLabel, 16f * unit);
+        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, minLabel,
+            new Vector2(slider.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor,
+            0f, Vector2.Zero, minLabelScale, SpriteEffects.None, 0f);
+        var maxLabelScale = GetEditorDefaultFontScale(maxLabel, 16f * unit);
+        var maxSize = UnicodeTextRenderer.MeasureString(labelFont, maxLabel) * maxLabelScale;
+        UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, maxLabel,
+            new Vector2(slider.Right - maxSize.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor,
+            0f, Vector2.Zero, maxLabelScale, SpriteEffects.None, 0f);
 
         DrawEditorPreviewLabel("START TIME (SECONDS)", new Rectangle(GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), interfaceUi.MutedTextColor, unit);
         DrawEditorPreviewLabel("END TIME (SECONDS)", new Rectangle(GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), interfaceUi.MutedTextColor, unit);
@@ -1684,7 +1693,7 @@ public sealed partial class Playfield
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return;
         var maxWidth = Math.Max(1f, bounds.Width - 4f * unit);
-        var fitted = FitChartEditorText(rawText, _chartEditorInterfaceLayout.LabelFont, 24f,
+        var fitted = FitChartEditorText(rawText, 24f * unit,
             maxWidth, bounds.Height - 2f * unit);
         var size = fitted.Measured * fitted.Scale;
         UnicodeTextRenderer.DrawString(_spriteBatch, fitted.Font, fitted.Text,
@@ -1695,7 +1704,7 @@ public sealed partial class Playfield
     private void DrawEditorPreviewInput(Rectangle bounds, string text, bool focused, int caretIndex, float unit)
     {
         var interfaceUi = _chartEditorInterfaceLayout;
-        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
+        var labelFont = _font;
         var accent = focused ? Active : new Color(100, 100, 102);
         _spriteBatch.Draw(_pixel, bounds, interfaceUi.ButtonColor);
         var edge = Math.Max(1, (int)MathF.Round(1.5f * unit));
@@ -1705,11 +1714,7 @@ public sealed partial class Playfield
         var visibleStart = 0;
         var visibleEnd = text.Length;
         var textWidth = Math.Max(1f, bounds.Width - 20f * unit);
-        var textScale = Math.Min(1f, Math.Max(0.55f,
-            (bounds.Height - 8f * unit) / Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y)));
-        labelFont = GetChartEditorFont(interfaceUi.LabelFont, 24f * textScale);
-        textScale = Math.Min(1f, (bounds.Height - 8f * unit) /
-            Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y));
+        var textScale = GetEditorTextFieldFontScale(bounds.Height, unit);
         text = FontSafeText(labelFont, text);
         var display = focused
             ? FitEditorTextAroundCaret(labelFont, text, caretIndex, textWidth,

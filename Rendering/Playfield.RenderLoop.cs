@@ -359,6 +359,12 @@ public sealed partial class Playfield
             }
         }
 
+        // The Lua editor draws the formatter at the active text caret using uiStyle.
+        // Keep the C# drawing path only for the stable emergency/fallback editor UI.
+        if (_chartEditorMode && !_editorPreviewMode && !IsEditorMetaBbCodeStripRenderedByLua &&
+            _editorMetaPanelOpen && _editorMetaBbCodeStripOpen)
+            DrawEditorMetaBbCodeStripOverlay(virtualWidth, virtualHeight);
+
         if (_showPerformanceDebug)
             DrawPerformanceDebugOverlay();
 

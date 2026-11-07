@@ -141,6 +141,9 @@ public sealed partial class Playfield
     private (double CaretOffset, double SelectionOffset, double SelectionWidth, double TextWidth) GetEditorTextFieldMetrics(
         string text, int caret, int anchor)
     {
+        // The active Lua editor measures with its own uiStyle font. This is only
+        // used to align its caret/selection metrics; the C# fallback renderer uses
+        // the same DefaultFont instance as the stable C# menus.
         const string fontPath = "Roboto-Regular.ttf";
         var textSize = 24f * _projection.ScalePixels(1f);
         if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
@@ -157,16 +160,16 @@ public sealed partial class Playfield
                 Math.Max(0, skinSelectionEndOffset - skinSelectionOffset), skinTextWidth);
         }
 
-        var font = GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont,
-            24f * _projection.ScalePixels(1f));
+        var font = _font;
         var safeText = FontSafeText(font, text);
+        var textScale = GetEditorTextFieldFontScale(_editorTextActiveBounds.Height, _projection.ScalePixels(1f));
         caret = Math.Clamp(caret, 0, safeText.Length);
         anchor = Math.Clamp(anchor, 0, safeText.Length);
         var (selectionStart, selectionEnd) = GetEditorTextSelection(safeText, caret, anchor);
-        var caretOffset = UnicodeTextRenderer.MeasureString(font, safeText[..caret]).X;
-        var selectionOffset = UnicodeTextRenderer.MeasureString(font, safeText[..selectionStart]).X;
-        var selectionEndOffset = UnicodeTextRenderer.MeasureString(font, safeText[..selectionEnd]).X;
-        var textWidth = UnicodeTextRenderer.MeasureString(font, safeText).X;
+        var caretOffset = UnicodeTextRenderer.MeasureString(font, safeText[..caret]).X * textScale;
+        var selectionOffset = UnicodeTextRenderer.MeasureString(font, safeText[..selectionStart]).X * textScale;
+        var selectionEndOffset = UnicodeTextRenderer.MeasureString(font, safeText[..selectionEnd]).X * textScale;
+        var textWidth = UnicodeTextRenderer.MeasureString(font, safeText).X * textScale;
         return (caretOffset, selectionOffset, Math.Max(0, selectionEndOffset - selectionOffset), textWidth);
     }
 
@@ -455,7 +458,12 @@ public sealed partial class Playfield
                 ["kind"] = kind,
                 ["editable"] = fieldKey is not null,
                 ["editing"] = editing,
-                ["selected"] = selected
+                ["selected"] = selected,
+                ["user_text"] = BbCodeTextRenderer.IsSupportedMetadataField(fieldKey),
+                ["bbcode_strip_open"] = editing &&
+                    _editorMetaBbCodeStripOpen &&
+                    BbCodeTextRenderer.IsSupportedMetadataField(fieldKey) &&
+                    string.Equals(_editorMetaBbCodeStripField, fieldKey, StringComparison.OrdinalIgnoreCase)
             };
             if (row.Label == "ELEMENT")
             {
@@ -804,8 +812,15 @@ public sealed partial class Playfield
         if (action is null) return false;
         var name = action.Name;
         var value = action.Value;
+        if (_editorMetaBbCodeStripOpen && name != "editor.meta.bbcode" &&
+            name != "editor.meta.bbcode.panel")
+        {
+            _editorMetaBbCodeStripOpen = false;
+            _editorMetaBbCodeStripField = null;
+        }
         if (_editorMetaEditingField is not null && name != "editor.meta.row" &&
-            name != "editor.meta.close" && name != "editor.meta.exit")
+            name != "editor.meta.close" && name != "editor.meta.exit" &&
+            name != "editor.meta.bbcode" && name != "editor.meta.bbcode.panel")
             CommitEditorMetaFieldOnBlur();
         int Number() => value switch
         {
@@ -835,6 +850,19 @@ public sealed partial class Playfield
         {
             case "editor.block":
                 if (_editorMetaPanelOpen) CommitEditorMetaFieldOnBlur();
+                return true;
+            case "editor.meta.bbcode.panel":
+                // The strip surface blocks clicks from reaching the text field below,
+                // but clicking its padding must not commit or close the active editor.
+                return true;
+            case "editor.meta.bbcode":
+                if (value is string tag && EditorMetaBbCodeTags.Any(item =>
+                        string.Equals(item.Name, tag, StringComparison.OrdinalIgnoreCase)))
+                {
+                    ApplyEditorMetaBbCodeTag(tag);
+                    _editorMetaBbCodeStripOpen = false;
+                    _editorMetaBbCodeStripField = null;
+                }
                 return true;
             case "editor.action":
                 HandleEditorActionClick(Number());

@@ -483,16 +483,11 @@ public sealed partial class Playfield
     private int GetEditorPreviewTextCaretIndex(Rectangle bounds, string value, XnaPoint pixel, float unit)
     {
         var interfaceUi = _chartEditorInterfaceLayout;
-        var font = GetChartEditorFont(interfaceUi.LabelFont);
+        var font = _font;
         var fieldId = _editorPreviewFocusedField == 0 ? "preview-start" : "preview-end";
         var textLeft = bounds.X + 10f * unit;
         var textWidth = Math.Max(1f, bounds.Width - 20f * unit);
-        var measured = UnicodeTextRenderer.MeasureString(font, FontSafeText(font, value));
-        var scale = Math.Min(1f, Math.Max(0.55f,
-            (bounds.Height - 8f * unit) / Math.Max(1f, measured.Y)));
-        font = GetChartEditorFont(interfaceUi.LabelFont, 24f * scale);
-        scale = Math.Min(1f, (bounds.Height - 8f * unit) /
-            Math.Max(1f, UnicodeTextRenderer.MeasureString(font, "Ag").Y));
+        var scale = GetEditorTextFieldFontScale(bounds.Height, unit);
         return GetEditorTextCaretIndexFromMouse(fieldId, value, pixel.X, textLeft, textWidth, scale, font);
     }
 

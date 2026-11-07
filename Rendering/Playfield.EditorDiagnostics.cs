@@ -418,8 +418,9 @@ public sealed partial class Playfield
             return;
         RefreshEditorDiagnostics();
         var interfaceUi = _chartEditorInterfaceLayout;
-        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
+        var labelFont = _font;
         var unit = _projection.ScalePixels(1f);
+        var textScale = GetEditorDefaultFontScale(18f * unit);
         var panel = GetEditorProblemsPanelBounds(virtualWidth, virtualHeight);
         var header = GetEditorProblemsHeaderBounds(virtualWidth, virtualHeight);
         var list = GetEditorProblemsListBounds(virtualWidth, virtualHeight);
@@ -452,11 +453,13 @@ public sealed partial class Playfield
         };
         var quickFixButton = GetEditorProblemsQuickFixButtonBounds(virtualWidth, virtualHeight);
         var summaryMax = Math.Max(1f, quickFixButton.X - header.X - 20f * unit);
-        summary = FitHudText(labelFont, FontSafeText(labelFont, summary), summaryMax);
-        var summarySize = UnicodeTextRenderer.MeasureString(labelFont, summary);
+        summary = FitHudText(labelFont, FontSafeText(labelFont, summary), summaryMax / textScale);
+        var summaryScale = GetEditorDefaultFontScale(summary, 18f * unit);
+        var summarySize = UnicodeTextRenderer.MeasureString(labelFont, summary) * summaryScale;
         UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, summary,
             new Vector2(header.X + 12f * unit, header.Y + (header.Height - summarySize.Y) * 0.5f),
-            errorCount > 0 ? new Color(255, 205, 208) : warningCount > 0 ? new Color(255, 226, 158) : new Color(165, 239, 198));
+            errorCount > 0 ? new Color(255, 205, 208) : warningCount > 0 ? new Color(255, 226, 158) : new Color(165, 239, 198),
+            0f, Vector2.Zero, summaryScale, SpriteEffects.None, 0f);
         var quickFixBorder = interfaceUi.AccentColor;
         var quickFixFill = ResolveEditorButtonStateFill(quickFixButton, interfaceUi.ButtonColor, interfaceUi);
         _spriteBatch.Draw(_pixel, quickFixButton, quickFixFill);
@@ -465,8 +468,8 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.X, quickFixButton.Y, edge, quickFixButton.Height), quickFixBorder);
         _spriteBatch.Draw(_pixel, new Rectangle(quickFixButton.Right - edge, quickFixButton.Y, edge, quickFixButton.Height), quickFixBorder);
         var quickFixFit = FitChartEditorText(
-            interfaceUi.Label("button:QUICK FIX", "QUICK FIX"), interfaceUi.ButtonFont,
-            24f * (float)interfaceUi.ButtonTextScale,
+            interfaceUi.Label("button:QUICK FIX", "QUICK FIX"),
+            24f * unit * (float)interfaceUi.ButtonTextScale,
             Math.Max(1f, quickFixButton.Width - 12f * unit),
             Math.Max(1f, quickFixButton.Height - 8f * unit));
         var quickFixTextSize = quickFixFit.Measured * quickFixFit.Scale;
@@ -476,9 +479,11 @@ public sealed partial class Playfield
             interfaceUi.ButtonTextColor, 0f, Vector2.Zero, quickFixFit.Scale, SpriteEffects.None, 0f);
 
         var chevron = _editorProblemsExpanded ? "−" : "+";
-        var chevronSize = UnicodeTextRenderer.MeasureString(labelFont, chevron);
+        var chevronScale = GetEditorDefaultFontScale(chevron, 18f * unit);
+        var chevronSize = UnicodeTextRenderer.MeasureString(labelFont, chevron) * chevronScale;
         UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, chevron,
-            new Vector2(header.Right - chevronSize.X - 12f * unit, header.Y + (header.Height - chevronSize.Y) * 0.5f), interfaceUi.ButtonTextColor);
+            new Vector2(header.Right - chevronSize.X - 12f * unit, header.Y + (header.Height - chevronSize.Y) * 0.5f),
+            interfaceUi.ButtonTextColor, 0f, Vector2.Zero, chevronScale, SpriteEffects.None, 0f);
 
         if (_editorProblemsExpanded && list.Height > 0 && _editorProblems.Count > 0)
         {
@@ -496,11 +501,14 @@ public sealed partial class Playfield
                 var issueColor = problem.IsWarning ? yellow : red;
                 _spriteBatch.Draw(_pixel, new Rectangle(row.X, row.Y + 3, Math.Max(2, (int)MathF.Round(3f * unit)), row.Height - 6), issueColor);
                 var prefix = problem.Track >= 0 ? $"Tick {problem.Tick} · Track {problem.Track}: " : $"Tick {problem.Tick}: ";
-                var rowText = FitHudText(labelFont, FontSafeText(labelFont, prefix + problem.Message), Math.Max(1f, row.Width - 18f * unit));
-                var textSize = UnicodeTextRenderer.MeasureString(labelFont, rowText);
+                var rowText = FitHudText(labelFont, FontSafeText(labelFont, prefix + problem.Message),
+                    Math.Max(1f, row.Width - 18f * unit) / textScale);
+                var rowTextScale = GetEditorDefaultFontScale(rowText, 18f * unit);
+                var textSize = UnicodeTextRenderer.MeasureString(labelFont, rowText) * rowTextScale;
                 UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, rowText,
                     new Vector2(row.X + 10f * unit, row.Y + (row.Height - textSize.Y) * 0.5f),
-                    problem.IsWarning ? new Color(255, 229, 168, 245) : new Color(247, 210, 213, 245));
+                    problem.IsWarning ? new Color(255, 229, 168, 245) : new Color(247, 210, 213, 245),
+                    0f, Vector2.Zero, rowTextScale, SpriteEffects.None, 0f);
             }
             if (_editorProblems.Count > visibleRows && list.Height > 0)
             {

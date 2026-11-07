@@ -709,6 +709,19 @@ public sealed partial class Playfield
         var pointerPixel = new Microsoft.Xna.Framework.Point((int)MathF.Round(point.X), (int)MathF.Round(point.Y));
         var editorLuaUiActive = _chartEditorMode && _chartEditorInterfaceRuntime.IsLoaded &&
                                 _chartEditorInterfaceRuntime.LastError is null;
+        // The metadata formatting strip is deliberately opened only from a
+        // user-authored metadata field, never from ordinary chart/UI text.
+        if (leftPressed && _chartEditorMode && _editorMetaBbCodeStripOpen &&
+            !IsEditorMetaBbCodeStripRenderedByLua &&
+            TryHandleEditorMetaBbCodeStripClick(pointerPixel, virtualWidth, virtualHeight))
+            return;
+        if (rightPressed && !touchPressed && _chartEditorMode)
+        {
+            if (TryHandleEditorMetaBbCodeRightClick(pointerPixel, virtualWidth, virtualHeight))
+                return;
+            _editorMetaBbCodeStripOpen = false;
+            _editorMetaBbCodeStripField = null;
+        }
         if (!editorLuaUiActive && HandleEditorMusicVolumeFallbackPointer(
                 pointerPixel, leftPressed, leftDown, leftReleased, virtualWidth, virtualHeight))
             return;
@@ -779,7 +792,11 @@ public sealed partial class Playfield
         // for pointer capture and could leave click-only scrubbing.
 
         if ((leftPressed || touchPressed) && _editorMetaEditingField is not null)
+        {
             CommitEditorMetaFieldOnBlur();
+            _editorMetaBbCodeStripOpen = false;
+            _editorMetaBbCodeStripField = null;
+        }
         var pointerOverToolbar = (editorLuaUiActive &&
                                   _chartEditorInterfaceRuntime.IsUiPointOverControl(point.X, point.Y)) ||
                                  GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight).Contains(pointerPixel) ||
@@ -2639,7 +2656,7 @@ public sealed partial class Playfield
         float unit, string? fieldId = null)
     {
         var interfaceUi = _chartEditorInterfaceLayout;
-        var font = GetChartEditorFont(interfaceUi.LabelFont);
+        var font = _font;
         fieldId ??= _editorTextActiveFieldId ?? "editor-numeric";
         var toolbarInput = fieldId is "bpm" or "duration" ||
                            fieldId.StartsWith("stutter:", StringComparison.Ordinal);
@@ -2647,12 +2664,7 @@ public sealed partial class Playfield
             Math.Min(Math.Max(26, (int)MathF.Round(34f * unit)), Math.Max(1, bounds.Width / 3));
         var textLeft = bounds.X + (int)MathF.Round(10f * unit);
         var availableWidth = Math.Max(1f, bounds.Width - spinnerWidth - 16f * unit);
-        var measured = UnicodeTextRenderer.MeasureString(font, FontSafeText(font, value));
-        var scale = Math.Min(1f, Math.Max(0.55f,
-            (bounds.Height - 8f * unit) / Math.Max(1f, measured.Y)));
-        font = GetChartEditorFont(interfaceUi.LabelFont, 24f * scale);
-        scale = Math.Min(1f, (bounds.Height - 8f * unit) /
-            Math.Max(1f, UnicodeTextRenderer.MeasureString(font, "Ag").Y));
+        var scale = GetEditorTextFieldFontScale(bounds.Height, unit);
         return GetEditorTextCaretIndexFromMouse(fieldId, value, pixel.X, textLeft, availableWidth, scale, font);
     }
 
@@ -3018,9 +3030,10 @@ public sealed partial class Playfield
         // Match the Lua field width: content padding, the scrollbar rail, the
         // skin's extra trailing gap, and both field text insets are reserved.
         var fieldWidth = Math.Max(1f, content.Width - (scrollbarSpace + 42f * unit));
-        var font = GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont, 24f);
-        // Keep this in lockstep with chartEditorInterface.lua's small text size.
-        var lineHeight = Math.Max(16f * unit, 24f * 1.2f * unit);
+        var font = _font;
+        var fieldTextScale = GetEditorTextFieldFontScale(GetEditorMetaFieldHeight(unit), unit);
+        var lineHeight = Math.Max(16f * unit,
+            UnicodeTextRenderer.GetLogicalLineSpacing(font) * fieldTextScale * 1.2f);
         var layouts = new List<EditorMetaRowLayout>(rows.Count);
         foreach (var row in rows)
         {
@@ -3040,9 +3053,11 @@ public sealed partial class Playfield
                 var isEditing = fieldKey is not null &&
                     string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase);
                 var lineCount = isEditing
-                    ? WrapEditorTextWithRanges(safeValue, fieldWidth,
+                    ? WrapEditorTextWithRanges(safeValue, fieldWidth / Math.Max(0.01f, fieldTextScale),
                         candidate => UnicodeTextRenderer.MeasureString(font, candidate).X).Count
-                    : WrapEditorHudText(font, safeValue, fieldWidth).Count;
+                    : BbCodeTextRenderer.IsSupportedMetadataField(fieldKey)
+                        ? BbCodeTextRenderer.MeasureLineCount(font, displayValue, fieldWidth, fieldTextScale)
+                        : WrapEditorHudText(font, safeValue, fieldWidth / Math.Max(0.01f, fieldTextScale)).Count;
                 fieldHeight = Math.Max(fieldHeight,
                     (int)MathF.Ceiling(lineCount * lineHeight + 12f * unit));
             }
@@ -3267,20 +3282,29 @@ public sealed partial class Playfield
         var optionWidth = Math.Max(1, modalWidth - sidePadding * 2);
         var textWidth = Math.Max(1f, optionWidth - 32f * unit);
         var interfaceUi = _chartEditorInterfaceLayout;
-        var titleFont = GetChartEditorFont(interfaceUi.ButtonFont, 20f * unit);
-        var descriptionFont = GetChartEditorFont(interfaceUi.LabelFont, 16f * unit);
-        var titleLineHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(titleFont, "Ag").Y);
-        var descriptionLineHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(descriptionFont, "Ag").Y);
+        var titleFont = _font;
+        var descriptionFont = _font;
+        var baseDescriptionScale = GetEditorDefaultFontScale(16f * unit);
         var titleTop = (int)MathF.Round(8f * unit);
         var descriptionGap = (int)MathF.Round(4f * unit);
         var bottomPadding = (int)MathF.Round(9f * unit);
         var result = new int[count];
         for (var i = 0; i < count; i++)
         {
-            var (_, description, _, _) = GetEditorMetaExportOption(i);
-            var lines = WrapEditorTextToWidth(descriptionFont, description, textWidth);
-            result[i] = Math.Max(1, (int)MathF.Ceiling(titleTop + titleLineHeight + descriptionGap +
-                lines.Count * descriptionLineHeight * 1.22f + bottomPadding));
+            var (label, description, _, _) = GetEditorMetaExportOption(i);
+            var labelText = FontSafeText(titleFont, interfaceUi.Label("export:" + label, label));
+            var labelScale = GetEditorDefaultFontScale(labelText, 22f * unit);
+            var titleHeight = UnicodeTextRenderer.MeasureString(titleFont, labelText).Y * labelScale;
+            var lines = WrapEditorTextToWidth(descriptionFont, description, textWidth / baseDescriptionScale);
+            var descriptionHeight = 0f;
+            foreach (var line in lines)
+            {
+                var safeLine = FontSafeText(descriptionFont, line);
+                var lineScale = GetEditorDefaultFontScale(safeLine, 16f * unit);
+                descriptionHeight += UnicodeTextRenderer.MeasureString(descriptionFont, safeLine).Y * lineScale * 1.22f;
+            }
+            result[i] = Math.Max(1, (int)MathF.Ceiling(titleTop + titleHeight + descriptionGap +
+                descriptionHeight + bottomPadding));
         }
         return result;
     }
@@ -3320,6 +3344,9 @@ public sealed partial class Playfield
         var skinRuntimeAvailable = _chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null;
         var textLeft = bounds.X + 10f * unit;
         var textWidth = Math.Max(1f, bounds.Width - (skinRuntimeAvailable ? 20f : 42f) * unit);
+        // Lua's active uiStyle field is rendered with its configured Roboto face;
+        // query that face only for caret hit-testing while Lua is drawing. The C#
+        // fallback path below always draws the shared DefaultFont used by stable menus.
         const string fontPath = "Roboto-Regular.ttf";
         var textSize = 24f * unit;
         SpriteFont? fallbackFont = null;
@@ -3329,26 +3356,22 @@ public sealed partial class Playfield
         {
             if (skinRuntimeAvailable)
                 return _chartEditorInterfaceRuntime.MeasureTextWidthForUi(candidate, fontPath, textSize);
-            fallbackFont ??= GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont, 24f);
+            fallbackFont ??= _font;
             return UnicodeTextRenderer.MeasureString(fallbackFont, FontSafeText(fallbackFont, candidate)).X * fallbackScale;
         }
 
         if (!skinRuntimeAvailable)
         {
-            var fontName = _chartEditorInterfaceLayout.LabelFont;
-            fallbackFont = GetChartEditorFont(fontName);
-            var initialSize = UnicodeTextRenderer.MeasureString(fallbackFont, FontSafeText(fallbackFont, _editorMetaInputText));
-            fallbackScale = Math.Min(1f, Math.Max(0.55f,
-                (bounds.Height - 8f * unit) / Math.Max(1f, initialSize.Y)));
-            fallbackFont = GetChartEditorFont(fontName, 24f * fallbackScale);
-            fallbackScale = Math.Min(1f, (bounds.Height - 8f * unit) /
-                Math.Max(1f, UnicodeTextRenderer.MeasureString(fallbackFont, "Ag").Y));
+            fallbackFont = _font;
+            fallbackScale = GetEditorTextFieldFontScale(bounds.Height, unit);
         }
 
         // The active field is visually wrapped now, so place the caret using both
         // pointer axes and the same wrapped line ranges used by the renderer.
         var lines = WrapEditorTextWithRanges(_editorMetaInputText, textWidth, Measure);
-        var lineHeight = Math.Max(16f * unit, textSize * 1.2f);
+        var defaultLineHeight = UnicodeTextRenderer.GetLogicalLineSpacing(fallbackFont ?? _font);
+        var lineHeight = Math.Max(16f * unit,
+            (skinRuntimeAvailable ? textSize : defaultLineHeight * fallbackScale) * 1.2f);
         var blockHeight = lines.Count * lineHeight;
         var firstLineY = bounds.Y + (bounds.Height - blockHeight) * 0.5f;
         var localLine = Math.Clamp((int)MathF.Floor((pixel.Y - firstLineY) / Math.Max(1f, lineHeight)),
@@ -3404,9 +3427,13 @@ public sealed partial class Playfield
             _editorMetaEditingField = fieldKey;
             _editorMetaInputText = GetEditorMetaFieldValue(fieldKey, rowValue);
             _editorMetaInputReplaceOnNextKey = false;
+            PlaceEditorMetaCaretForNewField(fieldKey, bounds, pixel, _projection.ScalePixels(1f));
+        }
+        else
+        {
+            PlaceEditorMetaCaretFromClick(bounds, pixel, _projection.ScalePixels(1f));
         }
 
-        PlaceEditorMetaCaretFromClick(bounds, pixel, _projection.ScalePixels(1f));
         _editorMetaSelectionAnchor = _editorMetaInputCaretIndex;
         BeginEditorTextFieldMouseSelection("meta:" + fieldKey, bounds,
             _editorMetaInputCaretIndex, ref _editorMetaSelectionAnchor);
@@ -3743,7 +3770,7 @@ public sealed partial class Playfield
                     CommitEditorMetaFieldOnBlur();
                 _editorMetaEditingField = fieldKey;
                 _editorMetaInputText = GetEditorMetaFieldValue(fieldKey, metaRows[i].Value);
-                PlaceEditorMetaCaretFromClick(bounds, pixel, _projection.ScalePixels(1f));
+                PlaceEditorMetaCaretForNewField(fieldKey, bounds, pixel, _projection.ScalePixels(1f));
                 _editorMetaInputReplaceOnNextKey = false;
                 _editorMetaSelectionAnchor = _editorMetaInputCaretIndex;
                 BeginEditorTextFieldMouseSelection("meta:" + fieldKey, bounds,
@@ -4638,6 +4665,11 @@ public sealed partial class Playfield
     private bool TryHandleChartEditorToolbarClick(Vector2 point, int virtualWidth, int virtualHeight)
     {
         var pixel = new Microsoft.Xna.Framework.Point((int)MathF.Round(point.X), (int)MathF.Round(point.Y));
+
+        // A click on the floating formatter belongs to the active text field even
+        // though it is outside the field rectangle. Handle it before blur commits.
+        if (_editorMetaBbCodeStripOpen && TryHandleEditorMetaBbCodeStripClick(pixel, virtualWidth, virtualHeight))
+            return true;
 
         if (_editorMetaEditingField is not null)
         {

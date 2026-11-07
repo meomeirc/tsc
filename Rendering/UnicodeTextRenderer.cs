@@ -33,7 +33,7 @@ public static class UnicodeTextRenderer
     private const int TexturePadding = 4;
 
     private sealed record FontInfo(string FamilyName, float SizePixels, string? FontFilePath, float LogicalScale);
-    private readonly record struct TextKey(SpriteFont Font, string Text);
+    private readonly record struct TextKey(SpriteFont Font, string Text, FontStyle Style);
     private readonly record struct GlyphKey(string FontId, string RuneText);
 
     private sealed class TextCacheEntry
@@ -110,7 +110,20 @@ public static class UnicodeTextRenderer
         if (!NeedsUnicodeFallback(font, text))
             return font.MeasureString(text) * GetLogicalFontScale(font);
 
-        return GetOrCreateEntry(font, text).Size;
+        return GetOrCreateEntry(font, text, FontStyle.Regular).Size;
+    }
+
+    /// <summary>Measures a run using the same font face with optional bold and italic styling.</summary>
+    public static XnaVector2 MeasureStyledString(SpriteFont font, string? text, bool bold, bool italic)
+    {
+        if (font is null || string.IsNullOrEmpty(text))
+            return XnaVector2.Zero;
+        if (!bold && !italic)
+            return MeasureString(font, text);
+
+        var style = (bold ? FontStyle.Bold : FontStyle.Regular) |
+                    (italic ? FontStyle.Italic : FontStyle.Regular);
+        return GetOrCreateEntry(font, text, style).Size;
     }
 
     public static void DrawString(SpriteBatch batch, SpriteFont font, string? text, XnaVector2 position, XnaColor color)
@@ -141,10 +154,40 @@ public static class UnicodeTextRenderer
             return;
         }
 
-        var entry = GetOrCreateEntry(font, text);
+        var entry = GetOrCreateEntry(font, text, FontStyle.Regular);
         var texture = EnsureTexture(font, entry);
         // The fallback texture is rasterized at three times its source font size.
         // Convert padding and source coordinates into this font's logical units.
+        var rasterPadding = TexturePadding * FallbackRasterScale / logicalScale;
+        var sourceScale = FallbackRasterScale / logicalScale;
+        batch.Draw(texture, position, null, color, rotation,
+            origin * sourceScale + new XnaVector2(rasterPadding, rasterPadding),
+            scale * logicalScale / FallbackRasterScale, effects, layerDepth);
+    }
+
+    /// <summary>Draws a bold/italic text run using the registered font face and Unicode fallback pipeline.</summary>
+    public static void DrawStyledString(SpriteBatch batch, SpriteFont font, string? text,
+        XnaVector2 position, XnaColor color, float rotation, XnaVector2 origin,
+        XnaVector2 scale, SpriteEffects effects, float layerDepth, bool bold, bool italic)
+    {
+        if (font is null || string.IsNullOrEmpty(text))
+        {
+            if (font is not null)
+                batch.DrawString(font, text ?? string.Empty, position, color, rotation, origin, scale, effects, layerDepth);
+            return;
+        }
+
+        if (!bold && !italic)
+        {
+            DrawString(batch, font, text, position, color, rotation, origin, scale, effects, layerDepth);
+            return;
+        }
+
+        var style = (bold ? FontStyle.Bold : FontStyle.Regular) |
+                    (italic ? FontStyle.Italic : FontStyle.Regular);
+        var entry = GetOrCreateEntry(font, text, style);
+        var texture = EnsureTexture(font, entry);
+        var logicalScale = GetLogicalFontScale(font);
         var rasterPadding = TexturePadding * FallbackRasterScale / logicalScale;
         var sourceScale = FallbackRasterScale / logicalScale;
         batch.Draw(texture, position, null, color, rotation,
@@ -262,9 +305,9 @@ public static class UnicodeTextRenderer
         return info;
     }
 
-    private static TextCacheEntry GetOrCreateEntry(SpriteFont font, string text)
+    private static TextCacheEntry GetOrCreateEntry(SpriteFont font, string text, FontStyle style)
     {
-        var key = new TextKey(font, text);
+        var key = new TextKey(font, text, style);
         lock (Sync)
         {
             if (TextCache.TryGetValue(key, out var cached))
@@ -276,7 +319,7 @@ public static class UnicodeTextRenderer
 
         var info = GetFontInfo(font);
         var safeText = SanitizeText(font, text);
-        var size = MeasureFallbackText(info, font.LineSpacing, safeText);
+        var size = MeasureFallbackText(info, font.LineSpacing, safeText, style);
         var created = new TextCacheEntry { Key = key, SafeText = safeText, Size = size };
         lock (Sync)
         {
@@ -304,7 +347,7 @@ public static class UnicodeTextRenderer
             }
         }
 
-        var texture = BuildFallbackTexture(font, GetFontInfo(font), entry.SafeText, entry.Size);
+        var texture = BuildFallbackTexture(font, GetFontInfo(font), entry.SafeText, entry.Size, entry.Key.Style);
         lock (Sync)
         {
             // Another render path may have built the same string while this one
@@ -322,12 +365,12 @@ public static class UnicodeTextRenderer
         }
     }
 
-    private static XnaVector2 MeasureFallbackText(FontInfo info, int spriteLineSpacing, string text)
+    private static XnaVector2 MeasureFallbackText(FontInfo info, int spriteLineSpacing, string text, FontStyle style)
     {
         using var fontCollection = new PrivateFontCollection();
         using var bitmap = new Bitmap(1, 1, PixelFormat.Format32bppArgb);
         using var graphics = Graphics.FromImage(bitmap);
-        using var gdiFont = CreateGdiFont(info, fontCollection);
+        using var gdiFont = CreateGdiFont(info, fontCollection, 1f, style);
         graphics.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
         var format = StringFormat.GenericTypographic;
         var lines = SplitLines(text);
@@ -343,14 +386,14 @@ public static class UnicodeTextRenderer
             Math.Max(1, spriteLineSpacing) * info.LogicalScale * Math.Max(1, lines.Length));
     }
 
-    private static Texture2D BuildFallbackTexture(SpriteFont spriteFont, FontInfo info, string text, XnaVector2 measuredSize)
+    private static Texture2D BuildFallbackTexture(SpriteFont spriteFont, FontInfo info, string text, XnaVector2 measuredSize, FontStyle style)
     {
         using var fontCollection = new PrivateFontCollection();
         using var measureBitmap = new Bitmap(1, 1, PixelFormat.Format32bppArgb);
         using var measureGraphics = Graphics.FromImage(measureBitmap);
         // Rasterize from the larger source font at three times its native size.
         // DrawString maps it back to the old logical UI size for clean downsampling.
-        using var gdiFont = CreateGdiFont(info, fontCollection, FallbackRasterScale);
+        using var gdiFont = CreateGdiFont(info, fontCollection, FallbackRasterScale, style);
         measureGraphics.TextRenderingHint = TextRenderingHint.AntiAlias;
         var lines = SplitLines(text);
         var logicalScale = info.LogicalScale;
@@ -398,17 +441,18 @@ public static class UnicodeTextRenderer
     private static string[] SplitLines(string text)
         => text.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Split('\n');
 
-    private static Font CreateGdiFont(FontInfo info, PrivateFontCollection privateFonts, float sizeMultiplier = 1f)
+    private static Font CreateGdiFont(FontInfo info, PrivateFontCollection privateFonts, float sizeMultiplier = 1f,
+        FontStyle style = FontStyle.Regular)
     {
         var rasterSize = Math.Max(1f, info.SizePixels * Math.Max(0.1f, sizeMultiplier));
         if (!string.IsNullOrWhiteSpace(info.FontFilePath) && File.Exists(info.FontFilePath))
         {
             privateFonts.AddFontFile(info.FontFilePath);
             if (privateFonts.Families.Length > 0)
-                return new Font(privateFonts.Families[0], rasterSize, FontStyle.Regular, GraphicsUnit.Pixel);
+                return new Font(privateFonts.Families[0], rasterSize, style, GraphicsUnit.Pixel);
         }
 
-        return new Font(info.FamilyName, rasterSize, FontStyle.Regular, GraphicsUnit.Pixel);
+        return new Font(info.FamilyName, rasterSize, style, GraphicsUnit.Pixel);
     }
 
     private static XnaColor[] ReadPremultipliedPixels(Bitmap bitmap)

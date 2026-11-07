@@ -241,8 +241,7 @@ public sealed partial class Playfield
     private SkinRuntime _chartEditorInterfaceRuntime;
     private ChartEditorInterfaceLayout _chartEditorInterfaceLayout = ChartEditorInterfaceLayout.Default;
     private string? _chartEditorInterfaceLayoutScriptPath;
-    private SkinFontStore _chartEditorFontStore;
-    private SkinFontStore? _chartEditorDefaultFontStore;
+    // The native editor UI follows the same built-in font path as the C# menus.
     private HitSoundPlayer _hitSounds;
     private readonly Effect? _skinSparklesEffect;
     private readonly Effect? _skinQuad3DEffect;
@@ -561,6 +560,8 @@ public sealed partial class Playfield
     private string _editorMetaInputText = string.Empty;
     private int _editorMetaInputCaretIndex;
     private bool _editorMetaInputReplaceOnNextKey;
+    private bool _editorMetaBbCodeStripOpen;
+    private string? _editorMetaBbCodeStripField;
     private bool _editorBpmPlacementPending;
     private bool _editorAutoAdjustBpm;
     private EditorStutterInputField _editorStutterInputField;
@@ -1277,6 +1278,8 @@ public sealed partial class Playfield
         if (enabled)
         {
             _editorMetaPanelOpen = false;
+            _editorMetaBbCodeStripOpen = false;
+            _editorMetaBbCodeStripField = null;
             _lockMenuPlayMode = false;
             _hideDebugHud = false;
             _gameplayMode = false;
@@ -1340,6 +1343,8 @@ public sealed partial class Playfield
             _beatLines = false;
             _tempoLines = false;
             _editorMetaPanelOpen = false;
+            _editorMetaBbCodeStripOpen = false;
+            _editorMetaBbCodeStripField = null;
             _editorElementDropdownOpen = false;
             _editorMenuSection = EditorMenuSection.None;
             _editorPlacementEnabled = false;
@@ -2074,12 +2079,6 @@ public sealed partial class Playfield
         _skin = skin;
         _skinSparklesEffect = skinSparklesEffect;
         _skinQuad3DEffect = skinQuad3DEffect;
-        _chartEditorFontStore = new SkinFontStore(graphics, skin.SkinDirectory);
-        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
-        _chartEditorDefaultFontStore = string.Equals(
-            Path.GetFullPath(defaultSkinDirectory), Path.GetFullPath(skin.SkinDirectory), StringComparison.OrdinalIgnoreCase)
-            ? null
-            : new SkinFontStore(graphics, defaultSkinDirectory);
         _laneLineEffect = laneLineEffect ?? throw new ArgumentNullException(nameof(laneLineEffect));
         var gameConfigPath = UserDataPaths.GameConfigPath;
         var (initialVirtualWidth, initialVirtualHeight) = GetVirtualResolution(graphics.Viewport.Width, graphics.Viewport.Height);
@@ -2125,7 +2124,8 @@ public sealed partial class Playfield
             skinQuad3DEffect: skinQuad3DEffect);
         RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
         _skin.UIConfig = _skinRuntime.UIConfig;
-        var defaultAudioDirectory = Path.Combine(SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory), "audio");
+        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
+        var defaultAudioDirectory = Path.Combine(defaultSkinDirectory, "audio");
         _hitSounds = new HitSoundPlayer(skin.AudioDirectory, defaultAudioDirectory);
         _spriteBatch = new SpriteBatch(graphics);
         _primitiveEffect = new BasicEffect(graphics)
@@ -4310,6 +4310,8 @@ public sealed partial class Playfield
         }
         _editorMetaPanelOpen = false;
         _editorMetaEditingField = null;
+        _editorMetaBbCodeStripOpen = false;
+        _editorMetaBbCodeStripField = null;
         _editorMetaInputText = string.Empty;
         _editorMetaInputCaretIndex = 0;
         ClearEditorMultiSelection();
@@ -6274,6 +6276,8 @@ public sealed partial class Playfield
         _editorMetaEditingField = null;
         _editorMetaInputCaretIndex = 0;
         _editorMetaInputText = string.Empty;
+        _editorMetaBbCodeStripOpen = false;
+        _editorMetaBbCodeStripField = null;
         _statusMessage = "Metadata updated.";
     }
 
@@ -6336,6 +6340,8 @@ public sealed partial class Playfield
         _editorMetaInputText = string.Empty;
         _editorMetaInputCaretIndex = 0;
         _editorMetaInputReplaceOnNextKey = false;
+        _editorMetaBbCodeStripOpen = false;
+        _editorMetaBbCodeStripField = null;
         EndEditorTextFieldMouseSelection();
     }
 
@@ -11344,8 +11350,6 @@ public sealed partial class Playfield
         SkinRuntime? nextPauseRuntime = null;
         SkinRuntime? nextResultRuntime = null;
         SkinRuntime? nextEditorInterfaceRuntime = null;
-        SkinFontStore? nextEditorFontStore = null;
-        SkinFontStore? nextDefaultFontStore = null;
         HitSoundPlayer? nextHitSounds = null;
         NoteTextures? nextTextures = null;
 
@@ -11359,13 +11363,6 @@ public sealed partial class Playfield
             nextEditorInterfaceRuntime = CreateSkinRuntime(skin, "chartEditorInterface.lua", virtualWidth, virtualHeight);
 
             var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
-            nextEditorFontStore = new SkinFontStore(_graphics, skin.SkinDirectory);
-            nextDefaultFontStore = string.Equals(
-                Path.GetFullPath(defaultSkinDirectory),
-                Path.GetFullPath(skin.SkinDirectory),
-                StringComparison.OrdinalIgnoreCase)
-                ? null
-                : new SkinFontStore(_graphics, defaultSkinDirectory);
             var defaultAudioDirectory = Path.Combine(defaultSkinDirectory, "audio");
             nextHitSounds = new HitSoundPlayer(skin.AudioDirectory, defaultAudioDirectory);
             nextTextures = new NoteTextures(
@@ -11379,8 +11376,6 @@ public sealed partial class Playfield
             nextPauseRuntime?.Dispose();
             nextResultRuntime?.Dispose();
             nextEditorInterfaceRuntime?.Dispose();
-            nextEditorFontStore?.Dispose();
-            nextDefaultFontStore?.Dispose();
             nextHitSounds?.Dispose();
             nextTextures?.Dispose();
             Program.LogFatal("PLAYFIELD_SKIN_SWITCH_PREPARE", ex);
@@ -11395,8 +11390,6 @@ public sealed partial class Playfield
         _pauseSkinRuntime.Dispose();
         _resultSkinRuntime.Dispose();
         _chartEditorInterfaceRuntime.Dispose();
-        _chartEditorFontStore.Dispose();
-        _chartEditorDefaultFontStore?.Dispose();
         _hitSounds.Dispose();
         _textures.Dispose();
         _editorMetronomeSound?.Dispose();
@@ -11409,8 +11402,6 @@ public sealed partial class Playfield
         _pauseSkinRuntime = nextPauseRuntime!;
         _resultSkinRuntime = nextResultRuntime!;
         _chartEditorInterfaceRuntime = nextEditorInterfaceRuntime!;
-        _chartEditorFontStore = nextEditorFontStore!;
-        _chartEditorDefaultFontStore = nextDefaultFontStore;
         _hitSounds = nextHitSounds!;
         _textures = nextTextures!;
 
@@ -12261,8 +12252,6 @@ public sealed partial class Playfield
         _pauseSkinRuntime.Dispose();
         _resultSkinRuntime.Dispose();
         _chartEditorInterfaceRuntime.Dispose();
-        _chartEditorFontStore.Dispose();
-        _chartEditorDefaultFontStore?.Dispose();
         _debugProcess.Dispose();
     }
     private static Texture2D CreateCircleTexture(GraphicsDevice device, int size)

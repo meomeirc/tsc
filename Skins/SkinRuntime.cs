@@ -1534,6 +1534,7 @@ public enum SkinDrawCommandKind
 {
     Sprite,
     Text,
+    UserText,
     Rect,
     Line,
     LineBatch,
@@ -1634,6 +1635,8 @@ public sealed class SkinDrawCommand
     internal SkinLineSegment[]? LineSegments { get; set; }
     internal int LineSegmentCount { get; set; }
     public float TextSize { get; internal set; }
+    public float TextMaxWidth { get; internal set; }
+    public bool TextWrap { get; internal set; }
     public XnaColor Color { get; internal set; } = XnaColor.White;
     public int Layer { get; internal set; }
     internal long Order { get; set; }
@@ -1684,6 +1687,8 @@ public sealed class SkinDrawCommand
         LineWidth = 1f;
         LineSegmentCount = 0;
         TextSize = 0f;
+        TextMaxWidth = 0f;
+        TextWrap = false;
         Color = XnaColor.White;
         Layer = 0;
         Order = 0L;
@@ -3566,11 +3571,15 @@ public sealed class SkinRuntime : IDisposable
                     }
 
                     case SkinDrawCommandKind.Text:
+                    case SkinDrawCommandKind.UserText:
                     {
+                        var userText = command.Kind == SkinDrawCommandKind.UserText;
                         var font = command.Font?.Font ?? fallbackFont;
                         var text = command.Text ?? string.Empty;
-                        var layout = BuildTextLayout(font, fallbackFont, text);
-                        var measured = layout.Size;
+                        var layout = userText ? null : BuildTextLayout(font, fallbackFont, text);
+                        var measured = userText
+                            ? TSC.Rendering.BbCodeTextRenderer.Measure(font, text)
+                            : layout!.Size;
                         if (measured.X <= 0f || measured.Y <= 0f)
                             break;
 
@@ -3590,12 +3599,22 @@ public sealed class SkinRuntime : IDisposable
 
                         void DrawText(SpriteFont drawFont, Vector2 pos, XnaColor tint, Vector2 drawScale)
                         {
-                            var drawLayout = ReferenceEquals(drawFont, font)
-                                ? layout
-                                : BuildTextLayout(drawFont, fallbackFont, text);
-                            DrawTextWithFallback(
-                                spriteBatch, drawLayout, pos, tint,
-                                command.Rotation, drawScale, command.Anchor);
+                            if (userText)
+                            {
+                                TSC.Rendering.BbCodeTextRenderer.DrawTransformed(
+                                    spriteBatch, fallbackPixel, drawFont, text, pos, tint,
+                                    command.Rotation, drawScale, command.Anchor,
+                                    command.TextMaxWidth, command.TextWrap);
+                            }
+                            else
+                            {
+                                var drawLayout = ReferenceEquals(drawFont, font)
+                                    ? layout!
+                                    : BuildTextLayout(drawFont, fallbackFont, text);
+                                DrawTextWithFallback(
+                                    spriteBatch, drawLayout, pos, tint,
+                                    command.Rotation, drawScale, command.Anchor);
+                            }
                         }
 
                         if (command.Shadow is not null)
@@ -3617,8 +3636,9 @@ public sealed class SkinRuntime : IDisposable
                             {
                                 // Backwards-compatible handling for old Lua skins
                                 // that pass an independent fonts.shadow(raster, ...).
-                                var shadowLayout = BuildTextLayout(shadowFont, fallbackFont, text);
-                                var shadowMeasured = shadowLayout.Size;
+                                var shadowMeasured = userText
+                                    ? TSC.Rendering.BbCodeTextRenderer.Measure(shadowFont, text)
+                                    : BuildTextLayout(shadowFont, fallbackFont, text).Size;
                                 if (shadowMeasured.X > 0f && shadowMeasured.Y > 0f)
                                 {
                                     shadowScale = new Vector2(
@@ -3736,7 +3756,7 @@ public sealed class SkinRuntime : IDisposable
         {
             SkinDrawCommandKind.Sprite => command.Asset is not null && command.Fill > 0f &&
                 command.Scale.X > 0f && command.Scale.Y > 0f && command.Size.X > 0f && command.Size.Y > 0f,
-            SkinDrawCommandKind.Text => !string.IsNullOrEmpty(command.Text) &&
+            SkinDrawCommandKind.Text or SkinDrawCommandKind.UserText => !string.IsNullOrEmpty(command.Text) &&
                 command.Scale.X > 0f && command.Scale.Y > 0f,
             SkinDrawCommandKind.Rect => command.Size.X > 0f && command.Size.Y > 0f,
             SkinDrawCommandKind.Line => Vector2.DistanceSquared(command.Position, command.EndPosition) > 0.000001f &&
@@ -6056,7 +6076,12 @@ public sealed class SkinRuntime : IDisposable
         table.Set("quad3d_cached_batch", DynValue.NewCallback(DrawQuad3DCachedBatch));
         table.Set("sparkles", DynValue.NewCallback(DrawSparkles));
         table.Set("text", DynValue.NewCallback(DrawText));
+        // Explicit opt-in for user-authored metadata only. draw.text remains literal,
+        // so BBCode never changes ordinary skin UI labels or system messages.
+        table.Set("user_text", DynValue.NewCallback(DrawUserText));
         table.Set("measure_text", DynValue.NewCallback(MeasureTextWidth));
+        table.Set("measure_user_text_width", DynValue.NewCallback(MeasureUserTextWidth));
+        table.Set("measure_user_text_height", DynValue.NewCallback(MeasureUserTextHeight));
         table.Set("text_batch", DynValue.NewCallback(DrawTextBatch));
         table.Set("rect", DynValue.NewCallback(DrawRect));
         table.Set("line", DynValue.NewCallback(DrawLine));
@@ -7017,6 +7042,25 @@ public sealed class SkinRuntime : IDisposable
         }
     }
 
+    private DynValue DrawUserText(ScriptExecutionContext _, CallbackArguments args)
+    {
+        var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        try
+        {
+            if (args.Count < 1 || args[0].Type != DataType.String)
+                throw new ScriptRuntimeException("draw.user_text(text, options) expects a string");
+            return SubmitText(args[0].String ?? string.Empty, GetOptions(args, 1), userText: true);
+        }
+        finally
+        {
+            if (DebugMeasureApiAllocations)
+            {
+                DebugLastTextApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastTextApiCalls++;
+            }
+        }
+    }
+
     private DynValue MeasureTextWidth(ScriptExecutionContext _, CallbackArguments args)
     {
         if (args.Count < 1 || args[0].Type != DataType.String)
@@ -7034,6 +7078,57 @@ public sealed class SkinRuntime : IDisposable
         var width = MeasureTextWidthForUi(text, fontPath, size);
         var scale = GetScale(options);
         return DynValue.NewNumber(Math.Max(0f, width * Math.Abs(scale.X)));
+    }
+
+    private DynValue MeasureUserTextWidth(ScriptExecutionContext _, CallbackArguments args)
+    {
+        if (args.Count < 1 || args[0].Type != DataType.String)
+            throw new ScriptRuntimeException("draw.measure_user_text_width(text, options) expects a string");
+
+        var text = args[0].String ?? string.Empty;
+        var options = GetOptions(args, 1);
+        var fontPath = GetOptionalString(options, "font") ?? string.Empty;
+        var size = GetNumber(options, "size", 0f);
+        if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f)
+            return DynValue.NewNumber(0);
+
+        var font = _fonts.Load(fontPath, size);
+        if (font is null)
+            return DynValue.NewNumber(0);
+        var measured = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
+        if (measured.X <= 0f || measured.Y <= 0f)
+            return DynValue.NewNumber(0);
+        var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? measured.Y : font.RasterSize);
+        var scale = GetScale(options);
+        return DynValue.NewNumber(Math.Max(0f, measured.X * (size / sizeBasis) * Math.Abs(scale.X)));
+    }
+
+    private DynValue MeasureUserTextHeight(ScriptExecutionContext _, CallbackArguments args)
+    {
+        if (args.Count < 1 || args[0].Type != DataType.String)
+            throw new ScriptRuntimeException("draw.measure_user_text_height(text, options) expects a string");
+
+        var text = args[0].String ?? string.Empty;
+        var options = GetOptions(args, 1);
+        var fontPath = GetOptionalString(options, "font") ?? string.Empty;
+        var size = GetNumber(options, "size", 0f);
+        var maxWidth = GetNumber(options, "max_width", 0f);
+        if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f || maxWidth <= 0f)
+            return DynValue.NewNumber(0);
+
+        var font = _fonts.Load(fontPath, size);
+        if (font is null)
+            return DynValue.NewNumber(0);
+        var unwrapped = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
+        if (unwrapped.Y <= 0f)
+            return DynValue.NewNumber(0);
+        var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? unwrapped.Y : font.RasterSize);
+        var sizeScale = size / sizeBasis;
+        var transformScale = GetScale(options);
+        var xScale = Math.Max(0.01f, sizeScale * Math.Abs(transformScale.X));
+        var yScale = sizeScale * Math.Abs(transformScale.Y);
+        var measured = TSC.Rendering.BbCodeTextRenderer.MeasureWrapped(font.Font, text, maxWidth, xScale);
+        return DynValue.NewNumber(Math.Max(0f, measured.Y * yScale / xScale));
     }
 
     private DynValue DrawTextBatch(ScriptExecutionContext _, CallbackArguments args)
@@ -7075,12 +7170,14 @@ public sealed class SkinRuntime : IDisposable
         }
     }
 
-    private DynValue SubmitText(string text, Table options)
+    private DynValue SubmitText(string text, Table options, bool userText = false)
     {
         var position = GetPosition(options);
         var anchor = GetAnchor(options);
         var scale = GetScale(options);
         var size = GetNumber(options, "size", 0f);
+        var textMaxWidth = Math.Max(0f, GetNumber(options, "max_width", 0f));
+        var textWrap = userText && GetBool(options, "wrap", false);
         var color = GetColor(options, "color", XnaColor.White);
         var id = GetOptionalString(options, "id")?.Trim();
         var parentId = GetOptionalString(options, "parent")?.Trim();
@@ -7121,7 +7218,11 @@ public sealed class SkinRuntime : IDisposable
         if (!string.IsNullOrWhiteSpace(id) && font is not null)
         {
             Vector2 measured;
-            if (_defaultFallbackFont is { } fallback)
+            if (userText)
+                measured = textWrap && textMaxWidth > 0f
+                    ? TSC.Rendering.BbCodeTextRenderer.MeasureWrapped(font.Font, text, textMaxWidth)
+                    : TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
+            else if (_defaultFallbackFont is { } fallback)
                 measured = BuildTextLayout(font.Font, fallback, text).Size;
             else
                 measured = TSC.Rendering.UnicodeTextRenderer.MeasureString(font.Font, GetFontSafeText(font.Font, text));
@@ -7140,7 +7241,7 @@ public sealed class SkinRuntime : IDisposable
         }
 
         var command = AcquireDrawCommand();
-        command.Kind = SkinDrawCommandKind.Text;
+        command.Kind = userText ? SkinDrawCommandKind.UserText : SkinDrawCommandKind.Text;
         command.Text = text;
         command.Id = id;
         command.ParentId = parentId;
@@ -7149,6 +7250,8 @@ public sealed class SkinRuntime : IDisposable
         command.Size = layoutSize;
         command.Scale = scale;
         command.TextSize = Math.Max(0f, size);
+        command.TextMaxWidth = textMaxWidth;
+        command.TextWrap = textWrap;
         command.Rotation = rotation;
         command.Color = color;
         command.Alpha = alpha;

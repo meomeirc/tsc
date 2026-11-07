@@ -205,9 +205,8 @@ public sealed partial class Playfield
         var defaultTextX = _projection.ScalePixels(22f);
         var viewWidth = _graphics.Viewport.Width;
         var viewHeight = _graphics.Viewport.Height;
-        var editorHudFont = _chartEditorMode
-            ? GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont)
-            : _font;
+        var editorHudFont = _font;
+        var editorHudScale = GetEditorDefaultFontScale(24f * _projection.ScalePixels(1f));
         var editorTopY = _projection.ScalePixels(18f);
         var editorTopMaxWidth = viewWidth - defaultTextX * 2f;
         if (_chartEditorMode)
@@ -222,7 +221,7 @@ public sealed partial class Playfield
             editorTopY = Math.Max(speedPanel.Bottom + padY, _projection.ScalePixels(64f));
             editorTopMaxWidth = Math.Max(_projection.ScalePixels(10f), actionPanel.X - defaultTextX - padX);
 
-            var topLineGap = _projection.ScalePixels(22f);
+            var topLineGap = _projection.ScalePixels(28f);
             var topLines = new[]
             {
                 (hudLine, Text),
@@ -231,9 +230,11 @@ public sealed partial class Playfield
             };
             for (var i = 0; i < topLines.Length; i++)
             {
-                var text = FitHudText(editorHudFont, FontSafeText(editorHudFont, topLines[i].Item1), editorTopMaxWidth);
+                var text = FitHudText(editorHudFont, FontSafeText(editorHudFont, topLines[i].Item1),
+                    editorTopMaxWidth / editorHudScale);
                 UnicodeTextRenderer.DrawString(_spriteBatch, editorHudFont, text,
-                    new Vector2(defaultTextX, editorTopY + i * topLineGap), topLines[i].Item2);
+                    new Vector2(defaultTextX, editorTopY + i * topLineGap), topLines[i].Item2,
+                    0f, Vector2.Zero, editorHudScale, SpriteEffects.None, 0f);
             }
 
             if (_scoreDebugEnabled && _scoreEntries.Count > 0)
@@ -242,10 +243,12 @@ public sealed partial class Playfield
                 var debugY = editorTopY + topLines.Length * topLineGap + padY;
                 for (var i = 0; i < debugLines.Length; i++)
                 {
-                    var text = FitHudText(editorHudFont, FontSafeText(editorHudFont, debugLines[i]), editorTopMaxWidth);
+                    var text = FitHudText(editorHudFont, FontSafeText(editorHudFont, debugLines[i]),
+                        editorTopMaxWidth / editorHudScale);
+                    var lineScale = GetEditorDefaultFontScale(text, 18f * _projection.ScalePixels(1f));
                     UnicodeTextRenderer.DrawString(_spriteBatch, editorHudFont, text,
-                        new Vector2(defaultTextX, debugY + i * _projection.ScalePixels(18f)),
-                        i == 3 ? Text : Muted);
+                        new Vector2(defaultTextX, debugY + i * _projection.ScalePixels(22f)),
+                        i == 3 ? Text : Muted, 0f, Vector2.Zero, lineScale, SpriteEffects.None, 0f);
                 }
             }
 
@@ -261,19 +264,20 @@ public sealed partial class Playfield
             var rightMargin = _projection.ScalePixels(12f);
             var infoWidth = Math.Max(_projection.ScalePixels(10f), viewWidth - problemsPanel.X - rightMargin);
             var lineHeight = Math.Max(_projection.ScalePixels(20f),
-                UnicodeTextRenderer.GetLogicalLineSpacing(editorHudFont) * _projection.ScalePixels(1f));
+                UnicodeTextRenderer.GetLogicalLineSpacing(editorHudFont) * editorHudScale * 1.2f);
             var wrappedBottomLines = new List<(string Text, Color Color)>();
             foreach (var item in bottomLines)
             {
                 var safeText = FontSafeText(editorHudFont, item.Text);
-                foreach (var line in WrapEditorHudText(editorHudFont, safeText, infoWidth))
+                foreach (var line in WrapEditorHudText(editorHudFont, safeText, infoWidth / editorHudScale))
                     wrappedBottomLines.Add((line, item.Color));
             }
             var bottomTextTop = problemsPanel.Y - infoGap - wrappedBottomLines.Count * lineHeight;
             for (var i = 0; i < wrappedBottomLines.Count; i++)
             {
                 UnicodeTextRenderer.DrawString(_spriteBatch, editorHudFont, wrappedBottomLines[i].Text,
-                    new Vector2(problemsPanel.X, bottomTextTop + i * lineHeight), wrappedBottomLines[i].Color);
+                    new Vector2(problemsPanel.X, bottomTextTop + i * lineHeight), wrappedBottomLines[i].Color,
+                    0f, Vector2.Zero, editorHudScale, SpriteEffects.None, 0f);
             }
         }
         else
@@ -328,15 +332,22 @@ public sealed partial class Playfield
                 : _projection.ScalePixels(86);
             var debugWidth = _chartEditorMode ? editorTopMaxWidth : viewWidth - debugX - _projection.ScalePixels(22f);
             var debugFont = _chartEditorMode ? editorHudFont : _font;
-            var debugHeader = FitHudText(debugFont, FontSafeText(debugFont, $"SUPER FLICK DEBUG (F9 off)  log: {_superFlickDebugPath}"), debugWidth);
-            UnicodeTextRenderer.DrawString(_spriteBatch, debugFont, debugHeader, new Vector2(debugX, debugY), InnerSuperFlick);
-            var lineY = debugY + _projection.ScalePixels(22);
+            var debugScale = _chartEditorMode
+                ? GetEditorDefaultFontScale(18f * _projection.ScalePixels(1f))
+                : 1f;
+            var debugHeader = FitHudText(debugFont,
+                FontSafeText(debugFont, $"SUPER FLICK DEBUG (F9 off)  log: {_superFlickDebugPath}"),
+                debugWidth / debugScale);
+            UnicodeTextRenderer.DrawString(_spriteBatch, debugFont, debugHeader, new Vector2(debugX, debugY),
+                InnerSuperFlick, 0f, Vector2.Zero, debugScale, SpriteEffects.None, 0f);
+            var lineY = debugY + _projection.ScalePixels(22f);
             foreach (var line in _superFlickDebugRecent.Take(8))
             {
                 var visible = line.Length > 150 ? line[^150..] : line;
-                visible = FitHudText(debugFont, FontSafeText(debugFont, visible), debugWidth);
-                UnicodeTextRenderer.DrawString(_spriteBatch, debugFont, visible, new Vector2(debugX, lineY), Muted);
-                lineY += _projection.ScalePixels(18);
+                visible = FitHudText(debugFont, FontSafeText(debugFont, visible), debugWidth / debugScale);
+                UnicodeTextRenderer.DrawString(_spriteBatch, debugFont, visible, new Vector2(debugX, lineY),
+                    Muted, 0f, Vector2.Zero, debugScale, SpriteEffects.None, 0f);
+                lineY += _projection.ScalePixels(22f);
             }
         }
 
@@ -350,7 +361,7 @@ public sealed partial class Playfield
 
         var width = _graphics.Viewport.Width;
         var height = _graphics.Viewport.Height;
-        var labelFont = GetChartEditorFont(_chartEditorInterfaceLayout.ButtonFont);
+        var labelFont = _font;
         EnsureEditorIndicatorProjection(width, height);
         var unit = _editorIndicatorProjection.ScalePixels(1f);
         var currentTick = _tempo.SecondsToTick(_playSeconds);
@@ -405,10 +416,11 @@ public sealed partial class Playfield
                 _spriteBatch.Draw(_pixel, new Rectangle(bounds.Right - thickness, bounds.Y, thickness, bounds.Height), border);
                 var label = bank switch { "Forward" => "1K", "Center" => "2K", _ => "3K" };
                 var safeLabel = FontSafeText(labelFont, label);
-                var size = UnicodeTextRenderer.MeasureString(labelFont, safeLabel);
+                var labelScale = GetEditorDefaultFontScale(safeLabel, 20f * unit);
+                var size = UnicodeTextRenderer.MeasureString(labelFont, safeLabel) * labelScale;
                 UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, safeLabel,
                     new Vector2(bounds.Center.X - size.X * 0.5f, bounds.Center.Y - size.Y * 0.5f),
-                    labelColor);
+                    labelColor, 0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
             }
         }
         _spriteBatch.End();
@@ -443,7 +455,7 @@ public sealed partial class Playfield
             _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, thickness, bounds.Height), border);
             _spriteBatch.Draw(_pixel, new Rectangle(bounds.Right - thickness, bounds.Y, thickness, bounds.Height), border);
 
-            var fitted = FitChartEditorText(label, style.LabelFont, 24f * (float)style.LabelTextScale,
+            var fitted = FitChartEditorText(label, 24f * unit * (float)style.LabelTextScale,
                 bounds.Width - 8f * unit, bounds.Height - 4f * unit);
             var size = fitted.Measured * fitted.Scale;
             var position = new Vector2(bounds.Center.X - size.X * 0.5f, bounds.Center.Y - size.Y * 0.5f);
@@ -700,16 +712,16 @@ public sealed partial class Playfield
                                 ? headingValue?.ToString() ?? string.Empty : string.Empty;
                             var description = item.TryGetValue("description", out var descriptionValue)
                                 ? descriptionValue?.ToString() ?? string.Empty : string.Empty;
-                            var titleFit = FitChartEditorText(heading, interfaceUi.ButtonFont,
-                                20f * (float)interfaceUi.ButtonTextScale, bounds.Width - 14f * unit, 23f * unit);
+                            var titleFit = FitChartEditorText(heading,
+                                20f * unit * (float)interfaceUi.ButtonTextScale, bounds.Width - 14f * unit, 23f * unit);
                             var groupTextColor = primaryActive
                                 ? interfaceUi.PrimaryButtonTextColor
                                 : interfaceUi.ButtonTextColor;
                             UnicodeTextRenderer.DrawString(_spriteBatch, titleFit.Font, titleFit.Text,
                                 new Vector2(bounds.X + 10f * unit, bounds.Y + 7f * unit), groupTextColor,
                                 0f, Vector2.Zero, titleFit.Scale, SpriteEffects.None, 0f);
-                            var descriptionFit = FitChartEditorText(description, interfaceUi.LabelFont,
-                                17f * (float)interfaceUi.LabelTextScale, bounds.Width - 14f * unit, 18f * unit);
+                            var descriptionFit = FitChartEditorText(description,
+                                17f * unit * (float)interfaceUi.LabelTextScale, bounds.Width - 14f * unit, 18f * unit);
                             UnicodeTextRenderer.DrawString(_spriteBatch, descriptionFit.Font, descriptionFit.Text,
                                 new Vector2(bounds.X + 10f * unit, bounds.Y + 30f * unit), groupTextColor,
                                 0f, Vector2.Zero, descriptionFit.Scale, SpriteEffects.None, 0f);
@@ -719,8 +731,8 @@ public sealed partial class Playfield
                             _spriteBatch.Draw(_pixel, bounds, new Color(25, 25, 27, 150));
                             if (row == 0 && groupItems.Count == 0)
                             {
-                                var emptyFit = FitChartEditorText("NO GROUPS YET", interfaceUi.LabelFont,
-                                    18f * (float)interfaceUi.LabelTextScale, bounds.Width - 12f * unit, bounds.Height - 8f * unit);
+                                var emptyFit = FitChartEditorText("NO GROUPS YET",
+                                    18f * unit * (float)interfaceUi.LabelTextScale, bounds.Width - 12f * unit, bounds.Height - 8f * unit);
                                 var emptySize = emptyFit.Measured * emptyFit.Scale;
                                 UnicodeTextRenderer.DrawString(_spriteBatch, emptyFit.Font, emptyFit.Text,
                                     new Vector2(bounds.Center.X - emptySize.X * 0.5f, bounds.Center.Y - emptySize.Y * 0.5f),
@@ -1143,13 +1155,15 @@ public sealed partial class Playfield
             new Color(28, 28, 30, 242), new Color(148, 163, 184));
         DrawControlButton(GetEditorScrollSpeedButtonBounds(true, virtualWidth, virtualHeight), "+",
             new Color(28, 28, 30, 242), Active);
-        var speedFont = GetChartEditorFont(interfaceUi.LabelFont);
+        var speedFont = _font;
         var speedText = FontSafeText(speedFont, $"{_projection.ScrollSpeedScale:0.00}x");
-        var speedTextSize = UnicodeTextRenderer.MeasureString(speedFont, speedText);
         var speedUnit = _projection.ScalePixels(1f);
+        var speedScale = GetEditorDefaultFontScale(speedText, 18f * speedUnit);
+        var speedTextSize = UnicodeTextRenderer.MeasureString(speedFont, speedText) * speedScale;
         var speedX = speedPanel.X + (int)MathF.Round(46f * speedUnit);
         UnicodeTextRenderer.DrawString(_spriteBatch, speedFont, speedText,
-            new Vector2(speedX, speedPanel.Y + (speedPanel.Height - speedTextSize.Y) * 0.5f), interfaceUi.MutedTextColor);
+            new Vector2(speedX, speedPanel.Y + (speedPanel.Height - speedTextSize.Y) * 0.5f),
+            interfaceUi.MutedTextColor, 0f, Vector2.Zero, speedScale, SpriteEffects.None, 0f);
 
         DrawEditorTimelineScrubber(GetEditorTimelineScrubberBounds(virtualWidth, virtualHeight));
         if (_editorMetaPanelOpen)
@@ -1166,8 +1180,8 @@ public sealed partial class Playfield
             _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, accentWidth, bounds.Height), accent);
             var availableWidth = Math.Max(1f, bounds.Width - 16f * unit);
             var fitted = FitChartEditorText(
-                interfaceUi.Label("button:" + rawLabel, rawLabel), interfaceUi.ButtonFont,
-                24f * (float)interfaceUi.ButtonTextScale, availableWidth, bounds.Height - 8f * unit);
+                interfaceUi.Label("button:" + rawLabel, rawLabel),
+                24f * unit * (float)interfaceUi.ButtonTextScale, availableWidth, bounds.Height - 8f * unit);
             var size = fitted.Measured * fitted.Scale;
             var position = new Vector2(bounds.X + (bounds.Width - size.X) * 0.5f,
                 bounds.Y + (bounds.Height - size.Y) * 0.5f);
@@ -1189,8 +1203,8 @@ public sealed partial class Playfield
                 new Color(90, 90, 92, 240));
             var maxWidth = Math.Max(1f, close.X - bounds.X - 20f * unit);
             var fitted = FitChartEditorText(
-                interfaceUi.Label("header:" + rawLabel, rawLabel), interfaceUi.HeaderFont,
-                24f * (float)interfaceUi.LabelTextScale, maxWidth, bounds.Height - 6f * unit);
+                interfaceUi.Label("header:" + rawLabel, rawLabel),
+                24f * unit * (float)interfaceUi.LabelTextScale, maxWidth, bounds.Height - 6f * unit);
             var size = fitted.Measured * fitted.Scale;
             UnicodeTextRenderer.DrawString(_spriteBatch, fitted.Font, fitted.Text,
                 new Vector2(bounds.X + 10f * unit, bounds.Y + (bounds.Height - size.Y) * 0.5f),
@@ -1205,7 +1219,7 @@ public sealed partial class Playfield
 
             var edge = Math.Max(1, (int)MathF.Round(1.5f * scaleUnit));
             var interfaceUi = _chartEditorInterfaceLayout;
-            var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
+            var labelFont = _font;
             var accent = focused ? ResolveEditorAccent(caretColor, interfaceUi) : new Color(100, 100, 102, 245);
             _spriteBatch.Draw(_pixel, bounds, interfaceUi.ButtonColor);
             _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, bounds.Width, edge), accent);
@@ -1246,11 +1260,7 @@ public sealed partial class Playfield
             var textWidth = Math.Max(1f, up.X - textLeft - 4f * scaleUnit);
             var caretPrefix = string.Empty;
             var visibleStart = 0;
-            var textScale = Math.Min(1f, Math.Max(0.55f,
-                (bounds.Height - 8f * scaleUnit) / Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y)));
-            labelFont = GetChartEditorFont(interfaceUi.LabelFont, 24f * textScale);
-            textScale = Math.Min(1f, (bounds.Height - 8f * scaleUnit) /
-                Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y));
+            var textScale = GetEditorTextFieldFontScale(bounds.Height, scaleUnit);
             var safeValue = FontSafeText(labelFont, rawValue);
             var visibleEnd = safeValue.Length;
             var display = focused
@@ -1278,8 +1288,8 @@ public sealed partial class Playfield
             var interfaceUi = _chartEditorInterfaceLayout;
             var availableWidth = Math.Max(1f, bounds.Width - 4f * unit);
             var fitted = FitChartEditorText(
-                interfaceUi.Label("label:" + rawLabel, rawLabel), interfaceUi.LabelFont,
-                24f * (float)interfaceUi.LabelTextScale, availableWidth, bounds.Height - 4f * unit);
+                interfaceUi.Label("label:" + rawLabel, rawLabel),
+                24f * unit * (float)interfaceUi.LabelTextScale, availableWidth, bounds.Height - 4f * unit);
             var size = fitted.Measured * fitted.Scale;
             var position = new Vector2(bounds.X + 2f * unit,
                 bounds.Y + (bounds.Height - size.Y) * 0.5f);
@@ -1509,44 +1519,49 @@ public sealed partial class Playfield
         return lines;
     }
 
-    private (SpriteFont Font, string Text, Vector2 Measured, float Scale) FitChartEditorText(
-        string rawText, string requestedFont, float requestedPixelHeight, float maxWidth, float maxHeight)
+    private float GetEditorDefaultFontScale(float requestedPixelHeight)
     {
-        requestedPixelHeight = Math.Clamp(float.IsFinite(requestedPixelHeight) ? requestedPixelHeight : 24f, 8f, 256f);
-        maxWidth = Math.Max(1f, maxWidth);
-        maxHeight = Math.Max(1f, maxHeight);
-        var font = GetChartEditorFont(requestedFont, requestedPixelHeight);
-        var text = FontSafeText(font, rawText);
-        var measured = UnicodeTextRenderer.MeasureString(font, text);
-        var scale = Math.Min(1f, Math.Min(
-            maxWidth / Math.Max(1f, measured.X),
-            maxHeight / Math.Max(1f, measured.Y)));
-
-        // Lua menu text is rasterized at its display size. If the preferred face
-        // does not fit, rasterize a smaller face instead of shrinking a larger
-        // glyph atlas, which makes small editor labels look soft.
-        var fittedPixelHeight = requestedPixelHeight * scale;
-        if (fittedPixelHeight >= 8f && fittedPixelHeight < requestedPixelHeight - 0.5f)
-        {
-            font = GetChartEditorFont(requestedFont, fittedPixelHeight);
-            text = FontSafeText(font, rawText);
-            measured = UnicodeTextRenderer.MeasureString(font, text);
-            scale = Math.Min(1f, Math.Min(
-                maxWidth / Math.Max(1f, measured.X),
-                maxHeight / Math.Max(1f, measured.Y)));
-        }
-
-        return (font, text, measured, scale);
+        var nativeHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(_font, "Ag").Y);
+        return Math.Max(0.01f, requestedPixelHeight / nativeHeight);
     }
 
-    private SpriteFont GetChartEditorFont(string requestedFont, float requestedPixelHeight = 24f)
+    private float GetEditorDefaultFontScale(string text, float requestedPixelHeight)
     {
-        // Match the menu runtime: rasterize each Roboto face at the text's
-        // requested display size, with a few extra symbols for editor labels.
-        const string editorCharacters = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~•…→←↑↓▼▲−×÷≤≥≈°′″";
-        return _chartEditorFontStore.Load(requestedFont, requestedPixelHeight, rasterCharacters: editorCharacters)?.Font
-            ?? _chartEditorDefaultFontStore?.Load(requestedFont, requestedPixelHeight, rasterCharacters: editorCharacters)?.Font
-            ?? _font;
+        var safeText = FontSafeText(_font, text);
+        var nativeHeight = UnicodeTextRenderer.MeasureString(_font, safeText).Y;
+        return Math.Max(0.01f, requestedPixelHeight / Math.Max(1f, nativeHeight));
+    }
+
+    private float GetEditorTextFieldFontScale(float boundsHeight, float unit)
+    {
+        var nativeHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(_font, "Ag").Y);
+        var requested = 24f * unit / nativeHeight;
+        var available = Math.Max(1f, boundsHeight - 8f * unit) / nativeHeight;
+        return Math.Max(0.01f, Math.Min(requested, available));
+    }
+
+    private (SpriteFont Font, string Text, Vector2 Measured, float Scale) FitChartEditorText(
+        string rawText, float requestedPixelHeight, float maxWidth, float maxHeight)
+    {
+        requestedPixelHeight = Math.Clamp(float.IsFinite(requestedPixelHeight) ? requestedPixelHeight : 16f, 8f, 256f);
+        maxWidth = Math.Max(1f, maxWidth);
+        maxHeight = Math.Max(1f, maxHeight);
+
+        // Use the exact DefaultFont SpriteFont instance shared by the other C# menus.
+        // Match SongSelectMenu.DrawText: measure the native logical size, then scale
+        // that same font explicitly for the requested UI size. No Roboto path, font
+        // clone, alternate atlas, or per-editor font registration is involved.
+        var font = _font;
+        var text = FontSafeText(font, rawText);
+        var measured = UnicodeTextRenderer.MeasureString(font, text);
+        var scale = measured.Y <= 0f ? 1f : requestedPixelHeight / measured.Y;
+        var scaled = measured * scale;
+        var fit = Math.Min(1f, Math.Min(
+            maxWidth / Math.Max(1f, scaled.X),
+            maxHeight / Math.Max(1f, scaled.Y)));
+        scale *= fit;
+
+        return (font, text, measured, scale);
     }
 
     private static Color ResolveEditorAccent(Color accent, ChartEditorInterfaceLayout style)
@@ -1561,8 +1576,9 @@ public sealed partial class Playfield
     private void DrawEditorTimelineScrubber(Rectangle bounds)
     {
         var interfaceUi = _chartEditorInterfaceLayout;
-        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
+        var labelFont = _font;
         var unit = _projection.ScalePixels(1f);
+        var baseLabelScale = GetEditorDefaultFontScale(16f * unit);
         var duration = Math.Max(0.0, ChartDuration());
         var trackX = bounds.X + (int)MathF.Round(7f * unit);
         var trackTop = GetEditorTimelineTrackTop(bounds);
@@ -1986,15 +2002,18 @@ public sealed partial class Playfield
 
             var label = FormatEditorTimestamp(duration * ratio);
             var maxLabelWidth = Math.Max(1f, bounds.Width - _projection.ScalePixels(8f));
-            label = FitHudText(labelFont, label, maxLabelWidth);
-            var labelSize = UnicodeTextRenderer.MeasureString(labelFont, label);
+            label = FitHudText(labelFont, label, maxLabelWidth / baseLabelScale);
+            var labelScale = GetEditorDefaultFontScale(label, 16f * unit);
+            var labelSize = UnicodeTextRenderer.MeasureString(labelFont, label) * labelScale;
             var labelX = labelCenterX - labelSize.X * 0.5f;
             var labelY = y - labelSize.Y * 0.5f;
             var labelColor = i is 0 or 4 ? interfaceUi.ButtonTextColor : interfaceUi.MutedTextColor;
             // A one-pixel shadow keeps the plain labels readable over any lane art.
             UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, label,
-                new Vector2(labelX + unit, labelY + unit), new Color(0, 0, 0, 150));
-            UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, label, new Vector2(labelX, labelY), labelColor);
+                new Vector2(labelX + unit, labelY + unit), new Color(0, 0, 0, 150),
+                0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
+            UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, label, new Vector2(labelX, labelY),
+                labelColor, 0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
         }
 
         var playheadThickness = Math.Max(2, (int)MathF.Round(4f * unit));
@@ -2184,7 +2203,6 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var font = _chartEditorInterfaceLayout.LabelFont;
         var muted = _chartEditorInterfaceLayout.MutedTextColor;
         var normal = _chartEditorInterfaceLayout.ButtonTextColor;
         string status;
@@ -2210,20 +2228,25 @@ public sealed partial class Playfield
         }
         var chartSummary = GetEditorLanTestChartSummary();
         var musicAvailable = IsEditorLanTestMusicAvailable();
-        var textFont = GetChartEditorFont(font, 24f);
+        // Match the stable menus: use the shared DefaultFont SpriteFont, measure its native
+        // logical size, then scale both wrapping and drawing to the requested UI size.
+        var textFont = _font;
+        var baseTextScale = GetEditorDefaultFontScale(18f * unit);
         float cursorY = content.Y + 44f * unit;
-        var textLineHeight = Math.Max(16f * unit,
-            UnicodeTextRenderer.GetLogicalLineSpacing(textFont) * unit);
-        var textWidth = Math.Max(1f, content.Width);
+        var textWidth = Math.Max(1f, content.Width / baseTextScale);
 
         void Line(string value, Color color)
         {
             var safeText = FontSafeText(textFont, value);
             foreach (var wrapped in WrapEditorHudText(textFont, safeText, textWidth))
             {
+                var lineScale = GetEditorDefaultFontScale(wrapped, 18f * unit);
+                var lineHeight = Math.Max(16f * unit,
+                    UnicodeTextRenderer.MeasureString(textFont, wrapped).Y * lineScale * 1.2f);
                 UnicodeTextRenderer.DrawString(_spriteBatch, textFont, wrapped,
-                    new Vector2(content.X, cursorY), color);
-                cursorY += textLineHeight;
+                    new Vector2(content.X, cursorY), color, 0f, Vector2.Zero,
+                    lineScale, SpriteEffects.None, 0f);
+                cursorY += lineHeight;
             }
             cursorY += 4f * unit;
         }
@@ -2280,8 +2303,8 @@ public sealed partial class Playfield
     {
         var panel = GetEditorMetaPanelBounds(virtualWidth, virtualHeight);
         var interfaceUi = _chartEditorInterfaceLayout;
-        var headerFont = GetChartEditorFont(interfaceUi.HeaderFont);
-        var labelFont = GetChartEditorFont(interfaceUi.LabelFont);
+        var headerFont = _font;
+        var labelFont = _font;
         var unit = _projection.ScalePixels(1f);
         var padding = (int)MathF.Round(12f * unit);
         var headerHeight = (int)MathF.Round(54f * unit);
@@ -2293,8 +2316,10 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Bottom - edge, panel.Width, edge), new Color(90, 90, 92, 240));
 
         var title = FontSafeText(headerFont, interfaceUi.Label("header:SONG / CHART META", "SONG / CHART META"));
+        var headerScale = GetEditorDefaultFontScale(title, 24f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, headerFont, title,
-            new Vector2(panel.X + padding, panel.Y + padding + _projection.ScalePixels(10f)), interfaceUi.ButtonTextColor);
+            new Vector2(panel.X + padding, panel.Y + padding + _projection.ScalePixels(10f)),
+            interfaceUi.ButtonTextColor, 0f, Vector2.Zero, headerScale, SpriteEffects.None, 0f);
         DrawEditorMetaButton(GetEditorMetaCloseButtonBounds(virtualWidth, virtualHeight), "X",
             new Color(55, 30, 35, 245), interfaceUi.DangerColor);
         DrawEditorMetaButton(GetEditorMetaExitButtonBounds(virtualWidth, virtualHeight), "EXIT",
@@ -2305,8 +2330,10 @@ public sealed partial class Playfield
 
         var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
         var difficultyLabel = FontSafeText(labelFont, "DIFFICULTY");
+        var labelScale = GetEditorDefaultFontScale(difficultyLabel, 20f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, difficultyLabel,
-            new Vector2(panel.X + padding, panel.Y + _projection.ScalePixels(52f)), interfaceUi.MutedTextColor);
+            new Vector2(panel.X + padding, panel.Y + _projection.ScalePixels(52f)),
+            interfaceUi.MutedTextColor, 0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
         for (var i = 0; i < EditorDifficultyCodes.Length; i++)
         {
             var bounds = GetEditorMetaDifficultyButtonBounds(i, virtualWidth, virtualHeight);
@@ -2367,7 +2394,7 @@ public sealed partial class Playfield
                     : (mediaPicker || previewMedia) ? Active : editable ? new Color(100, 100, 102) : new Color(100, 100, 102, 245);
 
                 var labelAvailableWidth = Math.Max(1f, labelBounds.Width - 4f * unit);
-                var fittedLabel = FitChartEditorText(label, interfaceUi.LabelFont, 24f,
+                var fittedLabel = FitChartEditorText(label, 24f * unit,
                     labelAvailableWidth, labelBounds.Height - 4f * unit);
                 var labelSize = fittedLabel.Measured * fittedLabel.Scale;
                 UnicodeTextRenderer.DrawString(_spriteBatch, fittedLabel.Font, fittedLabel.Text,
@@ -2397,7 +2424,8 @@ public sealed partial class Playfield
                 else
                     DrawEditorMetaTextField(bounds, display, editing, editable, accent,
                         editing ? _editorMetaInputText : null, _editorMetaSelectionAnchor, _editorMetaInputCaretIndex,
-                        reserveMetaScrollbarSpace: true);
+                        reserveMetaScrollbarSpace: true,
+                        renderBbCode: !editing && BbCodeTextRenderer.IsSupportedMetadataField(fieldKey));
             }
 
             var totalContentHeight = GetEditorMetaPrefixHeight(rowLayouts, rowLayouts.Count);
@@ -2462,15 +2490,17 @@ public sealed partial class Playfield
         var height = Math.Max(1, (int)MathF.Round(190f * unit));
         var panel = new Rectangle((virtualWidth - width) / 2, (virtualHeight - height) / 2, width, height);
         _spriteBatch.Draw(_pixel, panel, _chartEditorInterfaceLayout.PanelColor);
-        var font = GetChartEditorFont(_chartEditorInterfaceLayout.HeaderFont);
+        var font = _font;
         var title = FontSafeText(font, "CREATE DIFFICULTY?");
+        var titleScale = GetEditorDefaultFontScale(title, 24f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, font, title,
             new Vector2(panel.Center.X, panel.Y + 24f * unit), _chartEditorInterfaceLayout.ButtonTextColor,
-            0f, new Vector2(font.MeasureString(title).X / 2f, 0f), unit, SpriteEffects.None, 0f);
+            0f, new Vector2(UnicodeTextRenderer.MeasureString(font, title).X / 2f, 0f),
+            titleScale, SpriteEffects.None, 0f);
         var difficulty = GetEditorDifficultyName(_editorPendingCreateDifficultyCode);
-        var body = FontSafeText(GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont),
+        var body = FontSafeText(_font,
             $"Create an empty {difficulty} chart file now? You can add notes afterward.");
-        var bodyFit = FitChartEditorText(body, _chartEditorInterfaceLayout.LabelFont, 16f, panel.Width - 28f * unit, 48f * unit);
+        var bodyFit = FitChartEditorText(body, 16f * unit, panel.Width - 28f * unit, 48f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, bodyFit.Font, bodyFit.Text,
             new Vector2(panel.Center.X, panel.Y + 66f * unit), _chartEditorInterfaceLayout.MutedTextColor,
             0f, new Vector2(bodyFit.Measured.X / 2f, 0f), bodyFit.Scale, SpriteEffects.None, 0f);
@@ -2489,14 +2519,16 @@ public sealed partial class Playfield
         var height = Math.Max(1, (int)MathF.Round(190f * unit));
         var panel = new Rectangle((virtualWidth - width) / 2, (virtualHeight - height) / 2, width, height);
         _spriteBatch.Draw(_pixel, panel, _chartEditorInterfaceLayout.PanelColor);
-        var font = GetChartEditorFont(_chartEditorInterfaceLayout.HeaderFont);
+        var font = _font;
         var title = FontSafeText(font, "DELETE DIFFICULTY?");
+        var titleScale = GetEditorDefaultFontScale(title, 24f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, font, title,
             new Vector2(panel.Center.X, panel.Y + 24f * unit), _chartEditorInterfaceLayout.ButtonTextColor,
-            0f, new Vector2(font.MeasureString(title).X / 2f, 0f), unit, SpriteEffects.None, 0f);
-        var bodyFont = GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont);
+            0f, new Vector2(UnicodeTextRenderer.MeasureString(font, title).X / 2f, 0f),
+            titleScale, SpriteEffects.None, 0f);
+        var bodyFont = _font;
         var body = FontSafeText(bodyFont, "This marks the chart for deletion. Its file will be removed when you save.");
-        var bodyFit = FitChartEditorText(body, _chartEditorInterfaceLayout.LabelFont, 16f, panel.Width - 28f * unit, 48f * unit);
+        var bodyFit = FitChartEditorText(body, 16f * unit, panel.Width - 28f * unit, 48f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, bodyFit.Font, bodyFit.Text,
             new Vector2(panel.X + 14f * unit, panel.Y + 64f * unit), _chartEditorInterfaceLayout.MutedTextColor,
             0f, Vector2.Zero, bodyFit.Scale, SpriteEffects.None, 0f);
@@ -2539,7 +2571,7 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, bounds.Width, edge), accent);
         _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Bottom - edge, bounds.Width, edge), interfaceUi.HeaderColor);
         var maxWidth = Math.Max(1f, bounds.Width - 20f * unit);
-        var fitted = FitChartEditorText(rawValue, interfaceUi.LabelFont, 24f, maxWidth, bounds.Height - 4f * unit);
+        var fitted = FitChartEditorText(rawValue, 24f * unit, maxWidth, bounds.Height - 4f * unit);
         var size = fitted.Measured * fitted.Scale;
         UnicodeTextRenderer.DrawString(_spriteBatch, fitted.Font, fitted.Text,
             new Vector2(bounds.X + 10f * unit, bounds.Y + (bounds.Height - size.Y) * 0.5f),
@@ -2548,13 +2580,13 @@ public sealed partial class Playfield
 
     private void DrawEditorMetaTextField(Rectangle bounds, string rawValue, bool editing, bool editable, Color accent,
         string? selectionText = null, int selectionAnchor = 0, int caretIndex = 0,
-        bool reserveMetaScrollbarSpace = false)
+        bool reserveMetaScrollbarSpace = false, bool renderBbCode = false)
     {
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return;
 
         var unit = _projection.ScalePixels(1f);
-        var labelFont = GetChartEditorFont(_chartEditorInterfaceLayout.LabelFont);
+        var labelFont = _font;
         var edge = Math.Max(1, (int)MathF.Round(1.5f * unit));
         var interfaceUi = _chartEditorInterfaceLayout;
         var border = interfaceUi.HeaderColor;
@@ -2570,21 +2602,24 @@ public sealed partial class Playfield
         // measurement and the actual draw width always produce the same line count.
         // Standalone MEDIA fields keep their full width because they have no list rail.
         var textWidth = Math.Max(1f, bounds.Width - (reserveMetaScrollbarSpace ? 42f : 20f) * unit);
-        var textScale = Math.Min(1f, Math.Max(0.55f,
-            (bounds.Height - 8f * unit) / Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y)));
-        labelFont = GetChartEditorFont(interfaceUi.LabelFont, 24f * textScale);
-        textScale = Math.Min(1f, (bounds.Height - 8f * unit) /
-            Math.Max(1f, UnicodeTextRenderer.MeasureString(labelFont, "Ag").Y));
+        var textScale = GetEditorTextFieldFontScale(bounds.Height, unit);
         var value = FontSafeText(labelFont, rawValue);
         var textColor = editing ? interfaceUi.ButtonTextColor : editable
             ? interfaceUi.ButtonTextColor
             : interfaceUi.MutedTextColor;
+        if (!editing && renderBbCode)
+        {
+            BbCodeTextRenderer.DrawWrapped(_spriteBatch, _pixel, labelFont, rawValue,
+                bounds, 10f * unit, textWidth, textScale, textColor);
+            return;
+        }
         if (editing)
         {
             var wrapWidth = textWidth / Math.Max(0.01f, textScale);
             var wrappedLines = WrapEditorTextWithRanges(value, wrapWidth,
                 candidate => UnicodeTextRenderer.MeasureString(labelFont, candidate).X);
-            var editingLineHeight = Math.Max(16f * unit, 24f * 1.2f * unit);
+            var editingLineHeight = Math.Max(16f * unit,
+                UnicodeTextRenderer.GetLogicalLineSpacing(labelFont) * textScale * 1.2f);
             var editingBlockHeight = wrappedLines.Count * editingLineHeight;
             var editingLineY = bounds.Y + (bounds.Height - editingBlockHeight) * 0.5f;
             var selectionStart = Math.Min(Math.Clamp(selectionAnchor, 0, value.Length),
@@ -2654,7 +2689,8 @@ public sealed partial class Playfield
         // value into one line. The row layout grows to fit these lines, preserving
         // the normal 24px text size and keeping adjacent rows in the right position.
         var lines = WrapEditorHudText(labelFont, value, textWidth / Math.Max(0.01f, textScale));
-        var lineHeight = Math.Max(16f * unit, 24f * 1.2f * unit);
+        var lineHeight = Math.Max(16f * unit,
+            UnicodeTextRenderer.GetLogicalLineSpacing(labelFont) * textScale * 1.2f);
         var blockHeight = lines.Count * lineHeight;
         var lineY = bounds.Y + (bounds.Height - blockHeight) * 0.5f;
         foreach (var line in lines)
@@ -2694,14 +2730,15 @@ public sealed partial class Playfield
         DrawEditorMetaButton(titleBounds, "EXPORT CHART", new Color(20, 20, 22, 252), Active);
 
         var interfaceUi = _chartEditorInterfaceLayout;
-        var descFont = GetChartEditorFont(interfaceUi.LabelFont, 16f * unit);
+        var descFont = _font;
         const string subtitle = "Choose a format for this chart or song bundle.";
-        UnicodeTextRenderer.DrawString(_spriteBatch, descFont, FontSafeText(descFont, subtitle),
+        var safeSubtitle = FontSafeText(descFont, subtitle);
+        var subtitleScale = GetEditorDefaultFontScale(safeSubtitle, 16f * unit);
+        UnicodeTextRenderer.DrawString(_spriteBatch, descFont, safeSubtitle,
             new Vector2(modal.X + padding, modal.Y + 56f * unit), interfaceUi.MutedTextColor,
-            0f, Vector2.Zero, 1f, SpriteEffects.None, 0f);
-        var descriptionLineHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(descFont, "Ag").Y) * 1.22f;
-        var titleFont = GetChartEditorFont(interfaceUi.ButtonFont, 20f * unit);
-        var titleLineHeight = Math.Max(1f, UnicodeTextRenderer.MeasureString(titleFont, "Ag").Y);
+            0f, Vector2.Zero, subtitleScale, SpriteEffects.None, 0f);
+        var baseDescriptionScale = GetEditorDefaultFontScale(16f * unit);
+        var titleFont = _font;
         var titleTop = 8f * unit;
         var descriptionGap = 4f * unit;
         for (var i = 0; i < count; i++)
@@ -2712,19 +2749,24 @@ public sealed partial class Playfield
             var accentWidth = Math.Max(1, (int)MathF.Round((float)interfaceUi.AccentWidth * unit));
             _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, accentWidth, bounds.Height), accent);
             var labelText = FontSafeText(titleFont, interfaceUi.Label("export:" + label, label));
-            var labelMeasured = UnicodeTextRenderer.MeasureString(titleFont, labelText);
-            var labelScale = Math.Min(1f, Math.Max(0.1f, 22f * unit / Math.Max(1f, labelMeasured.Y)));
+            var labelScale = GetEditorDefaultFontScale(labelText, 22f * unit);
+            var labelSize = UnicodeTextRenderer.MeasureString(titleFont, labelText) * labelScale;
             var labelPosition = new Vector2(bounds.X + 16f * unit, bounds.Y + titleTop);
             UnicodeTextRenderer.DrawString(_spriteBatch, titleFont, labelText, labelPosition,
                 interfaceUi.ButtonTextColor, 0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
 
-            var lines = WrapEditorTextToWidth(descFont, description, Math.Max(1f, bounds.Width - 32f * unit));
-            var descriptionY = bounds.Y + titleTop + titleLineHeight * labelScale + descriptionGap;
-            for (var lineIndex = 0; lineIndex < lines.Count; lineIndex++)
+            var lines = WrapEditorTextToWidth(descFont, description,
+                Math.Max(1f, bounds.Width - 32f * unit) / baseDescriptionScale);
+            var descriptionY = bounds.Y + titleTop + labelSize.Y + descriptionGap;
+            foreach (var line in lines)
             {
-                UnicodeTextRenderer.DrawString(_spriteBatch, descFont, FontSafeText(descFont, lines[lineIndex]),
-                    new Vector2(bounds.X + 16f * unit, descriptionY + lineIndex * descriptionLineHeight),
-                    interfaceUi.MutedTextColor, 0f, Vector2.Zero, 1f, SpriteEffects.None, 0f);
+                var safeLine = FontSafeText(descFont, line);
+                var lineScale = GetEditorDefaultFontScale(safeLine, 16f * unit);
+                var lineHeight = UnicodeTextRenderer.MeasureString(descFont, safeLine).Y * lineScale * 1.22f;
+                UnicodeTextRenderer.DrawString(_spriteBatch, descFont, safeLine,
+                    new Vector2(bounds.X + 16f * unit, descriptionY),
+                    interfaceUi.MutedTextColor, 0f, Vector2.Zero, lineScale, SpriteEffects.None, 0f);
+                descriptionY += lineHeight;
             }
         }
     }
@@ -2740,8 +2782,8 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, accentWidth, bounds.Height), accent);
         var availableWidth = Math.Max(1f, bounds.Width - 16f * unit);
         var fitted = FitChartEditorText(
-            interfaceUi.Label("button:" + rawLabel, rawLabel), interfaceUi.ButtonFont,
-            24f * (float)interfaceUi.ButtonTextScale, availableWidth, bounds.Height - 8f * unit);
+            interfaceUi.Label("button:" + rawLabel, rawLabel),
+            24f * unit * (float)interfaceUi.ButtonTextScale, availableWidth, bounds.Height - 8f * unit);
         var size = fitted.Measured * fitted.Scale;
         var position = new Vector2(bounds.X + (bounds.Width - size.X) * 0.5f,
             bounds.Y + (bounds.Height - size.Y) * 0.5f);
@@ -3156,19 +3198,27 @@ public sealed partial class Playfield
                     }
 
                     case SkinDrawCommandKind.Text:
+                    case SkinDrawCommandKind.UserText:
                     {
+                        var userText = command.Kind == SkinDrawCommandKind.UserText;
                         var font = command.Font?.Font ?? _font;
-                        var text = FontSafeText(font, command.Text ?? string.Empty);
-                        var measured = UnicodeTextRenderer.MeasureString(font, text);
-                        if (measured.X <= 0f || measured.Y <= 0f)
+                        var text = userText ? command.Text ?? string.Empty : FontSafeText(font, command.Text ?? string.Empty);
+                        var baseMeasured = userText
+                            ? BbCodeTextRenderer.Measure(font, text)
+                            : UnicodeTextRenderer.MeasureString(font, text);
+                        if (baseMeasured.X <= 0f || baseMeasured.Y <= 0f)
                             break;
 
                         var scale = command.Scale;
                         if (command.TextSize > 0f)
                         {
-                            var uniform = command.TextSize / measured.Y;
+                            var uniform = command.TextSize / baseMeasured.Y;
                             scale *= uniform;
                         }
+                        var measured = userText && command.TextWrap && command.TextMaxWidth > 0f
+                            ? BbCodeTextRenderer.MeasureWrapped(font, text,
+                                command.TextMaxWidth / Math.Max(0.01f, Math.Abs(scale.X)))
+                            : baseMeasured;
 
                         var origin = new Vector2(
                             measured.X * command.Anchor.X,
@@ -3181,16 +3231,25 @@ public sealed partial class Playfield
                             Vector2 drawScale,
                             Vector2 drawOrigin)
                         {
-                            UnicodeTextRenderer.DrawString(_spriteBatch,
-                                drawFont,
-                                text,
-                                position,
-                                tint,
-                                command.Rotation,
-                                drawOrigin,
-                                drawScale,
-                                SpriteEffects.None,
-                                0f);
+                            if (userText)
+                            {
+                                BbCodeTextRenderer.DrawTransformed(_spriteBatch, _pixel, drawFont, text,
+                                    position, tint, command.Rotation, drawScale, command.Anchor,
+                                    command.TextMaxWidth, command.TextWrap);
+                            }
+                            else
+                            {
+                                UnicodeTextRenderer.DrawString(_spriteBatch,
+                                    drawFont,
+                                    text,
+                                    position,
+                                    tint,
+                                    command.Rotation,
+                                    drawOrigin,
+                                    drawScale,
+                                    SpriteEffects.None,
+                                    0f);
+                            }
                         }
 
                         if (command.Shadow is not null)
@@ -3211,12 +3270,14 @@ public sealed partial class Playfield
                             }
                             else if (shadow.RasterFont is not null)
                             {
-                                var shadowMeasured = UnicodeTextRenderer.MeasureString(shadowFont, text);
+                                var shadowMeasured = userText
+                                    ? BbCodeTextRenderer.Measure(shadowFont, text)
+                                    : UnicodeTextRenderer.MeasureString(shadowFont, text);
                                 if (shadowMeasured.X > 0f && shadowMeasured.Y > 0f)
                                 {
                                     shadowScale = new Vector2(
-                                        scale.X * measured.X / shadowMeasured.X,
-                                        scale.Y * measured.Y / shadowMeasured.Y);
+                                        scale.X * baseMeasured.X / shadowMeasured.X,
+                                        scale.Y * baseMeasured.Y / shadowMeasured.Y);
                                     shadowOrigin = new Vector2(
                                         shadowMeasured.X * command.Anchor.X,
                                         shadowMeasured.Y * command.Anchor.Y);

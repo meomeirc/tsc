@@ -163,6 +163,30 @@ local function fit_text_size(value, baseSize, maxWidth, font)
     return math.max(0.01, baseSize * maxWidth / measured)
 end
 
+local function fit_user_text_size(value, baseSize, maxWidth, font)
+    local measured = draw.measure_user_text_width(tostring(value or ""), {
+        font = font or UI.fonts.regular,
+        size = baseSize,
+    })
+    if measured <= 0 or measured <= maxWidth then return baseSize end
+    return math.max(0.01, baseSize * maxWidth / measured)
+end
+
+local function draw_result_user_text(parent, text, x, y, size, color, font, anchor, layer, ref, shadowAlpha)
+    font = font or UI.fonts.regular
+    draw.user_text(text or "", {
+        parent = parent,
+        x = x,
+        y = y,
+        size = size,
+        color = color or WHITE,
+        font = font,
+        anchor = anchor or "left",
+        layer = layer or 20,
+        shadow = soft_shadow(font, ref, shadowAlpha),
+    })
+end
+
 local function format_score(value)
     local number = math.floor(tonumber(value) or 0)
     local sign = ""
@@ -305,21 +329,21 @@ function render()
         L.song.title_size_ref * ref,
         stripHeight * L.song.title_height_ratio,
         rightWidth * L.song.title_width_ratio)
-    local fittedTitleSize = fit_text_size(game.song_name, titleSize, rightWidth, UI.fonts.bold)
+    local fittedTitleSize = fit_user_text_size(game.song_name, titleSize, rightWidth, UI.fonts.bold)
     local artistSize = math.min(
         L.song.artist_size_ref * ref,
         stripHeight * L.song.artist_height_ratio,
         rightWidth * L.song.artist_width_ratio)
-    local fittedArtistSize = fit_text_size(game.artist, artistSize, rightWidth, UI.fonts.regular)
+    local fittedArtistSize = fit_user_text_size(game.artist, artistSize, rightWidth, UI.fonts.regular)
     local titleY = math.max(36 * ref, stripHeight * 0.085)
     local artistY = titleY + fittedTitleSize * 0.70 + fittedArtistSize * 0.58
 
     -- PLAY RESULT lives above the strip; song details begin at the strip top.
     draw_result_text("result_viewport", "PLAY RESULT", stripX, stripY - L.strip.heading_gap_ref * ref,
         L.heading.size_ref * ref, UI.colors.accent, UI.fonts.bold, "left", L.heading.layer, ref, L.heading.shadow_alpha)
-    draw_result_text("result_strip", tostring(game.song_name or ""), rightX, titleY,
+    draw_result_user_text("result_strip", tostring(game.song_name or ""), rightX, titleY,
         fittedTitleSize, WHITE, UI.fonts.bold, "left", 11, ref, L.song.title_shadow_alpha)
-    draw_result_text("result_strip", tostring(game.artist or ""), rightX, artistY,
+    draw_result_user_text("result_strip", tostring(game.artist or ""), rightX, artistY,
         fittedArtistSize, MUTED, UI.fonts.regular, "left", 11, ref, L.song.artist_shadow_alpha)
 
     -- Difficulty and level sit immediately under the song details at the top.

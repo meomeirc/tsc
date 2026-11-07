@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -3301,9 +3301,9 @@ public sealed class SongSelectMenu : IDisposable
                 continue;
 
             if (!string.IsNullOrWhiteSpace(_searchQuery) &&
-                !song.Name.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase) &&
-                !song.Artist.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase) &&
-                !(song.Series?.Contains(_searchQuery, StringComparison.OrdinalIgnoreCase) ?? false))
+                !BbCodeTextRenderer.StripMarkup(song.Name).Contains(_searchQuery, StringComparison.OrdinalIgnoreCase) &&
+                !BbCodeTextRenderer.StripMarkup(song.Artist).Contains(_searchQuery, StringComparison.OrdinalIgnoreCase) &&
+                !BbCodeTextRenderer.StripMarkup(song.Series).Contains(_searchQuery, StringComparison.OrdinalIgnoreCase))
                 continue;
 
             filteredSongs.Add(song);
@@ -3322,14 +3322,14 @@ public sealed class SongSelectMenu : IDisposable
                 4 => charts
                     .OrderByDescending(x => x.Chart.DifficultyRank)
                     .ThenByDescending(x => x.Chart.Level ?? int.MinValue)
-                    .ThenBy(x => x.Song.Name, StringComparer.OrdinalIgnoreCase)
-                    .ThenBy(x => x.Song.Artist, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(x => BbCodeTextRenderer.StripMarkup(x.Song.Name), StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(x => BbCodeTextRenderer.StripMarkup(x.Song.Artist), StringComparer.OrdinalIgnoreCase)
                     .ThenBy(x => x.Chart.Path, StringComparer.OrdinalIgnoreCase),
                 5 => charts
                     .OrderByDescending(x => x.Chart.Level ?? int.MinValue)
                     .ThenByDescending(x => x.Chart.DifficultyRank)
-                    .ThenBy(x => x.Song.Name, StringComparer.OrdinalIgnoreCase)
-                    .ThenBy(x => x.Song.Artist, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(x => BbCodeTextRenderer.StripMarkup(x.Song.Name), StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(x => BbCodeTextRenderer.StripMarkup(x.Song.Artist), StringComparer.OrdinalIgnoreCase)
                     .ThenBy(x => x.Chart.Path, StringComparer.OrdinalIgnoreCase),
                 _ => charts
             };
@@ -3452,11 +3452,15 @@ public sealed class SongSelectMenu : IDisposable
     {
         var sorted = mode switch
         {
-            0 => source.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase).ThenBy(s => s.Artist, StringComparer.OrdinalIgnoreCase),
-            1 => source.OrderBy(s => s.Artist, StringComparer.OrdinalIgnoreCase).ThenBy(s => s.Name, StringComparer.OrdinalIgnoreCase),
-            2 => source.OrderBy(s => s.Series, StringComparer.OrdinalIgnoreCase).ThenBy(s => s.Name, StringComparer.OrdinalIgnoreCase),
-            3 => source.OrderBy(s => s.RepresentativeChart.Score).ThenBy(s => s.Name, StringComparer.OrdinalIgnoreCase),
-            _ => source.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+            0 => source.OrderBy(s => BbCodeTextRenderer.StripMarkup(s.Name), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(s => BbCodeTextRenderer.StripMarkup(s.Artist), StringComparer.OrdinalIgnoreCase),
+            1 => source.OrderBy(s => BbCodeTextRenderer.StripMarkup(s.Artist), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(s => BbCodeTextRenderer.StripMarkup(s.Name), StringComparer.OrdinalIgnoreCase),
+            2 => source.OrderBy(s => BbCodeTextRenderer.StripMarkup(s.Series), StringComparer.OrdinalIgnoreCase)
+                .ThenBy(s => BbCodeTextRenderer.StripMarkup(s.Name), StringComparer.OrdinalIgnoreCase),
+            3 => source.OrderBy(s => s.RepresentativeChart.Score)
+                .ThenBy(s => BbCodeTextRenderer.StripMarkup(s.Name), StringComparer.OrdinalIgnoreCase),
+            _ => source.OrderBy(s => BbCodeTextRenderer.StripMarkup(s.Name), StringComparer.OrdinalIgnoreCase)
         };
 
         return _descending ? sorted.Reverse() : sorted;
@@ -4206,9 +4210,12 @@ public sealed class SongSelectMenu : IDisposable
 
         var textX = x + 38f * scale;
         var infoY = artRect.Bottom + 24f * scale;
-        DrawText(DisplaySeries(song.Series).ToUpperInvariant(), textX, infoY, 22f * scale, new XnaColor(170, 177, 188));
-        DrawText(Truncate(song.Name, 28, 44f * scale), textX, infoY + 26f * scale, 37f * scale, XnaColor.White);
-        DrawText(Truncate(song.Artist, 36, 24f * scale), textX, infoY + 76f * scale, 22f * scale, new XnaColor(170, 177, 188));
+        DrawUserText(DisplaySeries(song.Series).ToUpperInvariant(), textX, infoY, 22f * scale,
+            new XnaColor(170, 177, 188), width - 76f * scale);
+        DrawUserText(song.Name, textX, infoY + 26f * scale, 37f * scale,
+            XnaColor.White, width - 76f * scale);
+        DrawUserText(song.Artist, textX, infoY + 76f * scale, 22f * scale,
+            new XnaColor(170, 177, 188), width - 76f * scale);
 
         var bpm = chart?.Bpm ?? song.RepresentativeChart.Bpm;
         DrawText("BPM", textX, infoY + 121f * scale, 16f * scale, new XnaColor(125, 134, 148));
@@ -4278,8 +4285,10 @@ public sealed class SongSelectMenu : IDisposable
             DrawBorder(x - 3f * scale, y - 3f * scale, width + 6f * scale, height + 6f * scale, XnaColor.White, 2f * scale);
 
         DrawRect(x, y + height - 57f * scale, width, 57f * scale, new XnaColor(0, 0, 0, 175));
-        DrawText(Truncate(song.Name, 25, 20f * scale), x + 14f * scale, y + height - 47f * scale, 19f * scale, XnaColor.White);
-        DrawText(Truncate(song.Artist, 30, 15f * scale), x + 14f * scale, y + height - 24f * scale, 14f * scale, new XnaColor(190, 195, 204));
+        DrawUserText(song.Name, x + 14f * scale, y + height - 47f * scale, 19f * scale,
+            XnaColor.White, width - 28f * scale);
+        DrawUserText(song.Artist, x + 14f * scale, y + height - 24f * scale, 14f * scale,
+            new XnaColor(190, 195, 204), width - 28f * scale);
 
         var chartColor = displayChart.Difficulty switch
         {
@@ -4293,7 +4302,8 @@ public sealed class SongSelectMenu : IDisposable
         DrawRect(x + width - 48f * scale, y + 4f * scale, 44f * scale, 44f * scale, chartColor);
         DrawText(displayChart.Level?.ToString("00") ?? "--", x + width - 26f * scale, y + 26f * scale, 21f * scale, XnaColor.White, centered: true);
 
-        DrawText(DisplaySeries(song.Series).ToUpperInvariant(), x + 12f * scale, y + 10f * scale, 12f * scale, new XnaColor(220, 225, 232, 210));
+        DrawUserText(DisplaySeries(song.Series).ToUpperInvariant(), x + 12f * scale, y + 10f * scale,
+            12f * scale, new XnaColor(220, 225, 232, 210), width - 24f * scale);
     }
 
     private void DrawPackPopup(float offsetX, float offsetY, float scale)
@@ -4629,6 +4639,16 @@ public sealed class SongSelectMenu : IDisposable
         var newHeight = Math.Max(1, (int)(sourceWidth / destAspect));
         var top = (sourceHeight - newHeight) / 2;
         return new XnaRectangle(0, top, sourceWidth, newHeight);
+    }
+
+    private void DrawUserText(string text, float x, float y, float size, XnaColor color, float maxWidth)
+    {
+        var measured = BbCodeTextRenderer.Measure(_font, text);
+        if (measured.Y <= 0f || maxWidth <= 0f)
+            return;
+        var scale = size / Math.Max(1f, measured.Y);
+        BbCodeTextRenderer.DrawFittedSingleLine(_spriteBatch, _pixel, _font, text,
+            new Vector2(x, y), color, scale, maxWidth);
     }
 
     private void DrawText(string text, float x, float y, float size, XnaColor color, bool centered = false)

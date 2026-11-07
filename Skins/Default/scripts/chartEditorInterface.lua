@@ -1000,11 +1000,69 @@ local function drawBottomActions(items, x, y, width, layer, cols)
     end
 end
 
+local function drawMetaBbCodeContextStrip(caretX, caretY, caretHeight, screenWidth, screenHeight, layer)
+    local scale = ACTIVE_SCALE
+    local tags = {
+        { name = "sub", preview = "[sub]sub[/sub]" },
+        { name = "sup", preview = "[sup]sup[/sup]" },
+        { name = "b", preview = "[b]b[/b]" },
+        { name = "i", preview = "[i]i[/i]" },
+        { name = "u", preview = "[u]u[/u]" },
+        { name = "s", preview = "[s]s[/s]" },
+    }
+    local gap = math.max(2 * scale, 3 * scale)
+    local padX = 5 * scale
+    local padY = 4 * scale
+    -- Keep each tag control the same size as a metadata text input field.
+    local buttonSize = 46 * scale
+    local buttonWidth = buttonSize
+    local buttonHeight = buttonSize
+    local stripWidth = #tags * buttonWidth + (#tags - 1) * gap
+    local stripHeight = buttonHeight
+    local panelWidth = stripWidth + padX * 2
+    local panelHeight = stripHeight + padY * 2
+    local panelX = clamp(caretX - panelWidth * 0.5, 4 * scale,
+        math.max(4 * scale, screenWidth - panelWidth - 4 * scale))
+    -- The toolbar follows the caret itself, not the pointer used to open it.
+    -- Keep it above the caret and clamp only against the screen edge.
+    local panelY = clamp(caretY - panelHeight - 7 * scale, 4 * scale,
+        math.max(4 * scale, screenHeight - panelHeight - 4 * scale))
+    -- Capture the strip's empty padding too, so the metadata field beneath it
+    -- does not steal a click intended for the formatter surface.
+    ui.button({ id = "editor_meta_bbcode_context_shield", x = panelX, y = panelY,
+        width = panelWidth, height = panelHeight, action = "editor.meta.bbcode.panel",
+        hit_test_priority = 80 })
+    UI.draw_panel({ id = "editor_meta_bbcode_context_panel", x = panelX, y = panelY,
+        width = panelWidth, height = panelHeight, color = C.panel, layer = layer })
+    draw.rect({ x = panelX, y = panelY, width = panelWidth, height = math.max(2 * scale, 2),
+        color = C.accent, layer = layer + 1 })
+
+    -- Match the editable metadata field's text size exactly.
+    local tagTextSize = fontSize("small")
+    for index, tag in ipairs(tags) do
+        local x = panelX + padX + (index - 1) * (buttonWidth + gap)
+        local y = panelY + padY
+        UI.draw_button({
+            id = "editor_meta_bbcode_" .. tag.name,
+            x = x, y = y, width = buttonWidth, height = buttonHeight,
+            label = "", action = "editor.meta.bbcode", value = tag.name,
+            variant = "secondary", accent = true, font = F.medium,
+            text_size = tagTextSize, hit_test_priority = 100, layer = layer + 2,
+        })
+        draw.user_text(tag.preview, {
+            x = x + buttonWidth * 0.5, y = y + buttonHeight * 0.5,
+            size = tagTextSize,
+            color = C.text, font = F.medium, anchor = "center", layer = layer + 5,
+        })
+    end
+end
+
 -- Match settingsMenu's editable value fields: keep the uiStyle field surface,
 -- but draw the edited text, selection, and caret separately so the caret does
 -- not shift the value while the user types.
 drawTextField = function(id, value, action, actionValue, x, y, width, height, layer, focused, editable,
-    caretOffset, selectionOffset, selectionWidth, measuredTextWidth, centered, wrapValue, caretByteIndex, anchorByteIndex)
+    caretOffset, selectionOffset, selectionWidth, measuredTextWidth, centered, wrapValue, caretByteIndex, anchorByteIndex, userText,
+    bbcodeStripOpen, screenWidth, screenHeight)
     local display = tostring(value or "")
     local textLeft = x + 10 * ACTIVE_SCALE
     local textLimit = math.max(1, width - 20 * ACTIVE_SCALE)
@@ -1013,7 +1071,18 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     if not editable then
         draw.rect({ id = id .. "_readonly", x = x, y = y, width = width, height = height,
             color = C.button, layer = layer })
-        if wrapValue then
+        if userText and wrapValue then
+            local richHeight = draw.measure_user_text_height(display, {
+                font = F.regular, size = textSize, max_width = textLimit,
+            })
+            draw.user_text(display, { x = textLeft, y = y + (height - richHeight) * 0.5, size = textSize,
+                max_width = textLimit, wrap = true, color = C.muted,
+                font = F.regular, anchor = "top-left", layer = layer + 2 })
+        elseif userText then
+            draw.user_text(display, { x = textLeft, y = y + height * 0.5, size = textSize,
+                max_width = textLimit, color = C.muted,
+                font = F.regular, anchor = "left", layer = layer + 2 })
+        elseif wrapValue then
             local lines = wrapMeasuredText(display, textLimit, textSize, F.regular)
             local blockHeight = #lines * lineHeight
             local lineY = y + (height - blockHeight) * 0.5
@@ -1086,6 +1155,27 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
         local caretY = lineY + (caretLine - 1) * lineHeight + (lineHeight - textHeight) * 0.5
         draw.rect({ x = caretX, y = caretY, width = 1.5 * ACTIVE_SCALE, height = textHeight,
             color = C.text, layer = layer + 3 })
+        if bbcodeStripOpen == true and userText == true then
+            drawMetaBbCodeContextStrip(caretX, caretY, textHeight, screenWidth or width, screenHeight or height,
+                layer + 10)
+        end
+        return
+    end
+
+    if not focused and userText and wrapValue then
+        local richHeight = draw.measure_user_text_height(display, {
+            font = F.regular, size = textSize, max_width = textLimit,
+        })
+        draw.user_text(display, { x = textLeft, y = y + (height - richHeight) * 0.5, size = textSize,
+            max_width = textLimit, wrap = true, color = C.text,
+            font = F.regular, anchor = "top-left", layer = layer + 2 })
+        return
+    end
+
+    if not focused and userText then
+        draw.user_text(display, { x = textLeft, y = y + height * 0.5, size = textSize,
+            max_width = textLimit, color = C.text,
+            font = F.regular, anchor = "left", layer = layer + 2 })
         return
     end
 
@@ -1126,18 +1216,23 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     if focused then
         local fallbackCaret = measuredTextWidth
         local caretX = textLeft + clamp(num(caretOffset, fallbackCaret), 0, textLimit)
-        draw.rect({ x = caretX, y = textY - textHeight * 0.5,
-            width = 1.5 * ACTIVE_SCALE, height = textHeight,
+        local caretY = textY - textHeight * 0.5
+        draw.rect({ x = caretX, y = caretY, width = 1.5 * ACTIVE_SCALE, height = textHeight,
             color = C.text, layer = layer + 3 })
+        if bbcodeStripOpen == true and userText == true then
+            drawMetaBbCodeContextStrip(caretX, caretY, textHeight, screenWidth or width, screenHeight or height,
+                layer + 10)
+        end
     end
 end
 
-local function textField(item, x, y, width, height, layer, wrapValue)
+local function textField(item, x, y, width, height, layer, wrapValue, screenWidth, screenHeight)
     drawTextField("editor_meta_row_" .. tostring(item.index), item.value,
         item.editable and "editor.meta.row" or "editor.block", item.index,
         x, y, width, height, layer, item.editing == true, item.editable == true,
         item.caret_offset, item.selection_offset, item.selection_width, item.text_width, false, wrapValue == true,
-        item.caret_byte_index, item.anchor_byte_index)
+        item.caret_byte_index, item.anchor_byte_index, item.user_text == true,
+        item.bbcode_strip_open == true, screenWidth, screenHeight)
 end
 
 local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
@@ -1148,11 +1243,19 @@ local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabe
     local fieldH = 46 * scale
     if item.kind ~= "toggle" and item.kind ~= "picker" and item.kind ~= "danger" then
         local textSize = fontSize("small")
+        local textLimit = math.max(1, fieldW - 20 * scale)
         local lineHeight = math.max(16 * scale, textSize * 1.2)
-        local lines = item.editing == true
-            and wrapEditableText(item.value or "", math.max(1, fieldW - 20 * scale), textSize, F.regular)
-            or wrapMeasuredText(item.value or "", math.max(1, fieldW - 20 * scale), textSize, F.regular)
-        fieldH = math.ceil(math.max(fieldH, #lines * lineHeight + 12 * scale))
+        if item.user_text == true and item.editing ~= true then
+            local richHeight = draw.measure_user_text_height(item.value or "", {
+                font = F.regular, size = textSize, max_width = textLimit,
+            })
+            fieldH = math.ceil(math.max(fieldH, richHeight + 12 * scale))
+        else
+            local lines = item.editing == true
+                and wrapEditableText(item.value or "", textLimit, textSize, F.regular)
+                or wrapMeasuredText(item.value or "", textLimit, textSize, F.regular)
+            fieldH = math.ceil(math.max(fieldH, #lines * lineHeight + 12 * scale))
+        end
     end
     return {
         fieldW = fieldW,
@@ -1294,7 +1397,7 @@ local function drawMeta(state, w, h, layer)
                 font = (not isElementPicker and item.selected) and F.medium or F.regular,
                 text_size = fontSize("small"), layer = (layer or 100) + 5 })
         else
-            textField(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, wrapValue)
+            textField(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, wrapValue, w, h)
         end
         if item.label == "PREVIEW" then
             UI.draw_button({ id = "editor_meta_preview_edit", x = x + panelW - 130 * scale, y = fieldY,
