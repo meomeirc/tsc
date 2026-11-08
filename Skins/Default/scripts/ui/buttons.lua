@@ -127,6 +127,7 @@ function UI.draw_button(options)
         action = options.action,
         value = options.value,
         hit_test_priority = options.hit_test_priority,
+        clip = options.clip,
     })
 
     local state = ui.state(id)
@@ -137,6 +138,7 @@ function UI.draw_button(options)
         x = x, y = y, width = width, height = height,
         color = options.background_color or UI.button_color(state, options.selected == true, variant),
         alpha = options.alpha == nil and 1 or options.alpha,
+        clip = options.clip,
         layer = layer,
     })
 
@@ -152,6 +154,7 @@ function UI.draw_button(options)
             x = 0, y = 0, width = math.max(2, (options.accent_width or 4)), height = height,
             color = accent_color,
             alpha = options.alpha == nil and 1 or options.alpha,
+            clip = options.clip,
             layer = layer + 1,
         })
     end
@@ -167,6 +170,7 @@ function UI.draw_button(options)
         font = font,
         anchor = "center",
         shadow = options.shadow,
+        clip = options.clip,
         layer = layer + 2,
     })
 end

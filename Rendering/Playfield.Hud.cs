@@ -1,4 +1,4 @@
-using TSC;
+﻿using TSC;
 using TSC.Ares;
 using TSC.Input;
 using Microsoft.Xna.Framework;
@@ -695,7 +695,15 @@ public sealed partial class Playfield
                 if (_editorMenuSection == EditorMenuSection.NoteGroups)
                 {
                     var groupItems = BuildEditorNoteGroupMenuItems();
-                    for (var row = 0; row < 5; row++)
+                    var groupHeader = GetEditorMenuHeaderBounds(virtualWidth, virtualHeight);
+                    var groupListTop = groupHeader.Bottom + GetEditorMenuHeaderContentGap(unit);
+                    var groupRowHeight = Math.Max(1, (int)MathF.Round(50f * unit));
+                    var groupRowGap = Math.Max(1, (int)MathF.Round(5f * unit));
+                    var groupRowPitch = GetEditorNoteGroupScrollRowPitch();
+                    var groupScrollRemainder = GetEditorNoteGroupScrollPixelRemainder();
+                    var groupListBottom = groupListTop + EditorNoteGroupMenuVisibleRows * groupRowHeight +
+                        (EditorNoteGroupMenuVisibleRows - 1) * groupRowGap;
+                    for (var row = 0; row <= EditorNoteGroupMenuVisibleRows; row++)
                     {
                         var bounds = GetEditorNoteGroupEntryBounds(row, virtualWidth, virtualHeight);
                         if (bounds.IsEmpty) continue;
@@ -712,19 +720,31 @@ public sealed partial class Playfield
                                 ? headingValue?.ToString() ?? string.Empty : string.Empty;
                             var description = item.TryGetValue("description", out var descriptionValue)
                                 ? descriptionValue?.ToString() ?? string.Empty : string.Empty;
+                            var contentRowY = groupListTop + (int)Math.Round(
+                                row * groupRowPitch - groupScrollRemainder);
                             var titleFit = FitChartEditorText(heading,
                                 20f * unit * (float)interfaceUi.ButtonTextScale, bounds.Width - 14f * unit, 23f * unit);
                             var groupTextColor = primaryActive
                                 ? interfaceUi.PrimaryButtonTextColor
                                 : interfaceUi.ButtonTextColor;
-                            UnicodeTextRenderer.DrawString(_spriteBatch, titleFit.Font, titleFit.Text,
-                                new Vector2(bounds.X + 10f * unit, bounds.Y + 7f * unit), groupTextColor,
-                                0f, Vector2.Zero, titleFit.Scale, SpriteEffects.None, 0f);
+                            var titleY = contentRowY + 7f * unit;
+                            var titleHeight = titleFit.Measured.Y * titleFit.Scale;
+                            if (titleY >= groupListTop && titleY + titleHeight <= groupListBottom)
+                            {
+                                UnicodeTextRenderer.DrawString(_spriteBatch, titleFit.Font, titleFit.Text,
+                                    new Vector2(bounds.X + 10f * unit, titleY), groupTextColor,
+                                    0f, Vector2.Zero, titleFit.Scale, SpriteEffects.None, 0f);
+                            }
                             var descriptionFit = FitChartEditorText(description,
                                 17f * unit * (float)interfaceUi.LabelTextScale, bounds.Width - 14f * unit, 18f * unit);
-                            UnicodeTextRenderer.DrawString(_spriteBatch, descriptionFit.Font, descriptionFit.Text,
-                                new Vector2(bounds.X + 10f * unit, bounds.Y + 30f * unit), groupTextColor,
-                                0f, Vector2.Zero, descriptionFit.Scale, SpriteEffects.None, 0f);
+                            var descriptionY = contentRowY + 30f * unit;
+                            var descriptionHeight = descriptionFit.Measured.Y * descriptionFit.Scale;
+                            if (descriptionY >= groupListTop && descriptionY + descriptionHeight <= groupListBottom)
+                            {
+                                UnicodeTextRenderer.DrawString(_spriteBatch, descriptionFit.Font, descriptionFit.Text,
+                                    new Vector2(bounds.X + 10f * unit, descriptionY), groupTextColor,
+                                    0f, Vector2.Zero, descriptionFit.Scale, SpriteEffects.None, 0f);
+                            }
                         }
                         else
                         {
@@ -745,16 +765,15 @@ public sealed partial class Playfield
                     if (maxScroll > 0)
                     {
                         var first = GetEditorNoteGroupEntryBounds(0, virtualWidth, virtualHeight);
-                        var last = GetEditorNoteGroupEntryBounds(4, virtualWidth, virtualHeight);
+                        var barHeight = Math.Max(1, (int)MathF.Round(
+                            (5 * 50f + 4 * 5f) * unit));
                         var bar = new Rectangle(first.Right + (int)MathF.Round(9f * unit), first.Y,
-                            Math.Max(2, (int)MathF.Round(6f * unit)), last.Bottom - first.Y);
-                        _spriteBatch.Draw(_pixel, bar, new Color(48, 48, 51, 240));
-                        var thumbHeight = Math.Max((int)MathF.Round(24f * unit),
-                            (int)MathF.Round(bar.Height * 5f / (5f + maxScroll)));
-                        thumbHeight = Math.Min(bar.Height, thumbHeight);
-                        var travel = Math.Max(0, bar.Height - thumbHeight);
-                        var thumbY = bar.Y + (int)MathF.Round(travel * _editorNoteGroupsScrollOffset / (float)maxScroll);
-                        _spriteBatch.Draw(_pixel, new Rectangle(bar.X, thumbY, bar.Width, thumbHeight), new Color(174, 255, 0));
+                            Math.Max(2, (int)MathF.Round(6f * unit)), barHeight);
+                        TSC.UI.ScrollBarGeometry.Draw(_spriteBatch, _pixel, bar,
+                            _editorNoteGroupsScroll.Position, maxScroll,
+                            GetEditorNoteGroupScrollContentExtent(), GetEditorNoteGroupScrollViewportExtent(),
+                            new Color(48, 48, 51, 240), new Color(174, 255, 0),
+                            minimumThumbSize: Math.Max(1, (int)MathF.Round(24f * unit)));
                     }
 
                     DrawControlButton(GetEditorNoteGroupActionBounds(0, 0, 3, virtualWidth, virtualHeight), "CREATE",
@@ -2022,14 +2041,244 @@ public sealed partial class Playfield
             new Color(52, 211, 153, 160));
     }
 
+    private readonly record struct EditorMetaBankCounts(int OneK, int TwoK, int ThreeK);
+
+    private sealed record EditorMetaStatsData(
+        int EventCount,
+        int PanelEventCount,
+        int TempoChangeCount,
+        EditorMetaBankCounts Notes,
+        EditorMetaBankCounts Taps,
+        EditorMetaBankCounts Flicks,
+        EditorMetaBankCounts SuperFlicks,
+        EditorMetaBankCounts Holds,
+        EditorMetaBankCounts Vibratos,
+        EditorMetaBankCounts LinkPoints,
+        EditorMetaBankCounts LinkSegments,
+        int ComboTaps,
+        int ComboFlicks,
+        int ComboSuperFlicks,
+        int ComboHolds,
+        int ComboVibratos,
+        int ComboLinks)
+    {
+        // LinkTail events are endpoints, not combo-counting hits. LinkHead is
+        // the chain's combo-bearing start, matching ScoreEntry.CountsCombo.
+        public int ComboTotal => ComboTaps + ComboFlicks + ComboSuperFlicks +
+            ComboHolds + ComboVibratos + ComboLinks;
+    }
+
+    private EditorMetaStatsData? _editorMetaStatsCache;
+    private AresChart? _editorMetaStatsCacheChart;
+
+    private static int GetEditorMetaBankIndex(int track) => track switch
+    {
+        >= 0 and <= 5 => 0,   // 1K: forward banks
+        >= 12 and <= 15 => 1, // 2K: center banks
+        >= 6 and <= 11 => 2,  // 3K: backward banks
+        _ => -1
+    };
+
+    private static EditorMetaBankCounts ToEditorMetaBankCounts(int[] counts)
+        => new(counts[0], counts[1], counts[2]);
+
+    private EditorMetaStatsData GetEditorMetaStatsData()
+    {
+        var chart = _chart;
+        if (chart is null)
+            return new EditorMetaStatsData(0, 0, 0, default, default, default, default,
+                default, default, default, default, 0, 0, 0, 0, 0, 0);
+        if (ReferenceEquals(_editorMetaStatsCacheChart, chart) && _editorMetaStatsCache is not null)
+            return _editorMetaStatsCache;
+
+        var events = chart.Events;
+        var noteEvents = events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
+            ev.Track is >= 0 and <= 15 && ev.NoteType != NoteType.End).ToList();
+        var notes = new int[3];
+        var taps = new int[3];
+        var flicks = new int[3];
+        var superFlicks = new int[3];
+        var holds = new int[3];
+        var vibratos = new int[3];
+        var linkSegments = new int[3];
+        var linkPoints = new int[3];
+        var routeTimeline = new GearTimeline(chart);
+        var comboTaps = 0;
+        var comboFlicks = 0;
+        var comboSuperFlicks = 0;
+        var comboHolds = 0;
+        var comboVibratos = 0;
+        var comboLinks = 0;
+
+        foreach (var ev in noteEvents)
+        {
+            var bankIndex = GetEditorMetaBankIndex(ev.Track);
+            if (bankIndex < 0)
+                continue;
+
+            notes[bankIndex]++;
+            switch (ev.NoteType)
+            {
+                case NoteType.Single:
+                    if (ev.IsSuperFlick)
+                        superFlicks[bankIndex]++;
+                    else if (ev.IsFlick)
+                        flicks[bankIndex]++;
+                    else
+                        taps[bankIndex]++;
+                    break;
+                case NoteType.SingleLong:
+                    holds[bankIndex]++;
+                    break;
+                case NoteType.Vibrato:
+                    vibratos[bankIndex]++;
+                    break;
+                case NoteType.LinkHead:
+                    // One link segment begins at each head. Its head is also a
+                    // point, just like every tail endpoint.
+                    linkSegments[bankIndex]++;
+                    linkPoints[bankIndex]++;
+                    break;
+                case NoteType.LinkTail:
+                    linkPoints[bankIndex]++;
+                    break;
+            }
+
+            // Combo distribution represents only the intended playable route.
+            // Alternate bank copies remain visible in the per-bank counters below.
+            // The combo model stops at the configured playable end, matching
+            // BuildScoreModel. Keep the per-bank inventory above as a full-file
+            // count, but exclude post-PlayTick events from playable combo.
+            if ((chart.PlayTick > 0 && ev.Tick > chart.PlayTick) || !routeTimeline.IsActiveAt(ev))
+                continue;
+
+            switch (ev.NoteType)
+            {
+                case NoteType.Single:
+                    if (ev.IsSuperFlick)
+                        comboSuperFlicks++;
+                    else if (ev.IsFlick)
+                        comboFlicks++;
+                    else
+                        comboTaps++;
+                    break;
+                case NoteType.SingleLong:
+                    comboHolds += 1 + CountEditorMetaHoldTickComboCheckpoints(ev, routeTimeline);
+                    break;
+                case NoteType.Vibrato:
+                    comboVibratos += 1 + CountEditorMetaHoldTickComboCheckpoints(ev, routeTimeline);
+                    break;
+                case NoteType.LinkHead:
+                    comboLinks += 1 + CountEditorMetaHoldTickComboCheckpoints(ev, routeTimeline);
+                    break;
+            }
+        }
+
+        // Link segment counts are based on LinkHead notes, not the number of
+        // geometric edges in chart.Links. Link points count both heads and tails.
+        var data = new EditorMetaStatsData(
+            events.Count,
+            events.Count(ev => ev.Track is >= 17 and <= 20),
+            chart.TempoEvents.Count(tempo => tempo.Tick != 0),
+            ToEditorMetaBankCounts(notes),
+            ToEditorMetaBankCounts(taps),
+            ToEditorMetaBankCounts(flicks),
+            ToEditorMetaBankCounts(superFlicks),
+            ToEditorMetaBankCounts(holds),
+            ToEditorMetaBankCounts(vibratos),
+            ToEditorMetaBankCounts(linkPoints),
+            ToEditorMetaBankCounts(linkSegments),
+            comboTaps, comboFlicks, comboSuperFlicks, comboHolds, comboVibratos, comboLinks);
+        _editorMetaStatsCacheChart = chart;
+        _editorMetaStatsCache = data;
+        return data;
+    }
+
+
+    // Match BuildScoreModel/AddHoldTickEntries: a hold, vibrato, or LinkHead
+    // contributes a combo at its start and at each quarter-beat checkpoint,
+    // including the terminal checkpoint. Count only checkpoints whose current
+    // track is active on the authored route at that tick.
+    private int CountEditorMetaHoldTickComboCheckpoints(ChartEvent root, GearTimeline routeTimeline)
+    {
+        if (_tempo is null || _chart is null ||
+            (_chart.PlayTick > 0 && root.Tick > _chart.PlayTick))
+            return 0;
+
+        var nodes = BuildHoldChain(root);
+        if (nodes.Count == 0)
+            return 0;
+
+        var totalEndTick = nodes.Count > 1
+            ? (nodes[^1].Duration > 6 ? nodes[^1].EndTick : nodes[^1].Tick)
+            : root.EndTick;
+        if (_chart.PlayTick > 0)
+            totalEndTick = Math.Min(totalEndTick, _chart.PlayTick);
+
+        var step = Math.Max(1.0, _tempo.TicksPerBeat / 4.0);
+        var count = 0;
+        var lastScoredTick = double.NegativeInfinity;
+        var track = root.Track;
+        var nextNode = 1;
+
+        for (var tick = root.Tick + step; tick < totalEndTick - 1e-9; tick += step)
+        {
+            while (nextNode < nodes.Count && nodes[nextNode].Tick <= tick)
+                track = nodes[nextNode++].Track;
+
+            if (GearState.Position(track) is null)
+                continue;
+
+            if (routeTimeline.AtTick((int)Math.Floor(tick)).IsActive(track))
+                count++;
+            lastScoredTick = tick;
+        }
+
+        var terminalTrack = root.Track;
+        for (var i = 1; i < nodes.Count; i++)
+        {
+            if (nodes[i].Tick <= totalEndTick + 1e-9)
+                terminalTrack = nodes[i].Track;
+            else
+                break;
+        }
+
+        if (GearState.Position(terminalTrack) is not null &&
+            totalEndTick >= root.Tick - 1e-9 &&
+            (double.IsNegativeInfinity(lastScoredTick) || Math.Abs(lastScoredTick - totalEndTick) > 1e-9) &&
+            routeTimeline.AtTick(totalEndTick).IsActive(terminalTrack))
+        {
+            count++;
+        }
+
+        return count;
+    }
+
+    private static string FormatEditorMetaBankValue(EditorMetaBankCounts counts)
+        => $"{counts.OneK:N0}  ·  {counts.TwoK:N0}  ·  {counts.ThreeK:N0}";
+
+    private static bool IsEditorMetaStatsBankHeaderRow(string label)
+        => string.Equals(label, "BANKS", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsEditorMetaStatsBankRow(string label) => label is
+        "NOTES" or "TAP" or "HOLD" or "VIBRATO" or "LINK SEGMENTS / POINTS" or
+        "FLICK" or "SUPERFLICK";
+
+    private static bool IsEditorMetaStatsComboRow(string label)
+        => string.Equals(label, "COMBO DISTRIBUTION", StringComparison.OrdinalIgnoreCase);
+
     private List<(string Label, string Value)> GetEditorMetaRows(double currentTick)
+        => GetEditorMetaRows(currentTick,
+            string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase) && _chart is not null
+                ? GetEditorMetaStatsData()
+                : null);
+
+    private List<(string Label, string Value)> GetEditorMetaRows(double currentTick, EditorMetaStatsData? statsData)
     {
         if (_chart is null)
             return new List<(string Label, string Value)> { ("CHART", "No chart loaded") };
 
         string Show(string? value) => string.IsNullOrWhiteSpace(value) ? "Not set" : value;
-        var events = _chart.Events;
-        var notes = events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 && ev.Track is >= 0 and <= 15).ToList();
         var source = _loadedSourcePath ?? _sourceName ?? _lastLoadedSourceName;
         var initialMode = _chart.InitialGearAttr switch { 0 or 2 => "1K", 4 => "2K", _ => "3K" };
         var templateLabel = _editorBundleTemplate switch
@@ -2079,21 +2328,7 @@ public sealed partial class Playfield
                 ("PERFECT MS", judgementPrefix ? _chart.PerfectWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled"),
                 ("GOOD MS", judgementPrefix ? _chart.GoodWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled")
             },
-            "STATS" => new List<(string Label, string Value)>
-            {
-                ("SOURCE FILE", Show(source)),
-                ("EVENTS", events.Count.ToString("N0", CultureInfo.InvariantCulture)),
-                ("NOTES", notes.Count.ToString("N0", CultureInfo.InvariantCulture)),
-                ("TAP / FLICK", notes.Count(ev => ev.NoteType == NoteType.Single && !ev.IsFlick && !ev.IsSuperFlick).ToString("N0", CultureInfo.InvariantCulture) + " / " + notes.Count(ev => ev.IsFlick).ToString("N0", CultureInfo.InvariantCulture)),
-                ("SUPERFLICKS", notes.Count(ev => ev.IsSuperFlick).ToString("N0", CultureInfo.InvariantCulture)),
-                ("HOLDS / VIBRATO", notes.Count(ev => ev.NoteType == NoteType.SingleLong).ToString("N0", CultureInfo.InvariantCulture) + " / " + notes.Count(ev => ev.NoteType == NoteType.Vibrato).ToString("N0", CultureInfo.InvariantCulture)),
-                ("LINK POINTS", notes.Count(ev => ev.NoteType is NoteType.LinkHead or NoteType.LinkTail).ToString("N0", CultureInfo.InvariantCulture)),
-                ("LINK SEGMENTS", _chart.Links.Count.ToString("N0", CultureInfo.InvariantCulture)),
-                ("TEMPO CHANGES", _chart.TempoEvents.Count.ToString("N0", CultureInfo.InvariantCulture)),
-                ("TRACKS USED", events.Select(ev => ev.Track).Distinct().Count().ToString("N0", CultureInfo.InvariantCulture)),
-                ("AUX EVENTS", events.Count(ev => ev.RawType != 1).ToString("N0", CultureInfo.InvariantCulture)),
-                ("INSTRUMENTS", _chart.Instruments.Count.ToString("N0", CultureInfo.InvariantCulture))
-            },
+            "STATS" => BuildEditorMetaStatsRows(Show(source), statsData ?? GetEditorMetaStatsData()),
             "TEST" => new List<(string Label, string Value)>(),
             _ => new List<(string Label, string Value)>()
         };
@@ -2107,6 +2342,25 @@ public sealed partial class Playfield
         }
         return rows.Where(row => !row.Value.StartsWith("Unsupported by ", StringComparison.OrdinalIgnoreCase)).ToList();
     }
+
+    private static List<(string Label, string Value)> BuildEditorMetaStatsRows(
+        string source, EditorMetaStatsData stats)
+        => new()
+        {
+            ("SOURCE FILE", source),
+            ("EVENTS", stats.EventCount.ToString("N0", CultureInfo.InvariantCulture)),
+            ("COMBO DISTRIBUTION", "INTENDED ROUTE ONLY"),
+            ("BANKS", "1K / 2K / 3K"),
+            ("NOTES", FormatEditorMetaBankValue(stats.Notes)),
+            ("TAP", FormatEditorMetaBankValue(stats.Taps)),
+            ("HOLD", FormatEditorMetaBankValue(stats.Holds)),
+            ("VIBRATO", FormatEditorMetaBankValue(stats.Vibratos)),
+            ("LINK SEGMENTS / POINTS", $"{stats.LinkSegments.OneK:N0} / {stats.LinkPoints.OneK:N0}  ·  {stats.LinkSegments.TwoK:N0} / {stats.LinkPoints.TwoK:N0}  ·  {stats.LinkSegments.ThreeK:N0} / {stats.LinkPoints.ThreeK:N0}"),
+            ("FLICK", FormatEditorMetaBankValue(stats.Flicks)),
+            ("SUPERFLICK", FormatEditorMetaBankValue(stats.SuperFlicks)),
+            ("TEMPO CHANGES", stats.TempoChangeCount.ToString("N0", CultureInfo.InvariantCulture)),
+            ("PANEL EVENTS", stats.PanelEventCount.ToString("N0", CultureInfo.InvariantCulture))
+        };
 
     private bool HasEditorMediaResource(string field)
     {
@@ -2328,7 +2582,10 @@ public sealed partial class Playfield
             new Rectangle(panel.X + padding, panel.Y + headerHeight, panel.Width - padding * 2, edge),
             new Color(90, 90, 92, 240));
 
-        var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+        var statsData = string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase)
+            ? GetEditorMetaStatsData()
+            : null;
+        var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0, statsData);
         var difficultyLabel = FontSafeText(labelFont, "DIFFICULTY");
         var labelScale = GetEditorDefaultFontScale(difficultyLabel, 20f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, difficultyLabel,
@@ -2421,6 +2678,12 @@ public sealed partial class Playfield
                     DrawEditorMetaButton(bounds, "DELETE DIFFICULTY", new Color(55, 30, 35, 245),
                         HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName))
                             ? interfaceUi.DangerColor : new Color(100, 100, 102));
+                else if (statsData is not null && IsEditorMetaStatsComboRow(label))
+                    DrawEditorMetaComboDistributionField(bounds, statsData);
+                else if (statsData is not null && IsEditorMetaStatsBankHeaderRow(label))
+                    DrawEditorMetaBankHeaderField(bounds);
+                else if (statsData is not null && IsEditorMetaStatsBankRow(label))
+                    DrawEditorMetaBankStatsField(bounds, label, statsData);
                 else
                     DrawEditorMetaTextField(bounds, display, editing, editable, accent,
                         editing ? _editorMetaInputText : null, _editorMetaSelectionAnchor, _editorMetaInputCaretIndex,
@@ -2434,15 +2697,10 @@ public sealed partial class Playfield
             {
                 var unitSize = Math.Max(2, (int)MathF.Round(3f * unit));
                 var rail = new Rectangle(content.Right - unitSize, content.Y, unitSize, content.Height);
-                _spriteBatch.Draw(_pixel, rail, new Color(54, 54, 56, 220));
-                var thumbHeight = Math.Max((int)MathF.Round(24f * unit),
-                    (int)MathF.Round(content.Height * (content.Height / (float)totalContentHeight)));
-                thumbHeight = Math.Min(content.Height, thumbHeight);
-                var maxScrollY = Math.Max(1, GetEditorMetaPrefixHeight(rowLayouts, maxOffset));
-                var currentScrollY = GetEditorMetaPrefixHeight(rowLayouts, firstRow);
-                var travel = Math.Max(0, content.Height - thumbHeight);
-                var thumbY = content.Y + (int)MathF.Round(travel * Math.Clamp(currentScrollY / (float)maxScrollY, 0f, 1f));
-                _spriteBatch.Draw(_pixel, new Rectangle(rail.X, thumbY, rail.Width, thumbHeight), Active);
+                TSC.UI.ScrollBarGeometry.Draw(_spriteBatch, _pixel, rail,
+                    _editorMetaScroll.Position, maxOffset, totalContentHeight, content.Height,
+                    new Color(54, 54, 56, 220), Active,
+                    minimumThumbSize: Math.Max(1, (int)MathF.Round(24f * unit)));
             }
 
             if (_editorElementDropdownOpen && string.Equals(_editorMetaCategory, "SONG", StringComparison.OrdinalIgnoreCase))
@@ -2576,6 +2834,196 @@ public sealed partial class Playfield
         UnicodeTextRenderer.DrawString(_spriteBatch, fitted.Font, fitted.Text,
             new Vector2(bounds.X + 10f * unit, bounds.Y + (bounds.Height - size.Y) * 0.5f),
             accent, 0f, Vector2.Zero, fitted.Scale, SpriteEffects.None, 0f);
+    }
+
+    private void DrawEditorMetaBankStatsField(Rectangle bounds, string label, EditorMetaStatsData stats)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return;
+
+        var unit = _projection.ScalePixels(1f);
+        var font = _font;
+        var ui = _chartEditorInterfaceLayout;
+        var edge = Math.Max(1, (int)MathF.Round(unit));
+        _spriteBatch.Draw(_pixel, bounds, ui.PanelColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, bounds.Width, edge), ui.HeaderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Bottom - edge, bounds.Width, edge), ui.HeaderColor);
+
+        var values = label switch
+        {
+            "NOTES" => new[] { stats.Notes.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Notes.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Notes.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+            "TAP" => new[] { stats.Taps.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Taps.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Taps.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+            "HOLD" => new[] { stats.Holds.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Holds.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Holds.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+            "VIBRATO" => new[] { stats.Vibratos.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Vibratos.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Vibratos.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+            "LINK SEGMENTS / POINTS" => new[]
+            {
+                $"{stats.LinkSegments.OneK:N0} / {stats.LinkPoints.OneK:N0}",
+                $"{stats.LinkSegments.TwoK:N0} / {stats.LinkPoints.TwoK:N0}",
+                $"{stats.LinkSegments.ThreeK:N0} / {stats.LinkPoints.ThreeK:N0}"
+            },
+            "FLICK" => new[] { stats.Flicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Flicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.Flicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+            "SUPERFLICK" => new[] { stats.SuperFlicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.SuperFlicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                stats.SuperFlicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+            _ => new[] { "0", "0", "0" }
+        };
+
+        var cellWidth = bounds.Width / 3f;
+        for (var i = 0; i < 3; i++)
+        {
+            var left = bounds.X + cellWidth * i;
+            var right = i == 2 ? bounds.Right : bounds.X + cellWidth * (i + 1);
+            if (i > 0)
+                _spriteBatch.Draw(_pixel, new Rectangle((int)MathF.Round(left), bounds.Y + edge,
+                    edge, Math.Max(1, bounds.Height - edge * 2)), new Color(90, 90, 92, 170));
+
+            var cellCenter = (left + right) * 0.5f;
+            var valueText = FontSafeText(font, values[i]);
+            var valueFit = FitChartEditorText(valueText, 24f * unit,
+                Math.Max(1f, right - left - 10f * unit), Math.Max(1f, bounds.Height - 10f * unit));
+            var valueSize = valueFit.Measured * valueFit.Scale;
+            UnicodeTextRenderer.DrawString(_spriteBatch, valueFit.Font, valueFit.Text,
+                new Vector2(cellCenter - valueSize.X * 0.5f,
+                    bounds.Y + (bounds.Height - valueSize.Y) * 0.5f),
+                ui.ButtonTextColor, 0f, Vector2.Zero, valueFit.Scale, SpriteEffects.None, 0f);
+        }
+    }
+
+    private void DrawEditorMetaBankHeaderField(Rectangle bounds)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return;
+
+        var unit = _projection.ScalePixels(1f);
+        var font = _font;
+        var ui = _chartEditorInterfaceLayout;
+        var edge = Math.Max(1, (int)MathF.Round(unit));
+        _spriteBatch.Draw(_pixel, bounds, ui.ButtonColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, bounds.Width, edge), ui.HeaderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Bottom - edge, bounds.Width, edge), ui.HeaderColor);
+
+        var bankLabels = new[] { "1K", "2K", "3K" };
+        var cellWidth = bounds.Width / 3f;
+        for (var i = 0; i < 3; i++)
+        {
+            var left = bounds.X + cellWidth * i;
+            var right = i == 2 ? bounds.Right : bounds.X + cellWidth * (i + 1);
+            if (i > 0)
+                _spriteBatch.Draw(_pixel, new Rectangle((int)MathF.Round(left), bounds.Y + edge,
+                    edge, Math.Max(1, bounds.Height - edge * 2)), new Color(90, 90, 92, 170));
+
+            var bankText = FontSafeText(font, bankLabels[i]);
+            var bankScale = GetEditorDefaultFontScale(bankText, 24f * unit);
+            var bankSize = UnicodeTextRenderer.MeasureString(font, bankText) * bankScale;
+            var centerX = (left + right) * 0.5f;
+            UnicodeTextRenderer.DrawString(_spriteBatch, font, bankText,
+                new Vector2(centerX - bankSize.X * 0.5f,
+                    bounds.Y + (bounds.Height - bankSize.Y) * 0.5f),
+                ui.MutedTextColor, 0f, Vector2.Zero, bankScale, SpriteEffects.None, 0f);
+        }
+    }
+
+    private void DrawEditorMetaComboDistributionField(Rectangle bounds, EditorMetaStatsData stats)
+    {
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return;
+
+        var unit = _projection.ScalePixels(1f);
+        var font = _font;
+        var ui = _chartEditorInterfaceLayout;
+        _spriteBatch.Draw(_pixel, bounds, ui.ButtonColor);
+        var edge = Math.Max(1, (int)MathF.Round(unit));
+        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Y, bounds.Width, edge), ui.HeaderColor);
+        _spriteBatch.Draw(_pixel, new Rectangle(bounds.X, bounds.Bottom - edge, bounds.Width, edge), ui.HeaderColor);
+
+        var distribution = new (string Label, int Count, Color Color)[]
+        {
+            ("TAP", stats.ComboTaps, new Color(96, 165, 250)),
+            ("HOLD", stats.ComboHolds, new Color(251, 146, 60)),
+            ("VIBRATO", stats.ComboVibratos, new Color(34, 185, 129)),
+            ("LINK", stats.ComboLinks, new Color(250, 204, 21)),
+            ("FLICK", stats.ComboFlicks, new Color(163, 230, 53)),
+            ("SUPERFLICK", stats.ComboSuperFlicks, new Color(255, 77, 184))
+        };
+        var total = Math.Max(0, stats.ComboTotal);
+        var tag = FontSafeText(font, "INTENDED ROUTE ONLY");
+        var tagScale = GetEditorDefaultFontScale(tag, 24f * unit);
+        var tagSize = UnicodeTextRenderer.MeasureString(font, tag) * tagScale;
+        var headerBandHeight = 30f * unit;
+        var tagTop = bounds.Y + (headerBandHeight - tagSize.Y) * 0.5f;
+        UnicodeTextRenderer.DrawString(_spriteBatch, font, tag,
+            new Vector2(bounds.Right - 9f * unit - tagSize.X, tagTop),
+            ui.MutedTextColor, 0f, Vector2.Zero, tagScale, SpriteEffects.None, 0f);
+
+        var bar = new Rectangle(bounds.X + (int)MathF.Round(9f * unit),
+            bounds.Y + (int)MathF.Round(headerBandHeight),
+            Math.Max(1, bounds.Width - (int)MathF.Round(18f * unit)),
+            Math.Max(3, (int)MathF.Round(9f * unit)));
+        _spriteBatch.Draw(_pixel, bar, new Color(54, 54, 56, 230));
+        if (total > 0)
+        {
+            var cursorX = bar.X;
+            var remaining = bar.Width;
+            var visible = distribution.Where(item => item.Count > 0).ToArray();
+            for (var i = 0; i < visible.Length; i++)
+            {
+                var segmentWidth = i == visible.Length - 1
+                    ? remaining
+                    : Math.Clamp((int)MathF.Round(bar.Width * (visible[i].Count / (float)total)), 0, remaining);
+                if (segmentWidth > 0)
+                    _spriteBatch.Draw(_pixel, new Rectangle(cursorX, bar.Y, segmentWidth, bar.Height), visible[i].Color);
+                cursorX += segmentWidth;
+                remaining -= segmentWidth;
+            }
+        }
+
+        var horizontalPadding = 8f * unit;
+        var columnGap = 6f * unit;
+        var itemWidth = (bounds.Width - horizontalPadding * 2f - columnGap) / 2f;
+        var itemHeight = 24f * unit;
+        var rowGap = 3f * unit;
+        var swatchSize = Math.Max(4, (int)MathF.Round(7f * unit));
+        var swatchGap = 6f * unit;
+        var textPaddingRight = 8f * unit;
+        for (var i = 0; i < distribution.Length; i++)
+        {
+            var item = distribution[i];
+            var column = i % 2;
+            var row = i / 2;
+            var itemX = bounds.X + horizontalPadding + column * (itemWidth + columnGap);
+            var itemY = bounds.Y + 44f * unit + row * (itemHeight + rowGap);
+            var card = new Rectangle((int)MathF.Round(itemX), (int)MathF.Round(itemY),
+                Math.Max(1, (int)MathF.Round(itemWidth)), Math.Max(1, (int)MathF.Round(itemHeight)));
+            _spriteBatch.Draw(_pixel, card, ui.PanelColor);
+
+            var swatchX = itemX + 8f * unit;
+            var swatchY = itemY + (itemHeight - swatchSize) * 0.5f;
+            _spriteBatch.Draw(_pixel, new Rectangle((int)MathF.Round(swatchX), (int)MathF.Round(swatchY),
+                swatchSize, swatchSize), item.Color);
+
+            var percentage = total > 0 ? item.Count * 100f / total : 0f;
+            var legend = FontSafeText(font,
+                $"{item.Label}  {item.Count.ToString("N0", CultureInfo.InvariantCulture)}  ({percentage:0.#}%)");
+            var textX = swatchX + swatchSize + swatchGap;
+            var textWidth = Math.Max(1f, itemX + itemWidth - textPaddingRight - textX);
+            var fitted = FitChartEditorText(legend, 15f * unit, textWidth,
+                Math.Max(1f, itemHeight - 4f * unit));
+            var textSize = fitted.Measured * fitted.Scale;
+            var textY = itemY + (itemHeight - textSize.Y) * 0.5f;
+            UnicodeTextRenderer.DrawString(_spriteBatch, fitted.Font, fitted.Text,
+                new Vector2(textX, textY), ui.ButtonTextColor,
+                0f, Vector2.Zero, fitted.Scale, SpriteEffects.None, 0f);
+        }
     }
 
     private void DrawEditorMetaTextField(Rectangle bounds, string rawValue, bool editing, bool editable, Color accent,
@@ -3062,6 +3510,8 @@ public sealed partial class Playfield
         var quad3DRunOpen = false;
         var batchAdditive = false;
         var batchSampler = SamplerState.LinearClamp;
+        Rectangle? batchScissor = null;
+        var originalScissor = _graphics.ScissorRectangle;
 
         void BeginQuad3DRun()
         {
@@ -3081,25 +3531,29 @@ public sealed partial class Playfield
             quad3DRunOpen = false;
         }
 
-        void BeginBatch(SkinDrawCommand command)
+        void BeginBatch(SkinDrawCommand command, Rectangle? scissor)
         {
             var additive = command.AdditiveBlend;
             var sampler = command.Kind == SkinDrawCommandKind.Sprite && command.NineSlice is not null
                 ? SamplerState.PointClamp
                 : SamplerState.LinearClamp;
 
-            if (batchOpen && batchAdditive == additive && ReferenceEquals(batchSampler, sampler))
+            if (batchOpen && batchAdditive == additive &&
+                ReferenceEquals(batchSampler, sampler) && batchScissor == scissor)
                 return;
 
             if (batchOpen)
                 _spriteBatch.End();
 
+            _graphics.ScissorRectangle = scissor ?? originalScissor;
             _spriteBatch.Begin(
                 samplerState: sampler,
-                blendState: additive ? BlendState.Additive : BlendState.NonPremultiplied);
+                blendState: additive ? BlendState.Additive : BlendState.NonPremultiplied,
+                rasterizerState: scissor.HasValue ? _skinUiScissorRasterizerState : null);
             batchOpen = true;
             batchAdditive = additive;
             batchSampler = sampler;
+            batchScissor = scissor;
         }
 
         void EndBatch()
@@ -3109,6 +3563,8 @@ public sealed partial class Playfield
 
             _spriteBatch.End();
             batchOpen = false;
+            batchScissor = null;
+            _graphics.ScissorRectangle = originalScissor;
         }
 
         try
@@ -3143,7 +3599,16 @@ public sealed partial class Playfield
                 }
 
                 EndQuad3DRun();
-                BeginBatch(command);
+                Rectangle? commandScissor = command.ScissorClip;
+                if (commandScissor is { } requestedClip)
+                {
+                    var clipped = Rectangle.Intersect(requestedClip, _graphics.Viewport.Bounds);
+                    clipped = Rectangle.Intersect(clipped, originalScissor);
+                    if (clipped.Width <= 0 || clipped.Height <= 0)
+                        continue;
+                    commandScissor = clipped;
+                }
+                BeginBatch(command, commandScissor);
 
                 switch (command.Kind)
                 {
@@ -3390,6 +3855,7 @@ public sealed partial class Playfield
         {
             EndQuad3DRun();
             EndBatch();
+            _graphics.ScissorRectangle = originalScissor;
         }
     }
 

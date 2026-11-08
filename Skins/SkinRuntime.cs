@@ -1615,6 +1615,8 @@ public sealed class SkinDrawCommand
     public Vector4? MaskUv { get; internal set; }
     /// <summary>Optional screen-space clip rectangle: left, top, right, bottom.</summary>
     public Vector4? ClipRect { get; internal set; }
+    /// <summary>Optional pixel-space clip rectangle used by scrollable UI viewports.</summary>
+    public XnaRectangle? ScissorClip { get; internal set; }
     public XnaColor? BackgroundColor { get; internal set; }
     public string? Text { get; internal set; }
     public string? Id { get; internal set; }
@@ -1668,6 +1670,7 @@ public sealed class SkinDrawCommand
         MaskAsset = null;
         MaskUv = null;
         ClipRect = null;
+        ScissorClip = null;
         BackgroundColor = null;
         Text = null;
         Id = null;
@@ -1911,6 +1914,12 @@ public sealed class SkinRuntime : IDisposable
     private string? _uiPressedButtonId;
     private string? _uiPressedSliderId;
     private double? _uiPressedSliderValue;
+    private Func<string, TSC.UI.SmoothScrollHandler?>? _uiScrollHandlerResolver;
+    private readonly RasterizerState _uiScissorRasterizerState = new()
+    {
+        CullMode = CullMode.None,
+        ScissorTestEnable = true,
+    };
     private long _drawOrder;
 
     private sealed class SkinLuaProfileSection
@@ -2043,6 +2052,7 @@ public sealed class SkinRuntime : IDisposable
         public string? Action { get; }
         public object? ActionValue { get; }
         public int HitTestPriority { get; }
+        public XnaRectangle? ScissorClip { get; }
 
         public SkinUiButton(
             string id,
@@ -2054,7 +2064,8 @@ public sealed class SkinRuntime : IDisposable
             DynValue? onClick,
             string? action,
             object? actionValue,
-            int hitTestPriority)
+            int hitTestPriority,
+            XnaRectangle? scissorClip)
         {
             Id = id;
             ParentId = parentId;
@@ -2066,6 +2077,7 @@ public sealed class SkinRuntime : IDisposable
             Action = action;
             ActionValue = actionValue;
             HitTestPriority = hitTestPriority;
+            ScissorClip = scissorClip;
         }
 
         internal void SetResolvedPosition(Vector2 topLeft)
@@ -2075,7 +2087,12 @@ public sealed class SkinRuntime : IDisposable
         }
 
         public bool Contains(float px, float py)
-            => px >= X && px <= X + Width && py >= Y && py <= Y + Height;
+        {
+            if (ScissorClip is { } clip &&
+                (px < clip.Left || px >= clip.Right || py < clip.Top || py >= clip.Bottom))
+                return false;
+            return px >= X && px <= X + Width && py >= Y && py <= Y + Height;
+        }
     }
 
     private sealed class SkinUiSlider
@@ -2093,6 +2110,13 @@ public sealed class SkinRuntime : IDisposable
         public string? ReleaseAction { get; }
         public bool Vertical { get; }
         public bool Reverse { get; }
+        public bool ThumbAware { get; }
+        public double ScrollContentExtent { get; }
+        public double ScrollViewportExtent { get; }
+        public int ScrollMinimumThumbSize { get; }
+        public TSC.UI.SmoothScrollHandler? ScrollHandler { get; }
+        public double InitialValue { get; }
+        public XnaRectangle? ScissorClip { get; }
 
         public SkinUiSlider(
             string id,
@@ -2107,7 +2131,14 @@ public sealed class SkinRuntime : IDisposable
             string action,
             string? releaseAction,
             bool vertical,
-            bool reverse)
+            bool reverse,
+            bool thumbAware,
+            double scrollContentExtent,
+            double scrollViewportExtent,
+            int scrollMinimumThumbSize,
+            TSC.UI.SmoothScrollHandler? scrollHandler,
+            double initialValue,
+            XnaRectangle? scissorClip)
         {
             Id = id;
             ParentId = parentId;
@@ -2122,6 +2153,13 @@ public sealed class SkinRuntime : IDisposable
             ReleaseAction = releaseAction;
             Vertical = vertical;
             Reverse = reverse;
+            ThumbAware = thumbAware && vertical;
+            ScrollContentExtent = scrollContentExtent;
+            ScrollViewportExtent = scrollViewportExtent;
+            ScrollMinimumThumbSize = Math.Max(1, scrollMinimumThumbSize);
+            ScrollHandler = scrollHandler;
+            InitialValue = Math.Clamp(initialValue, min, max);
+            ScissorClip = scissorClip;
         }
 
         internal void SetResolvedPosition(Vector2 topLeft)
@@ -2131,7 +2169,13 @@ public sealed class SkinRuntime : IDisposable
         }
 
         public bool Contains(float px, float py)
-            => px >= X && px <= X + Width && py >= Y && py <= Y + Height;
+        {
+            if (ScissorClip is { } clip &&
+                (px < clip.Left || px >= clip.Right || py < clip.Top || py >= clip.Bottom))
+                return false;
+            return px >= X && px <= X + Width && py >= Y && py <= Y + Height;
+        }
+
 
         public double ValueFromPointer(float px, float py)
         {
@@ -2403,6 +2447,10 @@ public sealed class SkinRuntime : IDisposable
 
     private void ResetScriptAttemptState()
     {
+        if (_uiPressedSliderId is not null &&
+            _uiSliders.TryGetValue(_uiPressedSliderId, out var capturedSlider) && capturedSlider.ThumbAware)
+            capturedSlider.ScrollHandler?.CancelPointer();
+
         _script = null;
         _skinEffectTime = 0.0;
         _drawCommands.Clear();
@@ -2570,12 +2618,12 @@ public sealed class SkinRuntime : IDisposable
         string? currentSkin,
         IReadOnlyList<string> availableSkins,
         bool skinDropdownOpen,
-        int skinDropdownScroll,
+        double skinDropdownScroll,
         IReadOnlyList<(string Id, string Label, string Group, string Primary, string Secondary)>? keybindRows = null,
         bool keybindsOpen = false,
         string? keybindCaptureAction = null,
         string? keybindCaptureSlot = null,
-        int keybindScroll = 0,
+        double keybindScroll = 0,
         int editingCaret = 0,
         int editingSelectionStart = 0,
         int editingSelectionEnd = 0,
@@ -3476,20 +3524,30 @@ public sealed class SkinRuntime : IDisposable
         var batchOpen = false;
         BlendState? currentBlend = null;
         SamplerState? currentSampler = null;
+        XnaRectangle? currentScissor = null;
+        var originalScissor = _graphics.ScissorRectangle;
 
-        void EnsureBatch(BlendState blend, SamplerState sampler)
+        void EnsureBatch(BlendState blend, SamplerState sampler, XnaRectangle? scissor)
         {
-            if (batchOpen && ReferenceEquals(currentBlend, blend) && ReferenceEquals(currentSampler, sampler))
+            if (batchOpen && ReferenceEquals(currentBlend, blend) &&
+                ReferenceEquals(currentSampler, sampler) && currentScissor == scissor)
                 return;
 
             if (batchOpen)
                 spriteBatch.End();
 
+            if (scissor is { } clip)
+                _graphics.ScissorRectangle = clip;
+            else
+                _graphics.ScissorRectangle = originalScissor;
+
             spriteBatch.Begin(
                 samplerState: sampler,
-                blendState: blend);
+                blendState: blend,
+                rasterizerState: scissor.HasValue ? _uiScissorRasterizerState : null);
             currentBlend = blend;
             currentSampler = sampler;
+            currentScissor = scissor;
             batchOpen = true;
         }
 
@@ -3507,6 +3565,8 @@ public sealed class SkinRuntime : IDisposable
                         batchOpen = false;
                         currentBlend = null;
                         currentSampler = null;
+                        currentScissor = null;
+                        _graphics.ScissorRectangle = originalScissor;
                     }
 
                     RenderSkinQuad3D(command, width, height);
@@ -3521,7 +3581,15 @@ public sealed class SkinRuntime : IDisposable
                     ? SamplerState.PointClamp
                     : SamplerState.LinearClamp;
 
-                EnsureBatch(blend, sampler);
+                XnaRectangle? commandScissor = command.ScissorClip;
+                if (commandScissor is { } requestedClip)
+                {
+                    var clipped = XnaRectangle.Intersect(requestedClip, _graphics.Viewport.Bounds);
+                    if (clipped.Width <= 0 || clipped.Height <= 0)
+                        continue;
+                    commandScissor = clipped;
+                }
+                EnsureBatch(blend, sampler, commandScissor);
 
                 switch (command.Kind)
                 {
@@ -3742,6 +3810,7 @@ public sealed class SkinRuntime : IDisposable
         {
             if (batchOpen)
                 spriteBatch.End();
+            _graphics.ScissorRectangle = originalScissor;
         }
 
         return true;
@@ -5482,9 +5551,49 @@ public sealed class SkinRuntime : IDisposable
         var table = new Table(script);
         table.Set("button", DynValue.NewCallback(RegisterUiButton));
         table.Set("slider", DynValue.NewCallback(RegisterUiSlider));
+        table.Set("scrollbar_thumb", DynValue.NewCallback((_, args) => GetUiScrollbarThumb(script, args)));
         table.Set("state", DynValue.NewCallback(ReadUiState));
         table.Set("get", DynValue.NewCallback(GetUiLayout));
         return table;
+    }
+
+    private DynValue GetUiScrollbarThumb(Script script, CallbackArguments args)
+    {
+        if (args.Count < 1 || args[0].Type != DataType.Table)
+            throw new ScriptRuntimeException("ui.scrollbar_thumb(options) expects a table");
+
+        var options = args[0].Table!;
+        var x = GetOptionalNumber(options, "x", 0.0);
+        var y = GetOptionalNumber(options, "y", 0.0);
+        var width = GetOptionalNumber(options, "width", 0.0);
+        var height = GetOptionalNumber(options, "height", 0.0);
+        if (!double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(width) ||
+            !double.IsFinite(height) || width <= 0.0 || height <= 0.0)
+            throw new ScriptRuntimeException("ui.scrollbar_thumb requires finite x/y and positive width/height");
+
+        var track = new XnaRectangle(
+            (int)Math.Round(x, MidpointRounding.AwayFromZero),
+            (int)Math.Round(y, MidpointRounding.AwayFromZero),
+            Math.Max(1, (int)Math.Round(width, MidpointRounding.AwayFromZero)),
+            Math.Max(1, (int)Math.Round(height, MidpointRounding.AwayFromZero)));
+        var minimumThumbValue = GetOptionalNumber(options, "minimum_thumb", 22.0);
+        var minimumThumb = double.IsFinite(minimumThumbValue)
+            ? (int)Math.Clamp(Math.Round(minimumThumbValue, MidpointRounding.AwayFromZero), 1.0, int.MaxValue)
+            : 22;
+        var thumb = TSC.UI.ScrollBarGeometry.GetThumbBounds(
+            track,
+            GetOptionalNumber(options, "position", 0.0),
+            GetOptionalNumber(options, "maximum", 0.0),
+            GetOptionalNumber(options, "content_extent", 0.0),
+            GetOptionalNumber(options, "visible_extent", 0.0),
+            minimumThumb);
+
+        var result = new Table(script);
+        result.Set("x", DynValue.NewNumber(thumb.X));
+        result.Set("y", DynValue.NewNumber(thumb.Y));
+        result.Set("width", DynValue.NewNumber(thumb.Width));
+        result.Set("height", DynValue.NewNumber(thumb.Height));
+        return DynValue.NewTable(result);
     }
 
     private DynValue GetUiLayout(ScriptExecutionContext _, CallbackArguments args)
@@ -5565,6 +5674,7 @@ public sealed class SkinRuntime : IDisposable
             };
         }
 
+        var scissorClip = GetScissorClip(options);
         var button = new SkinUiButton(
             id,
             parentId,
@@ -5575,7 +5685,8 @@ public sealed class SkinRuntime : IDisposable
             onClick,
             action,
             parsedActionValue,
-            hitTestPriority);
+            hitTestPriority,
+            scissorClip);
         _uiButtons[id] = button;
         RegisterInteractiveLayoutNode(id, parentId, (float)x, (float)y, (float)width, (float)height, button, null);
 
@@ -5608,15 +5719,50 @@ public sealed class SkinRuntime : IDisposable
         var step = GetOptionalNumber(options, "step", 0.0);
         var vertical = string.Equals(GetOptionalString(options, "axis"), "vertical", StringComparison.OrdinalIgnoreCase);
         var reverse = GetOptionalNumber(options, "reverse", 0.0) != 0.0;
+        var thumbAwareValue = options.Get("thumb_aware");
+        var thumbAware = thumbAwareValue.Type == DataType.Boolean
+            ? thumbAwareValue.Boolean
+            : thumbAwareValue.Type == DataType.Number && thumbAwareValue.Number != 0.0;
+        var thumbSize = (float)GetOptionalNumber(options, "thumb_size", 0.0);
+        var scrollContentExtent = GetOptionalNumber(options, "content_extent", 0.0);
+        var scrollViewportExtent = GetOptionalNumber(options, "visible_extent", 0.0);
+        var scrollMinimumThumbValue = GetOptionalNumber(options, "minimum_thumb", 22.0);
+        var scrollMinimumThumbSize = double.IsFinite(scrollMinimumThumbValue)
+            ? (int)Math.Clamp(Math.Round(scrollMinimumThumbValue, MidpointRounding.AwayFromZero), 1.0, int.MaxValue)
+            : 22;
+        var initialValue = GetOptionalNumber(options, "value", min);
+        if (thumbAware)
+        {
+            if (!vertical)
+                throw new ScriptRuntimeException($"ui.slider '{id}' thumb-aware mode requires a vertical axis");
+            // Keep compatibility with older scripts that supplied only thumb_size.
+            if ((!double.IsFinite(scrollContentExtent) || scrollContentExtent <= 0.0 ||
+                 !double.IsFinite(scrollViewportExtent) || scrollViewportExtent <= 0.0) &&
+                double.IsFinite(thumbSize) && thumbSize > 0f)
+            {
+                scrollContentExtent = height;
+                scrollViewportExtent = thumbSize;
+            }
+            if (!double.IsFinite(scrollContentExtent) || scrollContentExtent <= 0.0 ||
+                !double.IsFinite(scrollViewportExtent) || scrollViewportExtent <= 0.0)
+                throw new ScriptRuntimeException($"ui.slider '{id}' thumb-aware mode requires positive content_extent and visible_extent");
+        }
         var action = GetOptionalString(options, "action")?.Trim();
         var releaseAction = GetOptionalString(options, "release_action")?.Trim();
         if (string.IsNullOrWhiteSpace(releaseAction)) releaseAction = null;
-        if (string.IsNullOrWhiteSpace(action))
+        if (string.IsNullOrWhiteSpace(action) && !thumbAware)
             throw new ScriptRuntimeException($"ui.slider '{id}' requires an action");
+        if (string.IsNullOrWhiteSpace(action))
+            action = string.Empty;
         if (!double.IsFinite(min) || !double.IsFinite(max) || min >= max)
             throw new ScriptRuntimeException($"ui.slider '{id}' requires finite min < max");
         if (!double.IsFinite(step) || step < 0.0)
             throw new ScriptRuntimeException($"ui.slider '{id}' step must be finite and >= 0");
+
+        var scissorClip = GetScissorClip(options);
+        var scrollHandler = thumbAware ? _uiScrollHandlerResolver?.Invoke(id) : null;
+        if (thumbAware && scrollHandler is null)
+            throw new ScriptRuntimeException($"ui.slider '{id}' could not resolve its shared SmoothScrollHandler");
 
         var slider = new SkinUiSlider(
             id,
@@ -5631,7 +5777,14 @@ public sealed class SkinRuntime : IDisposable
             action,
             releaseAction,
             vertical,
-            reverse);
+            reverse,
+            thumbAware,
+            scrollContentExtent,
+            scrollViewportExtent,
+            scrollMinimumThumbSize,
+            scrollHandler,
+            initialValue,
+            scissorClip);
         _uiSliders[id] = slider;
         RegisterInteractiveLayoutNode(id, parentId, (float)x, (float)y, (float)width, (float)height, null, slider);
 
@@ -5724,6 +5877,14 @@ public sealed class SkinRuntime : IDisposable
     }
 
     /// <summary>
+    /// Supplies the real scroll-state handlers owned by the active screen. Lua
+    /// scrollbar sliders then call HandleScrollbar on those exact instances rather
+    /// than creating a second controller and forwarding approximate values back.
+    /// </summary>
+    public void SetUiScrollHandlerResolver(Func<string, TSC.UI.SmoothScrollHandler?>? resolver)
+        => _uiScrollHandlerResolver = resolver;
+
+    /// <summary>
     /// Updates the pointer state consumed by ui.state(). The coordinates should
     /// be in the same virtual screen space used by the current skin render().
     /// </summary>
@@ -5735,14 +5896,29 @@ public sealed class SkinRuntime : IDisposable
         _uiPointerLeftDown = leftDown;
         if (!leftDown)
         {
+            var releasedSlider = _uiPressedSliderId is not null &&
+                _uiSliders.TryGetValue(_uiPressedSliderId, out var capturedSlider)
+                    ? capturedSlider
+                    : null;
+
             // Sliders may need one final action when their drag is committed. This
             // keeps expensive operations (such as baking audio) from running on
             // every pointer-move event.
-            if (wasLeftDown && _uiPressedSliderId is not null &&
-                _uiSliders.TryGetValue(_uiPressedSliderId, out var releasedSlider) &&
+            if (wasLeftDown && releasedSlider is not null &&
                 !string.IsNullOrWhiteSpace(releasedSlider.ReleaseAction))
             {
-                EmitUiAction(releasedSlider.ReleaseAction!, releasedSlider.ValueFromPointer(x, y));
+                EmitUiAction(releasedSlider.ReleaseAction!, releasedSlider.ThumbAware
+                    ? (releasedSlider.ScrollHandler?.Position ?? releasedSlider.InitialValue - releasedSlider.Min) + releasedSlider.Min
+                    : releasedSlider.ValueFromPointer(x, y));
+            }
+
+            if (releasedSlider is not null && releasedSlider.ThumbAware &&
+                releasedSlider.ScrollHandler is { } releasedScrollHandler)
+            {
+                // Finish capture through the same handler entry point used for
+                // press and drag, rather than maintaining a Lua-specific release path.
+                UpdateSharedScrollSlider(releasedSlider, releasedScrollHandler, x, y,
+                    mousePressed: false, mouseDown: false);
             }
 
             _uiPressedButtonId = null;
@@ -5825,6 +6001,13 @@ public sealed class SkinRuntime : IDisposable
         _uiPointerX = x;
         _uiPointerY = y;
         _uiPointerLeftDown = true;
+        if (_uiPressedSliderId is not null &&
+            _uiSliders.TryGetValue(_uiPressedSliderId, out var previousSlider) &&
+            previousSlider.ThumbAware && previousSlider.ScrollHandler is { } previousScrollHandler)
+        {
+            UpdateSharedScrollSlider(previousSlider, previousScrollHandler, x, y,
+                mousePressed: false, mouseDown: false);
+        }
         _uiPressedButtonId = null;
         _uiPressedSliderId = null;
         _uiPressedSliderValue = null;
@@ -5938,6 +6121,21 @@ public sealed class SkinRuntime : IDisposable
         _uiPressedSliderId = hitSlider.Id;
         try
         {
+            if (hitSlider.ThumbAware)
+            {
+                var scrollHandler = hitSlider.ScrollHandler;
+                if (scrollHandler is null)
+                    return true;
+
+                scrollHandler.SetMaximum(hitSlider.Max - hitSlider.Min);
+                UpdateSharedScrollSlider(hitSlider, scrollHandler, x, y,
+                    mousePressed: true, mouseDown: true);
+                _uiPressedSliderValue = scrollHandler.Position + hitSlider.Min;
+                // The handler is the source of truth. Do not round-trip its value
+                // through a Lua action callback and a second SetPosition call.
+                return true;
+            }
+
             var value = hitSlider.ValueFromPointer(x, y);
             _uiPressedSliderValue = value;
             EmitUiAction(hitSlider.Action, value);
@@ -5952,7 +6150,8 @@ public sealed class SkinRuntime : IDisposable
 
     /// <summary>
     /// Updates the currently captured slider while the left mouse button remains
-    /// held. Returns true if a slider emitted a new action/value.
+    /// held. Thumb-aware scrollbars update their bound SmoothScrollHandler directly;
+    /// ordinary sliders continue to emit the configured action/value.
     /// </summary>
     public bool HandleUiPointerDrag(float x, float y)
     {
@@ -5965,10 +6164,24 @@ public sealed class SkinRuntime : IDisposable
 
         try
         {
+            if (slider.ThumbAware)
+            {
+                var scrollHandler = slider.ScrollHandler;
+                if (scrollHandler is null)
+                    return true;
+
+                UpdateSharedScrollSlider(slider, scrollHandler, x, y,
+                    mousePressed: false, mouseDown: true);
+                _uiPressedSliderValue = scrollHandler.Position + slider.Min;
+                // Keep pointer capture even when the scroll position is unchanged
+                // for this frame; the shared handler owns all drag state.
+                return true;
+            }
+
             var value = slider.ValueFromPointer(x, y);
             if (_uiPressedSliderValue.HasValue &&
                 Math.Abs(_uiPressedSliderValue.Value - value) < 0.0000001)
-                return false;
+                return true;
 
             _uiPressedSliderValue = value;
             EmitUiAction(slider.Action, value);
@@ -5979,6 +6192,30 @@ public sealed class SkinRuntime : IDisposable
             HandleScriptRuntimeFailure(ex, $"ui.slider:{slider.Id}");
             return true;
         }
+    }
+
+    private static void UpdateSharedScrollSlider(
+        SkinUiSlider slider,
+        TSC.UI.SmoothScrollHandler scrollHandler,
+        float x,
+        float y,
+        bool mousePressed,
+        bool mouseDown)
+    {
+        var track = new XnaRectangle(
+            (int)MathF.Round(slider.X),
+            (int)MathF.Round(slider.Y),
+            Math.Max(1, (int)MathF.Round(slider.Width)),
+            Math.Max(1, (int)MathF.Round(slider.Height)));
+        scrollHandler.HandleScrollbar(
+            mousePressed,
+            mouseDown,
+            pointerX: x,
+            pointerY: y,
+            track: track,
+            contentExtent: slider.ScrollContentExtent,
+            viewportExtent: slider.ScrollViewportExtent,
+            minimumThumbSize: slider.ScrollMinimumThumbSize);
     }
 
     private void EmitUiAction(string action, object? value)
@@ -7243,6 +7480,7 @@ public sealed class SkinRuntime : IDisposable
         var command = AcquireDrawCommand();
         command.Kind = userText ? SkinDrawCommandKind.UserText : SkinDrawCommandKind.Text;
         command.Text = text;
+        command.ScissorClip = GetScissorClip(options);
         command.Id = id;
         command.ParentId = parentId;
         command.Position = position;
@@ -7288,6 +7526,7 @@ public sealed class SkinRuntime : IDisposable
 
         var command = AcquireDrawCommand();
         command.Kind = SkinDrawCommandKind.Rect;
+        command.ScissorClip = GetScissorClip(options);
         command.Id = id;
         command.ParentId = parentId;
         command.Position = position;
@@ -7855,6 +8094,29 @@ public sealed class SkinRuntime : IDisposable
             second.Type == DataType.Number ? (float)second.Number : fallback.Y);
     }
 
+    private static XnaRectangle? GetScissorClip(Table options)
+    {
+        var value = options.Get("clip");
+        if (value.Type != DataType.Table || value.Table is null)
+            return null;
+
+        var clip = value.Table;
+        var left = GetOptionalNumber(clip, "left", double.NaN);
+        var top = GetOptionalNumber(clip, "top", double.NaN);
+        var right = GetOptionalNumber(clip, "right", double.NaN);
+        var bottom = GetOptionalNumber(clip, "bottom", double.NaN);
+        if (!double.IsFinite(left) || !double.IsFinite(top) ||
+            !double.IsFinite(right) || !double.IsFinite(bottom) ||
+            right <= left || bottom <= top)
+            return null;
+
+        var x = (int)Math.Clamp(Math.Floor(left), int.MinValue, int.MaxValue);
+        var y = (int)Math.Clamp(Math.Floor(top), int.MinValue, int.MaxValue);
+        var farX = (int)Math.Clamp(Math.Ceiling(right), int.MinValue, int.MaxValue);
+        var farY = (int)Math.Clamp(Math.Ceiling(bottom), int.MinValue, int.MaxValue);
+        return new XnaRectangle(x, y, Math.Max(0, farX - x), Math.Max(0, farY - y));
+    }
+
     private static float GetNumber(Table options, string key, float fallback)
     {
         var value = options.Get(key);
@@ -8014,6 +8276,7 @@ public sealed class SkinRuntime : IDisposable
         _fonts.Dispose();
         _skin3DWhiteTexture.Dispose();
         _skin3DEffect.Dispose();
+        _uiScissorRasterizerState.Dispose();
         // Content-loaded effects are owned by Game1/ContentManager, so do not dispose _skinQuad3DEffect.
         _drawCommands.Clear();
     }

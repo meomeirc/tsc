@@ -93,7 +93,7 @@ function Get-ManagedManifest([string]$Root, [string]$PackVersion, [string]$Kind)
     return [pscustomobject]@{ schemaVersion = 1; version = $PackVersion; kind = $Kind; files = @($files | Sort-Object path) }
 }
 
-function Remove-ExcludedFiles([string]$Root, [bool]$Minimal) {
+function Remove-ExcludedFiles([string]$Root) {
     # The update mode lives in data/TSC.exe; only the small Native AOT launcher is at root.
     # Remove leftovers if this publish directory was previously built by an older version.
     foreach ($legacyName in @('updater', 'updater.next', 'updater.old', 'data/updater', 'data/updater.next', 'data/updater.old')) {
@@ -110,9 +110,6 @@ function Remove-ExcludedFiles([string]$Root, [bool]$Minimal) {
             # custom skins, or any user's FFmpeg executable.
             Remove-Item -LiteralPath $file.FullName -Force
             continue
-        }
-        if ($Minimal -and $relative.StartsWith('Skins/Default/', [StringComparison]::OrdinalIgnoreCase)) {
-            Remove-Item -LiteralPath $file.FullName -Force
         }
     }
     Get-ChildItem -LiteralPath $Root -Directory -Recurse | Sort-Object FullName -Descending | ForEach-Object {
@@ -238,37 +235,33 @@ try {
     if ($launcherSize -gt 5MB) { throw "Launcher is too large ($launcherSize bytes). The release package must use the small Native AOT launcher." }
 
     $fullRoot = Join-Path $work 'full'
-    $minimalRoot = Join-Path $work 'minimal'
     New-Item -ItemType Directory -Path $fullRoot -Force | Out-Null
-    New-Item -ItemType Directory -Path $minimalRoot -Force | Out-Null
     Copy-DirectoryContents $publish $fullRoot
-    Copy-DirectoryContents $publish $minimalRoot
-    Remove-ExcludedFiles $fullRoot $false
-    Remove-ExcludedFiles $minimalRoot $true
+    Remove-ExcludedFiles $fullRoot
 
     $fullManifest = Get-ManagedManifest $fullRoot $Version 'full'
-    $minimalManifest = Get-ManagedManifest $minimalRoot $Version 'minimal'
     $releaseManifestPath = Join-Path $output "TSC-win-x64-$Version-manifest.json"
     $legacyMinimalManifestPath = Join-Path $output "TSC-win-x64-$Version-minimal-manifest.json"
     $legacyPatchManifestPath = Join-Path $output "TSC-win-x64-$Version-patch-manifest.json"
-    # Remove this version's old metadata before rebuilding. If later validation fails,
-    # a stale combined manifest must not remain beside a newly written patch ZIP.
-    foreach ($staleManifest in @($releaseManifestPath, $legacyMinimalManifestPath, $legacyPatchManifestPath)) {
-        if (Test-Path -LiteralPath $staleManifest) { Remove-Item -LiteralPath $staleManifest -Force }
+    $legacyMinimalZipPath = Join-Path $output "TSC-win-x64-$Version-minimal.zip"
+
+    # Remove obsolete minimal assets as well as stale metadata before rebuilding.
+    # This prevents a reused output directory from accidentally publishing the old flavor.
+    foreach ($staleAsset in @($releaseManifestPath, $legacyMinimalManifestPath, $legacyPatchManifestPath, $legacyMinimalZipPath)) {
+        if (Test-Path -LiteralPath $staleAsset) { Remove-Item -LiteralPath $staleAsset -Force }
     }
+    Get-ChildItem -LiteralPath $output -File -Filter 'TSC-win-x64-*-minimal.zip' -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+    Get-ChildItem -LiteralPath $output -File -Filter 'TSC-win-x64-*-minimal-manifest.json' -ErrorAction SilentlyContinue |
+        Remove-Item -Force
 
     $fullZip = Join-Path $output "TSC-win-x64-$Version.zip"
-    $minimalZip = Join-Path $output "TSC-win-x64-$Version-minimal.zip"
     Write-AssetZip $fullRoot $fullZip
-    Write-AssetZip $minimalRoot $minimalZip
     Assert-NoEmbeddedManifest $fullZip '.tsc-package-manifest.json'
-    Assert-NoEmbeddedManifest $minimalZip '.tsc-package-manifest.json'
     Write-Host "Created $fullZip"
-    Write-Host "Created $minimalZip"
 
-    # The release manifest is written once at the end and contains the metadata
-    # for both package variants and, when available, the patch. The older
-    # per-package/patch manifest filenames are only read for migration purposes.
+    # The release manifest contains the full package and, when available, its patch.
+    # New releases no longer publish or select a minimal package.
     $patchManifest = $null
 
     if (-not [string]::IsNullOrWhiteSpace($PreviousFullZip)) {
@@ -287,7 +280,7 @@ try {
                 $candidateManifestPaths += [IO.Path]::GetFullPath($PreviousManifestPath)
             }
             $zipBase = [IO.Path]::GetFileName($previousZip)
-            if ($zipBase -match '^TSC-win-x64-(?<version>\d+(?:\.\d+){1,3})(?:-minimal)?\.zip$') {
+            if ($zipBase -match '^TSC-win-x64-(?<version>\d+(?:\.\d+){1,3})\.zip$') {
                 $previousVersionFromName = $Matches['version']
                 $manifestName = "TSC-win-x64-$previousVersionFromName-manifest.json"
                 $candidateManifestPaths += (Join-Path (Split-Path -Parent $previousZip) $manifestName)
@@ -298,8 +291,8 @@ try {
                 throw 'The previous ZIP has no embedded manifest and no matching external manifest was found. Keep TSC-win-x64-<previous-version>-manifest.json beside the ZIP or pass -PreviousManifestPath.'
             }
             $previousDocument = Get-Content -LiteralPath $foundPreviousManifest -Raw | ConvertFrom-Json
-            # New releases wrap package manifests under `full` and `minimal`.
-            # Older releases stored the full package manifest at the JSON root.
+            # Combined release manifests contain the full package; older releases stored
+            # that package manifest directly at the JSON root.
             if ($null -ne $previousDocument.full -and $null -ne $previousDocument.full.files) {
                 $previousManifest = $previousDocument.full
             }
@@ -374,7 +367,6 @@ try {
         schemaVersion = 2
         version = $Version
         full = $fullManifest
-        minimal = $minimalManifest
         patch = $patchManifest
     }
     [IO.File]::WriteAllText($releaseManifestPath, ($releaseManifest | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))

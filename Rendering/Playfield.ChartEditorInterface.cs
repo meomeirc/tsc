@@ -399,10 +399,12 @@ public sealed partial class Playfield
         var problems = new List<object?>();
         var errorCount = _editorProblemErrorCount;
         var warningCount = _editorProblemWarningCount;
+        var problemWindowRows = GetEditorProblemsScrollWindowRows(width, height);
         var problemStart = _editorProblemsExpanded
-            ? Math.Clamp(_editorProblemsScrollOffset, 0, Math.Max(0, _editorProblems.Count - LAYOUT_PROBLEM_ROW_COUNT))
+            ? Math.Clamp(GetEditorProblemsScrollFirstRow(width, height), 0,
+                Math.Max(0, _editorProblems.Count - problemWindowRows))
             : 0;
-        var problemEnd = Math.Min(_editorProblems.Count, problemStart + LAYOUT_PROBLEM_ROW_COUNT);
+        var problemEnd = Math.Min(_editorProblems.Count, problemStart + problemWindowRows + 1);
         for (var i = problemStart; i < problemEnd; i++)
         {
             var issue = _editorProblems[i];
@@ -415,7 +417,10 @@ public sealed partial class Playfield
         }
 
         var currentTick = _tempo?.SecondsToTick(_playSeconds) ?? 0.0;
-        var rows = GetEditorMetaRows(currentTick);
+        var metaStats = string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase) && _chart is not null
+            ? GetEditorMetaStatsData()
+            : null;
+        var rows = GetEditorMetaRows(currentTick, metaStats);
         var bpmInputMetrics = GetEditorTextFieldMetrics(_editorBpmInputText, _editorBpmInputCaretIndex, _editorBpmSelectionAnchor);
         var durationInputText = GetEditorDurationFieldDisplayText();
         var durationInputMetrics = GetEditorTextFieldMetrics(durationInputText, _editorDurationInputCaretIndex, _editorDurationSelectionAnchor);
@@ -465,6 +470,68 @@ public sealed partial class Playfield
                     BbCodeTextRenderer.IsSupportedMetadataField(fieldKey) &&
                     string.Equals(_editorMetaBbCodeStripField, fieldKey, StringComparison.OrdinalIgnoreCase)
             };
+            if (metaStats is not null && IsEditorMetaStatsBankHeaderRow(row.Label))
+            {
+                item["stats_kind"] = "bank_header";
+                item["stats_columns"] = new object?[]
+                {
+                    new Dictionary<string, object?> { ["label"] = "1K" },
+                    new Dictionary<string, object?> { ["label"] = "2K" },
+                    new Dictionary<string, object?> { ["label"] = "3K" }
+                };
+            }
+            else if (metaStats is not null && IsEditorMetaStatsBankRow(row.Label))
+            {
+                string[] statsValues = row.Label switch
+                {
+                    "NOTES" => new[] { metaStats.Notes.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Notes.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Notes.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                    "TAP" => new[] { metaStats.Taps.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Taps.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Taps.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                    "HOLD" => new[] { metaStats.Holds.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Holds.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Holds.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                    "VIBRATO" => new[] { metaStats.Vibratos.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Vibratos.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Vibratos.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                    "LINK SEGMENTS / POINTS" => new[]
+                    {
+                        $"{metaStats.LinkSegments.OneK:N0} / {metaStats.LinkPoints.OneK:N0}",
+                        $"{metaStats.LinkSegments.TwoK:N0} / {metaStats.LinkPoints.TwoK:N0}",
+                        $"{metaStats.LinkSegments.ThreeK:N0} / {metaStats.LinkPoints.ThreeK:N0}"
+                    },
+                    "FLICK" => new[] { metaStats.Flicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Flicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.Flicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                    "SUPERFLICK" => new[] { metaStats.SuperFlicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.SuperFlicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                        metaStats.SuperFlicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                    _ => new[] { "0", "0", "0" }
+                };
+                item["stats_kind"] = "bank";
+                item["stats_columns"] = new object?[]
+                {
+                    new Dictionary<string, object?> { ["value"] = statsValues[0] },
+                    new Dictionary<string, object?> { ["value"] = statsValues[1] },
+                    new Dictionary<string, object?> { ["value"] = statsValues[2] }
+                };
+            }
+            else if (metaStats is not null && IsEditorMetaStatsComboRow(row.Label))
+            {
+                item["stats_kind"] = "combo";
+                item["combo_total"] = metaStats.ComboTotal;
+                item["combo_items"] = new object?[]
+                {
+                    new Dictionary<string, object?> { ["label"] = "TAP", ["count"] = metaStats.ComboTaps },
+                    new Dictionary<string, object?> { ["label"] = "HOLD", ["count"] = metaStats.ComboHolds },
+                    new Dictionary<string, object?> { ["label"] = "VIBRATO", ["count"] = metaStats.ComboVibratos },
+                    new Dictionary<string, object?> { ["label"] = "LINK", ["count"] = metaStats.ComboLinks },
+                    new Dictionary<string, object?> { ["label"] = "FLICK", ["count"] = metaStats.ComboFlicks },
+                    new Dictionary<string, object?> { ["label"] = "SUPERFLICK", ["count"] = metaStats.ComboSuperFlicks }
+                };
+            }
             if (row.Label == "ELEMENT")
             {
                 // The element picker is a neutral control; show the current element
@@ -654,7 +721,7 @@ public sealed partial class Playfield
             ["stutter_patterns"] = stutterPatterns,
             ["note_groups"] = BuildEditorNoteGroupMenuItems(),
             ["note_group_actions"] = BuildEditorNoteGroupActions(),
-            ["note_groups_scroll"] = _editorNoteGroupsScrollOffset,
+            ["note_groups_scroll"] = _editorNoteGroupsScroll.Position,
             ["note_groups_scroll_max"] = GetEditorNoteGroupScrollMaximum(),
             ["note_group_edit_mode"] = _editorNoteGroupEditMode,
             ["menu_width"] = _editorMenuSection switch
@@ -729,7 +796,7 @@ public sealed partial class Playfield
             ["meta_music_volume"] = _editorMusicVolumePercent,
             ["meta_music_volume_pending"] = _editorMusicVolumePendingPercent,
             ["meta_visible_rows"] = GetEditorMetaVisibleRowCount(rows, width, height),
-            ["meta_scroll"] = _editorMetaScrollOffset,
+            ["meta_scroll"] = _editorMetaScroll.Position,
             ["meta_scroll_max"] = GetEditorMetaMaxScrollOffset(rows, width, height),
             ["meta_export_expanded"] = _editorMetaExportExpanded,
             ["meta_export_options"] = exportOptions,
@@ -777,8 +844,8 @@ public sealed partial class Playfield
             ["problems_errors"] = errorCount,
             ["problems_warnings"] = warningCount,
             ["problems_expanded"] = _editorProblemsExpanded,
-            ["problems_scroll"] = _editorProblemsScrollOffset,
-            ["problems_scroll_max"] = Math.Max(0, _editorProblems.Count - LAYOUT_PROBLEM_ROW_COUNT),
+            ["problems_scroll"] = _editorProblemsScroll.Position,
+            ["problems_scroll_max"] = GetEditorProblemsScrollMaximum(width, height),
             ["problems"] = problems,
             ["banks"] = banks,
             ["status"] = _statusMessage ?? string.Empty,
@@ -939,7 +1006,7 @@ public sealed partial class Playfield
             case "editor.note_groups.edit":
                 HandleEditorNoteGroupUiAction("edit", 0); return true;
             case "editor.note_groups.scroll_to":
-                _editorNoteGroupsScrollOffset = Math.Clamp(Number(), 0, GetEditorNoteGroupScrollMaximum());
+                SetEditorNoteGroupScrollPosition(Number(), immediate: true);
                 return true;
             case "editor.problems.toggle":
                 _editorProblemsExpanded = !_editorProblemsExpanded; ClampEditorProblemsScroll(width, height); return true;
@@ -976,22 +1043,20 @@ public sealed partial class Playfield
                 return true;
             case "editor.problems.scroll":
                 RefreshEditorDiagnostics();
-                _editorProblemsScrollOffset = Math.Clamp(_editorProblemsScrollOffset + Number(), 0, Math.Max(0, _editorProblems.Count - LAYOUT_PROBLEM_ROW_COUNT));
+                SetEditorProblemsScrollPosition(_editorProblemsScroll.Target + Number());
                 return true;
             case "editor.problems.scroll_to":
                 RefreshEditorDiagnostics();
-                _editorProblemsScrollOffset = Math.Clamp(Number(), 0,
-                    Math.Max(0, _editorProblems.Count - LAYOUT_PROBLEM_ROW_COUNT));
+                SetEditorProblemsScrollPosition(Number(), immediate: true);
                 return true;
             case "editor.meta.scroll":
                 var metaRowsForScroll = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
-                _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset + Number(), 0,
-                    GetEditorMetaMaxScrollOffset(metaRowsForScroll, width, height));
+                SetEditorMetaScrollPosition(_editorMetaScroll.Target + Number(), rows: metaRowsForScroll,
+                    virtualWidth: width, virtualHeight: height);
                 return true;
             case "editor.meta.scroll_to":
                 var scrollMetaRows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
-                _editorMetaScrollOffset = Math.Clamp(Number(), 0,
-                    GetEditorMetaMaxScrollOffset(scrollMetaRows, width, height));
+                SetEditorMetaScrollPosition(Number(), immediate: true, rows: scrollMetaRows, virtualWidth: width, virtualHeight: height);
                 return true;
             case "editor.meta.close":
                 CancelEditorMetaField();
@@ -1011,6 +1076,7 @@ public sealed partial class Playfield
                     CancelEditorMetaField();
                     _editorElementDropdownOpen = false;
                     _editorMetaCategory = EditorMetaCategories[categoryIndex];
+                    _editorMetaScroll.Reset();
                     _editorMetaScrollOffset = 0;
                 }
                 return true;
@@ -1018,6 +1084,7 @@ public sealed partial class Playfield
                 var difficultyIndex = Number();
                 if (difficultyIndex >= 0 && difficultyIndex < EditorDifficultyCodes.Length)
                 {
+                    _editorMetaScroll.Reset();
                     _editorMetaScrollOffset = 0;
                     _editorElementDropdownOpen = false;
                     SwitchEditorDifficulty(EditorDifficultyCodes[difficultyIndex]);

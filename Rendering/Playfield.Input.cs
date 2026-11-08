@@ -7,6 +7,7 @@ using Microsoft.Xna.Framework.Input;
 using System.Collections.Generic;
 using Color = Microsoft.Xna.Framework.Color;
 using Keys = Microsoft.Xna.Framework.Input.Keys;
+using ButtonState = Microsoft.Xna.Framework.Input.ButtonState;
 using Rectangle = Microsoft.Xna.Framework.Rectangle;
 using System.Globalization;
 using System.Diagnostics;
@@ -54,6 +55,12 @@ public sealed partial class Playfield
 
         UpdateEditorWheelScrollPause(dt);
         UpdateEditorSeekPauseState();
+        UpdateEditorMenuScrollControllers(dt);
+        if (HandleEditorFallbackScrollbarInput())
+        {
+            UpdateLaneHighlights(keyboard, dt);
+            return;
+        }
 
         // A focused field gets first refusal on the keyboard before preview or
         // gameplay shortcuts. Its text-edit keys must never also hit mapped lanes
@@ -173,6 +180,183 @@ public sealed partial class Playfield
         UpdateLaneHighlights(keyboard, dt);
     }
 
+
+    private void UpdateEditorMenuScrollControllers(double deltaSeconds)
+    {
+        var viewport = _graphics.Viewport;
+        var (virtualWidth, virtualHeight) = GetVirtualResolution(viewport.Width, viewport.Height);
+        if (_chartEditorMode && _chart is not null)
+        {
+            _editorNoteGroupsScroll.SetMaximum(GetEditorNoteGroupScrollMaximum());
+            if (_editorProblemsExpanded)
+                _editorProblemsScroll.SetMaximum(GetEditorProblemsScrollMaximum(virtualWidth, virtualHeight));
+            else
+                _editorProblemsScroll.SetMaximum(0.0);
+
+            if (_editorMetaPanelOpen)
+            {
+                var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+                _editorMetaScroll.SetMaximum(GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+            }
+        }
+
+        _editorNoteGroupsScroll.Update(deltaSeconds);
+        _editorMetaScroll.Update(deltaSeconds);
+        _editorProblemsScroll.Update(deltaSeconds);
+        _editorNoteGroupsScrollOffset = GetEditorNoteGroupScrollFirstRow();
+        if (_editorMetaPanelOpen)
+        {
+            var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+            var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+            _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
+        }
+        _editorProblemsScrollOffset = GetEditorProblemsScrollFirstRow(virtualWidth, virtualHeight);
+    }
+
+
+    private bool HandleEditorFallbackScrollbarInput()
+    {
+        if (!_chartEditorMode || _chart is null)
+        {
+            _editorNoteGroupsScroll.CancelPointer();
+            _editorMetaScroll.CancelPointer();
+            _editorProblemsScroll.CancelPointer();
+            return false;
+        }
+
+        // When the Lua editor interface is active, its skin controls route
+        // presses and drags through the same SmoothScrollHandler instances via
+        // SkinRuntime's handler resolver. Do not cancel pointer capture here:
+        // this fallback path runs every frame before the Lua drag update.
+        if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+            return false;
+
+        var viewport = _graphics.Viewport;
+        var (virtualWidth, virtualHeight) = GetVirtualResolution(viewport.Width, viewport.Height);
+        var mouse = GlobalInput.Mouse;
+        var previousMouse = GlobalInput.PreviousMouse;
+        var mouseDown = mouse.LeftButton == ButtonState.Pressed;
+        var mousePressed = mouseDown && previousMouse.LeftButton != ButtonState.Pressed;
+        var pointer = new Microsoft.Xna.Framework.Point(
+            (int)MathF.Round(mouse.X * virtualWidth / (float)Math.Max(1, viewport.Width)),
+            (int)MathF.Round(mouse.Y * virtualHeight / (float)Math.Max(1, viewport.Height)));
+
+        if (_editorMenuSection == EditorMenuSection.NoteGroups)
+        {
+            var firstRow = GetEditorNoteGroupEntryBounds(0, virtualWidth, virtualHeight);
+            if (!firstRow.IsEmpty)
+            {
+                var unit = _projection.ScalePixels(1f);
+                var trackHeight = Math.Max(1, (int)MathF.Round((5 * 50f + 4 * 5f) * unit));
+                var visualTrack = new Rectangle(firstRow.Right + (int)MathF.Round(9f * unit), firstRow.Y,
+                    Math.Max(2, (int)MathF.Round(6f * unit)), trackHeight);
+                var interactionTrack = new Rectangle(visualTrack.X - Math.Max(4, (int)MathF.Round(6f * unit)),
+                    visualTrack.Y, visualTrack.Width + Math.Max(8, (int)MathF.Round(12f * unit)), visualTrack.Height);
+                var maximum = GetEditorNoteGroupScrollMaximum();
+                _editorNoteGroupsScroll.SetMaximum(maximum);
+                if (_editorNoteGroupsScroll.HandleScrollbar(mousePressed, mouseDown, pointer.X, pointer.Y,
+                    interactionTrack, GetEditorNoteGroupScrollContentExtent(), GetEditorNoteGroupScrollViewportExtent(),
+                    minimumThumbSize: Math.Max(1, (int)MathF.Round(24f * unit))))
+                {
+                    _editorNoteGroupsScrollOffset = GetEditorNoteGroupScrollFirstRow();
+                    return true;
+                }
+            }
+        }
+        _editorNoteGroupsScroll.CancelPointer();
+
+        if (_editorMetaPanelOpen &&
+            !string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase))
+        {
+            var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+            var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+            var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+            var maximum = GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight);
+            var totalContentHeight = GetEditorMetaPrefixHeight(layouts, layouts.Count);
+            if (!content.IsEmpty && maximum > 0 && totalContentHeight > content.Height)
+            {
+                var unit = _projection.ScalePixels(1f);
+                var railWidth = Math.Max(2, (int)MathF.Round(3f * unit));
+                var visualTrack = new Rectangle(content.Right - railWidth, content.Y, railWidth, content.Height);
+                var hitPadding = Math.Max(4, (int)MathF.Round(6f * unit));
+                var interactionTrack = new Rectangle(visualTrack.X - hitPadding, visualTrack.Y,
+                    visualTrack.Width + hitPadding * 2, visualTrack.Height);
+                _editorMetaScroll.SetMaximum(maximum);
+                if (_editorMetaScroll.HandleScrollbar(mousePressed, mouseDown, pointer.X, pointer.Y,
+                    interactionTrack, totalContentHeight, content.Height,
+                    minimumThumbSize: Math.Max(1, (int)MathF.Round(24f * unit))))
+                {
+                    _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
+                    return true;
+                }
+            }
+        }
+        _editorMetaScroll.CancelPointer();
+
+        if (_editorProblemsExpanded)
+        {
+            RefreshEditorDiagnostics();
+            var list = GetEditorProblemsListBounds(virtualWidth, virtualHeight);
+            var visibleRows = GetEditorProblemsScrollWindowRows(virtualWidth, virtualHeight);
+            if (!list.IsEmpty && visibleRows > 0)
+            {
+                var unit = _projection.ScalePixels(1f);
+                var railWidth = Math.Max(2, (int)MathF.Round(3f * unit));
+                var visualTrack = new Rectangle(list.Right - railWidth, list.Y, railWidth, list.Height);
+                var hitPadding = Math.Max(4, (int)MathF.Round(6f * unit));
+                var interactionTrack = new Rectangle(visualTrack.X - hitPadding, visualTrack.Y,
+                    visualTrack.Width + hitPadding * 2, visualTrack.Height);
+                var maximum = GetEditorProblemsScrollMaximum(virtualWidth, virtualHeight);
+                _editorProblemsScroll.SetMaximum(maximum);
+                if (_editorProblemsScroll.HandleScrollbar(mousePressed, mouseDown, pointer.X, pointer.Y,
+                    interactionTrack, GetEditorProblemsScrollContentExtent(virtualWidth, virtualHeight),
+                    GetEditorProblemsScrollViewportExtent(virtualWidth, virtualHeight),
+                    minimumThumbSize: Math.Max(15, (int)MathF.Round(15f * unit))))
+                {
+                    _editorProblemsScrollOffset = GetEditorProblemsScrollFirstRow(virtualWidth, virtualHeight);
+                    return true;
+                }
+            }
+        }
+        _editorProblemsScroll.CancelPointer();
+        return false;
+    }
+
+    private void SetEditorNoteGroupScrollPosition(double value, bool immediate = false)
+    {
+        _editorNoteGroupsScroll.SetMaximum(GetEditorNoteGroupScrollMaximum());
+        var pixelPosition = Math.Max(0.0, value) * GetEditorNoteGroupScrollRowPitch();
+        if (immediate) _editorNoteGroupsScroll.SetPosition(pixelPosition);
+        else _editorNoteGroupsScroll.SetTarget(pixelPosition);
+        _editorNoteGroupsScrollOffset = GetEditorNoteGroupScrollFirstRow();
+    }
+
+    private void SetEditorMetaScrollPosition(double value, bool immediate = false,
+        IReadOnlyList<(string Label, string Value)>? rows = null, int virtualWidth = 0, int virtualHeight = 0)
+    {
+        if (rows is not null && virtualWidth > 0 && virtualHeight > 0)
+            _editorMetaScroll.SetMaximum(GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+        if (immediate) _editorMetaScroll.SetPosition(value);
+        else _editorMetaScroll.SetTarget(value);
+        var effectiveRows = rows ?? GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+        var fallbackResolution = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
+        var effectiveWidth = virtualWidth > 0 ? virtualWidth : fallbackResolution.Width;
+        var effectiveHeight = virtualHeight > 0 ? virtualHeight : fallbackResolution.Height;
+        var layouts = GetEditorMetaRowLayouts(effectiveRows, effectiveWidth, effectiveHeight);
+        _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
+    }
+
+    private void SetEditorProblemsScrollPosition(double value, bool immediate = false)
+    {
+        var viewport = _graphics.Viewport;
+        var (virtualWidth, virtualHeight) = GetVirtualResolution(viewport.Width, viewport.Height);
+        _editorProblemsScroll.SetMaximum(GetEditorProblemsScrollMaximum(virtualWidth, virtualHeight));
+        if (immediate) _editorProblemsScroll.SetPosition(value);
+        else _editorProblemsScroll.SetTarget(value);
+        _editorProblemsScrollOffset = GetEditorProblemsScrollFirstRow(virtualWidth, virtualHeight);
+    }
+
     private bool IsEditorSeekKeyDown()
         => KeybindSettings.IsDown("editor_seek_backward_1_beat") ||
            KeybindSettings.IsDown("editor_seek_forward_1_beat") ||
@@ -263,6 +447,17 @@ public sealed partial class Playfield
         }
     }
 
+    private double GetEditorWheelScrollDistance(int virtualHeight)
+    {
+        // Editor content is laid out in the fixed-height virtual canvas, while
+        // Info and Settings use output-screen pixels. Convert the shared wheel
+        // distance so it moves the same physical distance at every resolution.
+        var outputHeight = Math.Max(1, _graphics.Viewport.Height);
+        var logicalLineSpacing = _font is null ? 21.0 : UnicodeTextRenderer.GetLogicalLineSpacing(_font);
+        var outputPixelsPerNotch = TSC.UI.SmoothScrollHandler.GetWheelPixelsPerNotch(logicalLineSpacing);
+        return outputPixelsPerNotch * Math.Max(1, virtualHeight) / (double)outputHeight;
+    }
+
     private void HandleEditorMouseWheelScroll()
     {
         var wheelDelta = GlobalInput.Mouse.ScrollWheelValue - GlobalInput.PreviousMouse.ScrollWheelValue;
@@ -291,10 +486,9 @@ public sealed partial class Playfield
                         lastRow.Right - firstRow.X + scrollbarPadding, lastRow.Bottom - firstRow.Y);
                     if (listBounds.Contains(pointer))
                     {
-                        var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
-                        _editorNoteGroupsScrollOffset = Math.Clamp(
-                            _editorNoteGroupsScrollOffset + (wheelDelta < 0 ? steps : -steps),
-                            0, GetEditorNoteGroupScrollMaximum());
+                        _editorNoteGroupsScroll.SetMaximum(GetEditorNoteGroupScrollMaximum());
+                        _editorNoteGroupsScroll.HandleWheel(wheelDelta, GetEditorWheelScrollDistance(virtualHeight));
+                        _editorNoteGroupsScrollOffset = GetEditorNoteGroupScrollFirstRow();
                     }
                     return;
                 }
@@ -307,19 +501,21 @@ public sealed partial class Playfield
                 var uiOverProblems = _editorProblemsExpanded &&
                     (_chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problems_") ||
                      _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problem_"));
-                var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
                 if (uiOverMetaContent)
                 {
                     var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
-                    _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset + (wheelDelta < 0 ? steps : -steps),
-                        0, GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+                    _editorMetaScroll.SetMaximum(GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+                    var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+                    _editorMetaScroll.HandleWheel(wheelDelta, GetEditorWheelScrollDistance(virtualHeight));
+                    _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
                     return;
                 }
                 if (uiOverProblems)
                 {
                     RefreshEditorDiagnostics();
-                    _editorProblemsScrollOffset = Math.Clamp(_editorProblemsScrollOffset + (wheelDelta < 0 ? steps : -steps),
-                        0, Math.Max(0, _editorProblems.Count - 5));
+                    _editorProblemsScroll.SetMaximum(GetEditorProblemsScrollMaximum(virtualWidth, virtualHeight));
+                    _editorProblemsScroll.HandleWheel(wheelDelta, GetEditorWheelScrollDistance(virtualHeight));
+                    _editorProblemsScrollOffset = GetEditorProblemsScrollFirstRow(virtualWidth, virtualHeight);
                     return;
                 }
             }
@@ -328,9 +524,9 @@ public sealed partial class Playfield
                 if (_editorProblemsExpanded && GetEditorProblemsListBounds(virtualWidth, virtualHeight).Contains(pointer))
                 {
                     RefreshEditorDiagnostics();
-                    var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
-                    _editorProblemsScrollOffset += wheelDelta < 0 ? steps : -steps;
-                    ClampEditorProblemsScroll(virtualWidth, virtualHeight);
+                    _editorProblemsScroll.SetMaximum(GetEditorProblemsScrollMaximum(virtualWidth, virtualHeight));
+                    _editorProblemsScroll.HandleWheel(wheelDelta, GetEditorWheelScrollDistance(virtualHeight));
+                    _editorProblemsScrollOffset = GetEditorProblemsScrollFirstRow(virtualWidth, virtualHeight);
                 }
                 return;
             }
@@ -353,9 +549,10 @@ public sealed partial class Playfield
                 {
                     var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
                     ClampEditorMetaScrollOffset(rows, virtualWidth, virtualHeight);
-                    var steps = Math.Max(1, (int)Math.Round(Math.Abs(wheelDelta) / 120.0));
-                    _editorMetaScrollOffset += wheelDelta < 0 ? steps : -steps;
-                    ClampEditorMetaScrollOffset(rows, virtualWidth, virtualHeight);
+                    _editorMetaScroll.SetMaximum(GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+                    var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+                    _editorMetaScroll.HandleWheel(wheelDelta, GetEditorWheelScrollDistance(virtualHeight));
+                    _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
                 }
                 return;
             }

@@ -3026,10 +3026,9 @@ public sealed partial class Playfield
     {
         var unit = _projection.ScalePixels(1f);
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
-        var scrollbarSpace = (int)MathF.Round(8f * unit);
-        // Match the Lua field width: content padding, the scrollbar rail, the
-        // skin's extra trailing gap, and both field text insets are reserved.
-        var fieldWidth = Math.Max(1f, content.Width - (scrollbarSpace + 42f * unit));
+        // Match the Lua field's actual text width. The skin reserves a different
+        // trailing area for PREVIEW and artwork rows, then keeps a 20px inner
+        // text inset in addition to its 22px control/scrollbar allowance.
         var font = _font;
         var fieldTextScale = GetEditorTextFieldFontScale(GetEditorMetaFieldHeight(unit), unit);
         var lineHeight = Math.Max(16f * unit,
@@ -3037,27 +3036,37 @@ public sealed partial class Playfield
         var layouts = new List<EditorMetaRowLayout>(rows.Count);
         foreach (var row in rows)
         {
+            var trailingWidth = row.Label == "PREVIEW" ? 132f * unit :
+                row.Label is "ALBUM" or "ALBUM BIG" ? 68f * unit : 8f * unit;
+            var fieldTextWidth = Math.Max(1f, content.Width - trailingWidth - 42f * unit);
             var displayValue = row.Value;
             var fieldKey = GetEditorMetaFieldKey(row.Label);
             if (fieldKey is not null && string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase))
                 displayValue = _editorMetaInputText;
 
-            // These are controls rather than free-form text fields. Keep them at the
-            // standard height; editable/readonly text values expand to fit wrapped lines.
-            var wrapValue = row.Label is not ("ELEMENT" or "CUSTOM JUDGEMENT WINDOWS" or
+            // Bank headers, bank counters and combo distribution use compact grid
+            // renderers; they must not inherit the generic wrapped-text row sizing.
+            var statsBankHeaderRow = IsEditorMetaStatsBankHeaderRow(row.Label);
+            var statsBankRow = IsEditorMetaStatsBankRow(row.Label);
+            var statsComboRow = IsEditorMetaStatsComboRow(row.Label);
+            var wrapValue = !statsBankHeaderRow && !statsBankRow && !statsComboRow && row.Label is not ("ELEMENT" or "CUSTOM JUDGEMENT WINDOWS" or
                 "DELETE DIFFICULTY" or "MUSIC" or "ALBUM" or "ALBUM BIG");
-            var fieldHeight = GetEditorMetaFieldHeight(unit);
+            var fieldHeight = statsComboRow
+                ? Math.Max(GetEditorMetaFieldHeight(unit), (int)MathF.Round(128f * unit))
+                : statsBankHeaderRow
+                    ? Math.Max(1, (int)MathF.Round(36f * unit))
+                    : GetEditorMetaFieldHeight(unit);
             if (wrapValue)
             {
                 var safeValue = FontSafeText(font, displayValue);
                 var isEditing = fieldKey is not null &&
                     string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase);
                 var lineCount = isEditing
-                    ? WrapEditorTextWithRanges(safeValue, fieldWidth / Math.Max(0.01f, fieldTextScale),
+                    ? WrapEditorTextWithRanges(safeValue, fieldTextWidth / Math.Max(0.01f, fieldTextScale),
                         candidate => UnicodeTextRenderer.MeasureString(font, candidate).X).Count
                     : BbCodeTextRenderer.IsSupportedMetadataField(fieldKey)
-                        ? BbCodeTextRenderer.MeasureLineCount(font, displayValue, fieldWidth, fieldTextScale)
-                        : WrapEditorHudText(font, safeValue, fieldWidth / Math.Max(0.01f, fieldTextScale)).Count;
+                        ? BbCodeTextRenderer.MeasureLineCount(font, displayValue, fieldTextWidth, fieldTextScale)
+                        : WrapEditorHudText(font, safeValue, fieldTextWidth / Math.Max(0.01f, fieldTextScale)).Count;
                 fieldHeight = Math.Max(fieldHeight,
                     (int)MathF.Ceiling(lineCount * lineHeight + 12f * unit));
             }
@@ -3077,22 +3086,37 @@ public sealed partial class Playfield
         return height;
     }
 
-    private int GetEditorMetaMaxScrollOffset(IReadOnlyList<(string Label, string Value)> rows,
+    private double GetEditorMetaScrollVisualOffset(IReadOnlyList<EditorMetaRowLayout> layouts)
+    {
+        var viewport = _graphics.Viewport;
+        var (virtualWidth, virtualHeight) = GetVirtualResolution(viewport.Width, viewport.Height);
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var totalHeight = GetEditorMetaPrefixHeight(layouts, layouts.Count);
+        return Math.Clamp(_editorMetaScroll.Position, 0.0, Math.Max(0.0, totalHeight - content.Height));
+    }
+
+    private int GetEditorMetaScrollFirstVisibleRow(IReadOnlyList<EditorMetaRowLayout> layouts)
+    {
+        var scrollOffset = GetEditorMetaScrollVisualOffset(layouts);
+        var rowTop = 0.0;
+        for (var index = 0; index < layouts.Count; index++)
+        {
+            if (rowTop + layouts[index].Pitch > scrollOffset + 0.0001)
+                return index;
+            rowTop += layouts[index].Pitch;
+        }
+        return layouts.Count;
+    }
+
+    private double GetEditorMetaMaxScrollOffset(IReadOnlyList<(string Label, string Value)> rows,
         int virtualWidth, int virtualHeight)
     {
         if (rows.Count == 0)
-            return 0;
+            return 0.0;
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
-        var suffixHeight = 0;
-        for (var i = layouts.Count - 1; i >= 0; i--)
-        {
-            var pitch = layouts[i].Pitch;
-            if (suffixHeight + pitch > content.Height)
-                return suffixHeight == 0 ? i : i + 1;
-            suffixHeight += pitch;
-        }
-        return 0;
+        var totalHeight = GetEditorMetaPrefixHeight(layouts, layouts.Count);
+        return Math.Max(0.0, totalHeight - content.Height);
     }
 
     private int GetEditorMetaVisibleRowCount(IReadOnlyList<(string Label, string Value)> rows,
@@ -3102,25 +3126,29 @@ public sealed partial class Playfield
             return 0;
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
-        var start = Math.Clamp(_editorMetaScrollOffset, 0, GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
-        var used = 0;
+        var scrollTop = _editorMetaScroll.Position;
+        var scrollBottom = scrollTop + content.Height;
+        var rowTop = 0.0;
         var count = 0;
-        for (var i = start; i < layouts.Count; i++)
+        for (var index = 0; index < layouts.Count; index++)
         {
-            if (count > 0 && used + layouts[i].Pitch > content.Height)
-                break;
-            used += layouts[i].Pitch;
-            count++;
-            if (used >= content.Height)
+            var rowBottom = rowTop + layouts[index].Pitch;
+            if (rowBottom > scrollTop && rowTop < scrollBottom)
+                count++;
+            rowTop = rowBottom;
+            if (rowTop >= scrollBottom)
                 break;
         }
-        return Math.Max(1, count);
+        return count;
     }
 
     private void ClampEditorMetaScrollOffset(IReadOnlyList<(string Label, string Value)> rows,
         int virtualWidth, int virtualHeight)
-        => _editorMetaScrollOffset = Math.Clamp(_editorMetaScrollOffset, 0,
-            GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+    {
+        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+        _editorMetaScroll.SetMaximum(GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+        _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
+    }
 
     private Rectangle GetEditorMetaFieldLabelBounds(int index, int virtualWidth, int virtualHeight)
     {
@@ -3134,8 +3162,7 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var start = Math.Clamp(_editorMetaScrollOffset, 0, Math.Max(0, rows.Count - 1));
-        var rowTop = content.Y + GetEditorMetaPrefixHeight(layouts, index) - GetEditorMetaPrefixHeight(layouts, start);
+        var rowTop = content.Y + (int)Math.Round(GetEditorMetaPrefixHeight(layouts, index) - GetEditorMetaScrollVisualOffset(layouts));
         var scrollbarSpace = (int)MathF.Round(8f * unit);
         return new Rectangle(content.X, rowTop,
             Math.Max(1, content.Width - scrollbarSpace), layouts[index].LabelHeight);
@@ -3153,8 +3180,7 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var start = Math.Clamp(_editorMetaScrollOffset, 0, Math.Max(0, rows.Count - 1));
-        var rowTop = content.Y + GetEditorMetaPrefixHeight(layouts, index) - GetEditorMetaPrefixHeight(layouts, start);
+        var rowTop = content.Y + (int)Math.Round(GetEditorMetaPrefixHeight(layouts, index) - GetEditorMetaScrollVisualOffset(layouts));
         var scrollbarSpace = (int)MathF.Round(8f * unit);
         return new Rectangle(content.X, rowTop + layouts[index].LabelHeight + layouts[index].LabelGap,
             Math.Max(1, content.Width - scrollbarSpace), layouts[index].FieldHeight);
@@ -3540,6 +3566,7 @@ public sealed partial class Playfield
         {
             if (!GetEditorMetaDifficultyButtonBounds(i, virtualWidth, virtualHeight).Contains(pixel))
                 continue;
+            _editorMetaScroll.Reset();
             _editorMetaScrollOffset = 0;
             _editorElementDropdownOpen = false;
             // Switching to an absent chart asks before creating its file.
@@ -3553,6 +3580,7 @@ public sealed partial class Playfield
             CancelEditorMetaField();
             _editorElementDropdownOpen = false;
             _editorMetaCategory = EditorMetaCategories[i];
+            _editorMetaScroll.Reset();
             _editorMetaScrollOffset = 0;
             return true;
         }
@@ -4375,7 +4403,8 @@ public sealed partial class Playfield
                 CancelEditorMetaField();
                 _editorMetaPanelOpen = !_editorMetaPanelOpen;
                 if (_editorMetaPanelOpen)
-                    _editorMetaScrollOffset = 0;
+                    _editorMetaScroll.Reset();
+                _editorMetaScrollOffset = 0;
                 break;
             case EditorActionSnap:
                 _editorMenuSection = _editorMenuSection == EditorMenuSection.Snap

@@ -179,25 +179,14 @@ internal sealed class UpdateEngine
 
             var versionText = latest.Version!.ToString();
             var fullAsset = FindAsset(latest, $"TSC-win-x64-{versionText}.zip");
-            var minimalAsset = FindAsset(latest, $"TSC-win-x64-{versionText}-minimal.zip");
-            // A patch-only release is valid as long as a verified patch chain can
-            // take the installed version to this release. Keep a full/minimal package
-            // optional here; we decide whether one is required after trying patches.
-            var fallback = minimalAsset ?? fullAsset;
-            string? fallbackKind = fallback is null
-                ? null
-                : ReferenceEquals(fallback, minimalAsset) ? "minimal" : "full";
-            var releaseManifestAsset = FindAsset(latest, GetReleaseManifestAssetName(versionText));
-            ReleaseAsset? fallbackManifestAsset = null;
+            // Updates have exactly two delivery paths: a verified patch chain when it
+            // is smaller, otherwise a complete full-package download.
+            var fallback = fullAsset;
+            const string fallbackKind = "full";
+            var fallbackManifestAsset = FindAsset(latest, GetReleaseManifestAssetName(versionText));
             long fallbackCost = long.MaxValue;
-            if (fallback is not null && fallbackKind is not null)
+            if (fallback is not null)
             {
-                var legacyKindManifestAsset = FindAsset(latest, GetPackageManifestAssetName(versionText, fallbackKind));
-                // Older releases have a separate minimal manifest. New releases have one
-                // combined manifest; prefer the legacy minimal manifest only when present.
-                fallbackManifestAsset = fallbackKind.Equals("minimal", StringComparison.OrdinalIgnoreCase)
-                    ? legacyKindManifestAsset ?? releaseManifestAsset
-                    : releaseManifestAsset ?? legacyKindManifestAsset;
                 var packageAndMetadataSize = (decimal)Math.Max(0L, fallback.Size)
                     + (decimal)Math.Max(0L, fallbackManifestAsset?.Size ?? 0L);
                 fallbackCost = (long)Math.Min((decimal)long.MaxValue, packageAndMetadataSize);
@@ -259,7 +248,7 @@ internal sealed class UpdateEngine
                     // A patch chain is an optimization, never a reason to leave the game partially updated.
                     patchChainFailure = ex.Message;
                     Report(fallback is not null
-                        ? "Patch chain unavailable; using a complete package…"
+                        ? "Patch chain unavailable; downloading the full package…"
                         : "Patch chain unavailable; checking available fallback…", 5, ex.Message);
                     foreach (var path in Directory.EnumerateFiles(_work, "patch-*.zip"))
                     {
@@ -281,14 +270,14 @@ internal sealed class UpdateEngine
 
             // If the release has no complete package, a patch chain is the only
             // safe route. Never try to install a partial ZIP as though it were full.
-            if (fallback is null || fallbackKind is null)
+            if (fallback is null)
             {
                 var patchAsset = FindAsset(latest, $"TSC-win-x64-{versionText}-patch.zip");
                 if (patchAsset is null)
                 {
                     throw new InvalidDataException(
-                        $"Release {latest.TagName} contains neither a full/minimal game ZIP nor a patch ZIP. " +
-                        "Publish a full or minimal package, or publish a valid patch with its combined manifest.");
+                        $"Release {latest.TagName} contains neither a full game ZIP nor a patch ZIP. " +
+                        "Publish a full package, or publish a valid patch with its combined manifest.");
                 }
 
                 var reason = string.IsNullOrWhiteSpace(patchChainFailure)
@@ -296,14 +285,14 @@ internal sealed class UpdateEngine
                     : $"Patch validation failed: {patchChainFailure}";
                 var newline = Environment.NewLine;
                 throw new InvalidDataException(
-                    $"Release {latest.TagName} contains a patch ZIP but no full or minimal fallback package.{newline}{newline}" +
+                    $"Release {latest.TagName} contains a patch ZIP but no full fallback package.{newline}{newline}" +
                     $"Installed version: {current}{newline}Target version: {latest.Version}{newline}{newline}" +
                     $"Reason: {reason}{newline}{newline}" +
                     "Check that the combined manifest's patch.fromVersion matches the installed version, patch.toVersion matches the target version, " +
-                    "and every required patch ZIP plus its combined manifest exists on the GitHub releases. Add a full or minimal ZIP if you want a fallback.");
+                    "and every required patch ZIP plus its combined manifest exists on the GitHub releases. Add the full ZIP if you want a fallback.");
             }
 
-            var flavor = fallbackKind.Equals("minimal", StringComparison.OrdinalIgnoreCase) ? "Minimal" : "Full";
+            const string flavor = "Full";
             Report($"Downloading {flavor} game…", 6, fallback.Name);
             var packagePath = Path.Combine(_work, "game-package.zip");
             await DownloadAssetAsync(fallback, packagePath, (received, total) =>
@@ -326,22 +315,9 @@ internal sealed class UpdateEngine
             Directory.CreateDirectory(packageStage);
             var package = await ExtractPackageAsync(packagePath, packageStage, versionText, fallbackKind, externalManifest).ConfigureAwait(true);
 
-            Dictionary<string, byte[]> skinFiles = new(StringComparer.OrdinalIgnoreCase);
-            HashSet<string> skinDeletedPaths = new(StringComparer.OrdinalIgnoreCase);
-            string? skinCommit = null;
-            if (ReferenceEquals(fallback, minimalAsset))
-            {
-                Report("Downloading Default skin from main…", 70);
-                var skinResult = await DownloadMainSkinAsync(71).ConfigureAwait(true);
-                skinFiles = skinResult.Files;
-                skinDeletedPaths = skinResult.DeletedPaths;
-                skinCommit = skinResult.Commit;
-            }
-
             Report("Installing game files…", 80);
             var oldState = await ReadStateAsync(GetUpdaterStatePath(StateFileName)).ConfigureAwait(true);
-            var deletePaths = FindObsoleteManagedPaths(oldState, package.Manifest, package.Manifest.Kind == "minimal");
-            deletePaths.UnionWith(skinDeletedPaths);
+            var deletePaths = FindObsoleteManagedPaths(oldState, package.Manifest);
             if (package.Manifest.Kind == "full")
             {
                 var oldSkinState = await ReadSkinStateAsync().ConfigureAwait(true);
@@ -352,8 +328,6 @@ internal sealed class UpdateEngine
                         deletePaths.Add(oldSkinPath);
             }
             var writes = package.Files.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
-            foreach (var skinFile in skinFiles) writes[skinFile.Key] = skinFile.Value;
-
             await ApplyTransactionAsync(writes, deletePaths, 82, 95).ConfigureAwait(true);
 
             var newState = new ManagedState
@@ -363,14 +337,7 @@ internal sealed class UpdateEngine
                 Files = package.Manifest.Files.Where(f => !IsProtectedPath(f.Path)).ToList()
             };
 
-            if (package.Manifest.Kind == "minimal")
-            {
-                await SaveSkinStateAsync(skinFiles.Keys, skinCommit, versionText).ConfigureAwait(true);
-            }
-            else
-            {
-                await SaveSkinStateFromPackageAsync(package.Manifest.Files, versionText).ConfigureAwait(true);
-            }
+            await SaveSkinStateFromPackageAsync(package.Manifest.Files, versionText).ConfigureAwait(true);
 
             await WriteUpdaterStateAsync(StateFileName, JsonSerializer.Serialize(newState, JsonOptions)).ConfigureAwait(true);
             await ScheduleRestartAsync(latest).ConfigureAwait(true);
@@ -803,67 +770,6 @@ internal sealed class UpdateEngine
         await ScheduleRestartAsync(targetRelease).ConfigureAwait(true);
     }
 
-    private async Task<SkinDownloadResult> DownloadMainSkinAsync(int startPercent)
-    {
-        var repo = _options.Repository;
-        using var commitResponse = await Client.GetAsync($"https://api.github.com/repos/{repo}/commits/main").ConfigureAwait(true);
-        commitResponse.EnsureSuccessStatusCode();
-        using var commitDoc = JsonDocument.Parse(await commitResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(true));
-        var commit = GetString(commitDoc.RootElement, "sha") ?? throw new InvalidDataException("Could not resolve the main branch commit.");
-
-        using var treeResponse = await Client.GetAsync($"https://api.github.com/repos/{repo}/git/trees/{commit}?recursive=1").ConfigureAwait(true);
-        treeResponse.EnsureSuccessStatusCode();
-        using var treeDoc = JsonDocument.Parse(await treeResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(true));
-        if (treeDoc.RootElement.TryGetProperty("truncated", out var truncated) && truncated.ValueKind == JsonValueKind.True)
-            throw new InvalidDataException("The GitHub repository tree was truncated; refusing an incomplete skin update.");
-        if (!treeDoc.RootElement.TryGetProperty("tree", out var tree) || tree.ValueKind != JsonValueKind.Array)
-            throw new InvalidDataException("GitHub did not return a repository tree.");
-
-        var entries = new List<(string Path, string Sha, long Size)>();
-        foreach (var node in tree.EnumerateArray())
-        {
-            var path = GetString(node, "path");
-            if (string.IsNullOrWhiteSpace(path) || !path.StartsWith("Skins/Default/", StringComparison.OrdinalIgnoreCase)) continue;
-            if (!string.Equals(GetString(node, "type"), "blob", StringComparison.OrdinalIgnoreCase)) continue;
-            var relative = path["Skins/Default/".Length..];
-            if (string.IsNullOrWhiteSpace(relative)) continue;
-            if (node.TryGetProperty("size", out var sizeValue) && sizeValue.TryGetInt64(out var size) && size >= 0)
-                entries.Add(("Skins/Default/" + relative.Replace('\\', '/'), GetString(node, "sha") ?? string.Empty, size));
-        }
-        if (entries.Count == 0) throw new InvalidDataException("No files were found under Skins/Default on main.");
-
-        var files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-        var previousSkinState = await ReadSkinStateAsync().ConfigureAwait(true);
-        var total = entries.Sum(e => (double)e.Size);
-        double completed = 0;
-        for (var i = 0; i < entries.Count; i++)
-        {
-            var entry = entries[i];
-            var uri = $"https://raw.githubusercontent.com/{repo}/{commit}/{string.Join('/', entry.Path.Split('/').Select(Uri.EscapeDataString))}";
-            using var response = await Client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(true);
-            response.EnsureSuccessStatusCode();
-            await using var input = await response.Content.ReadAsStreamAsync().ConfigureAwait(true);
-            using var output = new MemoryStream((int)Math.Min(entry.Size, 16 * 1024 * 1024));
-            await input.CopyToAsync(output).ConfigureAwait(true);
-            var bytes = output.ToArray();
-            if (bytes.LongLength != entry.Size || !GitBlobSha1(bytes).Equals(entry.Sha, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException($"Default skin file failed GitHub verification: {entry.Path}");
-            files[entry.Path] = bytes;
-            completed += entry.Size;
-            var ratio = total > 0 ? completed / total : (double)(i + 1) / entries.Count;
-            Report("Downloading Default skin from main…", startPercent + (int)(ratio * 8), $"{i + 1} / {entries.Count} files");
-        }
-
-        // Remove only files recorded as previously managed by this updater. An
-        // installation without skin state is never scanned for speculative deletions.
-        var currentPaths = files.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var removedPaths = (previousSkinState?.Files ?? [])
-            .Select(NormalizeArchivePath)
-            .Where(path => IsDefaultSkinPath(path) && !currentPaths.Contains(path))
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return new SkinDownloadResult(files, commit, removedPaths);
-    }
-
     private async Task ApplyTransactionAsync(Dictionary<string, byte[]> writes, HashSet<string> deletions, int startPercent, int endPercent)
     {
         var actualWrites = writes.Where(p => !IsProtectedPath(p.Key) &&
@@ -935,14 +841,13 @@ internal sealed class UpdateEngine
         }
     }
 
-    private HashSet<string> FindObsoleteManagedPaths(ManagedState? oldState, PackageManifest newManifest, bool isMinimal)
+    private HashSet<string> FindObsoleteManagedPaths(ManagedState? oldState, PackageManifest newManifest)
     {
         var newPaths = newManifest.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in oldState?.Files ?? [])
         {
             if (newPaths.Contains(file.Path) || IsProtectedPath(file.Path)) continue;
-            if (isMinimal && IsDefaultSkinPath(file.Path)) continue;
             result.Add(file.Path);
         }
         return result;
@@ -1020,10 +925,6 @@ internal sealed class UpdateEngine
 
     private static ReleaseAsset? FindAsset(ReleaseInfo release, string name) => release.Assets.FirstOrDefault(a => string.Equals(a.Name, name, StringComparison.OrdinalIgnoreCase));
     private static string GetReleaseManifestAssetName(string version) => $"TSC-win-x64-{version}-manifest.json";
-    // Kept for reading releases created before the unified manifest format.
-    private static string GetPackageManifestAssetName(string version, string kind) => kind.Equals("minimal", StringComparison.OrdinalIgnoreCase)
-        ? $"TSC-win-x64-{version}-minimal-manifest.json"
-        : GetReleaseManifestAssetName(version);
     private static string GetPatchManifestAssetName(string version) => $"TSC-win-x64-{version}-patch-manifest.json";
 
     private async Task<PackageManifest?> ReadPackageManifestAssetAsync(string path, string assetName, string expectedVersion, string expectedKind)
@@ -1034,24 +935,22 @@ internal sealed class UpdateEngine
         using var document = await JsonDocument.ParseAsync(stream).ConfigureAwait(true);
         var root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object) throw new InvalidDataException($"Manifest asset {assetName} is not a JSON object.");
-        if (root.TryGetProperty("full", out _) || root.TryGetProperty("minimal", out _))
+        if (root.TryGetProperty("full", out _))
         {
             var combined = root.Deserialize<ReleaseManifest>(JsonOptions)
                 ?? throw new InvalidDataException($"Release manifest {assetName} is empty.");
             if (combined.SchemaVersion != 2 || !string.Equals(combined.Version, expectedVersion, StringComparison.Ordinal))
                 throw new InvalidDataException($"Release manifest {assetName} has the wrong schema or version.");
-            var selected = expectedKind.Equals("minimal", StringComparison.OrdinalIgnoreCase) ? combined.Minimal : combined.Full;
+            var selected = combined.Full;
             if (selected is null)
-                throw new InvalidDataException($"Release manifest {assetName} does not describe the {expectedKind} package.");
+                throw new InvalidDataException($"Release manifest {assetName} does not describe the full package.");
             if (!string.Equals(selected.Version, expectedVersion, StringComparison.Ordinal) ||
                 !string.Equals(selected.Kind, expectedKind, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException($"Release manifest {assetName} contains invalid {expectedKind} package metadata.");
             return selected;
         }
 
-        // Schema v1 package manifests were separate assets in older releases. If
-        // this is a legacy full manifest but the selected ZIP is minimal, ignore it
-        // and let the archive's embedded manifest be used when available.
+        // Schema v1 package manifests were stored directly as separate release assets.
         var legacy = root.Deserialize<PackageManifest>(JsonOptions)
             ?? throw new InvalidDataException($"Package manifest {assetName} is empty.");
         return string.Equals(legacy.Version, expectedVersion, StringComparison.Ordinal) &&
@@ -1141,16 +1040,6 @@ internal sealed class UpdateEngine
 
     private static bool HashMatches(byte[] bytes, string expected) => Sha256(bytes).Equals(expected, StringComparison.OrdinalIgnoreCase);
     private static string Sha256(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes));
-    private static string GitBlobSha1(byte[] bytes)
-    {
-        var header = Encoding.UTF8.GetBytes($"blob {bytes.LongLength}\0");
-        using var sha = SHA1.Create();
-        sha.TransformBlock(header, 0, header.Length, header, 0);
-        sha.TransformFinalBlock(bytes, 0, bytes.Length);
-        return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
-    }
-
-
     private static string FormatBytes(long bytes)
     {
         string[] units = ["B", "KB", "MB", "GB"];
@@ -1176,10 +1065,9 @@ internal sealed class UpdateEngine
     private sealed record PatchRelease(Version FromVersion, Version Version, ReleaseInfo Release, ReleaseAsset Asset, ReleaseAsset? ManifestAsset, string? ManifestPath = null);
     private sealed record PreparedPackage(PackageManifest Manifest, Dictionary<string, byte[]> Files);
     private sealed record PatchResult(PackageManifest Manifest, HashSet<string> Deletions, Dictionary<string, byte[]> FinalWrites);
-    private sealed record SkinDownloadResult(Dictionary<string, byte[]> Files, string Commit, HashSet<string> DeletedPaths);
 
     private sealed class PackageManifest { public int SchemaVersion { get; set; } = 1; public string Version { get; set; } = ""; public string Kind { get; set; } = "full"; public List<ManagedFile> Files { get; set; } = []; }
-    private sealed class ReleaseManifest { public int SchemaVersion { get; set; } = 2; public string Version { get; set; } = ""; public PackageManifest? Full { get; set; } public PackageManifest? Minimal { get; set; } public PatchManifest? Patch { get; set; } }
+    private sealed class ReleaseManifest { public int SchemaVersion { get; set; } = 2; public string Version { get; set; } = ""; public PackageManifest? Full { get; set; } public PatchManifest? Patch { get; set; } }
     private sealed class ManagedFile { public string Path { get; set; } = ""; public long Size { get; set; } public string Sha256 { get; set; } = ""; }
     private sealed class PatchManifest { public int SchemaVersion { get; set; } = 1; public string FromVersion { get; set; } = ""; public string ToVersion { get; set; } = ""; public List<PatchFile> Files { get; set; } = []; public List<PatchDeletion> DeletedFiles { get; set; } = []; public PackageManifest? TargetManifest { get; set; } public long AssetSize { get; set; } public string AssetSha256 { get; set; } = ""; }
     private sealed class PatchFile { public string Path { get; set; } = ""; public string? FromSha256 { get; set; } public long Size { get; set; } public string Sha256 { get; set; } = ""; }

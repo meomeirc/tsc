@@ -34,6 +34,7 @@ function UI.draw_panel(options)
         anchor = options.anchor or "top-left",
         color = options.color or UI.colors.panel,
         alpha = options.alpha == nil and 1 or options.alpha,
+        clip = options.clip,
         layer = options.layer or 0,
     })
 end

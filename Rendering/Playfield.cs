@@ -73,6 +73,7 @@ public sealed partial class Playfield
     private bool? _editorExtraDifficultyEnabledFromMetadata;
     private string _editorMetaCategory = "SONG";
     private int _editorMetaScrollOffset;
+    private readonly TSC.UI.SmoothScrollHandler _editorMetaScroll = new();
     private bool _editorMetaExportExpanded;
     private bool _editorMetaDeleteConfirmOpen;
     private bool _editorCreateDifficultyConfirmOpen;
@@ -81,6 +82,7 @@ public sealed partial class Playfield
     private bool _editorElementDropdownOpen;
     private bool _editorProblemsExpanded;
     private int _editorProblemsScrollOffset;
+    private readonly TSC.UI.SmoothScrollHandler _editorProblemsScroll = new();
     private bool _editorDiagnosticsDirty = true;
     private AresChart? _editorDiagnosticsChart;
     private readonly List<EditorChartProblem> _editorProblems = new();
@@ -246,6 +248,11 @@ public sealed partial class Playfield
     private readonly Effect? _skinSparklesEffect;
     private readonly Effect? _skinQuad3DEffect;
     private readonly SpriteBatch _spriteBatch;
+    private readonly RasterizerState _skinUiScissorRasterizerState = new()
+    {
+        CullMode = CullMode.None,
+        ScissorTestEnable = true,
+    };
     private readonly BasicEffect _primitiveEffect;
     private readonly BasicEffect _textureEffect;
     private readonly Effect _laneLineEffect;
@@ -1206,6 +1213,7 @@ public sealed partial class Playfield
         _editorDifficultyStates.Remove(code);
         _editorDeletedDifficultyCodes.Add(code);
         _editorMetaDeleteConfirmOpen = false;
+        _editorMetaScroll.Reset();
         _editorMetaScrollOffset = 0;
         MarkEditorDirty(auxiliaryChange: true);
         _statusMessage = $"{GetEditorDifficultyName(code)} difficulty marked for deletion. The file will be deleted when you save.";
@@ -1418,6 +1426,7 @@ public sealed partial class Playfield
         _editorMetaPanelOpen = !_editorMetaPanelOpen;
         if (_editorMetaPanelOpen)
         {
+            _editorMetaScroll.Reset();
             _editorMetaScrollOffset = 0;
             _editorElementDropdownOpen = false;
         }
@@ -1425,6 +1434,8 @@ public sealed partial class Playfield
 
     private void MarkEditorDirty(bool auxiliaryChange = false)
     {
+        _editorMetaStatsCache = null;
+        _editorMetaStatsCacheChart = null;
         if (_chartEditorMode)
         {
             if (auxiliaryChange)
@@ -2112,16 +2123,8 @@ public sealed partial class Playfield
             initialVirtualHeight,
             skinSparklesEffect: skinSparklesEffect,
             skinQuad3DEffect: skinQuad3DEffect);
-        _chartEditorInterfaceRuntime = new SkinRuntime(
-            skin.SkinDirectory,
-            graphics,
-            "chartEditorInterface.lua",
-            skin.GameConfig,
-            gameConfigPath,
-            initialVirtualWidth,
-            initialVirtualHeight,
-            skinSparklesEffect: skinSparklesEffect,
-            skinQuad3DEffect: skinQuad3DEffect);
+        _chartEditorInterfaceRuntime = CreateSkinRuntime(
+            skin, "chartEditorInterface.lua", initialVirtualWidth, initialVirtualHeight);
         RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
         _skin.UIConfig = _skinRuntime.UIConfig;
         var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
@@ -2189,6 +2192,7 @@ public sealed partial class Playfield
         _editorPreviewEditorOpen = false;
         _editorPreviewRangeInitialized = false;
         _editorMetaCategory = "SONG";
+        _editorMetaScroll.Reset();
         _editorMetaScrollOffset = 0;
         var difficultyCode = GetEditorDifficultyCode(difficulty);
         _loadedSourcePath = null;
@@ -2298,6 +2302,8 @@ public sealed partial class Playfield
         _editorBpmInputReplaceOnNextKey = false;
         _editorBpmPlacementPending = false;
         _editorSelectedTempoEvent = null;
+        _editorMetaStatsCache = null;
+        _editorMetaStatsCacheChart = null;
         _gear = new GearTimeline(_chart);
         _editorPreviewGearState = CreateEditorPreviewInitialState();
         _gameplayState = _editorPreviewGearState.Copy();
@@ -2416,6 +2422,7 @@ public sealed partial class Playfield
             _editorMetaPanelOpen = true;
             _editorMetaExportExpanded = false;
             _editorElementDropdownOpen = false;
+            _editorMetaScroll.Reset();
             _editorMetaScrollOffset = 0;
             return true;
         }
@@ -2955,6 +2962,7 @@ public sealed partial class Playfield
             : _editorExtraDifficultyEnabledFromMetadata ?? true;
         _editorExtraDifficultyEnabledFromMetadata = null;
         _editorElementDropdownOpen = false;
+        _editorProblemsScroll.Reset();
         _editorProblemsScrollOffset = 0;
         _editorDiagnosticsDirty = true;
         _editorDifficultyStates.Clear();
@@ -3360,6 +3368,7 @@ public sealed partial class Playfield
         _editorSharedAlbumBytes = null;
         _editorSharedAlbumBigBytes = null;
         _editorMetaCategory = "SONG";
+        _editorMetaScroll.Reset();
         _editorMetaScrollOffset = 0;
 
         var bytes = File.ReadAllBytes(fullPath);
@@ -3891,6 +3900,7 @@ public sealed partial class Playfield
         _editorSharedAlbumBytes = null;
         _editorSharedAlbumBigBytes = null;
         _editorMetaCategory = "SONG";
+        _editorMetaScroll.Reset();
         _editorMetaScrollOffset = 0;
         var chart = TscLoader.Load(path);
         var songJsonPath = Path.Combine(assetDirectory, "song.json");
@@ -4359,6 +4369,8 @@ public sealed partial class Playfield
         RebuildRenderEventCache();
         _simultaneousCountsCache.Clear();
         InvalidateLaneMeshCache();
+        _editorMetaStatsCache = null;
+        _editorMetaStatsCacheChart = null;
         _gear = new GearTimeline(_chart);
         _editorPreviewGearState = null;
         _gameplayState = _gear.Initial;
@@ -5777,6 +5789,7 @@ public sealed partial class Playfield
         _editorSharedAlbumBytes = null;
         _editorSharedAlbumBigBytes = null;
         _editorMetaCategory = "SONG";
+        _editorMetaScroll.Reset();
         _editorMetaScrollOffset = 0;
         var package = FpkPackage.Load(path);
         var songJsonEntry = package.Entries.FirstOrDefault(item =>
@@ -10513,6 +10526,8 @@ public sealed partial class Playfield
             MarkEditorDirty();
             StoreActiveEditorDifficulty();
         }
+        _editorMetaStatsCache = null;
+        _editorMetaStatsCacheChart = null;
         _gear = new GearTimeline(_chart);
         _gameplayState = _gear.Initial;
         _skinRuntime.SetPanelTracks(_chart, _tempo);
@@ -11326,7 +11341,8 @@ public sealed partial class Playfield
     }
 
     private SkinRuntime CreateSkinRuntime(SkinContext skin, string scriptFileName, int width, int height)
-        => new(
+    {
+        var runtime = new SkinRuntime(
             skin.SkinDirectory,
             _graphics,
             scriptFileName,
@@ -11336,6 +11352,20 @@ public sealed partial class Playfield
             height,
             skinSparklesEffect: _skinSparklesEffect,
             skinQuad3DEffect: _skinQuad3DEffect);
+
+        if (string.Equals(scriptFileName, "chartEditorInterface.lua", StringComparison.OrdinalIgnoreCase))
+        {
+            runtime.SetUiScrollHandlerResolver(id => id switch
+            {
+                "editor_note_groups_scrollbar" => _editorNoteGroupsScroll,
+                "editor_meta_scrollbar" => _editorMetaScroll,
+                "editor_problems_scrollbar" => _editorProblemsScroll,
+                _ => null
+            });
+        }
+
+        return runtime;
+    }
 
     /// <summary>
     /// Rebinds every skin-owned resource while keeping the currently open chart
@@ -12239,6 +12269,7 @@ public sealed partial class Playfield
         _pixel.Dispose();
         _circle.Dispose();
         _spriteBatch.Dispose();
+        _skinUiScissorRasterizerState.Dispose();
         _primitiveEffect.Dispose();
         _textureEffect.Dispose();
         _textures.Dispose();

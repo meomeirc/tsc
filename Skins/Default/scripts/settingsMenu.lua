@@ -1,6 +1,7 @@
 -- Settings page for editing live gameConfig.json values.
 
 local UI = import("uiStyle")
+local Scroll = import("uiScroll")
 
 function init()
 end
@@ -257,29 +258,53 @@ local function draw_skin_dropdown(width, height, scale)
     })
 
     local current_skin = tostring(menu.skin or "Default")
-    local requested_first = math.floor(tonumber(menu.skin_dropdown_scroll or 0) or 0) + 1
-    local first_index = clamp(requested_first, 1, math.max(1, count - visible_count + 1))
-    for visible_index = 1, visible_count do
+    local row_pitch = row_height + row_gap
+    local content_extent = count > 0 and (count * row_pitch - row_gap) or 0
+    local max_scroll = math.max(0, content_extent - list_height)
+    local scroll_position = clamp(tonumber(menu.skin_dropdown_scroll or 0) or 0, 0, max_scroll)
+    local first_offset, fraction = Scroll.split_pixels(scroll_position, row_pitch, max_scroll)
+    local first_index = clamp(first_offset + 1, 1, math.max(1, count - visible_count + 1))
+    local list_top = padding + 56
+    local list_bottom = list_top + list_height
+    local list_clip = {
+        left = panel_x + padding,
+        top = panel_y + list_top,
+        right = panel_x + panel_width - padding,
+        bottom = panel_y + list_bottom,
+    }
+    for visible_index = 1, visible_count + 1 do
         local skin_index = first_index + visible_index - 1
         local skin_name = tostring(skins[skin_index] or "")
-        local y = padding + 56 + (visible_index - 1) * (row_height + row_gap)
-        UI.draw_button({
-            id = "settings_skin_option_" .. tostring(skin_index),
-            parent = "settings_skin_popup",
-            x = padding,
-            y = y,
-            width = panel_width - padding * 2,
-            height = row_height,
-            label = skin_name,
-            text_size = UI.sizes.button,
-            font = UI.fonts.medium,
-            action = "select_skin",
-            value = skin_name,
-            selected = skin_name == current_skin,
-            layer = 74,
-        })
+        local y = list_top + (visible_index - 1) * (row_height + row_gap) - fraction * (row_height + row_gap)
+        local visible_top = math.max(list_top, y)
+        local visible_bottom = math.min(list_bottom, y + row_height)
+        local visible_height = visible_bottom - visible_top
+        if skin_name ~= "" and visible_height > 0 then
+            UI.draw_button({
+                id = "settings_skin_option_" .. tostring(skin_index),
+                parent = "settings_skin_popup",
+                x = padding,
+                y = y,
+                width = panel_width - padding * 2,
+                height = row_height,
+                label = skin_name,
+                text_size = UI.sizes.button,
+                font = UI.fonts.medium,
+                action = "select_skin",
+                value = skin_name,
+                selected = skin_name == current_skin,
+                clip = list_clip,
+                layer = 74,
+            })
+        end
     end
     if has_more_skins then
+        Scroll.draw_bar({ id = "settings_skin_dropdown_scrollbar", parent = "settings_skin_popup",
+            x = panel_width - padding - 8,
+            y = list_top, width = 8, height = list_height, position = scroll_position,
+            maximum = max_scroll, content_extent = content_extent,
+            visible_extent = list_height, minimum_thumb = 28,
+            track_color = UI.colors.panel, thumb_color = UI.colors.accent, layer = 73 })
         draw.text("SCROLL TO VIEW MORE SKINS", {
             parent = "settings_skin_popup",
             x = panel_width * 0.5,
@@ -318,9 +343,17 @@ local function draw_keybinds_page(width, height)
     local row_gap = 5
     local footer_height = 92
     local panel_height = math.max(260, height - panel_top - footer_height - 20)
-    local visible_rows = math.max(1, math.floor((panel_height - 130) / (row_height + row_gap)))
-    local max_scroll = math.max(0, #rows - visible_rows)
-    local first_index = clamp((tonumber(menu.keybind_scroll or 0) or 0) + 1, 1, math.max(1, max_scroll + 1))
+    local row_view_top = 60
+    local row_view_bottom = panel_height - 20
+    local row_view_height = math.max(1, row_view_bottom - row_view_top)
+    local row_pitch = row_height + row_gap
+    local visible_row_extent = (row_view_height + row_gap) / row_pitch
+    local visible_rows = math.max(1, math.floor(visible_row_extent))
+    local content_extent = #rows > 0 and (#rows * row_pitch - row_gap) or 0
+    local max_scroll = math.max(0, content_extent - row_view_height)
+    local scroll_position = clamp(tonumber(menu.keybind_scroll or 0) or 0, 0, max_scroll)
+    local first_offset, scroll_fraction = Scroll.split_pixels(scroll_position, row_pitch, max_scroll)
+    local first_index = clamp(first_offset + 1, 1, math.max(1, #rows))
 
     UI.layout_box({ id = "settings_viewport", width = width, height = height })
     draw.text("KEYBOARD BINDINGS", {
@@ -378,7 +411,7 @@ local function draw_keybinds_page(width, height)
                 id = "keybind_editor_subcategory_" .. sub.id, parent = "settings_viewport",
                 x = sub_left + (i - 1) * (sub_width + sub_gap), y = 108,
                 width = sub_width, height = 28,
-                label = sub.label, text_size = UI.sizes.tiny or UI.sizes.small, font = UI.fonts.bold,
+                label = sub.label, text_size = UI.sizes.small, font = UI.fonts.bold,
                 action = "keybind_editor_subcategory", value = sub.id,
                 selected = editor_subcategory == sub.id,
                 variant = "secondary", layer = 4,
@@ -419,21 +452,31 @@ local function draw_keybinds_page(width, height)
         anchor = "center", layer = 9,
     })
 
-    for row_offset = 0, visible_rows - 1 do
+    local row_clip = {
+        left = panel_x + padding,
+        top = panel_top + row_view_top,
+        right = panel_x + padding + row_width,
+        bottom = panel_top + row_view_bottom,
+    }
+    for row_offset = 0, visible_rows do
         local index = first_index + row_offset
         local item = rows[index]
-        if item ~= nil then
-            local y = 60 + row_offset * (row_height + row_gap)
+        local y = row_view_top + row_offset * (row_height + row_gap) - scroll_fraction * (row_height + row_gap)
+        local visible_top = math.max(row_view_top, y)
+        local visible_bottom = math.min(row_view_bottom, y + row_height)
+        local visible_height = visible_bottom - visible_top
+        if item ~= nil and visible_height > 0 then
             local row_id = "keybind_row_" .. tostring(index)
             UI.draw_panel({
                 id = row_id, parent = "keybind_panel",
                 x = padding, y = y, width = row_width,
-                height = row_height, color = UI.colors.panel, alpha = 0.92, layer = 8,
+                height = row_height, color = UI.colors.panel, alpha = 0.92,
+                clip = row_clip, layer = 8,
             })
             draw.text(tostring(item.label or item.id or ""), {
                 parent = row_id, x = 10, y = row_height * 0.5,
                 size = UI.sizes.small, color = UI.colors.text, font = UI.fonts.medium,
-                anchor = "left", layer = 10,
+                clip = row_clip, anchor = "left", layer = 10,
             })
             local primary_value = tostring(item.primary or "UNBOUND")
             local secondary_value = tostring(item.secondary or "UNBOUND")
@@ -446,7 +489,7 @@ local function draw_keybinds_page(width, height)
                 label = primary_value, text_size = UI.sizes.small, font = UI.fonts.medium,
                 action = "capture_keybind", value = tostring(item.id) .. "|primary",
                 selected = is_capture and capture_slot == "primary",
-                variant = "secondary", layer = 11,
+                clip = row_clip, variant = "secondary", layer = 11,
             })
             UI.draw_button({
                 id = "clear_keybind_" .. tostring(item.id) .. "_primary",
@@ -454,7 +497,7 @@ local function draw_keybinds_page(width, height)
                 width = clear_width, height = row_height - 10, label = "X",
                 text_size = UI.sizes.small, font = UI.fonts.bold,
                 action = "clear_keybind", value = tostring(item.id) .. "|primary",
-                variant = "secondary", layer = 12,
+                clip = row_clip, variant = "secondary", layer = 12,
             })
             UI.draw_button({
                 id = "reset_keybind_" .. tostring(item.id) .. "_primary",
@@ -462,7 +505,7 @@ local function draw_keybinds_page(width, height)
                 width = clear_width, height = row_height - 10, label = "↶",
                 text_size = UI.sizes.button, font = UI.fonts.bold,
                 action = "reset_keybind", value = tostring(item.id) .. "|primary",
-                variant = "secondary", layer = 12,
+                clip = row_clip, variant = "secondary", layer = 12,
             })
             UI.draw_button({
                 id = "keybind_" .. tostring(item.id) .. "_secondary",
@@ -471,7 +514,7 @@ local function draw_keybinds_page(width, height)
                 label = secondary_value, text_size = UI.sizes.small, font = UI.fonts.medium,
                 action = "capture_keybind", value = tostring(item.id) .. "|secondary",
                 selected = is_capture and capture_slot == "secondary",
-                variant = "secondary", layer = 11,
+                clip = row_clip, variant = "secondary", layer = 11,
             })
             UI.draw_button({
                 id = "clear_keybind_" .. tostring(item.id) .. "_secondary",
@@ -479,7 +522,7 @@ local function draw_keybinds_page(width, height)
                 width = clear_width, height = row_height - 10, label = "X",
                 text_size = UI.sizes.small, font = UI.fonts.bold,
                 action = "clear_keybind", value = tostring(item.id) .. "|secondary",
-                variant = "secondary", layer = 12,
+                clip = row_clip, variant = "secondary", layer = 12,
             })
             UI.draw_button({
                 id = "reset_keybind_" .. tostring(item.id) .. "_secondary",
@@ -487,32 +530,23 @@ local function draw_keybinds_page(width, height)
                 width = clear_width, height = row_height - 10, label = "↶",
                 text_size = UI.sizes.button, font = UI.fonts.bold,
                 action = "reset_keybind", value = tostring(item.id) .. "|secondary",
-                variant = "secondary", layer = 12,
+                clip = row_clip, variant = "secondary", layer = 12,
             })
         end
     end
 
-    if #rows > visible_rows then
+    if max_scroll > 0 then
         local track_width = scrollbar_width
         local track_x = panel_width - padding - track_width
         local track_y = 60
         local track_height = math.max(1, panel_height - 80)
-        local thumb_height = clamp(math.floor(track_height * (visible_rows / #rows)), 24, track_height)
-        local thumb_travel = math.max(0, track_height - thumb_height)
-        local thumb_y = track_y
-        if max_scroll > 0 then
-            thumb_y = track_y + math.floor(thumb_travel * ((tonumber(menu.keybind_scroll or 0) or 0) / max_scroll) + 0.5)
-        end
-        draw.rect({
-            parent = "keybind_panel", x = track_x, y = track_y,
-            width = track_width, height = track_height,
-            color = UI.colors.panel, layer = 12,
-        })
-        draw.rect({
-            parent = "keybind_panel", x = track_x + 2, y = thumb_y,
-            width = math.max(1, track_width - 4), height = thumb_height,
-            color = UI.colors.accent, layer = 13,
-        })
+        Scroll.draw_bar({ id = "settings_keybind_scrollbar", parent = "keybind_panel",
+            x = track_x, y = track_y,
+            width = track_width, height = track_height, position = scroll_position,
+            maximum = max_scroll,
+            content_extent = content_extent,
+            visible_extent = row_view_height, minimum_thumb = 24,
+            track_color = UI.colors.panel, thumb_color = UI.colors.accent, layer = 12 })
     end
 
     local instructions = menu.keybind_capture_action
@@ -657,27 +691,27 @@ function render()
     elseif tab == "audio" then
         draw_slider_row({ parent = "settings_panel", id = "setting_music_volume_row", control_id = "setting_music_volume",
             setting_key = "music_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-            label = "MUSIC VOLUME", current = music_volume, minimum = 0, maximum = 1, step = 0.01,
+            label = "MUSIC VOLUME", current = music_volume, minimum = 0, maximum = 1, step = 0,
             action = "set_music_volume", value_label = value_text("%.0f%%", music_volume * 100, "100%") })
         next_row()
         draw_slider_row({ parent = "settings_panel", id = "setting_tap_volume_row", control_id = "setting_tap_volume",
             setting_key = "tap_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-            label = "TAP VOLUME", current = tap_volume, minimum = 0, maximum = 1, step = 0.01,
+            label = "TAP VOLUME", current = tap_volume, minimum = 0, maximum = 1, step = 0,
             action = "set_tap_volume", value_label = value_text("%.0f%%", tap_volume * 100, "100%") })
         next_row()
         draw_slider_row({ parent = "settings_panel", id = "setting_link_volume_row", control_id = "setting_link_volume",
             setting_key = "link_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-            label = "LINK VOLUME", current = link_volume, minimum = 0, maximum = 1, step = 0.01,
+            label = "LINK VOLUME", current = link_volume, minimum = 0, maximum = 1, step = 0,
             action = "set_link_volume", value_label = value_text("%.0f%%", link_volume * 100, "100%") })
         next_row()
         draw_slider_row({ parent = "settings_panel", id = "setting_lane_switch_volume_row", control_id = "setting_lane_switch_volume",
             setting_key = "lane_switch_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-            label = "LANE SWITCH VOLUME", current = lane_volume, minimum = 0, maximum = 1, step = 0.01,
+            label = "LANE SWITCH VOLUME", current = lane_volume, minimum = 0, maximum = 1, step = 0,
             action = "set_lane_switch_volume", value_label = value_text("%.0f%%", lane_volume * 100, "100%") })
         next_row()
         draw_slider_row({ parent = "settings_panel", id = "setting_metronome_volume_row", control_id = "setting_metronome_volume",
             setting_key = "metronome_volume", x = row_x, y = row_y, width = row_width, height = row_height,
-            label = "METRONOME VOLUME", current = metronome_volume, minimum = 0, maximum = 1, step = 0.01,
+            label = "METRONOME VOLUME", current = metronome_volume, minimum = 0, maximum = 1, step = 0,
             action = "set_metronome_volume", value_label = value_text("%.0f%%", metronome_volume * 100, "100%") })
     else
         draw_slider_row({ parent = "settings_panel", id = "setting_max_frame_rate_row", control_id = "setting_max_frame_rate",

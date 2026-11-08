@@ -5,6 +5,7 @@ using System.Globalization;
 using TSC.Rendering;
 using TSC.Ares;
 using TSC.Input;
+using TSC.UI;
 using TSC.Updater;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -55,6 +56,7 @@ public sealed class Game1 : Game
     private SpriteBatch? _startupSpriteBatch;
     private Texture2D? _startupPixel;
     private SpriteFont? _font;
+    private RasterizerState? _infoScrollRasterizerState;
     private Effect? _laneLineEffect;
     private Effect? _skinSparklesEffect;
     private Effect? _skinQuad3DEffect;
@@ -72,9 +74,19 @@ public sealed class Game1 : Game
     private string? _infoMarkdownSource;
     private readonly List<InfoVisualLine> _infoVisualLines = new();
     private int _infoLayoutWidth = -1;
-    private int _infoScrollOffset;
+    private double _infoScrollOffset;
+    private double _infoTotalContentHeight;
+    private float _infoLayoutLineSpacing = -1f;
+    private readonly SmoothScrollHandler _infoScroll = new();
 
-    private readonly record struct InfoVisualLine(string Text, float Scale, Color Color, bool IsRule, bool IsSpacer);
+    private readonly record struct InfoVisualLine(
+        string Text,
+        float Scale,
+        Color Color,
+        bool IsRule,
+        bool IsSpacer,
+        double Top = 0,
+        double Height = 0);
     private string? _settingsEditingKey;
     private string _settingsEditingText = string.Empty;
     private readonly TextFieldEditor _settingsTextEditor = new();
@@ -85,17 +97,17 @@ public sealed class Game1 : Game
     private string? _keybindCaptureAction;
     private string _keybindCaptureSlot = "primary";
     private int[] _keybindPendingScancodes = Array.Empty<int>();
-    private int _keybindScroll;
+    private double _keybindScroll;
+    private readonly SmoothScrollHandler _keybindScrollState = new();
     private bool _keybindCaptureArmed;
     private string _keybindCapturePreview = string.Empty;
     private double _keybindEscapeHoldSeconds;
-    private bool _keybindScrollbarDragging;
-    private int _keybindScrollbarDragOffset;
     private string _keybindCategory = "navigation";
     private string _keybindEditorSubcategory = "file";
     private bool _settingsSkinDropdownOpen;
     private bool _returnToEditorFromSettings;
-    private int _settingsSkinDropdownScroll;
+    private double _settingsSkinDropdownScroll;
+    private readonly SmoothScrollHandler _skinDropdownScrollState = new();
     private IReadOnlyList<string> _availableSettingsSkins = Array.Empty<string>();
     private int _fallbackSettingsSelectedIndex;
     private static readonly string[] FallbackSettingsLabels =
@@ -363,6 +375,7 @@ public sealed class Game1 : Game
                 else if (_settingsKeybindsOpen)
                 {
                     _settingsKeybindsOpen = false;
+                    _keybindScrollState.Reset();
                     _keybindScroll = 0;
                 }
                 else
@@ -1381,6 +1394,8 @@ public sealed class Game1 : Game
                 UnicodeTextRenderer.Dispose(GraphicsDevice);
             _startupPixel?.Dispose();
             _startupSpriteBatch?.Dispose();
+            _infoScrollRasterizerState?.Dispose();
+            _infoScrollRasterizerState = null;
         }
         base.Dispose(disposing);
     }
@@ -1393,7 +1408,7 @@ public sealed class Game1 : Game
                 UpdateMenu(keyboard);
                 break;
             case StartupScreen.Info:
-                UpdateInfoScreen(keyboard);
+                UpdateInfoScreen(keyboard, gameTime);
                 break;
             case StartupScreen.SettingsMenu:
                 UpdateSettingsMenu(keyboard, gameTime);
@@ -1425,35 +1440,91 @@ public sealed class Game1 : Game
         }
     }
 
-    private void UpdateInfoScreen(KeyboardState keyboard)
+    private void UpdateInfoScreen(KeyboardState keyboard, GameTime gameTime)
     {
         if (!IsWindowInputActive())
             return;
 
         var viewportWidth = GraphicsDevice.Viewport.Width;
+        var viewportHeight = GraphicsDevice.Viewport.Height;
         var infoMargin = Math.Clamp(viewportWidth * 0.045f, 28f, 76f);
         EnsureInfoLines((int)Math.Max(1f, viewportWidth - infoMargin * 2f));
+        var logicalLineSpacing = _font is null ? 21f : UnicodeTextRenderer.GetLogicalLineSpacing(_font);
+        var contentTop = 116f;
+        var contentBottom = viewportHeight - 68f;
+        var contentHeight = Math.Max(1.0, contentBottom - contentTop);
+        var totalContentHeight = GetInfoContentHeight(logicalLineSpacing);
+        _infoScroll.SetMaximum(Math.Max(0.0, totalContentHeight - contentHeight));
+
+        var track = GetInfoScrollTrackBounds(viewportWidth, viewportHeight);
+        var interactionTrack = new Rectangle(track.X - 7, track.Y, track.Width + 14, track.Height);
+        var mouse = GlobalInput.Mouse;
+        var previousMouse = GlobalInput.PreviousMouse;
+        var mouseDown = mouse.LeftButton == Microsoft.Xna.Framework.Input.ButtonState.Pressed;
+        var mousePressed = mouseDown && previousMouse.LeftButton != Microsoft.Xna.Framework.Input.ButtonState.Pressed;
+        _infoScroll.HandleScrollbar(mousePressed, mouseDown, mouse.Position.X, mouse.Position.Y,
+            interactionTrack, totalContentHeight, contentHeight, minimumThumbSize: 22);
+
         var wheelDelta = GlobalInput.Mouse.ScrollWheelValue - GlobalInput.PreviousMouse.ScrollWheelValue;
         if (wheelDelta != 0)
-            _infoScrollOffset -= Math.Sign(wheelDelta) * Math.Max(1, Math.Abs(wheelDelta) / 120) * 3;
-
-        var viewportHeight = GraphicsDevice.Viewport.Height;
-        var logicalLineSpacing = _font is null ? 21f : UnicodeTextRenderer.GetLogicalLineSpacing(_font);
-        var approximateVisibleRows = Math.Max(1, (viewportHeight - 190) / Math.Max(1, (int)MathF.Ceiling(logicalLineSpacing + 7f)));
-        var maxScroll = Math.Max(0, _infoVisualLines.Count - approximateVisibleRows);
+            _infoScroll.HandleWheel(wheelDelta, SmoothScrollHandler.GetWheelPixelsPerNotch(logicalLineSpacing));
 
         if (KeybindSettings.IsPressed("menu_back") || KeybindSettings.IsPressed("editor_cancel") || Pressed(keyboard, Keys.Escape))
         {
             _startupScreen = StartupScreen.Menu;
             return;
         }
-        if (Pressed(keyboard, Keys.PageUp)) _infoScrollOffset -= Math.Max(1, approximateVisibleRows - 2);
-        if (Pressed(keyboard, Keys.PageDown)) _infoScrollOffset += Math.Max(1, approximateVisibleRows - 2);
-        if (KeybindSettings.IsPressed("menu_up")) _infoScrollOffset--;
-        if (KeybindSettings.IsPressed("menu_down")) _infoScrollOffset++;
-        if (Pressed(keyboard, Keys.Home)) _infoScrollOffset = 0;
-        if (Pressed(keyboard, Keys.End)) _infoScrollOffset = maxScroll;
-        _infoScrollOffset = Math.Clamp(_infoScrollOffset, 0, maxScroll);
+        if (Pressed(keyboard, Keys.PageUp)) _infoScroll.ScrollBy(-contentHeight * 0.85);
+        if (Pressed(keyboard, Keys.PageDown)) _infoScroll.ScrollBy(contentHeight * 0.85);
+        if (KeybindSettings.IsPressed("menu_up")) _infoScroll.ScrollBy(-logicalLineSpacing);
+        if (KeybindSettings.IsPressed("menu_down")) _infoScroll.ScrollBy(logicalLineSpacing);
+        if (Pressed(keyboard, Keys.Home)) _infoScroll.SetPosition(0);
+        if (Pressed(keyboard, Keys.End)) _infoScroll.SetPosition(_infoScroll.Maximum);
+
+        _infoScroll.Update(gameTime.ElapsedGameTime.TotalSeconds);
+        _infoScrollOffset = _infoScroll.Position;
+    }
+
+    private double GetInfoContentHeight(float logicalLineSpacing)
+    {
+        EnsureInfoLineLayout(logicalLineSpacing);
+        return _infoTotalContentHeight;
+    }
+
+    private void EnsureInfoLineLayout(float logicalLineSpacing)
+    {
+        if (_infoLayoutLineSpacing.Equals(logicalLineSpacing) && _infoVisualLines.Count > 0)
+            return;
+
+        var top = 0.0;
+        for (var i = 0; i < _infoVisualLines.Count; i++)
+        {
+            var line = _infoVisualLines[i];
+            var lineHeight = line.IsSpacer ? Math.Max(8f, logicalLineSpacing * 0.45f)
+                : line.IsRule ? 12f
+                : logicalLineSpacing * line.Scale + 7f;
+            _infoVisualLines[i] = line with { Top = top, Height = lineHeight };
+            top += lineHeight;
+        }
+
+        _infoTotalContentHeight = top;
+        _infoLayoutLineSpacing = logicalLineSpacing;
+    }
+
+    private int FindFirstInfoLineEndingAfter(double contentOffset)
+    {
+        var low = 0;
+        var high = _infoVisualLines.Count;
+        while (low < high)
+        {
+            var middle = low + (high - low) / 2;
+            var line = _infoVisualLines[middle];
+            if (line.Top + line.Height <= contentOffset)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        return low;
     }
 
     private void DrawInfoScreen()
@@ -1472,9 +1543,9 @@ public sealed class Game1 : Game
         EnsureInfoLines((int)contentWidth);
 
         var logicalLineSpacing = UnicodeTextRenderer.GetLogicalLineSpacing(_font);
-        var approximateVisibleRows = Math.Max(1, (height - 190) / Math.Max(1, (int)MathF.Ceiling(logicalLineSpacing + 7f)));
-        var maxScroll = Math.Max(0, _infoVisualLines.Count - approximateVisibleRows);
-        _infoScrollOffset = Math.Clamp(_infoScrollOffset, 0, maxScroll);
+        var totalContentHeight = GetInfoContentHeight(logicalLineSpacing);
+        _infoScroll.SetMaximum(Math.Max(0.0, totalContentHeight - (contentBottom - contentTop)));
+        _infoScrollOffset = _infoScroll.Position;
 
         _startupSpriteBatch!.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.NonPremultiplied);
         const string title = "INFO";
@@ -1482,42 +1553,65 @@ public sealed class Game1 : Game
         UnicodeTextRenderer.DrawString(_startupSpriteBatch, _font, title,
             new Vector2(width * 0.5f - titleSize.X * 0.5f, 30f), new Color(244, 197, 27), 0f, Vector2.Zero, 1.35f, SpriteEffects.None, 0f);
         _startupSpriteBatch.Draw(_startupPixel, new Rectangle((int)margin, 80, Math.Max(1, width - (int)(margin * 2f)), 2), new Color(74, 78, 88));
+        _startupSpriteBatch.End();
 
-        var y = contentTop;
-        for (var i = _infoScrollOffset; i < _infoVisualLines.Count; i++)
+        // Smooth scrolling moves text by fractional pixels. Clip the moving
+        // content to its viewport instead of allowing partially visible lines
+        // to overlap the fixed title or footer.
+        _infoScrollRasterizerState ??= new RasterizerState
+        {
+            ScissorTestEnable = true,
+            CullMode = CullMode.None
+        };
+        var previousScissor = GraphicsDevice.ScissorRectangle;
+        GraphicsDevice.ScissorRectangle = new Rectangle(
+            (int)MathF.Floor(contentLeft), (int)MathF.Floor(contentTop),
+            Math.Max(1, (int)MathF.Ceiling(contentWidth)),
+            Math.Max(1, (int)MathF.Ceiling(contentBottom - contentTop)));
+        _startupSpriteBatch.Begin(samplerState: SamplerState.LinearClamp,
+            blendState: BlendState.NonPremultiplied, rasterizerState: _infoScrollRasterizerState);
+
+        // The Markdown is parsed and measured as one complete page. Start drawing
+        // at the first line intersecting the viewport instead of rescanning every
+        // earlier section on every frame as the scroll offset grows.
+        var visibleContentTop = _infoScrollOffset;
+        var visibleContentBottom = visibleContentTop + (contentBottom - contentTop);
+        var firstVisibleLine = FindFirstInfoLineEndingAfter(visibleContentTop);
+        for (var i = firstVisibleLine; i < _infoVisualLines.Count; i++)
         {
             var line = _infoVisualLines[i];
-            var lineHeight = line.IsSpacer ? Math.Max(8f, logicalLineSpacing * 0.45f)
-                : line.IsRule ? 12f
-                : logicalLineSpacing * line.Scale + 7f;
-            if (y + lineHeight > contentBottom)
+            if (line.Top >= visibleContentBottom)
                 break;
-
-            if (line.IsRule)
+            var y = contentTop + (float)(line.Top - visibleContentTop);
+            if (line.Top + line.Height > visibleContentTop)
             {
-                _startupSpriteBatch.Draw(_startupPixel, new Rectangle((int)contentLeft, (int)(y + 4), (int)contentWidth, 1), new Color(65, 70, 82));
+                if (line.IsRule)
+                {
+                    _startupSpriteBatch.Draw(_startupPixel, new Rectangle((int)contentLeft,
+                        (int)(y + 4), (int)contentWidth, 1), new Color(65, 70, 82));
+                }
+                else if (!line.IsSpacer && line.Text.Length > 0)
+                {
+                    UnicodeTextRenderer.DrawString(_startupSpriteBatch, _font, line.Text,
+                        new Vector2(contentLeft, y), line.Color, 0f, Vector2.Zero,
+                        line.Scale, SpriteEffects.None, 0f);
+                }
             }
-            else if (!line.IsSpacer && line.Text.Length > 0)
-            {
-                UnicodeTextRenderer.DrawString(_startupSpriteBatch, _font, line.Text,
-                    new Vector2(contentLeft, y), line.Color, 0f, Vector2.Zero, line.Scale, SpriteEffects.None, 0f);
-            }
-            y += lineHeight;
-        }
-
-        if (maxScroll > 0)
-        {
-            var ratio = _infoScrollOffset / (float)maxScroll;
-            var trackX = width - 12;
-            var trackY = (int)contentTop;
-            var trackHeight = Math.Max(1, (int)(contentBottom - contentTop));
-            _startupSpriteBatch.Draw(_startupPixel, new Rectangle(trackX, trackY, 3, trackHeight), new Color(43, 47, 57));
-            var thumbHeight = Math.Max(22, trackHeight * approximateVisibleRows / Math.Max(1, _infoVisualLines.Count));
-            var thumbY = trackY + (int)((trackHeight - thumbHeight) * ratio);
-            _startupSpriteBatch.Draw(_startupPixel, new Rectangle(trackX, thumbY, 3, thumbHeight), new Color(244, 197, 27));
         }
         _startupSpriteBatch.End();
+        GraphicsDevice.ScissorRectangle = previousScissor;
+
+        _startupSpriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.NonPremultiplied);
+        var track = GetInfoScrollTrackBounds(width, height);
+        if (_infoScroll.Maximum > 0)
+            ScrollBarGeometry.Draw(_startupSpriteBatch, _startupPixel, track, _infoScroll.Position,
+                _infoScroll.Maximum, totalContentHeight, contentBottom - contentTop,
+                new Color(43, 47, 57), new Color(244, 197, 27), minimumThumbSize: 22);
+        _startupSpriteBatch.End();
     }
+
+    private static Rectangle GetInfoScrollTrackBounds(int viewportWidth, int viewportHeight)
+        => new(viewportWidth - 12, 116, 3, Math.Max(1, viewportHeight - 68 - 116));
 
     private void EnsureInfoLines(int availableWidth)
     {
@@ -1526,7 +1620,11 @@ public sealed class Game1 : Game
             return;
         _infoLayoutWidth = availableWidth;
         _infoVisualLines.Clear();
+        _infoLayoutLineSpacing = -1f;
+        _infoTotalContentHeight = 0;
+        _infoScroll.Reset();
         _infoScrollOffset = 0;
+        _infoScroll.CancelPointer();
 
         if (_infoMarkdownSource is null)
         {
@@ -1611,7 +1709,7 @@ public sealed class Game1 : Game
             var bullet = Regex.Match(trimmed, @"^[-+*]\s+(.*)$");
             if (bullet.Success)
             {
-                AddWrapped(StripMarkdownInline(bullet.Groups[1].Value), 1f, baseColor, "• ", "  ");
+                AddWrapped(StripMarkdownInline(bullet.Groups[1].Value), 1f, baseColor, "- ", "  ");
                 continue;
             }
             var numbered = Regex.Match(trimmed, @"^(\d+\.)\s+(.*)$");
@@ -1631,6 +1729,12 @@ public sealed class Game1 : Game
         }
         while (_infoVisualLines.Count > 0 && _infoVisualLines[^1].IsSpacer)
             _infoVisualLines.RemoveAt(_infoVisualLines.Count - 1);
+
+        // Keep ordinary Markdown on the built-in SpriteFont path. Eagerly preloading
+        // every line forces a serial GDI rasterization and GPU texture upload pass
+        // whenever the Info page opens. Uncommon Unicode runs can use the renderer's
+        // existing lazy fallback only when they are actually drawn.
+        EnsureInfoLineLayout(UnicodeTextRenderer.GetLogicalLineSpacing(_font));
     }
 
     private static string StripMarkdownInline(string text)
@@ -1736,6 +1840,7 @@ public sealed class Game1 : Game
             {
                 _mainMenuSelectedIndex = 3;
                 _startupScreen = StartupScreen.Info;
+                _infoScroll.Reset();
                 _infoScrollOffset = 0;
                 return;
             }
@@ -1838,6 +1943,7 @@ public sealed class Game1 : Game
             case "info":
                 _mainMenuSelectedIndex = 3;
                 _mainMenuRuntime?.UpdateMainMenuState(_errorMessage, _mainMenuSelectedIndex);
+                _infoScroll.Reset();
                 _infoScrollOffset = 0;
                 _startupScreen = StartupScreen.Info;
                 break;
@@ -1863,6 +1969,7 @@ public sealed class Game1 : Game
                 break;
             case 3:
                 _mainMenuSelectedIndex = 3;
+                _infoScroll.Reset();
                 _infoScrollOffset = 0;
                 _startupScreen = StartupScreen.Info;
                 break;
@@ -1924,6 +2031,12 @@ public sealed class Game1 : Game
                 GraphicsDevice.Viewport.Height,
                 skinSparklesEffect: _skinSparklesEffect,
                 skinQuad3DEffect: _skinQuad3DEffect);
+            _settingsMenuRuntime.SetUiScrollHandlerResolver(id => id switch
+            {
+                "settings_keybind_scrollbar" => _keybindScrollState,
+                "settings_skin_dropdown_scrollbar" => _skinDropdownScrollState,
+                _ => null
+            });
             return _settingsMenuRuntime.IsLoaded;
         }
         catch (Exception ex)
@@ -1951,6 +2064,24 @@ public sealed class Game1 : Game
                            previousMouse.LeftButton != Microsoft.Xna.Framework.Input.ButtonState.Pressed;
         var mouseDown = mouse.LeftButton == Microsoft.Xna.Framework.Input.ButtonState.Pressed;
         var wheelDelta = mouse.ScrollWheelValue - previousMouse.ScrollWheelValue;
+        var logicalLineSpacing = _font is null ? 21.0 : UnicodeTextRenderer.GetLogicalLineSpacing(_font);
+        var wheelPixelsPerNotch = SmoothScrollHandler.GetWheelPixelsPerNotch(logicalLineSpacing);
+        var settingsRowsForScroll = KeybindSettings.GetUiRows(_keybindCategory, _keybindEditorSubcategory);
+        var keybindScrollMetrics = GetSettingsKeybindScrollMetrics(settingsRowsForScroll.Count);
+        _keybindScrollState.SetMaximum(Math.Max(0.0, keybindScrollMetrics.ContentExtent - keybindScrollMetrics.ViewportExtent));
+
+        var skinRowHeight = 46.0;
+        var skinRowGap = 6.0;
+        var skinRowPitch = skinRowHeight + skinRowGap;
+        var skinVisibleRowLimit = Math.Max(1, (int)Math.Floor((Math.Max(skinRowHeight, GraphicsDevice.Viewport.Height - 180.0) + skinRowGap) / skinRowPitch));
+        var skinVisibleRows = Math.Min(_availableSettingsSkins.Count, skinVisibleRowLimit);
+        var skinContentExtent = _availableSettingsSkins.Count > 0
+            ? _availableSettingsSkins.Count * skinRowPitch - skinRowGap
+            : 0.0;
+        var skinViewportExtent = skinVisibleRows > 0
+            ? skinVisibleRows * skinRowHeight + (skinVisibleRows - 1) * skinRowGap
+            : 0.0;
+        _skinDropdownScrollState.SetMaximum(Math.Max(0.0, skinContentExtent - skinViewportExtent));
 
         if (Pressed(keyboard, Keys.F10))
             _settingsMenuRuntime.Reload();
@@ -2022,56 +2153,23 @@ public sealed class Game1 : Game
 
         if (!handlingKeybindCapture && _keybindCaptureAction is null && _settingsKeybindsOpen)
         {
-            var rowsForScrollbar = KeybindSettings.GetUiRows(_keybindCategory, _keybindEditorSubcategory);
-            var maxScrollbar = Math.Max(0, rowsForScrollbar.Count - SettingsKeybindVisibleRows());
-            if (_keybindScrollbarDragging)
-            {
-                if (mouseDown && maxScrollbar > 0)
-                {
-                    UpdateKeybindScrollFromMouse(mouse.Position.Y, rowsForScrollbar.Count, _keybindScrollbarDragOffset);
-                    return;
-                }
-                _keybindScrollbarDragging = false;
-            }
-            if (mousePressed && maxScrollbar > 0)
-            {
-                var track = GetKeybindScrollbarTrackBounds();
-                if (track.Contains(mouse.Position))
-                {
-                    var thumb = GetKeybindScrollbarThumbBounds(rowsForScrollbar.Count);
-                    if (thumb.Contains(mouse.Position))
-                        _keybindScrollbarDragOffset = mouse.Position.Y - thumb.Y;
-                    else
-                        _keybindScrollbarDragOffset = Math.Max(1, thumb.Height / 2);
-                    UpdateKeybindScrollFromMouse(mouse.Position.Y, rowsForScrollbar.Count, _keybindScrollbarDragOffset);
-                    _keybindScrollbarDragging = true;
-                    return;
-                }
-            }
-        }
-
-        if (!handlingKeybindCapture && _keybindCaptureAction is null && _settingsKeybindsOpen)
-        {
-            var rows = KeybindSettings.GetUiRows(_keybindCategory, _keybindEditorSubcategory);
             if (wheelDelta != 0)
-            {
-                var steps = Math.Max(1, Math.Abs(wheelDelta) / 120);
-                _keybindScroll = Math.Clamp(_keybindScroll - Math.Sign(wheelDelta) * steps, 0,
-                    Math.Max(0, rows.Count - SettingsKeybindVisibleRows()));
-            }
+                _keybindScrollState.HandleWheel(wheelDelta, wheelPixelsPerNotch);
             if (KeybindSettings.IsPressed("menu_up"))
-                _keybindScroll = Math.Max(0, _keybindScroll - 1);
+                _keybindScrollState.ScrollBy(-keybindScrollMetrics.RowPitch);
             else if (KeybindSettings.IsPressed("menu_down"))
-                _keybindScroll = Math.Min(Math.Max(0, rows.Count - SettingsKeybindVisibleRows()), _keybindScroll + 1);
+                _keybindScrollState.ScrollBy(keybindScrollMetrics.RowPitch);
         }
         else if (_settingsSkinDropdownOpen)
         {
             if (wheelDelta != 0)
-            {
-                var wheelSteps = Math.Max(1, Math.Abs(wheelDelta) / 120);
-                _settingsSkinDropdownScroll = Math.Max(0, _settingsSkinDropdownScroll - Math.Sign(wheelDelta) * wheelSteps);
-            }
+                _skinDropdownScrollState.HandleWheel(wheelDelta, wheelPixelsPerNotch);
         }
+
+        _keybindScrollState.Update(gameTime.ElapsedGameTime.TotalSeconds);
+        _skinDropdownScrollState.Update(gameTime.ElapsedGameTime.TotalSeconds);
+        _keybindScroll = _keybindScrollState.Position;
+        _settingsSkinDropdownScroll = _skinDropdownScrollState.Position;
 
         if (!handlingKeybindCapture && _keybindCaptureAction is null && _settingsEditingKey is not null)
         {
@@ -2392,57 +2490,20 @@ public sealed class Game1 : Game
         }
     }
 
-    private int SettingsKeybindVisibleRows()
+    private (double ContentExtent, double ViewportExtent, double RowPitch) GetSettingsKeybindScrollMetrics(int rowCount)
     {
-        // Mirrors settingsMenu.lua's category-dependent top offset and panel size.
+        // Mirror settingsMenu.lua's keybind-list geometry, but keep the shared
+        // handler's position in pixels rather than row units.
         var panelTop = string.Equals(_keybindCategory, "editor", StringComparison.OrdinalIgnoreCase) ? 146 : 110;
         var panelHeight = Math.Max(260, GraphicsDevice.Viewport.Height - panelTop - 92 - 20);
-        return Math.Max(1, (int)Math.Floor((panelHeight - 130f) / 53f));
-    }
-
-    private Rectangle GetKeybindScrollbarTrackBounds()
-    {
-        var viewportWidth = GraphicsDevice.Viewport.Width;
-        var viewportHeight = GraphicsDevice.Viewport.Height;
-        var panelWidth = Math.Min(1180, viewportWidth - 48);
-        var panelX = (viewportWidth - panelWidth) / 2;
-        var panelTop = string.Equals(_keybindCategory, "editor", StringComparison.OrdinalIgnoreCase) ? 146 : 110;
-        var panelHeight = Math.Max(260, viewportHeight - panelTop - 92 - 20);
-        const int padding = 24;
-        const int trackWidth = 10;
-        return new Rectangle(panelX + panelWidth - padding - trackWidth, panelTop + 60,
-            trackWidth, Math.Max(1, panelHeight - 80));
-    }
-
-    private Rectangle GetKeybindScrollbarThumbBounds(int rowCount)
-    {
-        var track = GetKeybindScrollbarTrackBounds();
-        var visibleRows = SettingsKeybindVisibleRows();
-        if (rowCount <= 0 || rowCount <= visibleRows)
-            return new Rectangle(track.X, track.Y, track.Width, track.Height);
-        var thumbHeight = Math.Clamp((int)Math.Floor(track.Height * (visibleRows / (double)rowCount)), 24, track.Height);
-        var maxScroll = Math.Max(1, rowCount - visibleRows);
-        var travel = Math.Max(0, track.Height - thumbHeight);
-        var thumbY = track.Y + (int)Math.Floor(travel * (_keybindScroll / (double)maxScroll) + 0.5);
-        return new Rectangle(track.X, thumbY, track.Width, thumbHeight);
-    }
-
-    private void UpdateKeybindScrollFromMouse(int mouseY, int rowCount, int dragOffset)
-    {
-        var track = GetKeybindScrollbarTrackBounds();
-        var visibleRows = SettingsKeybindVisibleRows();
-        var maxScroll = Math.Max(0, rowCount - visibleRows);
-        if (maxScroll == 0)
-        {
-            _keybindScroll = 0;
-            return;
-        }
-        var thumb = GetKeybindScrollbarThumbBounds(rowCount);
-        var thumbHeight = thumb.Height;
-        var travel = Math.Max(1, track.Height - thumbHeight);
-        var desiredY = Math.Clamp(mouseY - dragOffset, track.Y, track.Bottom - thumbHeight);
-        var proportion = (desiredY - track.Y) / (double)travel;
-        _keybindScroll = Math.Clamp((int)Math.Floor(proportion * maxScroll + 0.5), 0, maxScroll);
+        const double rowViewTop = 60.0;
+        const double rowGap = 5.0;
+        const double rowHeight = 48.0;
+        const double rowPitch = rowHeight + rowGap;
+        var rowViewBottom = panelHeight - 20.0;
+        var viewportExtent = Math.Max(1.0, rowViewBottom - rowViewTop);
+        var contentExtent = rowCount > 0 ? rowCount * rowPitch - rowGap : 0.0;
+        return (contentExtent, viewportExtent, rowPitch);
     }
 
     private void ResetKeybindCapture()
@@ -2586,8 +2647,8 @@ public sealed class Game1 : Game
             _settingsKeybindsOpen = true;
             _keybindCategory = "navigation";
             _keybindEditorSubcategory = "file";
+            _keybindScrollState.Reset();
             _keybindScroll = 0;
-            _keybindScrollbarDragging = false;
             _settingsSkinDropdownOpen = false;
             return;
         }
@@ -2595,8 +2656,8 @@ public sealed class Game1 : Game
         {
             _keybindCategory = name == "keybind_tab_gameplay" ? "gameplay" :
                 name == "keybind_tab_editor" ? "editor" : "navigation";
+            _keybindScrollState.Reset();
             _keybindScroll = 0;
-            _keybindScrollbarDragging = false;
             ResetKeybindCapture();
             return;
         }
@@ -2605,8 +2666,8 @@ public sealed class Game1 : Game
             if (subcategory is "file" or "editing" or "view" or "selection" or "note_tools" or "edit_tools" or "tempo" or "panels" or "debug")
             {
                 _keybindEditorSubcategory = subcategory;
+                _keybindScrollState.Reset();
                 _keybindScroll = 0;
-                _keybindScrollbarDragging = false;
                 ResetKeybindCapture();
             }
             return;
@@ -2614,8 +2675,8 @@ public sealed class Game1 : Game
         if (name == "close_keybinds")
         {
             _settingsKeybindsOpen = false;
+            _keybindScrollState.Reset();
             _keybindScroll = 0;
-            _keybindScrollbarDragging = false;
             ResetKeybindCapture();
             return;
         }
@@ -2686,15 +2747,36 @@ public sealed class Game1 : Game
             _settingsSkinDropdownOpen = !_settingsSkinDropdownOpen;
             if (_settingsSkinDropdownOpen)
             {
+                _skinDropdownScrollState.Reset();
                 _settingsSkinDropdownScroll = 0;
                 _availableSettingsSkins = GetAvailableSkinNames();
             }
             return;
         }
 
+        if (name == "scroll_skin_dropdown")
+        {
+            // Preserve the legacy action's row-based value while the handler itself
+            // stores a continuous pixel offset.
+            _skinDropdownScrollState.SetPosition(action.Value is double scrollValue
+                ? scrollValue * 52.0
+                : _settingsSkinDropdownScroll);
+            return;
+        }
+        if (name == "keybinds.scroll_to")
+        {
+            // Preserve the legacy action's row-based value while the handler itself
+            // stores a continuous pixel offset.
+            _keybindScrollState.SetPosition(action.Value is double keybindValue
+                ? keybindValue * 53.0
+                : _keybindScroll);
+            return;
+        }
+
         if (name == "close_skin_dropdown")
         {
             _settingsSkinDropdownOpen = false;
+            _skinDropdownScrollState.Reset();
             _settingsSkinDropdownScroll = 0;
             return;
         }
@@ -2702,6 +2784,7 @@ public sealed class Game1 : Game
         if (name == "select_skin" && action.Value is string selectedSkin)
         {
             _settingsSkinDropdownOpen = false;
+            _skinDropdownScrollState.Reset();
             _settingsSkinDropdownScroll = 0;
             var available = GetAvailableSkinNames();
             if (!available.Contains(selectedSkin, StringComparer.OrdinalIgnoreCase))
@@ -2726,9 +2809,11 @@ public sealed class Game1 : Game
     {
         CommitSettingsValueEdit();
         _settingsSkinDropdownOpen = false;
+        _skinDropdownScrollState.Reset();
         _settingsSkinDropdownScroll = 0;
         _settingsKeybindsOpen = false;
         ResetKeybindCapture();
+        _keybindScrollState.Reset();
         _keybindScroll = 0;
         _startupScreen = _returnToEditorFromSettings ? StartupScreen.Gameplay : StartupScreen.Menu;
         _returnToEditorFromSettings = false;
@@ -2833,6 +2918,7 @@ public sealed class Game1 : Game
         ResetKeybindCapture();
         _settingsKeybindsOpen = false;
         _settingsSkinDropdownOpen = false;
+        _skinDropdownScrollState.Reset();
         _settingsSkinDropdownScroll = 0;
         _settingsMenuRuntime?.Dispose();
         _settingsMenuRuntime = null;

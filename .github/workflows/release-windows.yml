@@ -127,7 +127,7 @@ jobs:
 
           Write-Host "Verified publish layout with launcher size $launcherSize bytes. Removed temporary test fixtures."
 
-      - name: Build full, minimal, patch, and manifest assets
+      - name: Build full, patch, and manifest assets
         shell: pwsh
         run: |
           $tag = $env:GITHUB_REF_NAME
@@ -214,19 +214,25 @@ jobs:
             & $packager -Version $version -PublishDirectory $publishRoot -OutputDirectory $outputDir -PreviousFullZip $previousZip -PreviousManifestPath $previousManifest
           }
           else {
-            Write-Host 'No earlier release with a full ZIP and combined manifest was found. This will be packaged as the first full/minimal release, without a patch ZIP.'
+            Write-Host 'No earlier release with a full ZIP and combined manifest was found. This will be packaged as the first full release, without a patch ZIP.'
             & $packager -Version $version -PublishDirectory $publishRoot -OutputDirectory $outputDir
           }
 
           $requiredAssets = @(
             "TSC-win-x64-$version.zip",
-            "TSC-win-x64-$version-minimal.zip",
             "TSC-win-x64-$version-manifest.json"
           )
+          if ($null -ne $previous) {
+            $requiredAssets += "TSC-win-x64-$version-patch.zip"
+          }
           foreach ($name in $requiredAssets) {
             if (-not (Test-Path -LiteralPath (Join-Path $outputDir $name) -PathType Leaf)) {
               throw "Release packaging did not produce required asset '$name'."
             }
+          }
+          $unexpectedMinimal = @(Get-ChildItem -LiteralPath $outputDir -File | Where-Object { $_.Name -match '^TSC-win-x64-.*-minimal(?:-manifest)?\.(zip|json)$' })
+          if ($unexpectedMinimal.Count -gt 0) {
+            throw "Minimal package assets are no longer supported: $($unexpectedMinimal.Name -join ', ')"
           }
           Write-Host 'Release assets:'
           Get-ChildItem -LiteralPath $outputDir -File | Sort-Object Name | ForEach-Object { Write-Host " - $($_.Name) ($($_.Length) bytes)" }
@@ -238,8 +244,8 @@ jobs:
           $version = (Get-Content -LiteralPath 'version.txt' -Raw).Trim()
           $outputDir = Join-Path $env:GITHUB_WORKSPACE 'release-assets'
           $assetPaths = @(Get-ChildItem -LiteralPath $outputDir -File | Sort-Object Name | ForEach-Object { $_.FullName })
-          if ($assetPaths.Count -lt 3) {
-            throw "Expected full ZIP, minimal ZIP, and combined manifest in '$outputDir'."
+          if ($assetPaths.Count -lt 2) {
+            throw "Expected full ZIP and combined manifest in '$outputDir'."
           }
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY --json tagName *> $null
@@ -254,4 +260,19 @@ jobs:
           }
           if ($LASTEXITCODE -ne 0) {
             throw "GitHub release publishing failed for $tag."
+          }
+
+          # A release may be rebuilt in place. Remove minimal ZIPs left by older
+          # workflows so each release exposes only the patch/full update choices.
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$tag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect release assets for $tag after publishing."
+          }
+          $releaseInfo = ($release -join [Environment]::NewLine) | ConvertFrom-Json
+          foreach ($asset in @($releaseInfo.assets | Where-Object { $_.name -match '^TSC-win-x64-.*-minimal(?:-manifest)?\.(zip|json)$' })) {
+            gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)"
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not remove obsolete minimal release asset '$($asset.name)'."
+            }
+            Write-Host "Removed obsolete release asset $($asset.name)."
           }

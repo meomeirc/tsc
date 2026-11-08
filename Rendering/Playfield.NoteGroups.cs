@@ -113,6 +113,7 @@ public sealed partial class Playfield
 
     private const int EditorNoteGroupVisibleRows = 5;
     private int _editorNoteGroupsScrollOffset;
+    private readonly TSC.UI.SmoothScrollHandler _editorNoteGroupsScroll = new();
     private int? _editorSelectedNoteGroupId;
     // A library row can be selected without selecting a chart instance. Keep
     // that intentional selection after placement is disarmed, until a new chart
@@ -403,8 +404,48 @@ public sealed partial class Playfield
     private long _editorLastGroupNoteClickTimestamp;
     private Vector2 _editorLastGroupNoteClickPosition;
 
-    private int GetEditorNoteGroupScrollMaximum()
-        => Math.Max(0, (_chart?.NoteGroups.Count ?? 0) - EditorNoteGroupVisibleRows);
+    private double GetEditorNoteGroupScrollRowPitch()
+    {
+        var unit = _projection.ScalePixels(1f);
+        var rowHeight = Math.Max(1.0, 50.0 * unit);
+        var rowGap = Math.Max(1.0, 5.0 * unit);
+        return rowHeight + rowGap;
+    }
+
+    private double GetEditorNoteGroupScrollContentExtent()
+    {
+        var count = _chart?.NoteGroups.Count ?? 0;
+        if (count <= 0) return 0.0;
+        var unit = _projection.ScalePixels(1f);
+        var rowGap = Math.Max(1.0, 5.0 * unit);
+        return count * GetEditorNoteGroupScrollRowPitch() - rowGap;
+    }
+
+    private double GetEditorNoteGroupScrollViewportExtent()
+    {
+        var unit = _projection.ScalePixels(1f);
+        var rowHeight = Math.Max(1.0, 50.0 * unit);
+        var rowGap = Math.Max(1.0, 5.0 * unit);
+        return EditorNoteGroupVisibleRows * rowHeight + (EditorNoteGroupVisibleRows - 1) * rowGap;
+    }
+
+    private double GetEditorNoteGroupScrollMaximum()
+        => Math.Max(0.0,
+            GetEditorNoteGroupScrollContentExtent() - GetEditorNoteGroupScrollViewportExtent());
+
+    private int GetEditorNoteGroupScrollFirstRow()
+    {
+        var pitch = GetEditorNoteGroupScrollRowPitch();
+        return Math.Clamp((int)Math.Floor(_editorNoteGroupsScroll.Position / pitch), 0,
+            Math.Max(0, (_chart?.NoteGroups.Count ?? 0) - 1));
+    }
+
+    private double GetEditorNoteGroupScrollPixelRemainder()
+    {
+        var pitch = GetEditorNoteGroupScrollRowPitch();
+        var firstRow = GetEditorNoteGroupScrollFirstRow();
+        return Math.Clamp(_editorNoteGroupsScroll.Position - firstRow * pitch, 0.0, pitch);
+    }
 
     private List<object?> BuildEditorNoteGroupMenuItems()
     {
@@ -413,10 +454,10 @@ public sealed partial class Playfield
 
         RefreshEditorNoteGroupLibrarySelectionFromNotes();
         var groups = _chart.NoteGroups.OrderBy(group => group.Id).ToList();
-        var maxScroll = Math.Max(0, groups.Count - EditorNoteGroupVisibleRows);
-        _editorNoteGroupsScrollOffset = Math.Clamp(_editorNoteGroupsScrollOffset, 0, maxScroll);
+        _editorNoteGroupsScroll.SetMaximum(GetEditorNoteGroupScrollMaximum());
+        _editorNoteGroupsScrollOffset = GetEditorNoteGroupScrollFirstRow();
         var visible = new List<object?>();
-        foreach (var group in groups.Skip(_editorNoteGroupsScrollOffset).Take(EditorNoteGroupVisibleRows))
+        foreach (var group in groups.Skip(_editorNoteGroupsScrollOffset).Take(EditorNoteGroupVisibleRows + 1))
         {
             var instances = _chart.NoteGroupInstances.Where(instance => instance.GroupId == group.Id)
                 .OrderBy(instance => instance.StartTick).ThenBy(instance => instance.StartTrack)
@@ -1232,9 +1273,9 @@ public sealed partial class Playfield
         if (index >= 0 && (index < _editorNoteGroupsScrollOffset ||
                            index >= _editorNoteGroupsScrollOffset + EditorNoteGroupVisibleRows))
         {
-            _editorNoteGroupsScrollOffset = Math.Clamp(
+            SetEditorNoteGroupScrollPosition(Math.Clamp(
                 index - EditorNoteGroupVisibleRows + 1, 0,
-                Math.Max(0, orderedGroups.Count - EditorNoteGroupVisibleRows));
+                Math.Max(0, orderedGroups.Count - EditorNoteGroupVisibleRows)), immediate: true);
         }
     }
 
@@ -1315,8 +1356,8 @@ public sealed partial class Playfield
         _editorConnectorMode = false;
         _editorSuperFlickTool = EditorSuperFlickTool.None;
         _editorSelectedTempoEvent = null;
-        _editorNoteGroupsScrollOffset = Math.Max(0,
-            _chart.NoteGroups.OrderBy(group => group.Id).ToList().FindIndex(group => group.Id == groupId) - EditorNoteGroupVisibleRows + 1);
+        SetEditorNoteGroupScrollPosition(Math.Max(0,
+            _chart.NoteGroups.OrderBy(group => group.Id).ToList().FindIndex(group => group.Id == groupId) - EditorNoteGroupVisibleRows + 1), immediate: true);
         _statusMessage = $"Group G{groupId} selected. Click an empty lane cell to place another instance; click this row again or press Cancel to stop.";
     }
 
@@ -1590,8 +1631,8 @@ public sealed partial class Playfield
         _editorSelectedNoteGroupId = null;
         _editorNoteGroupLibrarySelectionExplicit = false;
         _editorNoteGroupPlacementArmed = false;
-        _editorNoteGroupsScrollOffset = Math.Min(_editorNoteGroupsScrollOffset,
-            Math.Max(0, _chart.NoteGroups.Count - EditorNoteGroupVisibleRows));
+        _editorNoteGroupsScroll.SetMaximum(GetEditorNoteGroupScrollMaximum());
+        _editorNoteGroupsScrollOffset = GetEditorNoteGroupScrollFirstRow();
         CommitEditorUndoSnapshot(snapshot);
         RefreshAfterEditorMutation();
         _statusMessage = $"Removed Group {groupId}; all of its instances are now independent notes.";
@@ -2046,6 +2087,7 @@ public sealed partial class Playfield
         // group later inherited that number instead of the original group.
         _editorSelectedNoteGroupId = null;
         _editorNoteGroupLibrarySelectionExplicit = false;
+        _editorNoteGroupsScroll.Reset();
         _editorNoteGroupsScrollOffset = 0;
 
         // This is a metadata-identity operation, not a note drag. Avoid the usual
@@ -2085,6 +2127,7 @@ public sealed partial class Playfield
         _editorNoteGroupEditMode = false;
         _editorEditingNoteGroupId = null;
         _editorEditingNoteGroupInstanceId = null;
+        _editorNoteGroupsScroll.Reset();
         _editorNoteGroupsScrollOffset = 0;
         ClearEditorMultiSelection();
         _selectedEventKey = null;
@@ -2156,8 +2199,8 @@ public sealed partial class Playfield
         _editorEditingNoteGroupId = groupId;
         _editorEditingNoteGroupInstanceId = instanceId;
         ClearEditorMultiSelection();
-        _editorNoteGroupsScrollOffset = Math.Max(0,
-            _chart.NoteGroups.OrderBy(group => group.Id).ToList().FindIndex(group => group.Id == groupId) - EditorNoteGroupVisibleRows + 1);
+        SetEditorNoteGroupScrollPosition(Math.Max(0,
+            _chart.NoteGroups.OrderBy(group => group.Id).ToList().FindIndex(group => group.Id == groupId) - EditorNoteGroupVisibleRows + 1), immediate: true);
         if (selectedNote is not null)
         {
             _editorSelectedHoldEnd = false;
@@ -2230,11 +2273,11 @@ public sealed partial class Playfield
         }
     }
 
-    private const int EditorNoteGroupMenuVisibleRows = 5;
+    private const int EditorNoteGroupMenuVisibleRows = EditorNoteGroupVisibleRows;
 
     private Rectangle GetEditorNoteGroupEntryBounds(int row, int virtualWidth, int virtualHeight)
     {
-        if (row is < 0 or >= EditorNoteGroupMenuVisibleRows)
+        if (row is < 0 or > EditorNoteGroupMenuVisibleRows)
             return Rectangle.Empty;
         var panel = GetEditorMenuPanelBounds(virtualWidth, virtualHeight);
         if (panel.IsEmpty) return Rectangle.Empty;
@@ -2245,8 +2288,17 @@ public sealed partial class Playfield
         var rowHeight = Math.Max(1, (int)MathF.Round(50f * unit));
         var rowGap = Math.Max(1, (int)MathF.Round(5f * unit));
         var scrollbarWidth = Math.Max(1, (int)MathF.Round(18f * unit));
-        return new Rectangle(panel.X + padding, listY + row * (rowHeight + rowGap),
-            Math.Max(1, panel.Width - padding * 2 - scrollbarWidth), rowHeight);
+        var rowPitch = GetEditorNoteGroupScrollRowPitch();
+        var scrollRemainder = GetEditorNoteGroupScrollPixelRemainder();
+        var rowY = listY + (int)Math.Round(row * rowPitch - scrollRemainder);
+        var listBottom = listY + EditorNoteGroupMenuVisibleRows * rowHeight +
+            (EditorNoteGroupMenuVisibleRows - 1) * rowGap;
+        var visibleTop = Math.Max(listY, rowY);
+        var visibleBottom = Math.Min(listBottom, rowY + rowHeight);
+        if (visibleBottom <= visibleTop)
+            return Rectangle.Empty;
+        return new Rectangle(panel.X + padding, visibleTop,
+            Math.Max(1, panel.Width - padding * 2 - scrollbarWidth), visibleBottom - visibleTop);
     }
 
     private Rectangle GetEditorNoteGroupActionBounds(int row, int column, int columns, int virtualWidth, int virtualHeight)
@@ -2274,12 +2326,12 @@ public sealed partial class Playfield
         if (_editorMenuSection != EditorMenuSection.NoteGroups || _chart is null)
             return false;
 
-        for (var row = 0; row < EditorNoteGroupMenuVisibleRows; row++)
+        for (var row = 0; row <= EditorNoteGroupMenuVisibleRows; row++)
         {
             if (!GetEditorNoteGroupEntryBounds(row, virtualWidth, virtualHeight).Contains(pixel))
                 continue;
             var visibleGroups = _chart.NoteGroups.OrderBy(group => group.Id)
-                .Skip(_editorNoteGroupsScrollOffset).Take(EditorNoteGroupMenuVisibleRows).ToList();
+                .Skip(_editorNoteGroupsScrollOffset).Take(EditorNoteGroupMenuVisibleRows + 1).ToList();
             if (row < visibleGroups.Count)
                 SelectEditorNoteGroup(visibleGroups[row].Id);
             return true;
@@ -2451,8 +2503,8 @@ public sealed partial class Playfield
         var groupIndex = orderedGroups.FindIndex(group => group.Id == groupId);
         if (groupIndex >= 0 && (groupIndex < _editorNoteGroupsScrollOffset ||
                                 groupIndex >= _editorNoteGroupsScrollOffset + EditorNoteGroupVisibleRows))
-            _editorNoteGroupsScrollOffset = Math.Clamp(groupIndex - EditorNoteGroupVisibleRows + 1,
-                0, Math.Max(0, orderedGroups.Count - EditorNoteGroupVisibleRows));
+            SetEditorNoteGroupScrollPosition(Math.Clamp(groupIndex - EditorNoteGroupVisibleRows + 1,
+                0, Math.Max(0, orderedGroups.Count - EditorNoteGroupVisibleRows)), immediate: true);
 
         if (_editorNoteGroupEditMode)
         {

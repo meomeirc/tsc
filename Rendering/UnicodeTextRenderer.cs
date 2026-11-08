@@ -113,6 +113,20 @@ public static class UnicodeTextRenderer
         return GetOrCreateEntry(font, text, FontStyle.Regular).Size;
     }
 
+    /// <summary>
+    /// Warms the text renderer's fallback texture cache without drawing the text.
+    /// Useful for small, fixed documents that should not hitch as new lines enter
+    /// the viewport for the first time.
+    /// </summary>
+    public static void PreloadText(SpriteFont font, string? text)
+    {
+        if (font is null || string.IsNullOrEmpty(text) || !NeedsUnicodeFallback(font, text))
+            return;
+
+        var entry = GetOrCreateEntry(font, text, FontStyle.Regular);
+        _ = EnsureTexture(font, entry);
+    }
+
     /// <summary>Measures a run using the same font face with optional bold and italic styling.</summary>
     public static XnaVector2 MeasureStyledString(SpriteFont font, string? text, bool bold, bool italic)
     {

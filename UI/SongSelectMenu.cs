@@ -4795,7 +4795,7 @@ public sealed class SongSelectMenu : IDisposable
             if (replacement.LastError is null &&
                 (_errorMessage?.StartsWith("Song-select skin failed:", StringComparison.OrdinalIgnoreCase) == true ||
                  _errorMessage?.StartsWith("Song-select skin could not load:", StringComparison.OrdinalIgnoreCase) == true))
-                _errorMessage = null;
+                _errorMessage = string.Empty;
             Program.LogRuntime(
                 $"SONG_SELECT_SKIN_SWITCH_DONE skinDirectory={_skinDirectory} loaded={replacement.IsLoaded} " +
                 $"error={replacement.LastError ?? "none"}");

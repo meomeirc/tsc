@@ -405,11 +405,59 @@ public sealed partial class Playfield
             : Math.Max(1, GetEditorProblemsVisibleRows(virtualWidth, virtualHeight));
     }
 
+    private double GetEditorProblemsScrollRowPitch(int virtualWidth, int virtualHeight)
+    {
+        var unit = _projection.ScalePixels(1f);
+        return _chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null
+            ? 44.0 * unit
+            : Math.Max(22.0, (int)MathF.Round(30f * unit));
+    }
+
+    private double GetEditorProblemsScrollContentExtent(int virtualWidth, int virtualHeight)
+    {
+        if (_editorProblems.Count <= 0) return 0.0;
+        var pitch = GetEditorProblemsScrollRowPitch(virtualWidth, virtualHeight);
+        var trailingGap = _chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null
+            ? 4.0 * _projection.ScalePixels(1f)
+            : 0.0;
+        return Math.Max(0.0, _editorProblems.Count * pitch - trailingGap);
+    }
+
+    private double GetEditorProblemsScrollViewportExtent(int virtualWidth, int virtualHeight)
+    {
+        if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+        {
+            var rowCount = Math.Min(LAYOUT_PROBLEM_ROW_COUNT, _editorProblems.Count);
+            if (rowCount <= 0) return 0.0;
+            var rowPitch = GetEditorProblemsScrollRowPitch(virtualWidth, virtualHeight);
+            return Math.Max(0.0, rowCount * rowPitch - 4.0 * _projection.ScalePixels(1f));
+        }
+
+        return Math.Max(0, GetEditorProblemsListBounds(virtualWidth, virtualHeight).Height);
+    }
+
+    private double GetEditorProblemsScrollMaximum(int virtualWidth, int virtualHeight)
+        => Math.Max(0.0, GetEditorProblemsScrollContentExtent(virtualWidth, virtualHeight) -
+            GetEditorProblemsScrollViewportExtent(virtualWidth, virtualHeight));
+
+    private int GetEditorProblemsScrollFirstRow(int virtualWidth, int virtualHeight)
+    {
+        var pitch = Math.Max(1.0, GetEditorProblemsScrollRowPitch(virtualWidth, virtualHeight));
+        return Math.Clamp((int)Math.Floor(_editorProblemsScroll.Position / pitch), 0,
+            Math.Max(0, _editorProblems.Count - 1));
+    }
+
+    private double GetEditorProblemsScrollPixelRemainder(int virtualWidth, int virtualHeight)
+    {
+        var pitch = Math.Max(1.0, GetEditorProblemsScrollRowPitch(virtualWidth, virtualHeight));
+        return Math.Clamp(_editorProblemsScroll.Position -
+            GetEditorProblemsScrollFirstRow(virtualWidth, virtualHeight) * pitch, 0.0, pitch);
+    }
+
     private void ClampEditorProblemsScroll(int virtualWidth, int virtualHeight)
     {
-        var visible = GetEditorProblemsScrollWindowRows(virtualWidth, virtualHeight);
-        _editorProblemsScrollOffset = Math.Clamp(_editorProblemsScrollOffset, 0,
-            Math.Max(0, _editorProblems.Count - visible));
+        _editorProblemsScroll.SetMaximum(GetEditorProblemsScrollMaximum(virtualWidth, virtualHeight));
+        _editorProblemsScrollOffset = GetEditorProblemsScrollFirstRow(virtualWidth, virtualHeight);
     }
 
     private void DrawEditorProblemsPanel(int virtualWidth, int virtualHeight)
@@ -490,36 +538,48 @@ public sealed partial class Playfield
             ClampEditorProblemsScroll(virtualWidth, virtualHeight);
             var rowPitch = Math.Max(22, (int)MathF.Round(30f * unit));
             var visibleRows = GetEditorProblemsVisibleRows(virtualWidth, virtualHeight);
-            for (var slot = 0; slot < visibleRows; slot++)
+            var fractionalOffset = GetEditorProblemsScrollPixelRemainder(virtualWidth, virtualHeight);
+            for (var slot = 0; slot <= visibleRows; slot++)
             {
                 var index = _editorProblemsScrollOffset + slot;
                 if (index >= _editorProblems.Count) break;
                 var problem = _editorProblems[index];
-                var row = new Rectangle(list.X, list.Y + slot * rowPitch, list.Width, rowPitch);
+                var rowY = list.Y + slot * rowPitch - (int)MathF.Round((float)fractionalOffset);
+                var rowTop = Math.Max(list.Y, rowY);
+                var rowBottom = Math.Min(list.Bottom, rowY + rowPitch);
+                if (rowBottom <= rowTop) continue;
+                var row = new Rectangle(list.X, rowTop, list.Width, rowBottom - rowTop);
                 var rowFill = index % 2 == 0 ? interfaceUi.ButtonColor : interfaceUi.PanelColor;
                 _spriteBatch.Draw(_pixel, row, ResolveEditorButtonStateFill(row, rowFill, interfaceUi));
                 var issueColor = problem.IsWarning ? yellow : red;
-                _spriteBatch.Draw(_pixel, new Rectangle(row.X, row.Y + 3, Math.Max(2, (int)MathF.Round(3f * unit)), row.Height - 6), issueColor);
+                if (row.Height > 6)
+                    _spriteBatch.Draw(_pixel, new Rectangle(row.X, row.Y + 3,
+                        Math.Max(2, (int)MathF.Round(3f * unit)), row.Height - 6), issueColor);
                 var prefix = problem.Track >= 0 ? $"Tick {problem.Tick} · Track {problem.Track}: " : $"Tick {problem.Tick}: ";
                 var rowText = FitHudText(labelFont, FontSafeText(labelFont, prefix + problem.Message),
                     Math.Max(1f, row.Width - 18f * unit) / textScale);
                 var rowTextScale = GetEditorDefaultFontScale(rowText, 18f * unit);
                 var textSize = UnicodeTextRenderer.MeasureString(labelFont, rowText) * rowTextScale;
-                UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, rowText,
-                    new Vector2(row.X + 10f * unit, row.Y + (row.Height - textSize.Y) * 0.5f),
-                    problem.IsWarning ? new Color(255, 229, 168, 245) : new Color(247, 210, 213, 245),
-                    0f, Vector2.Zero, rowTextScale, SpriteEffects.None, 0f);
+                var textY = rowY + (rowPitch - textSize.Y) * 0.5f;
+                if (textY >= list.Y && textY + textSize.Y <= list.Bottom)
+                {
+                    UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, rowText,
+                        new Vector2(row.X + 10f * unit, (float)textY),
+                        problem.IsWarning ? new Color(255, 229, 168, 245) : new Color(247, 210, 213, 245),
+                        0f, Vector2.Zero, rowTextScale, SpriteEffects.None, 0f);
+                }
             }
             if (_editorProblems.Count > visibleRows && list.Height > 0)
             {
                 var railWidth = Math.Max(2, (int)MathF.Round(3f * unit));
                 var rail = new Rectangle(list.Right - railWidth, list.Y, railWidth, list.Height);
-                _spriteBatch.Draw(_pixel, rail, interfaceUi.HeaderColor);
-                var thumbHeight = Math.Max(15, (int)MathF.Round(list.Height * visibleRows / (float)_editorProblems.Count));
-                thumbHeight = Math.Min(list.Height, thumbHeight);
-                var maxScroll = Math.Max(1, _editorProblems.Count - Math.Max(1, visibleRows));
-                var thumbY = list.Y + (int)MathF.Round((list.Height - thumbHeight) * (_editorProblemsScrollOffset / (float)maxScroll));
-                _spriteBatch.Draw(_pixel, new Rectangle(rail.X, thumbY, rail.Width, thumbHeight), statusColor);
+                var maxScroll = GetEditorProblemsScrollMaximum(virtualWidth, virtualHeight);
+                TSC.UI.ScrollBarGeometry.Draw(_spriteBatch, _pixel, rail,
+                    _editorProblemsScroll.Position, maxScroll,
+                    GetEditorProblemsScrollContentExtent(virtualWidth, virtualHeight),
+                    GetEditorProblemsScrollViewportExtent(virtualWidth, virtualHeight),
+                    interfaceUi.HeaderColor, statusColor,
+                    minimumThumbSize: Math.Max(15, (int)MathF.Round(15f * unit)));
             }
         }
         _spriteBatch.End();
@@ -550,7 +610,8 @@ public sealed partial class Playfield
         if (!list.Contains(pixel))
             return true;
         var rowPitch = Math.Max(22, (int)MathF.Round(30f * _projection.ScalePixels(1f)));
-        var visibleIndex = (pixel.Y - list.Y) / rowPitch;
+        var fractionalOffset = GetEditorProblemsScrollPixelRemainder(virtualWidth, virtualHeight);
+        var visibleIndex = (int)Math.Floor((pixel.Y - list.Y + fractionalOffset) / rowPitch);
         var index = _editorProblemsScrollOffset + visibleIndex;
         if (index < 0 || index >= _editorProblems.Count)
             return true;

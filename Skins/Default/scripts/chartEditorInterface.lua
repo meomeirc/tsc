@@ -4,6 +4,7 @@
 -- fonts, colors, hover treatment, and every visible control.
 
 local UI = import("uiStyle")
+local Scroll = import("uiScroll")
 local C = UI.colors
 local F = UI.fonts
 local ACTIVE_SCALE = 1
@@ -310,11 +311,11 @@ local function panel(id, x, y, width, height, title, layer)
     end
 end
 
-local function label(text, x, y, size, color, parent, layer, font)
+local function label(text, x, y, size, color, parent, layer, font, clip)
     draw.text(tostring(text or ""), {
         parent = parent, x = x, y = y, size = size or fontSize("body"),
         color = color or C.text, font = font or F.regular, anchor = "top-left",
-        layer = layer or 10,
+        clip = clip, layer = layer or 10,
     })
 end
 
@@ -328,7 +329,7 @@ local function button(item, x, y, width, height, options)
     if disabled then
         draw.rect({
             id = item.id .. "_disabled", x = x, y = y, width = width, height = height,
-            color = C.button, alpha = 0.75, layer = options.layer or 4,
+            color = C.button, alpha = 0.75, clip = options.clip, layer = options.layer or 4,
         })
         local label = tostring(item.label or "")
         local font = F.regular
@@ -339,7 +340,7 @@ local function button(item, x, y, width, height, options)
         draw.text(label, {
             x = x + width * 0.5, y = y + height * 0.5,
             size = textSize, color = C.muted,
-            font = font, anchor = "center", layer = (options.layer or 4) + 1,
+            font = font, anchor = "center", clip = options.clip, layer = (options.layer or 4) + 1,
         })
         return
     end
@@ -354,7 +355,7 @@ local function button(item, x, y, width, height, options)
         background_color = options.background_color,
         accent_width = options.accent_width or 3,
         font = F.medium, text_size = options.text_size or fontSize("body"),
-        text_color = options.text_color, layer = options.layer or 4,
+        text_color = options.text_color, clip = options.clip, layer = options.layer or 4,
     })
 end
 
@@ -603,52 +604,54 @@ local function drawToolbar(state, screenWidth, x, stripY, width, layer)
         local scrollbarW = 18 * ACTIVE_SCALE
         local rowW = math.max(1, innerW - scrollbarW)
         local groups = state.note_groups or {}
-        for slot = 1, 5 do
+        local scrollMax = num(state.note_groups_scroll_max, 0)
+        local scrollPosition = num(state.note_groups_scroll, 0)
+        local rowPitch = rowH + rowGap
+        local scrollRemainder = scrollPosition % rowPitch
+        local listHeight = 5 * rowH + 4 * rowGap
+        local listBottom = listTop + listHeight
+        local listClip = { left = innerX, top = listTop, right = innerX + rowW, bottom = listBottom }
+        for slot = 1, 6 do
             local item = groups[slot]
-            local rowY = listTop + (slot - 1) * (rowH + rowGap)
-            if item then
-                button(item, innerX, rowY, rowW, rowH, {
-                    layer = (layer or 4) + 3, text_size = fontSize("small"),
-                    variant = item.primary_active == true and "primary" or "secondary",
-                })
-                local heading = tostring(item.header or "")
-                local description = tostring(item.description or "")
-                local groupTextColor = item.primary_active == true and C.primary_text or C.text
-                draw.text(fittedMeasuredText(heading, rowW - 14 * ACTIVE_SCALE, fontSize("body"), F.medium), {
-                    x = innerX + 10 * ACTIVE_SCALE, y = rowY + 15 * ACTIVE_SCALE,
-                    size = fontSize("body"), color = groupTextColor, font = F.medium, anchor = "left",
-                    layer = (layer or 4) + 5 })
-                draw.text(fittedMeasuredText(description, rowW - 14 * ACTIVE_SCALE, fontSize("small"), F.regular), {
-                    x = innerX + 10 * ACTIVE_SCALE, y = rowY + 36 * ACTIVE_SCALE,
-                    size = fontSize("small"), color = groupTextColor, font = F.regular, anchor = "left",
-                    layer = (layer or 4) + 5 })
-            else
-                draw.rect({ x = innerX, y = rowY, width = rowW, height = rowH,
-                    color = C.button, alpha = 0.48, layer = (layer or 4) + 2 })
-                if slot == 1 and #groups == 0 then
-                    draw.text("NO GROUPS YET", { x = innerX + rowW * 0.5, y = rowY + rowH * 0.5,
-                        size = fontSize("small"), color = C.muted, font = F.regular, anchor = "center",
-                        layer = (layer or 4) + 4 })
+            local rowY = listTop + (slot - 1) * rowPitch - scrollRemainder
+            local rowBottom = rowY + rowH
+            if rowBottom > listTop and rowY < listBottom then
+                if item then
+                    button(item, innerX, rowY, rowW, rowH, {
+                        layer = (layer or 4) + 3, text_size = fontSize("small"),
+                        variant = item.primary_active == true and "primary" or "secondary",
+                        clip = listClip,
+                    })
+                    local heading = tostring(item.header or "")
+                    local description = tostring(item.description or "")
+                    local groupTextColor = item.primary_active == true and C.primary_text or C.text
+                    draw.text(fittedMeasuredText(heading, rowW - 14 * ACTIVE_SCALE, fontSize("body"), F.medium), {
+                        x = innerX + 10 * ACTIVE_SCALE, y = rowY + 15 * ACTIVE_SCALE,
+                        size = fontSize("body"), color = groupTextColor, font = F.medium, anchor = "left",
+                        clip = listClip, layer = (layer or 4) + 5 })
+                    draw.text(fittedMeasuredText(description, rowW - 14 * ACTIVE_SCALE, fontSize("small"), F.regular), {
+                        x = innerX + 10 * ACTIVE_SCALE, y = rowY + 36 * ACTIVE_SCALE,
+                        size = fontSize("small"), color = groupTextColor, font = F.regular, anchor = "left",
+                        clip = listClip, layer = (layer or 4) + 5 })
+                else
+                    draw.rect({ x = innerX, y = rowY, width = rowW, height = rowH,
+                        color = C.button, alpha = 0.48, clip = listClip, layer = (layer or 4) + 2 })
+                    if slot == 1 and #groups == 0 then
+                        draw.text("NO GROUPS YET", { x = innerX + rowW * 0.5, y = rowY + rowH * 0.5,
+                            size = fontSize("small"), color = C.muted, font = F.regular, anchor = "center",
+                            clip = listClip, layer = (layer or 4) + 4 })
+                    end
                 end
             end
         end
 
-        local scrollMax = num(state.note_groups_scroll_max, 0)
         if scrollMax > 0 then
             local barX = innerX + innerW - 9 * ACTIVE_SCALE
-            local barY = listTop
-            local barH = 5 * rowH + 4 * rowGap
-            local thumbH = math.max(24 * ACTIVE_SCALE, barH * 5 / (5 + scrollMax))
-            thumbH = math.min(barH, thumbH)
-            local thumbTravel = math.max(0, barH - thumbH)
-            local thumbY = barY + thumbTravel * num(state.note_groups_scroll, 0) / scrollMax
-            draw.rect({ x = barX, y = barY, width = 6 * ACTIVE_SCALE, height = barH,
-                color = C.button, layer = (layer or 4) + 4 })
-            draw.rect({ x = barX, y = thumbY, width = 6 * ACTIVE_SCALE, height = thumbH,
-                color = C.accent, layer = (layer or 4) + 5 })
-            ui.slider({ id = "editor_note_groups_scrollbar", x = barX - 6 * ACTIVE_SCALE, y = barY,
-                width = 18 * ACTIVE_SCALE, height = barH, min = 0, max = scrollMax, step = 1,
-                axis = "vertical", action = "editor.note_groups.scroll_to" })
+            Scroll.draw_bar({ id = "editor_note_groups_scrollbar", x = barX, y = listTop,
+                width = 6 * ACTIVE_SCALE, height = listHeight, position = scrollPosition,
+                maximum = scrollMax, content_extent = listHeight + scrollMax,
+                visible_extent = listHeight, minimum_thumb = 24 * ACTIVE_SCALE,
+                track_color = C.button, thumb_color = C.accent, layer = (layer or 4) + 4 })
         end
 
         local actions = state.note_group_actions or {}
@@ -776,40 +779,44 @@ local function drawProblems(state, x, y, width, layer)
             font = F.medium, text_size = fontSize("small"), layer = (layer or 4) + 3 })
     end
     if expanded then
-        for slot = 1, rowCount do
+        local barY = y + 94 * ACTIVE_SCALE
+        local rowPitch = problemRowHeight + rowGap
+        local listHeight = math.max(1, rowCount * rowPitch - rowGap)
+        local listBottom = barY + listHeight
+        local scrollMax = num(state.problems_scroll_max, 0)
+        local scrollPosition = num(state.problems_scroll, 0)
+        local rowPitch = problemRowHeight + rowGap
+        local scrollRemainder = scrollPosition % rowPitch
+        local listClip = { left = x + 10 * ACTIVE_SCALE, top = barY,
+            right = x + width - 28 * ACTIVE_SCALE, bottom = listBottom }
+        for slot = 1, rowCount + 1 do
             local issue = rows[slot]
-            if issue then
-                local rowX = x + 10 * ACTIVE_SCALE
-                local rowY = y + 94 * ACTIVE_SCALE + (slot - 1) * (problemRowHeight + rowGap)
+            local rowX = x + 10 * ACTIVE_SCALE
+            local rowY = barY + (slot - 1) * rowPitch - scrollRemainder
+            local rowBottom = rowY + problemRowHeight
+            if issue and rowBottom > barY and rowY < listBottom then
                 local rowW = width - 38 * ACTIVE_SCALE
                 UI.draw_button({ id = "editor_problem_" .. tostring(issue.index),
                     x = rowX, y = rowY, width = rowW, height = problemRowHeight,
                     action = "editor.problems.row", value = issue.index, label = "",
                     variant = "secondary", accent = true,
-                    accent_color = issue.warning and C.accent or C.error, layer = (layer or 4) + 4 })
+                    accent_color = issue.warning and C.accent or C.error,
+                    clip = listClip, layer = (layer or 4) + 4 })
                 draw.text(fittedMeasuredText(issue.label, rowW - 16 * ACTIVE_SCALE,
                     fontSize("small"), F.regular), {
                     x = rowX + 8 * ACTIVE_SCALE, y = rowY + problemRowHeight * 0.5,
                     size = fontSize("small"), color = C.text, font = F.regular,
-                    anchor = "left", layer = (layer or 4) + 6,
+                    anchor = "left", clip = listClip, layer = (layer or 4) + 6,
                 })
             end
         end
-        if num(state.problems_scroll_max, 0) > 0 then
+        if scrollMax > 0 then
             local barX = x + width - 18 * ACTIVE_SCALE
-            local barY = y + 94 * ACTIVE_SCALE
-            local barH = math.max(1, rowCount * (problemRowHeight + rowGap) - rowGap)
-            local scrollMax = num(state.problems_scroll_max, 1)
-            local thumbH = math.max(24 * ACTIVE_SCALE, barH * rowCount / (rowCount + scrollMax))
-            local thumbTravel = math.max(0, barH - thumbH)
-            local thumbY = barY + thumbTravel * num(state.problems_scroll, 0) / scrollMax
-            draw.rect({ x = barX, y = barY, width = 6 * ACTIVE_SCALE, height = barH,
-                color = C.button, layer = (layer or 4) + 4 })
-            draw.rect({ x = barX, y = thumbY, width = 6 * ACTIVE_SCALE, height = thumbH,
-                color = C.accent, layer = (layer or 4) + 5 })
-            ui.slider({ id = "editor_problems_scrollbar", x = barX - 6 * ACTIVE_SCALE, y = barY,
-                width = 18 * ACTIVE_SCALE, height = barH, min = 0, max = scrollMax, step = 1,
-                axis = "vertical", action = "editor.problems.scroll_to" })
+            Scroll.draw_bar({ id = "editor_problems_scrollbar", x = barX, y = barY,
+                width = 6 * ACTIVE_SCALE, height = listHeight, position = scrollPosition,
+                maximum = scrollMax, content_extent = totalRows * rowPitch - rowGap,
+                visible_extent = listHeight, minimum_thumb = 24 * ACTIVE_SCALE,
+                track_color = C.button, thumb_color = C.accent, layer = (layer or 4) + 4 })
         end
     end
 end
@@ -1062,7 +1069,7 @@ end
 -- not shift the value while the user types.
 drawTextField = function(id, value, action, actionValue, x, y, width, height, layer, focused, editable,
     caretOffset, selectionOffset, selectionWidth, measuredTextWidth, centered, wrapValue, caretByteIndex, anchorByteIndex, userText,
-    bbcodeStripOpen, screenWidth, screenHeight)
+    bbcodeStripOpen, screenWidth, screenHeight, clip)
     local display = tostring(value or "")
     local textLeft = x + 10 * ACTIVE_SCALE
     local textLimit = math.max(1, width - 20 * ACTIVE_SCALE)
@@ -1070,31 +1077,31 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     local lineHeight = math.max(16 * ACTIVE_SCALE, textSize * 1.2)
     if not editable then
         draw.rect({ id = id .. "_readonly", x = x, y = y, width = width, height = height,
-            color = C.button, layer = layer })
+            color = C.button, clip = clip, layer = layer })
         if userText and wrapValue then
             local richHeight = draw.measure_user_text_height(display, {
                 font = F.regular, size = textSize, max_width = textLimit,
             })
             draw.user_text(display, { x = textLeft, y = y + (height - richHeight) * 0.5, size = textSize,
                 max_width = textLimit, wrap = true, color = C.muted,
-                font = F.regular, anchor = "top-left", layer = layer + 2 })
+                font = F.regular, anchor = "top-left", clip = clip, layer = layer + 2 })
         elseif userText then
             draw.user_text(display, { x = textLeft, y = y + height * 0.5, size = textSize,
                 max_width = textLimit, color = C.muted,
-                font = F.regular, anchor = "left", layer = layer + 2 })
+                font = F.regular, anchor = "left", clip = clip, layer = layer + 2 })
         elseif wrapValue then
             local lines = wrapMeasuredText(display, textLimit, textSize, F.regular)
             local blockHeight = #lines * lineHeight
             local lineY = y + (height - blockHeight) * 0.5
             for _, line in ipairs(lines) do
                 draw.text(line, { x = textLeft, y = lineY, size = textSize, color = C.muted,
-                    font = F.regular, anchor = "top-left", layer = layer + 2 })
+                    font = F.regular, anchor = "top-left", clip = clip, layer = layer + 2 })
                 lineY = lineY + lineHeight
             end
         else
             draw.text(display, {
                 x = textLeft, y = y + height * 0.5, size = textSize, color = C.muted,
-                font = F.regular, anchor = "left", layer = layer + 2,
+                font = F.regular, anchor = "left", clip = clip, layer = layer + 2,
             })
         end
         return
@@ -1105,7 +1112,7 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
         text_size = textSize, text_color = C.text,
         font = F.medium, background_color = focused and C.selected or C.button,
         accent = focused, selected = focused,
-        action = action, value = actionValue, layer = layer,
+        action = action, value = actionValue, clip = clip, layer = layer,
     })
 
     if wrapValue and focused then
@@ -1133,11 +1140,11 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
                 local selectedWidth = draw.measure_text(selected, { font = F.regular, size = textSize })
                 draw.rect({ x = textLeft + prefixWidth, y = currentY + (lineHeight - textHeight) * 0.5,
                     width = math.max(1, selectedWidth), height = textHeight,
-                    color = C.accent_dim, layer = layer + 1 })
+                    color = C.accent_dim, clip = clip, layer = layer + 1 })
             end
 
             draw.text(line.text, { x = textLeft, y = currentY, size = textSize, color = C.text,
-                font = F.regular, anchor = "top-left", layer = layer + 2 })
+                font = F.regular, anchor = "top-left", clip = clip, layer = layer + 2 })
             if caretByte >= lineStart and caretByte < nextStart then
                 caretLine = lineIndex
                 caretLocalByte = math.max(0, math.min(caretByte, lineEnd) - lineStart)
@@ -1154,7 +1161,7 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
         local caretX = textLeft + draw.measure_text(caretPrefix, { font = F.regular, size = textSize })
         local caretY = lineY + (caretLine - 1) * lineHeight + (lineHeight - textHeight) * 0.5
         draw.rect({ x = caretX, y = caretY, width = 1.5 * ACTIVE_SCALE, height = textHeight,
-            color = C.text, layer = layer + 3 })
+            color = C.text, clip = clip, layer = layer + 3 })
         if bbcodeStripOpen == true and userText == true then
             drawMetaBbCodeContextStrip(caretX, caretY, textHeight, screenWidth or width, screenHeight or height,
                 layer + 10)
@@ -1168,14 +1175,14 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
         })
         draw.user_text(display, { x = textLeft, y = y + (height - richHeight) * 0.5, size = textSize,
             max_width = textLimit, wrap = true, color = C.text,
-            font = F.regular, anchor = "top-left", layer = layer + 2 })
+            font = F.regular, anchor = "top-left", clip = clip, layer = layer + 2 })
         return
     end
 
     if not focused and userText then
         draw.user_text(display, { x = textLeft, y = y + height * 0.5, size = textSize,
             max_width = textLimit, color = C.text,
-            font = F.regular, anchor = "left", layer = layer + 2 })
+            font = F.regular, anchor = "left", clip = clip, layer = layer + 2 })
         return
     end
 
@@ -1185,7 +1192,7 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
         local lineY = y + (height - blockHeight) * 0.5
         for _, line in ipairs(lines) do
             draw.text(line, { x = textLeft, y = lineY, size = textSize, color = C.text,
-                font = F.regular, anchor = "top-left", layer = layer + 2 })
+                font = F.regular, anchor = "top-left", clip = clip, layer = layer + 2 })
             lineY = lineY + lineHeight
         end
         return
@@ -1206,19 +1213,19 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     if focused and selectionWidth > 0 then
         draw.rect({ x = textLeft + selectionOffset, y = textY - textHeight * 0.5,
             width = math.max(1, selectionWidth), height = textHeight,
-            color = C.accent_dim, layer = layer + 1 })
+            color = C.accent_dim, clip = clip, layer = layer + 1 })
     end
     draw.text(display, {
         x = textLeft, y = textY,
         size = textSize, color = C.text,
-        font = F.regular, anchor = "left", layer = layer + 2,
+        font = F.regular, anchor = "left", clip = clip, layer = layer + 2,
     })
     if focused then
         local fallbackCaret = measuredTextWidth
         local caretX = textLeft + clamp(num(caretOffset, fallbackCaret), 0, textLimit)
         local caretY = textY - textHeight * 0.5
         draw.rect({ x = caretX, y = caretY, width = 1.5 * ACTIVE_SCALE, height = textHeight,
-            color = C.text, layer = layer + 3 })
+            color = C.text, clip = clip, layer = layer + 3 })
         if bbcodeStripOpen == true and userText == true then
             drawMetaBbCodeContextStrip(caretX, caretY, textHeight, screenWidth or width, screenHeight or height,
                 layer + 10)
@@ -1226,13 +1233,13 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
     end
 end
 
-local function textField(item, x, y, width, height, layer, wrapValue, screenWidth, screenHeight)
+local function textField(item, x, y, width, height, layer, wrapValue, screenWidth, screenHeight, clip)
     drawTextField("editor_meta_row_" .. tostring(item.index), item.value,
         item.editable and "editor.meta.row" or "editor.block", item.index,
         x, y, width, height, layer, item.editing == true, item.editable == true,
         item.caret_offset, item.selection_offset, item.selection_width, item.text_width, false, wrapValue == true,
         item.caret_byte_index, item.anchor_byte_index, item.user_text == true,
-        item.bbcode_strip_open == true, screenWidth, screenHeight)
+        item.bbcode_strip_open == true, screenWidth, screenHeight, clip)
 end
 
 local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
@@ -1240,8 +1247,13 @@ local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabe
         (item.label == "ALBUM" or
             (item.label == "ALBUM BIG" and item.value ~= "Unsupported by TSTS")) and (68 * scale) or (8 * scale)
     local fieldW = math.max(96 * scale, panelW - padding * 2 - trailing - 22 * scale)
-    local fieldH = 46 * scale
-    if item.kind ~= "toggle" and item.kind ~= "picker" and item.kind ~= "danger" then
+    -- The bank labels live in one shared header row; each data row only needs
+    -- enough height for its single centered value line.
+    local fieldH = item.stats_kind == "combo" and (128 * scale)
+        or item.stats_kind == "bank_header" and (36 * scale)
+        or item.stats_kind == "bank" and (46 * scale)
+        or (46 * scale)
+    if item.stats_kind == nil and item.kind ~= "toggle" and item.kind ~= "picker" and item.kind ~= "danger" then
         local textSize = fontSize("small")
         local textLimit = math.max(1, fieldW - 20 * scale)
         local lineHeight = math.max(16 * scale, textSize * 1.2)
@@ -1286,17 +1298,6 @@ local function metaPrefixHeight(layouts, endExclusive)
     return height
 end
 
-local function metaMaxScrollStart(layouts, contentHeight)
-    local suffixHeight = 0
-    for index = #layouts, 1, -1 do
-        local pitch = layouts[index].pitch
-        if suffixHeight + pitch > contentHeight then
-            return math.max(0, suffixHeight == 0 and index - 1 or index)
-        end
-        suffixHeight = suffixHeight + pitch
-    end
-    return 0
-end
 
 local function drawMeta(state, w, h, layer)
     if state.meta_open ~= true then return end
@@ -1347,13 +1348,133 @@ local function drawMeta(state, w, h, layer)
     local dynamicLayouts, totalRowsHeight = buildMetaRowLayouts(rows, panelW, padding, scale,
         rowLabelH, rowLabelGap, rowGap)
     local contentHeight = math.max(0, contentBottom - contentTop)
-    -- C# computes the same row heights for wheel input and passes the maximum
-    -- scroll start through state, keeping wheel and scrollbar limits in sync.
-    local maxScrollStart = clamp(num(state.meta_scroll_max,
-        metaMaxScrollStart(dynamicLayouts, contentHeight)), 0, math.max(0, #rows - 1))
-    local rowStart = clamp(num(state.meta_scroll, 0), 0, maxScrollStart)
+    local contentClip = { left = x + padding, top = contentTop,
+        right = x + panelW - padding, bottom = contentBottom }
+    -- Metadata rows use the same continuous pixel offset as the shared
+    -- SmoothScrollHandler. Variable-height rows are positioned from their prefix
+    -- heights, allowing the viewport to show partial rows at either edge.
+    local computedMaximum = math.max(0, totalRowsHeight - contentHeight)
+    local maxScrollStart = clamp(num(state.meta_scroll_max, computedMaximum), 0, computedMaximum)
+    local scrollPosition = clamp(num(state.meta_scroll, 0), 0, maxScrollStart)
+    local currentScrollHeight = scrollPosition
 
-    local function drawMetaRow(item, rowY, rowLayout)
+    local function drawMetaBankHeader(item, fieldX, fieldY, fieldW, fieldH, drawLayer, clip)
+        draw.rect({ id = "editor_meta_stats_" .. tostring(item.index), x = fieldX, y = fieldY,
+            width = fieldW, height = fieldH, color = C.button, clip = clip, layer = drawLayer })
+        local columns = item.stats_columns or {}
+        local cellW = fieldW / 3
+        for column = 1, 3 do
+            local columnData = columns[column] or {}
+            local cx = fieldX + (column - 1) * cellW
+            if column > 1 then
+                draw.rect({ x = cx, y = fieldY + 1 * scale, width = math.max(1, scale),
+                    height = math.max(1, fieldH - 2 * scale), color = C.accent_dim,
+                    alpha = 0.75, clip = clip, layer = drawLayer + 1 })
+            end
+            draw.text(tostring(columnData.label or ({ "1K", "2K", "3K" })[column]), {
+                x = cx + cellW * 0.5, y = fieldY + fieldH * 0.5,
+                size = fontSize("small"), color = C.muted, font = F.medium,
+                anchor = "center", clip = clip, layer = drawLayer + 2,
+            })
+        end
+    end
+
+    local function drawMetaBankStats(item, fieldX, fieldY, fieldW, fieldH, drawLayer, clip)
+        draw.rect({ id = "editor_meta_stats_" .. tostring(item.index), x = fieldX, y = fieldY,
+            width = fieldW, height = fieldH, color = C.button, clip = clip, layer = drawLayer })
+        local columns = item.stats_columns or {}
+        local cellW = fieldW / 3
+        for column = 1, 3 do
+            local columnData = columns[column] or {}
+            local cx = fieldX + (column - 1) * cellW
+            if column > 1 then
+                draw.rect({ x = cx, y = fieldY + 1 * scale, width = math.max(1, scale),
+                    height = math.max(1, fieldH - 2 * scale), color = C.accent_dim,
+                    alpha = 0.75, clip = clip, layer = drawLayer + 1 })
+            end
+            draw.text(tostring(columnData.value or "0"), {
+                x = cx + cellW * 0.5, y = fieldY + fieldH * 0.5,
+                size = fontSize("small"), color = C.text, font = F.medium,
+                anchor = "center", clip = clip, layer = drawLayer + 2,
+            })
+        end
+    end
+
+    local function drawMetaComboDistribution(item, fieldX, fieldY, fieldW, fieldH, drawLayer, clip)
+        draw.rect({ id = "editor_meta_stats_combo", x = fieldX, y = fieldY,
+            width = fieldW, height = fieldH, color = C.button, clip = clip, layer = drawLayer })
+        local headerBandHeight = 30 * scale
+        draw.text("INTENDED ROUTE ONLY", {
+            x = fieldX + fieldW - 8 * scale, y = fieldY + headerBandHeight * 0.5,
+            size = fontSize("small"), color = C.muted, font = F.regular,
+            anchor = "right", clip = clip, layer = drawLayer + 2,
+        })
+
+        local items = item.combo_items or {}
+        local total = math.max(0, num(item.combo_total, 0))
+        -- Keep the legend colors fixed so each note type has the same meaning
+        -- in both the distribution bar and its labels.
+        local colors = { "#60A5FA", "#FB923C", "#22B981", "#FACC15", "#A3E635", "#FF4DB8" }
+        local barX = fieldX + 9 * scale
+        local barY = fieldY + headerBandHeight
+        local barW = math.max(1, fieldW - 18 * scale)
+        local barH = math.max(3, 9 * scale)
+        draw.rect({ x = barX, y = barY, width = barW, height = barH,
+            color = C.panel, clip = clip, layer = drawLayer + 1 })
+        if total > 0 then
+            local cursorX = barX
+            local remaining = barW
+            local visible = {}
+            for index = 1, #items do
+                if num(items[index].count, 0) > 0 then visible[#visible + 1] = index end
+            end
+            for visibleIndex, itemIndex in ipairs(visible) do
+                local itemWidth = visibleIndex == #visible and remaining or
+                    math.floor(barW * num(items[itemIndex].count, 0) / total + 0.5)
+                itemWidth = clamp(itemWidth, 0, remaining)
+                if itemWidth > 0 then
+                    draw.rect({ x = cursorX, y = barY, width = itemWidth, height = barH,
+                        color = colors[itemIndex], clip = clip, layer = drawLayer + 2 })
+                end
+                cursorX = cursorX + itemWidth
+                remaining = remaining - itemWidth
+            end
+        end
+
+        local horizontalPadding = 8 * scale
+        local columnGap = 6 * scale
+        local itemW = (fieldW - horizontalPadding * 2 - columnGap) / 2
+        local itemH = 24 * scale
+        local rowGap = 3 * scale
+        local swatchSize = 7 * scale
+        local swatchGap = 6 * scale
+        local textPaddingRight = 8 * scale
+        for index, comboItem in ipairs(items) do
+            local column = (index - 1) % 2
+            local row = math.floor((index - 1) / 2)
+            local ix = fieldX + horizontalPadding + column * (itemW + columnGap)
+            local iy = fieldY + 44 * scale + row * (itemH + rowGap)
+            -- Each legend entry gets its own padded surface. Text and swatch
+            -- share the same vertical center instead of relying on fixed offsets.
+            draw.rect({ x = ix, y = iy, width = itemW, height = itemH,
+                color = C.panel, alpha = 0.9, clip = clip, layer = drawLayer + 1 })
+            draw.rect({ x = ix + 8 * scale, y = iy + (itemH - swatchSize) * 0.5,
+                width = swatchSize, height = swatchSize,
+                color = colors[index] or C.accent, clip = clip, layer = drawLayer + 2 })
+            local count = num(comboItem.count, 0)
+            local percent = total > 0 and (count * 100 / total) or 0
+            local summary = string.format("%s  %s  (%.1f%%)", tostring(comboItem.label or ""),
+                tostring(count), percent)
+            local textX = ix + 8 * scale + swatchSize + swatchGap
+            local textWidth = math.max(1, itemW - (textX - ix) - textPaddingRight)
+            summary = fittedMeasuredText(summary, textWidth, fontSize("small"), F.regular)
+            draw.text(summary, { x = textX, y = iy + itemH * 0.5,
+                size = fontSize("small"), color = C.text, font = F.regular,
+                anchor = "left", clip = clip, layer = drawLayer + 3 })
+        end
+    end
+
+    local function drawMetaRow(item, rowY, rowLayout, clip)
         if not item then return end
         local wrapValue = rowLayout ~= nil
         if not rowLayout then
@@ -1362,23 +1483,29 @@ local function drawMeta(state, w, h, layer)
                     (item.label == "ALBUM BIG" and item.value ~= "Unsupported by TSTS")) and (68 * scale) or (8 * scale)
             rowLayout = { fieldW = math.max(96 * scale, panelW - padding * 2 - trailing - 22 * scale), fieldH = baseFieldH }
         end
-        label(item.label, x + padding, rowY, fontSize("small"), C.muted, nil, (layer or 100) + 4)
+        label(item.label, x + padding, rowY, fontSize("small"), C.muted, nil, (layer or 100) + 4, nil, clip)
         local fieldY = rowY + rowLabelH + rowLabelGap
         local fieldX = x + padding
         local fieldW = rowLayout.fieldW
         local fieldH = rowLayout.fieldH
-        if item.kind == "danger" then
+        if item.stats_kind == "combo" then
+            drawMetaComboDistribution(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, clip)
+        elseif item.stats_kind == "bank_header" then
+            drawMetaBankHeader(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, clip)
+        elseif item.stats_kind == "bank" then
+            drawMetaBankStats(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, clip)
+        elseif item.kind == "danger" then
             if state.meta_delete_enabled == true then
                 UI.draw_button({ id = "editor_meta_delete_difficulty", x = fieldX, y = fieldY,
                     width = fieldW, height = fieldH, label = item.label,
                     action = "editor.meta.delete_confirm", variant = "danger", accent = false,
-                    font = F.medium, text_size = fontSize("small"), layer = (layer or 100) + 8 })
+                    font = F.medium, text_size = fontSize("small"), clip = clip, layer = (layer or 100) + 8 })
             else
                 draw.rect({ id = "editor_meta_delete_difficulty_disabled", x = fieldX, y = fieldY,
-                    width = fieldW, height = fieldH, color = C.button, alpha = 0.65, layer = (layer or 100) + 8 })
+                    width = fieldW, height = fieldH, color = C.button, alpha = 0.65, clip = clip, layer = (layer or 100) + 8 })
                 draw.text(item.label, { x = fieldX + fieldW * 0.5, y = fieldY + fieldH * 0.5,
                     size = fontSize("small"), color = C.muted, font = F.regular,
-                    anchor = "center", layer = (layer or 100) + 9 })
+                    anchor = "center", clip = clip, layer = (layer or 100) + 9 })
             end
         elseif item.kind == "toggle" or item.kind == "picker" then
             local isElementPicker = item.label == "ELEMENT"
@@ -1395,29 +1522,29 @@ local function drawMeta(state, w, h, layer)
                 accent_hover_color = isElementPicker and item.element_hover_color or nil,
                 background_color = isElementPicker and C.button or nil,
                 font = (not isElementPicker and item.selected) and F.medium or F.regular,
-                text_size = fontSize("small"), layer = (layer or 100) + 5 })
+                text_size = fontSize("small"), clip = clip, layer = (layer or 100) + 5 })
         else
-            textField(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, wrapValue, w, h)
+            textField(item, fieldX, fieldY, fieldW, fieldH, (layer or 100) + 5, wrapValue, w, h, clip)
         end
         if item.label == "PREVIEW" then
             UI.draw_button({ id = "editor_meta_preview_edit", x = x + panelW - 130 * scale, y = fieldY,
                 width = 58 * scale, height = fieldH, label = "EDIT",
                 action = "editor.meta.preview_edit", font = F.medium, text_size = fontSize("small"),
-                layer = (layer or 100) + 7 })
+                clip = clip, layer = (layer or 100) + 7 })
             UI.draw_button({ id = "editor_meta_preview_play", x = x + panelW - 64 * scale, y = fieldY,
                 width = 58 * scale, height = fieldH, label = state.meta_preview_playing and "STOP" or "PLAY",
                 action = "editor.meta.preview_play", font = F.medium, text_size = fontSize("small"),
-                layer = (layer or 100) + 7 })
+                clip = clip, layer = (layer or 100) + 7 })
         elseif item.label == "ALBUM" then
             UI.draw_button({ id = "editor_meta_album", x = x + panelW - 70 * scale, y = fieldY,
                 width = 58 * scale, height = fieldH, label = "PICK",
                 action = "editor.meta.media_album", font = F.medium, text_size = fontSize("small"),
-                layer = (layer or 100) + 7 })
+                clip = clip, layer = (layer or 100) + 7 })
         elseif item.label == "ALBUM BIG" and item.value ~= "Unsupported by TSTS" then
             UI.draw_button({ id = "editor_meta_album_big", x = x + panelW - 70 * scale, y = fieldY,
                 width = 58 * scale, height = fieldH, label = "PICK",
                 action = "editor.meta.media_album_big", font = F.medium, text_size = fontSize("small"),
-                layer = (layer or 100) + 7 })
+                clip = clip, layer = (layer or 100) + 7 })
         end
     end
 
@@ -1652,33 +1779,24 @@ local function drawMeta(state, w, h, layer)
             drawAlbumCard(album, x + padding, innerWidth, "editor_meta_album", "editor.meta.media_album")
         end
     else
-        local rowY = contentTop
-        for index = rowStart + 1, #rows do
+        for index = 1, #rows do
+            local rowY = contentTop + metaPrefixHeight(dynamicLayouts, index - 1) - currentScrollHeight
             if rowY >= contentBottom then break end
             local item = rows[index]
             local rowLayout = dynamicLayouts[index]
-            if index > rowStart + 1 and rowY + rowLayout.pitch > contentBottom then break end
-            drawMetaRow(item, rowY, rowLayout)
-            rowY = rowY + rowLayout.pitch
+            local rowBottom = rowY + rowLayout.pitch
+            if rowBottom > contentTop and rowY < contentBottom then
+                drawMetaRow(item, rowY, rowLayout, contentClip)
+            end
         end
 
         if maxScrollStart > 0 and contentHeight > 0 then
             local barX = x + panelW - padding - 10 * scale
-            local barY = contentTop
-            local barH = math.max(1, contentHeight)
-            local thumbH = math.max(30 * scale, barH * contentHeight / math.max(1, totalRowsHeight))
-            thumbH = math.min(barH, thumbH)
-            local thumbTravel = math.max(0, barH - thumbH)
-            local currentScrollHeight = metaPrefixHeight(dynamicLayouts, rowStart)
-            local maxScrollHeight = math.max(1, metaPrefixHeight(dynamicLayouts, maxScrollStart))
-            local thumbY = barY + thumbTravel * clamp(currentScrollHeight / maxScrollHeight, 0, 1)
-            draw.rect({ x = barX + 4 * scale, y = barY, width = 5 * scale, height = barH,
-                color = C.button, layer = (layer or 100) + 6 })
-            draw.rect({ x = barX + 4 * scale, y = thumbY, width = 5 * scale, height = thumbH,
-                color = C.accent, layer = (layer or 100) + 7 })
-            ui.slider({ id = "editor_meta_scrollbar", x = barX, y = barY,
-                width = 14 * scale, height = barH, min = 0, max = maxScrollStart, step = 1,
-                axis = "vertical", action = "editor.meta.scroll_to" })
+            Scroll.draw_bar({ id = "editor_meta_scrollbar", x = barX + 4 * scale, y = contentTop,
+                width = 5 * scale, height = contentHeight, position = scrollPosition,
+                maximum = maxScrollStart, content_extent = totalRowsHeight,
+                visible_extent = contentHeight, minimum_thumb = 30 * scale,
+                track_color = C.button, thumb_color = C.accent, layer = (layer or 100) + 6 })
         end
     end
 
@@ -1710,26 +1828,29 @@ local function drawMeta(state, w, h, layer)
     -- the last registered overlapping control priority.
     if state.meta_element_open == true then
         local rows = state.meta_rows or {}
-        local rowStart = clamp(num(state.meta_scroll, 0), 0, maxScrollStart)
-        for index = rowStart + 1, #rows do
+        for index = 1, #rows do
             local item = rows[index]
-            local rowY = contentTop + metaPrefixHeight(dynamicLayouts, index - 1) - metaPrefixHeight(dynamicLayouts, rowStart)
+            local rowY = contentTop + metaPrefixHeight(dynamicLayouts, index - 1) - currentScrollHeight
             if rowY >= contentBottom then break end
             if item and item.label == "ELEMENT" then
                 local rowLayout = dynamicLayouts[index]
-                local fieldY = rowY + rowLabelH + rowLabelGap
-                local fieldX = x + padding
-                local fieldW = rowLayout.fieldW
-                local fieldH = rowLayout.fieldH
-                local options = state.meta_element_options or {}
-                local elementGap = 4 * scale
-                for optionIndex, option in ipairs(options) do
-                    button(option, fieldX,
-                        fieldY + fieldH + 2 * scale + (optionIndex - 1) * (28 * scale + elementGap),
-                        fieldW, 28 * scale,
-                        { layer = (layer or 100) + 12, text_size = fontSize("small"), hit_test_priority = 50,
-                          variant = "secondary", selected_visual = false, background_color = C.button,
-                          accent_color = option.element_color, accent_hover_color = option.element_hover_color })
+                -- Keep the dropdown attached to its field, but do not let it
+                -- escape the scroll viewport while its row is only partly visible.
+                if rowY >= contentTop and rowY + rowLayout.pitch <= contentBottom then
+                    local fieldY = rowY + rowLabelH + rowLabelGap
+                    local fieldX = x + padding
+                    local fieldW = rowLayout.fieldW
+                    local fieldH = rowLayout.fieldH
+                    local options = state.meta_element_options or {}
+                    local elementGap = 4 * scale
+                    for optionIndex, option in ipairs(options) do
+                        button(option, fieldX,
+                            fieldY + fieldH + 2 * scale + (optionIndex - 1) * (28 * scale + elementGap),
+                            fieldW, 28 * scale,
+                            { layer = (layer or 100) + 12, text_size = fontSize("small"), hit_test_priority = 50,
+                              variant = "secondary", selected_visual = false, background_color = C.button,
+                              accent_color = option.element_color, accent_hover_color = option.element_hover_color })
+                    end
                 end
                 break
             end
