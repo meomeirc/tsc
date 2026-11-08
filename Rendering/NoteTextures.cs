@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Xna.Framework.Graphics;
 
 namespace TSC.Rendering;
@@ -8,6 +9,13 @@ public sealed class NoteTextures : IDisposable
     private readonly Dictionary<string, Texture2D?> _textures = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _textureDirectory;
     private readonly string? _fallbackTextureDirectory;
+    private readonly Queue<(string Variant, int FrameNumber, string Key)> _pendingHitFrames = new();
+    private readonly HashSet<string> _pendingHitFrameKeys = new(StringComparer.OrdinalIgnoreCase);
+    private long _hitPreloadStartedTimestamp;
+    private double _hitPreloadProcessingMilliseconds;
+    private long _hitPreloadAllocatedBytes;
+    private int _hitPreloadRequestedFrames;
+    private int _hitPreloadCompletedFrames;
 
     private static readonly (string Key, string RelativePath)[] TextureFiles =
     {
@@ -107,7 +115,9 @@ public sealed class NoteTextures : IDisposable
         return texture;
     }
 
-    public void PreloadHitAnimations(params (string Variant, int FrameCount)[] animations)
+    public int PendingHitAnimationFrames => _pendingHitFrames.Count;
+
+    public void QueueHitAnimationPreload(params (string Variant, int FrameCount)[] animations)
     {
         foreach (var (variant, frameCount) in animations)
         {
@@ -116,8 +126,72 @@ public sealed class NoteTextures : IDisposable
 
             var count = Math.Max(0, frameCount);
             for (var frame = 1; frame <= count; frame++)
-                _ = GetHitFrame(variant, frame);
+            {
+                var key = $"hit-{variant}-{frame:0000}";
+                if (_textures.ContainsKey(key) || !_pendingHitFrameKeys.Add(key))
+                    continue;
+
+                if (_pendingHitFrames.Count == 0 && _hitPreloadStartedTimestamp == 0)
+                {
+                    _hitPreloadProcessingMilliseconds = 0;
+                    _hitPreloadAllocatedBytes = 0;
+                    _hitPreloadRequestedFrames = 0;
+                    _hitPreloadCompletedFrames = 0;
+                }
+
+                _pendingHitFrames.Enqueue((variant, frame, key));
+                _hitPreloadRequestedFrames++;
+            }
         }
+    }
+
+    /// <summary>
+    /// Performs a small amount of GPU texture creation on the game thread. This
+    /// lets gameplay's existing opaque warm-up absorb hit-effect uploads instead
+    /// of blocking the initial Playfield constructor for the entire set.
+    /// </summary>
+    public int ProcessPendingHitAnimationPreload(int maxFrames = 3, double budgetMilliseconds = 10.0)
+    {
+        if (_pendingHitFrames.Count == 0 || maxFrames <= 0)
+            return 0;
+
+        var started = Stopwatch.GetTimestamp();
+        if (_hitPreloadStartedTimestamp == 0)
+            _hitPreloadStartedTimestamp = started;
+        var allocatedAtStart = GC.GetAllocatedBytesForCurrentThread();
+        var processed = 0;
+        while (_pendingHitFrames.Count > 0 && processed < maxFrames)
+        {
+            var (variant, frameNumber, key) = _pendingHitFrames.Dequeue();
+            _pendingHitFrameKeys.Remove(key);
+            if (!_textures.ContainsKey(key))
+                _ = GetHitFrame(variant, frameNumber);
+
+            processed++;
+            if (budgetMilliseconds > 0 && processed > 0 &&
+                Stopwatch.GetElapsedTime(started).TotalMilliseconds >= budgetMilliseconds)
+                break;
+        }
+
+        _hitPreloadCompletedFrames += processed;
+        _hitPreloadProcessingMilliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        _hitPreloadAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocatedAtStart;
+        if (_pendingHitFrames.Count == 0 && _hitPreloadStartedTimestamp > 0)
+        {
+            var elapsedMs = Stopwatch.GetElapsedTime(_hitPreloadStartedTimestamp).TotalMilliseconds;
+            Program.LogRuntime(
+                $"LOAD_TIMING stage=hit_animation_texture_preload elapsedMs={elapsedMs:0.00} " +
+                $"processingMs={_hitPreloadProcessingMilliseconds:0.00} " +
+                $"requestedFrames={_hitPreloadRequestedFrames} processedFrames={_hitPreloadCompletedFrames} " +
+                $"allocatedBytes={_hitPreloadAllocatedBytes}");
+            _hitPreloadStartedTimestamp = 0;
+            _hitPreloadProcessingMilliseconds = 0;
+            _hitPreloadAllocatedBytes = 0;
+            _hitPreloadRequestedFrames = 0;
+            _hitPreloadCompletedFrames = 0;
+        }
+
+        return processed;
     }
 
     public Texture2D? GetComboDigit(int digit)
@@ -182,7 +256,7 @@ public sealed class NoteTextures : IDisposable
             try
             {
                 using var stream = File.OpenRead(path);
-                return (Texture2D.FromStream(_graphics, stream), null, null);
+                return (NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Gameplay), null, null);
             }
             catch (Exception ex)
             {
@@ -201,5 +275,12 @@ public sealed class NoteTextures : IDisposable
         foreach (var texture in _textures.Values)
             texture?.Dispose();
         _textures.Clear();
+        _pendingHitFrames.Clear();
+        _pendingHitFrameKeys.Clear();
+        _hitPreloadStartedTimestamp = 0;
+        _hitPreloadProcessingMilliseconds = 0;
+        _hitPreloadAllocatedBytes = 0;
+        _hitPreloadRequestedFrames = 0;
+        _hitPreloadCompletedFrames = 0;
     }
 }

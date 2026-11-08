@@ -48,12 +48,23 @@ local function merge_theme(defaults, overrides)
         end
     end
     for key, override_value in pairs(overrides or {}) do
-        if merged[key] == nil then merged[key] = override_value end
+        if merged[key] == nil then
+            -- Preserve deep-copy semantics for override-only tables too; this
+            -- keeps the merged configuration independent of imported modules.
+            merged[key] = type(override_value) == "table"
+                and merge_theme({}, override_value)
+                or override_value
+        end
     end
     return merged
 end
 
-local UI = merge_theme(merge_theme(fallback_theme, imported_theme_defaults), theme_overrides)
+local base_theme = merge_theme(fallback_theme, imported_theme_defaults)
+-- The Default ui/theme.lua returns the exact cached ui/themeDefaults table.
+-- Merging that same table a second time only clones the entire theme again.
+local UI = theme_overrides == imported_theme_defaults
+    and base_theme
+    or merge_theme(base_theme, theme_overrides)
 
 -- Component files extend the shared theme table. import() itself tries a
 -- selected-skin override first and the Default counterpart when an override

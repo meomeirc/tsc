@@ -493,15 +493,17 @@ public sealed partial class Playfield
             _editorInactiveBankRenderTarget.Height != height)
         {
             _editorInactiveBankRenderTarget?.Dispose();
-            _editorInactiveBankRenderTarget = new RenderTarget2D(
-                _graphics,
-                width,
-                height,
-                false,
-                SurfaceFormat.Color,
-                DepthFormat.None,
-                0,
-                RenderTargetUsage.DiscardContents);
+            _editorInactiveBankRenderTarget = NativeResourceDiagnostics.TrackTexture(
+                new RenderTarget2D(
+                    _graphics,
+                    width,
+                    height,
+                    false,
+                    SurfaceFormat.Color,
+                    DepthFormat.None,
+                    0,
+                    RenderTargetUsage.DiscardContents),
+                NativeResourceCategory.Editor);
         }
 
         var mainViewport = _graphics.Viewport;
@@ -561,27 +563,28 @@ public sealed partial class Playfield
             return;
 
         _gameplayRenderTarget?.Dispose();
-        _gameplayRenderTarget = new RenderTarget2D(
-            _graphics,
-            width,
-            height,
-            false,
-            SurfaceFormat.Color,
-            DepthFormat.None,
-            0,
-            preserveContents ? RenderTargetUsage.PreserveContents : RenderTargetUsage.DiscardContents);
+        _gameplayRenderTarget = NativeResourceDiagnostics.TrackTexture(
+            new RenderTarget2D(
+                _graphics,
+                width,
+                height,
+                false,
+                SurfaceFormat.Color,
+                DepthFormat.None,
+                0,
+                preserveContents ? RenderTargetUsage.PreserveContents : RenderTargetUsage.DiscardContents),
+            NativeResourceCategory.Gameplay);
         _gameplayRenderTargetPreservesContents = preserveContents;
     }
 
     private void WarmFeedbackRenderingIfNeeded()
     {
-        if (_feedbackRenderWarmupDone)
+        if (_feedbackRenderWarmupDone || _textures.PendingHitAnimationFrames > 0)
             return;
 
-        // Hit textures are preloaded at chart/skin load, but the first SpriteBatch
-        // submission can still initialize its internal batch/shader state. Do that
-        // before gameplay reaches the first judgement, so the audio/hit moment is
-        // not the first time this rendering path is exercised.
+        // Hit textures are prepared in batches during the hidden startup warm-up.
+        // The first SpriteBatch submission can still initialize its internal
+        // batch/shader state, so exercise that path before the first judgement.
         var textures = new List<Texture2D>();
         foreach (var (variant, frameCount) in new[]
                  {

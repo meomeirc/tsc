@@ -252,13 +252,14 @@ public sealed class WavSoundEffect : IDisposable
 
     private void RecreateNativeResources()
     {
-        var effect = new SoundEffect(_pcm16, _sampleRate, _channels);
+        var effect = NativeResourceDiagnostics.TrackAudioBuffer(
+            new SoundEffect(_pcm16, _sampleRate, _channels), _pcm16.LongLength, NativeAudioCategory.SoundEffects);
         var voices = new SoundEffectInstance[VoiceCount];
         try
         {
             for (var i = 0; i < voices.Length; i++)
             {
-                voices[i] = effect.CreateInstance();
+                voices[i] = NativeResourceDiagnostics.TrackAudioInstance(effect.CreateInstance(), NativeAudioCategory.SoundEffects);
                 voices[i].IsLooped = false;
                 voices[i].Volume = 1f;
             }
@@ -267,9 +268,9 @@ public sealed class WavSoundEffect : IDisposable
         {
             foreach (var voice in voices)
             {
-                try { voice?.Dispose(); } catch { }
+                try { if (voice is not null) { NativeResourceDiagnostics.Release(voice); voice.Dispose(); } } catch { }
             }
-            try { effect.Dispose(); } catch { }
+            try { NativeResourceDiagnostics.Release(effect); effect.Dispose(); } catch { }
             throw;
         }
 
@@ -283,10 +284,10 @@ public sealed class WavSoundEffect : IDisposable
         foreach (var voice in _voices)
         {
             try { voice.Stop(); } catch { }
-            try { voice.Dispose(); } catch { }
+            try { NativeResourceDiagnostics.Release(voice); voice.Dispose(); } catch { }
         }
         _voices = Array.Empty<SoundEffectInstance>();
-        try { _effect?.Dispose(); } catch { }
+        try { if (_effect is not null) { NativeResourceDiagnostics.Release(_effect); _effect.Dispose(); } } catch { }
         _effect = null;
         _nextVoice = 0;
     }

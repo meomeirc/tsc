@@ -146,6 +146,14 @@ public sealed class Game1 : Game
     private double _transitionElapsed;
     private double _transitionProgress;
     private double _transitionDuration;
+    // Transition updates are gated to frames that were actually drawn. With
+    // fixed-step updates, ElapsedGameTime can represent the configured update
+    // interval rather than the time between those drawn frames (especially when
+    // the FPS cap is above the display refresh rate). Use a monotonic clock for
+    // transition progress so its duration is independent of the update cap.
+    private long _transitionLastClockTimestamp;
+    private long _transitionStartedTimestamp;
+    private long _transitionTargetLoadStartedTimestamp;
     private bool _transitionLoadPending;
     private bool _transitionTargetReady;
     private bool _transitionFrameDrawnSinceUpdate;
@@ -257,6 +265,7 @@ public sealed class Game1 : Game
     protected override void LoadContent()
     {
         _font = Content.Load<SpriteFont>("DefaultFont");
+        NativeResourceDiagnostics.TrackTexture(_font.Texture, NativeResourceCategory.Font);
         // Build the glyph atlas at 24pt for cleaner downsampling, but keep every
         // C#-drawn menu/editor label at the original 16pt logical size. Registered
         // fonts default to 1:1 sizing, so explicitly restore the built-in font's scale.
@@ -266,7 +275,7 @@ public sealed class Game1 : Game
         _skinSparklesEffect = Content.Load<Effect>("SkinSparkles");
         _skinQuad3DEffect = Content.Load<Effect>("SkinQuad3D");
         _startupSpriteBatch = new SpriteBatch(GraphicsDevice);
-        _startupPixel = new Texture2D(GraphicsDevice, 1, 1);
+        _startupPixel = NativeResourceDiagnostics.TrackTexture(new Texture2D(GraphicsDevice, 1, 1), NativeResourceCategory.Core);
         _startupPixel.SetData(new[] { Color.White });
         Window.TextInput += HandleTextInput;
     }
@@ -439,7 +448,18 @@ public sealed class Game1 : Game
         }
 
         if (inputActive && !textTyping && keyboard.IsKeyDown(Keys.F11) && !_previousKeyboard.IsKeyDown(Keys.F11))
+        {
+#if DEBUG
+            // In Debug gameplay, F11 belongs to the auxiliary-track diagnostic.
+            // Keep Shift+F11 as the window-mode shortcut while the Playfield owns
+            // the unmodified F11 key. Other screens keep the normal F11 behavior.
+            var shiftDown = keyboard.IsKeyDown(Keys.LeftShift) || keyboard.IsKeyDown(Keys.RightShift);
+            if (_startupScreen != StartupScreen.Gameplay || shiftDown)
+                ToggleWindowMode();
+#else
             ToggleWindowMode();
+#endif
+        }
 
         if (_startupScreen == StartupScreen.Gameplay)
         {
@@ -3285,16 +3305,23 @@ public sealed class Game1 : Game
         _transitionFromScreen = from;
         _transitionToScreen = to;
         _transitionReason = reason ?? string.Empty;
+        _transitionStartedTimestamp = Stopwatch.GetTimestamp();
+        _transitionTargetLoadStartedTimestamp = 0;
         _transitionTargetLoader = targetLoader;
         _transitionTargetCommit = targetCommit;
         _transitionTargetStarted = false;
         _transitionElapsed = 0.0;
         _transitionProgress = 0.0;
         _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("out", 0.35));
+        Program.LogRuntime(
+            $"TRANSITION_BEGIN from={_transitionFromScreen.ToString().ToLowerInvariant()} " +
+            $"to={_transitionToScreen.ToString().ToLowerInvariant()} reason={_transitionReason} " +
+            $"outDurationMs={_transitionDuration * 1000.0:0.00}");
         _transitionLoadPending = false;
         _transitionTargetReady = false;
         _transitionError = null;
         _transitionPhase = TransitionPhase.Out;
+        ResetTransitionClock();
         UpdateTransitionRuntimeState();
     }
 
@@ -3318,27 +3345,53 @@ public sealed class Game1 : Game
 
     }
 
+    private void ResetTransitionClock()
+    {
+        _transitionLastClockTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    private double GetTransitionClockDeltaSeconds(GameTime gameTime)
+    {
+        var now = Stopwatch.GetTimestamp();
+        var previous = _transitionLastClockTimestamp;
+        _transitionLastClockTimestamp = now;
+
+        if (previous <= 0)
+            return Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
+
+        var elapsed = Stopwatch.GetElapsedTime(previous, now).TotalSeconds;
+        if (!double.IsFinite(elapsed) || elapsed < 0.0)
+            return 0.0;
+
+        // Native dialogs and debugger pauses must not consume the transition.
+        // Unlike the old 50 ms clamp, this still preserves the full elapsed time
+        // at low refresh rates (for example, 30 Hz or 24 Hz).
+        return elapsed > 0.25 ? 0.0 : elapsed;
+    }
+
     private void UpdateTransition(GameTime gameTime)
     {
         if (!_transitionFrameDrawnSinceUpdate)
             return;
         _transitionFrameDrawnSinceUpdate = false;
 
+        // The transition advances once per actually drawn frame. Measure the
+        // wall-clock interval between those frames rather than using the fixed
+        // update step, which can be much shorter than a display frame when the
+        // configured FPS limit exceeds the monitor refresh rate.
+        var dt = GetTransitionClockDeltaSeconds(gameTime);
+
         if (_transitionRuntime is null || !_transitionRuntime.IsLoaded)
         {
             if (_transitionPhase != TransitionPhase.None && _transitionReason == "chart_editor_load")
             {
-                UpdateFallbackChartEditorTransition(gameTime);
+                UpdateFallbackChartEditorTransition(dt);
                 return;
             }
 
             _transitionPhase = TransitionPhase.None;
             return;
         }
-
-        // Ignore long pauses (such as returning from the native Open Chart dialog)
-        // so a single elapsed-time spike cannot skip the outgoing transition.
-        var dt = Math.Clamp(gameTime.ElapsedGameTime.TotalSeconds, 0.0, 0.05);
 
         switch (_transitionPhase)
         {
@@ -3364,7 +3417,9 @@ public sealed class Game1 : Game
                 {
                     _transitionLoadPending = false;
                     var loader = _transitionTargetLoader;
-                    if (loader is null || !loader())
+                    _transitionTargetLoadStartedTimestamp = Stopwatch.GetTimestamp();
+                    var targetLoaded = loader is not null && loader();
+                    if (!targetLoaded)
                     {
                         _transitionError = _errorMessage ?? "Transition target failed to load.";
                         _transitionTargetReady = false;
@@ -3376,7 +3431,7 @@ public sealed class Game1 : Game
                             _songSelect?.Dispose();
                             _songSelect = null;
                         }
-                        _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.45));
+                        _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.35));
                         _transitionElapsed = 0.0;
                         _transitionProgress = 1.0;
                         _transitionPhase = TransitionPhase.In;
@@ -3419,7 +3474,7 @@ public sealed class Game1 : Game
                         _songSelect?.Dispose();
                         _songSelect = null;
                     }
-                    _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.45));
+                    _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.35));
                     _transitionElapsed = 0.0;
                     _transitionProgress = 1.0;
                     _transitionPhase = TransitionPhase.In;
@@ -3440,10 +3495,14 @@ public sealed class Game1 : Game
                 }
                 else if (_transitionTargetStarted && IsTransitionTargetReady())
                 {
+                    Program.LogRuntime(
+                        $"TRANSITION_TARGET_READY to={_transitionToScreen.ToString().ToLowerInvariant()} reason={_transitionReason} " +
+                        $"elapsedMs={(_transitionStartedTimestamp > 0 ? Stopwatch.GetElapsedTime(_transitionStartedTimestamp).TotalMilliseconds : 0):0.00} " +
+                        $"loadMs={(_transitionTargetLoadStartedTimestamp > 0 ? Stopwatch.GetElapsedTime(_transitionTargetLoadStartedTimestamp).TotalMilliseconds : 0):0.00}");
                     _transitionTargetReady = true;
                     _transitionTargetCommit?.Invoke();
                     _startupScreen = _transitionToScreen;
-                    _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.45));
+                    _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.35));
                     _transitionElapsed = 0.0;
                     _transitionProgress = 1.0;
                     _transitionPhase = TransitionPhase.In;
@@ -3459,6 +3518,11 @@ public sealed class Game1 : Game
                 _transitionRuntime.Update(dt);
                 if (_transitionProgress <= 0.0)
                 {
+                    Program.LogRuntime(
+                        $"TRANSITION_COMPLETE to={_transitionToScreen.ToString().ToLowerInvariant()} reason={_transitionReason} " +
+                        $"elapsedMs={(_transitionStartedTimestamp > 0 ? Stopwatch.GetElapsedTime(_transitionStartedTimestamp).TotalMilliseconds : 0):0.00}");
+                    _transitionStartedTimestamp = 0;
+                    _transitionTargetLoadStartedTimestamp = 0;
                     _transitionPhase = TransitionPhase.None;
                     _transitionTargetLoader = null;
                     _transitionTargetCommit = null;
@@ -3495,11 +3559,11 @@ public sealed class Game1 : Game
         _transitionTargetReady = false;
         _transitionError = null;
         _transitionPhase = TransitionPhase.Out;
+        ResetTransitionClock();
     }
 
-    private void UpdateFallbackChartEditorTransition(GameTime gameTime)
+    private void UpdateFallbackChartEditorTransition(double dt)
     {
-        var dt = Math.Clamp(gameTime.ElapsedGameTime.TotalSeconds, 0.0, 0.05);
 
         switch (_transitionPhase)
         {
@@ -4584,7 +4648,6 @@ public sealed class Game1 : Game
                         _chartEditorLoadPlayfield.QuickSaveRequested += HandleQuickSaveRequested;
                         _chartEditorLoadPlayfield.OpenFpkRequested += HandlePlayfieldOpenFpk;
                         _chartEditorLoadPlayfield.OpenAresRequested += HandlePlayfieldOpenAres;
-                        _chartEditorLoadPlayfield.EditEditorMetadataRequested += HandleEditEditorMetadataRequested;
                         _chartEditorLoadPlayfield.ImportEditorSongRequested += HandleImportEditorSongRequested;
                         _chartEditorLoadPlayfield.EditorMediaPickRequested += HandleEditorMediaPickRequested;
                         _chartEditorLoadPlayfield.EditorExitRequested += HandleEditorExitRequested;
@@ -4787,21 +4850,22 @@ public sealed class Game1 : Game
                     if (_chartEditorLoadPlayfield is null)
                         throw new InvalidOperationException("The loaded chart editor is missing.");
 
-                    if (_chartEditorLoadKind is ChartEditorLoadKind.FpkPicker or ChartEditorLoadKind.FpkChart)
-                    {
-                        _chartEditorLoadPlayfield.ReloadSkinScripts();
-                        _chartEditorLoadPlayfield.ConfigureChartEditor(true);
-                    }
-                    else
-                    {
-                        _chartEditorLoadPlayfield.ConfigureChartEditor(true);
-                    }
+                    // Chart preparation is sufficient to enter the editor.
+                    // Opus decoding continues on its dedicated worker; the active
+                    // Playfield.Update completes native audio setup on the game
+                    // thread when the worker is ready. Playback controls remain
+                    // unavailable until that completion has happened.
+                    var finalizeStarted = Stopwatch.GetTimestamp();
+                    _chartEditorLoadPlayfield.ReloadSkinForCurrentViewport();
+                    _chartEditorLoadPlayfield.ConfigureChartEditor(true);
 
                     var oldPlayfield = _playfield;
                     _playfield = _chartEditorLoadPlayfield;
                     _chartEditorLoadPlayfield = null;
                     if (oldPlayfield is not null && !ReferenceEquals(oldPlayfield, _playfield))
+                    {
                         oldPlayfield.Dispose();
+                    }
 
                     if (_transitionFromScreen == StartupScreen.SongSelect)
                     {
@@ -4825,6 +4889,8 @@ public sealed class Game1 : Game
                     _chartEditorLoadStageLabel = "READY";
                     _chartEditorLoadReady = true;
                     Window.Title = "TSC | Chart Editor";
+                    Program.LogRuntime(
+                        $"CHART_EDITOR_LOAD_READY finalizeElapsedMs={Stopwatch.GetElapsedTime(finalizeStarted).TotalMilliseconds:0.00}");
                     return;
 
                 case 6:
@@ -4841,6 +4907,7 @@ public sealed class Game1 : Game
         }
         catch (Exception ex)
         {
+            Program.LogRuntime($"CHART_EDITOR_LOAD_FAILED stage={_chartEditorLoadStage} error={ex}");
             _chartEditorLoadFailed = true;
             _chartEditorLoadError = $"Chart/editor load failed: {ex.Message}";
             _errorMessage = _chartEditorLoadError;
@@ -4895,218 +4962,6 @@ public sealed class Game1 : Game
         }
         if (!string.IsNullOrWhiteSpace(_errorMessage))
             UnicodeTextRenderer.DrawString(_startupSpriteBatch, _font, _errorMessage, new Vector2(left, top + ChartEditorSourceLabels.Length * 76 + 10), new Color(255, 150, 150));
-    }
-
-    private void HandleEditEditorMetadataRequested()
-    {
-        var chart = _playfield?.Chart;
-        if (chart is null || !_chartEditorMode)
-            return;
-
-        using var form = new System.Windows.Forms.Form
-        {
-            Text = "Chart Metadata",
-            StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen,
-            FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            ShowInTaskbar = false,
-            ClientSize = new System.Drawing.Size(680, 730)
-        };
-
-        var layout = new System.Windows.Forms.TableLayoutPanel
-        {
-            Dock = System.Windows.Forms.DockStyle.Fill,
-            ColumnCount = 1,
-            RowCount = 2,
-            Padding = new System.Windows.Forms.Padding(12)
-        };
-        layout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 100f));
-        layout.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 54f));
-        var scroll = new System.Windows.Forms.Panel { Dock = System.Windows.Forms.DockStyle.Fill, AutoScroll = true };
-        var fields = new System.Windows.Forms.TableLayoutPanel
-        {
-            Dock = System.Windows.Forms.DockStyle.Top,
-            AutoSize = true,
-            AutoSizeMode = System.Windows.Forms.AutoSizeMode.GrowAndShrink,
-            ColumnCount = 2,
-            Padding = new System.Windows.Forms.Padding(4),
-            GrowStyle = System.Windows.Forms.TableLayoutPanelGrowStyle.AddRows
-        };
-        fields.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Absolute, 190f));
-        fields.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 100f));
-        scroll.Controls.Add(fields);
-
-        var rowIndex = 0;
-        System.Windows.Forms.TextBox AddTextField(string label, string? value, bool readOnly = false)
-        {
-            var caption = new System.Windows.Forms.Label
-            {
-                Text = label,
-                Dock = System.Windows.Forms.DockStyle.Fill,
-                TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-                AutoSize = true,
-                Padding = new System.Windows.Forms.Padding(2, 5, 4, 5)
-            };
-            var text = new System.Windows.Forms.TextBox
-            {
-                Text = value ?? string.Empty,
-                Dock = System.Windows.Forms.DockStyle.Fill,
-                ReadOnly = readOnly,
-                Margin = new System.Windows.Forms.Padding(4, 4, 4, 8)
-            };
-            fields.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 36f));
-            fields.Controls.Add(caption, 0, rowIndex);
-            fields.Controls.Add(text, 1, rowIndex);
-            rowIndex++;
-            return text;
-        }
-
-        var nameBox = AddTextField("Song name", chart.Name);
-        var artistBox = AddTextField("Artist", chart.Artist);
-        var seriesBox = AddTextField("Series / collection", chart.Series);
-        var difficultyBox = AddTextField("Difficulty (switch below)", chart.Difficulty, readOnly: true);
-        difficultyBox.BackColor = System.Drawing.SystemColors.Control;
-        var levelBox = AddTextField("Level (optional)", chart.Level?.ToString(CultureInfo.InvariantCulture));
-        var musicBox = AddTextField("Imported song (Opus)", chart.MusicPath, readOnly: true);
-        musicBox.BackColor = System.Drawing.SystemColors.Control;
-        var previewBox = AddTextField("Preview audio path", chart.PreviewPath, readOnly: true);
-        var albumBox = AddTextField("Album image path", chart.AlbumPath, readOnly: true);
-        var albumBigBox = AddTextField("Large album image path", chart.AlbumBigPath, readOnly: true);
-        if (_playfield?.CurrentEditorBundleTemplate == ChartBundleTemplate.Tsts) albumBigBox.Text = "Not supported by TSTS";
-        var bpmBox = AddTextField("Initial BPM", chart.InitialTempo.ToString("0.###", CultureInfo.InvariantCulture));
-        var ticksBox = AddTextField("Ticks per measure", chart.TicksPerMeasure.ToString(CultureInfo.InvariantCulture));
-        var playTimeBox = AddTextField("Play time seconds (0/blank = audio length)", chart.PlayTime.ToString("0.###", CultureInfo.InvariantCulture));
-        var audioOriginBox = AddTextField("Audio origin tick", chart.AudioOriginTick.ToString(CultureInfo.InvariantCulture));
-
-        var gearLabel = new System.Windows.Forms.Label
-        {
-            Text = "Starting gear",
-            Dock = System.Windows.Forms.DockStyle.Fill,
-            TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-            AutoSize = true,
-            Padding = new System.Windows.Forms.Padding(2, 5, 4, 5)
-        };
-        var gearBox = new System.Windows.Forms.ComboBox
-        {
-            Dock = System.Windows.Forms.DockStyle.Fill,
-            DropDownStyle = System.Windows.Forms.ComboBoxStyle.DropDownList,
-            Margin = new System.Windows.Forms.Padding(4, 4, 4, 8)
-        };
-        gearBox.Items.AddRange(new object[] { "1K", "2K", "3K" });
-        gearBox.SelectedItem = chart.InitialGearAttr switch { 0 or 2 => "1K", 4 => "2K", _ => "3K" };
-        fields.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 36f));
-        fields.Controls.Add(gearLabel, 0, rowIndex);
-        fields.Controls.Add(gearBox, 1, rowIndex);
-
-        var buttons = new System.Windows.Forms.FlowLayoutPanel
-        {
-            Dock = System.Windows.Forms.DockStyle.Fill,
-            FlowDirection = System.Windows.Forms.FlowDirection.RightToLeft,
-            WrapContents = false,
-            Padding = new System.Windows.Forms.Padding(0, 8, 0, 0)
-        };
-        var okButton = new System.Windows.Forms.Button { Text = "Apply", Width = 100, Height = 32 };
-        var cancelButton = new System.Windows.Forms.Button { Text = "Cancel", Width = 100, Height = 32, DialogResult = System.Windows.Forms.DialogResult.Cancel };
-        buttons.Controls.Add(okButton);
-        buttons.Controls.Add(cancelButton);
-        layout.Controls.Add(scroll, 0, 0);
-        layout.Controls.Add(buttons, 0, 1);
-        form.Controls.Add(layout);
-        form.AcceptButton = okButton;
-        form.CancelButton = cancelButton;
-
-        okButton.Click += (_, _) =>
-        {
-            bool TryInt(System.Windows.Forms.TextBox box, string field, out int value)
-            {
-                if (int.TryParse(box.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
-                    return true;
-                System.Windows.Forms.MessageBox.Show(form, $"{field} must be a whole number.", "Invalid metadata",
-                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
-                box.Focus();
-                return false;
-            }
-            bool TryDouble(System.Windows.Forms.TextBox box, string field, out double value)
-            {
-                if (double.TryParse(box.Text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out value) && double.IsFinite(value))
-                    return true;
-                System.Windows.Forms.MessageBox.Show(form, $"{field} must be a number.", "Invalid metadata",
-                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
-                box.Focus();
-                return false;
-            }
-
-            int? level = null;
-            if (!string.IsNullOrWhiteSpace(levelBox.Text))
-            {
-                if (!int.TryParse(levelBox.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedLevel) || parsedLevel < 0)
-                {
-                    System.Windows.Forms.MessageBox.Show(form, "Level must be a non-negative whole number, or blank.", "Invalid metadata",
-                        System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
-                    levelBox.Focus();
-                    return;
-                }
-                level = parsedLevel;
-            }
-            if (!TryDouble(bpmBox, "Initial BPM", out var bpm))
-                return;
-            if (bpm < 1 || bpm > float.MaxValue)
-            {
-                System.Windows.Forms.MessageBox.Show(form, "Initial BPM must be at least 1 and fit the chart's numeric format.", "Invalid metadata",
-                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
-                bpmBox.Focus();
-                return;
-            }
-            if (!TryInt(ticksBox, "Ticks per measure", out var ticks))
-                return;
-            if (ticks < 1 || ticks > 3840)
-            {
-                System.Windows.Forms.MessageBox.Show(form, "Ticks per measure must be between 1 and 3840.", "Invalid metadata",
-                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
-                ticksBox.Focus();
-                return;
-            }
-            double playTime;
-            if (string.IsNullOrWhiteSpace(playTimeBox.Text))
-                playTime = 0;
-            else if (!TryDouble(playTimeBox, "Play time", out playTime))
-                return;
-            if (playTime < 0)
-            {
-                System.Windows.Forms.MessageBox.Show(form, "Play time cannot be negative.", "Invalid metadata",
-                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
-                playTimeBox.Focus();
-                return;
-            }
-            if (!TryInt(audioOriginBox, "Audio origin tick", out var audioOrigin))
-                return;
-            if (audioOrigin < 0)
-            {
-                System.Windows.Forms.MessageBox.Show(form, "Audio origin tick cannot be negative.", "Invalid metadata",
-                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Warning);
-                audioOriginBox.Focus();
-                return;
-            }
-            var gearAttr = gearBox.SelectedItem?.ToString() switch { "1K" => 0, "2K" => 4, _ => 6 };
-            try
-            {
-                _playfield?.UpdateEditorMetadata(
-                    nameBox.Text, artistBox.Text, seriesBox.Text, difficultyBox.Text, level,
-                    previewBox.Text, albumBox.Text, _playfield?.CurrentEditorBundleTemplate == ChartBundleTemplate.Tsts ? null : albumBigBox.Text, bpm, ticks, gearAttr,
-                    playTime, audioOrigin);
-                Window.Title = "TSC | Chart Editor";
-                form.DialogResult = System.Windows.Forms.DialogResult.OK;
-                form.Close();
-            }
-            catch (Exception ex)
-            {
-                System.Windows.Forms.MessageBox.Show(form, ex.Message, "Could not apply metadata",
-                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
-            }
-        };
-
-        ShowNativeDialog(form);
     }
 
     private void HandleEditorMediaPickRequested(string field)
@@ -5628,7 +5483,6 @@ public sealed class Game1 : Game
             _playfield.QuickSaveRequested += HandleQuickSaveRequested;
             _playfield.OpenFpkRequested += HandlePlayfieldOpenFpk;
             _playfield.OpenAresRequested += HandlePlayfieldOpenAres;
-            _playfield.EditEditorMetadataRequested += HandleEditEditorMetadataRequested;
             _playfield.ImportEditorSongRequested += HandleImportEditorSongRequested;
             _playfield.EditorMediaPickRequested += HandleEditorMediaPickRequested;
             _playfield.EditorExitRequested += HandleEditorExitRequested;
@@ -5708,7 +5562,7 @@ public sealed class Game1 : Game
         try
         {
             _playfield.LoadPreparedFpk(_preparedFpk);
-            _playfield.ReloadSkinScripts();
+            _playfield.ReloadSkinForCurrentViewport();
             _playfield.ConfigureChartEditor(_chartEditorMode);
             Window.Title = _chartEditorMode
                 ? "TSC | Chart Editor"

@@ -570,15 +570,18 @@ internal sealed class SkinAssetStore : IDisposable
 
     private bool TryLoadTexture(string fullPath, string relativePath, out SkinAssetHandle? handle)
     {
+        Texture2D? texture = null;
         try
         {
             using var stream = File.OpenRead(fullPath);
-            var texture = Texture2D.FromStream(_graphics, stream);
+            texture = NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Skin);
             handle = new SkinAssetHandle(texture, fullPath, relativePath);
+            texture = null; // Ownership transfers to the asset store through the handle.
             return true;
         }
         catch
         {
+            texture?.Dispose();
             // A corrupt custom asset should not block the matching Default asset.
             handle = null;
             return false;
@@ -626,7 +629,7 @@ internal sealed class SkinAssetStore : IDisposable
         try
         {
             using var stream = File.OpenRead(fullPath);
-            var texture = Texture2D.FromStream(_graphics, stream);
+            var texture = NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Skin);
             var handle = new SkinAssetHandle(texture, fullPath, Path.GetFileName(fullPath));
             _assets[key] = handle;
             return handle;
@@ -643,7 +646,7 @@ internal sealed class SkinAssetStore : IDisposable
                 if (converted is not null)
                 {
                     using var stream = new MemoryStream(converted, writable: false);
-                    var texture = Texture2D.FromStream(_graphics, stream);
+                    var texture = NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Skin);
                     var handle = new SkinAssetHandle(texture, fullPath, Path.GetFileName(fullPath));
                     _assets[key] = handle;
                     return handle;
@@ -672,7 +675,7 @@ internal sealed class SkinAssetStore : IDisposable
         try
         {
             using var stream = new MemoryStream(content, writable: false);
-            var texture = Texture2D.FromStream(_graphics, stream);
+            var texture = NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Skin);
             var virtualPath = "embedded-artwork:" + contentHash;
             var handle = new SkinAssetHandle(texture, virtualPath, Path.GetFileName(displayName));
             _assets[key] = handle;
@@ -689,7 +692,7 @@ internal sealed class SkinAssetStore : IDisposable
                 try
                 {
                     using var stream = new MemoryStream(converted, writable: false);
-                    var texture = Texture2D.FromStream(_graphics, stream);
+                    var texture = NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Skin);
                     var virtualPath = "embedded-artwork:" + contentHash + ".png";
                     var handle = new SkinAssetHandle(texture, virtualPath, Path.GetFileName(displayName));
                     _assets[key] = handle;
@@ -1059,10 +1062,20 @@ internal sealed class SkinFontStore : IDisposable
         }
 
         var texture = CreateTexture(bitmap);
-        var spriteFont = new SpriteFont(texture, glyphBounds, cropping, characters, metrics.CellHeight, 0f, kerning, '?');
-        UnicodeTextRenderer.RegisterFont(spriteFont, family.Name, rasterFontSize, fullPath);
-        return new SkinFontHandle(
-            spriteFont, texture, fullPath, relativePath, rasterFontSize, rasterCharacters);
+        try
+        {
+            var spriteFont = new SpriteFont(texture, glyphBounds, cropping, characters, metrics.CellHeight, 0f, kerning, '?');
+            UnicodeTextRenderer.RegisterFont(spriteFont, family.Name, rasterFontSize, fullPath);
+            return new SkinFontHandle(
+                spriteFont, texture, fullPath, relativePath, rasterFontSize, rasterCharacters);
+        }
+        catch
+        {
+            // The store never receives ownership if SpriteFont construction or
+            // registration fails, so release the GPU atlas here.
+            texture.Dispose();
+            throw;
+        }
     }
 
     private SkinShadowFontHandle BuildShadowFont(
@@ -1098,12 +1111,36 @@ internal sealed class SkinFontStore : IDisposable
         var cellWidth = glyphWidth + Padding * 2;
         var cellHeight = metrics.CellHeight;
         var layout = CalculateFontLayout(cellWidth, cellHeight, rasterCharacters.Length);
-        var atlasPixels = new XnaColor[layout.AtlasWidth * layout.AtlasHeight];
+        var atlasPixels = new XnaColor[checked(layout.AtlasWidth * layout.AtlasHeight)];
         var format = StringFormat.GenericTypographic;
         var glyphBounds = new List<XnaRectangle>(rasterCharacters.Length);
         var cropping = new List<XnaRectangle>(rasterCharacters.Length);
         var kerning = new List<Vector3>(rasterCharacters.Length);
         var characters = new List<char>(rasterCharacters.Length);
+
+        // Shadow generation used to allocate a Bitmap, raw pixel buffer, alpha
+        // buffer, expansion buffers, and two blur buffers for every glyph. At
+        // large raster sizes several of those arrays landed on the LOH, creating
+        // hundreds of MB of short-lived allocations during one font build.
+        // Reuse one glyph surface and all pixel-processing scratch buffers for
+        // the entire atlas instead. Only the final atlas pixels are retained.
+        var cellPixelCount = checked(cellWidth * cellHeight);
+        var glyphAlpha = new byte[cellPixelCount];
+        var expandHorizontal = expandPixels > 0 ? new byte[cellPixelCount] : Array.Empty<byte>();
+        var expandedAlpha = expandPixels > 0 ? new byte[cellPixelCount] : Array.Empty<byte>();
+        var blurBufferA = new byte[cellPixelCount];
+        var blurBufferB = new byte[cellPixelCount];
+        var blurDeque = expandPixels > 0 ? new int[Math.Max(cellWidth, cellHeight)] : Array.Empty<int>();
+        var rowBuffer = new byte[checked(cellWidth * 4)];
+        using var bitmap = new Bitmap(cellWidth, cellHeight, PixelFormat.Format32bppArgb);
+        using var graphics = Graphics.FromImage(bitmap);
+        graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        graphics.CompositingMode = CompositingMode.SourceOver;
+        graphics.CompositingQuality = CompositingQuality.HighQuality;
+        graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
+        using var brush = new SolidBrush(System.Drawing.Color.White);
+        using var path = new GraphicsPath { FillMode = System.Drawing.Drawing2D.FillMode.Winding };
 
         for (var i = 0; i < rasterCharacters.Length; i++)
         {
@@ -1113,32 +1150,40 @@ internal sealed class SkinFontStore : IDisposable
             var atlasX = column * cellWidth;
             var atlasY = row * cellHeight;
 
-            using var bitmap = new Bitmap(cellWidth, cellHeight, PixelFormat.Format32bppArgb);
-            using (var graphics = Graphics.FromImage(bitmap))
+            graphics.Clear(System.Drawing.Color.Transparent);
+            path.Reset();
+            path.FillMode = System.Drawing.Drawing2D.FillMode.Winding;
+            path.AddString(
+                c.ToString(),
+                family,
+                (int)FontStyle.Regular,
+                rasterFontSize,
+                new PointF(Padding + overhangPadding, Padding),
+                format);
+            graphics.FillPath(brush, path);
+
+            ReadBitmapAlpha(bitmap, glyphAlpha, rowBuffer);
+            var alphaForBlur = glyphAlpha;
+            if (expandPixels > 0)
             {
-                graphics.Clear(System.Drawing.Color.Transparent);
-                graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                graphics.CompositingMode = CompositingMode.SourceOver;
-                graphics.CompositingQuality = CompositingQuality.HighQuality;
-                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                graphics.TextRenderingHint = TextRenderingHint.AntiAlias;
-                using var brush = new SolidBrush(System.Drawing.Color.White);
-                var drawY = Padding;
-                using var path = new GraphicsPath { FillMode = System.Drawing.Drawing2D.FillMode.Winding };
-                path.AddString(
-                    c.ToString(),
-                    family,
-                    (int)FontStyle.Regular,
-                    rasterFontSize,
-                    new PointF(Padding + overhangPadding, drawY),
-                    format);
-                graphics.FillPath(brush, path);
+                ExpandAlpha(
+                    glyphAlpha,
+                    expandHorizontal,
+                    expandedAlpha,
+                    blurDeque,
+                    cellWidth,
+                    cellHeight,
+                    expandPixels);
+                alphaForBlur = expandedAlpha;
             }
 
-            var alpha = ReadBitmapAlpha(bitmap);
-            if (expandPixels > 0)
-                alpha = ExpandAlpha(alpha, cellWidth, cellHeight, expandPixels);
-            var blurred = BlurAlpha(alpha, cellWidth, cellHeight, blurRadius);
+            var blurred = BlurAlpha(
+                alphaForBlur,
+                blurBufferA,
+                blurBufferB,
+                cellWidth,
+                cellHeight,
+                blurRadius);
             for (var y = 0; y < cellHeight; y++)
             {
                 var srcRow = y * cellWidth;
@@ -1157,11 +1202,23 @@ internal sealed class SkinFontStore : IDisposable
             characters.Add(c);
         }
 
-        var texture = new Texture2D(_graphics, layout.AtlasWidth, layout.AtlasHeight, false, SurfaceFormat.Color);
-        texture.SetData(atlasPixels);
-        var spriteFont = new SpriteFont(texture, glyphBounds, cropping, characters, metrics.CellHeight, 0f, kerning, '?');
-        UnicodeTextRenderer.RegisterFont(spriteFont, family.Name, rasterFontSize, fullPath);
-        return new SkinShadowFontHandle(spriteFont, texture);
+        var texture = NativeResourceDiagnostics.TrackTexture(
+            new Texture2D(_graphics, layout.AtlasWidth, layout.AtlasHeight, false, SurfaceFormat.Color),
+            NativeResourceCategory.Font);
+        try
+        {
+            texture.SetData(atlasPixels);
+            var spriteFont = new SpriteFont(texture, glyphBounds, cropping, characters, metrics.CellHeight, 0f, kerning, '?');
+            UnicodeTextRenderer.RegisterFont(spriteFont, family.Name, rasterFontSize, fullPath);
+            return new SkinShadowFontHandle(spriteFont, texture);
+        }
+        catch
+        {
+            // Failed atlas uploads/construction must not leave a native texture
+            // allocated without a SkinShadowFontHandle to own it.
+            texture.Dispose();
+            throw;
+        }
     }
 
     private static (List<int> Widths, int MaxWidth, int CellHeight) MeasureFontMetrics(
@@ -1258,23 +1315,28 @@ internal sealed class SkinFontStore : IDisposable
 
     private Texture2D CreateTexture(Bitmap bitmap)
     {
-        var pixels = new XnaColor[bitmap.Width * bitmap.Height];
+        // Copy one scanline at a time. The old full-image byte[] duplicated the
+        // atlas-sized Color[] allocation and often crossed the LOH threshold for
+        // large fonts. A row buffer keeps this conversion's temporary memory
+        // small regardless of atlas dimensions.
+        var pixels = new XnaColor[checked(bitmap.Width * bitmap.Height)];
         var data = bitmap.LockBits(
             new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height),
             ImageLockMode.ReadOnly,
             PixelFormat.Format32bppArgb);
         try
         {
-            var raw = new byte[data.Stride * bitmap.Height];
-            Marshal.Copy(data.Scan0, raw, 0, raw.Length);
+            var stride = Math.Abs(data.Stride);
+            var rowBytes = new byte[stride];
             for (var y = 0; y < bitmap.Height; y++)
             {
-                var row = y * data.Stride;
+                Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), rowBytes, 0, stride);
+                var dstRow = y * bitmap.Width;
                 for (var x = 0; x < bitmap.Width; x++)
                 {
-                    var i = y * bitmap.Width + x;
-                    var src = row + x * 4;
-                    pixels[i] = new XnaColor(raw[src + 2], raw[src + 1], raw[src + 0], raw[src + 3]);
+                    var src = x * 4;
+                    pixels[dstRow + x] = new XnaColor(
+                        rowBytes[src + 2], rowBytes[src + 1], rowBytes[src + 0], rowBytes[src + 3]);
                 }
             }
         }
@@ -1283,47 +1345,70 @@ internal sealed class SkinFontStore : IDisposable
             bitmap.UnlockBits(data);
         }
 
-        var texture = new Texture2D(_graphics, bitmap.Width, bitmap.Height, false, SurfaceFormat.Color);
-        texture.SetData(pixels);
-        return texture;
+        var texture = NativeResourceDiagnostics.TrackTexture(
+            new Texture2D(_graphics, bitmap.Width, bitmap.Height, false, SurfaceFormat.Color),
+            NativeResourceCategory.Font);
+        try
+        {
+            texture.SetData(pixels);
+            return texture;
+        }
+        catch
+        {
+            texture.Dispose();
+            throw;
+        }
     }
 
-    private static byte[] ReadBitmapAlpha(Bitmap bitmap)
+    private static void ReadBitmapAlpha(Bitmap bitmap, byte[] alpha, byte[] rowBytes)
     {
-        var alpha = new byte[bitmap.Width * bitmap.Height];
+        if (alpha.Length < checked(bitmap.Width * bitmap.Height))
+            throw new ArgumentException("Alpha destination is too small.", nameof(alpha));
+
         var data = bitmap.LockBits(
             new System.Drawing.Rectangle(0, 0, bitmap.Width, bitmap.Height),
             ImageLockMode.ReadOnly,
             PixelFormat.Format32bppArgb);
         try
         {
-            var raw = new byte[data.Stride * bitmap.Height];
-            Marshal.Copy(data.Scan0, raw, 0, raw.Length);
+            var stride = Math.Abs(data.Stride);
+            if (rowBytes.Length < stride)
+                throw new ArgumentException("Bitmap row buffer is too small.", nameof(rowBytes));
+
             for (var y = 0; y < bitmap.Height; y++)
             {
-                var row = y * data.Stride;
+                Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), rowBytes, 0, stride);
+                var dstRow = y * bitmap.Width;
                 for (var x = 0; x < bitmap.Width; x++)
-                    alpha[y * bitmap.Width + x] = raw[row + x * 4 + 3];
+                    alpha[dstRow + x] = rowBytes[x * 4 + 3];
             }
         }
         finally
         {
             bitmap.UnlockBits(data);
         }
-        return alpha;
     }
 
-    private static byte[] ExpandAlpha(byte[] source, int width, int height, int expandRadius)
+    private static void ExpandAlpha(
+        byte[] source,
+        byte[] horizontal,
+        byte[] result,
+        int[] deque,
+        int width,
+        int height,
+        int expandRadius)
     {
         if (expandRadius <= 0)
-            return source;
+        {
+            Buffer.BlockCopy(source, 0, result, 0, source.Length);
+            return;
+        }
 
-        // Sliding-window maximum horizontally, then vertically. This grows the
-        // alpha mask without doing work proportional to the expand radius.
-        var horizontal = new byte[source.Length];
-        var result = new byte[source.Length];
-        var deque = new int[Math.Max(width, height)];
+        // Sliding-window maximum horizontally, then vertically. Scratch arrays
+        // are supplied by the font build and reused for every glyph.
         var window = expandRadius * 2 + 1;
+        if (horizontal.Length < source.Length || result.Length < source.Length || deque.Length < Math.Max(width, height))
+            throw new ArgumentException("Alpha expansion scratch buffer is too small.");
 
         for (var y = 0; y < height; y++)
         {
@@ -1371,23 +1456,29 @@ internal sealed class SkinFontStore : IDisposable
                     result[outY * width + x] = horizontal[deque[head] * width + x];
             }
         }
-
-        return result;
     }
 
-    private static byte[] BlurAlpha(byte[] source, int width, int height, float blurRadius)
+    private static byte[] BlurAlpha(
+        byte[] source,
+        byte[] bufferA,
+        byte[] bufferB,
+        int width,
+        int height,
+        float blurRadius)
     {
         if (blurRadius <= 0.01f)
             return source;
+        if (bufferA.Length < source.Length || bufferB.Length < source.Length)
+            throw new ArgumentException("Alpha blur scratch buffer is too small.");
 
-        // Three separable box-blur passes approximate a Gaussian very closely,
-        // while each pass is O(width*height) using a sliding sum. Large values
-        // such as 32 therefore stay fast instead of multiplying work by the
-        // kernel radius.
+        // Three separable box-blur passes approximate a Gaussian very closely.
+        // The two destination buffers are reused for every glyph. The original
+        // source may become an intermediate target after the first pass; the
+        // caller consumes only the final output, so this in-place reuse is safe.
         var radius = Math.Max(1, (int)MathF.Round(blurRadius / 2f));
         var a = source;
-        var b = new byte[source.Length];
-        var c = new byte[source.Length];
+        var b = bufferA;
+        var c = bufferB;
 
         for (var pass = 0; pass < 3; pass++)
         {
@@ -1398,11 +1489,7 @@ internal sealed class SkinFontStore : IDisposable
             c = swap;
         }
 
-        // Keep returning a standalone array because callers store it only while
-        // copying the finished glyph into the atlas.
-        if (!ReferenceEquals(a, source))
-            return a;
-        return source.ToArray();
+        return a;
     }
 
     private static void BoxBlurHorizontal(byte[] source, byte[] destination, int width, int height, int radius)
@@ -1447,13 +1534,26 @@ internal sealed class SkinFontStore : IDisposable
     public void Dispose()
     {
         foreach (var handle in _shadowFonts.Values)
-            handle?.Texture.Dispose();
+        {
+            if (handle is null)
+                continue;
+
+            UnicodeTextRenderer.ReleaseFont(handle.Font);
+            handle.Texture.Dispose();
+        }
         _shadowFonts.Clear();
 
         foreach (var handle in _fonts.Values)
-            handle?.Texture.Dispose();
+        {
+            if (handle is null)
+                continue;
+
+            UnicodeTextRenderer.ReleaseFont(handle.Font);
+            handle.Texture.Dispose();
+        }
         _fonts.Clear();
         _fontRequestCache.Clear();
+
     }
 }
 
@@ -1828,6 +1928,7 @@ public sealed class SkinRuntime : IDisposable
     private readonly string _skinDirectory;
     private readonly string _defaultSkinDirectory;
     private readonly bool _useLegacyUiTextSizing;
+    private bool _initialLoadDeferred;
     // The main gameplay skin is also used by the chart editor. Use the older
     // logical-size basis while editor_mode is active, without changing gameplay
     // and result HUD sizing after the high-resolution font update.
@@ -1858,6 +1959,19 @@ public sealed class SkinRuntime : IDisposable
     private readonly GameConfig _gameConfig;
     private readonly string _gameConfigPath;
     private readonly SkinGameView _game;
+    // Keep the source data for result-screen artwork so F10/script reloads can
+    // recreate its GPU handles after the asset store disposes the old textures.
+    // The Lua result script may capture these handles during top-level execution
+    // or init(), so they must be restored before the new script is executed.
+    private string? _resultSongName;
+    private string? _resultArtist;
+    private string? _resultDifficulty;
+    private int? _resultLevel;
+    private string? _resultAlbumPath;
+    private string? _resultAlbumBigPath;
+    private byte[]? _resultAlbumBytes;
+    private byte[]? _resultAlbumBigBytes;
+    private bool _hasResultSongInfo;
     private readonly SkinScreenView _screen = new();
     private Table? _songSelect;
     private Table? _chartEditor;
@@ -1903,6 +2017,8 @@ public sealed class SkinRuntime : IDisposable
     private readonly HashSet<string> _failedImports = new(StringComparer.OrdinalIgnoreCase);
     private string? _activeImportPath;
     private readonly Dictionary<int, List<SkinPanelEventData>> _panelTrackEvents = new();
+    private AresChart? _pendingPanelTrackChart;
+    private TempoMap? _pendingPanelTrackTempo;
     private readonly Dictionary<string, SkinUiButton> _uiButtons = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SkinUiSlider> _uiSliders = new(StringComparer.OrdinalIgnoreCase);
     private float _uiPointerX;
@@ -2237,6 +2353,7 @@ public sealed class SkinRuntime : IDisposable
     public int DebugLastShadowApiCalls { get; private set; }
 
     public bool IsLoaded => _script is not null && LastError is null;
+    internal bool IsInitialLoadDeferred => _initialLoadDeferred;
     public string ScriptPath => _scriptPath;
     internal string? ActiveScriptPath => _script is not null ? _activeScriptPath : null;
     public string? LastError { get; private set; }
@@ -2282,12 +2399,10 @@ public sealed class SkinRuntime : IDisposable
     }
 
     /// <summary>
-    /// Creates a skin runtime with an initial screen size. This is needed because
-    /// skin.lua and imported modules execute once during construction, before the
-    /// first per-frame BuildDrawCommands() call can refresh screen.width/height.
-    /// Callers that already know the target render size (for example gameplay's
-    /// virtual resolution) can provide it here so screen-dependent top-level Lua
-    /// expressions are correct from the first frame.
+    /// Creates a skin runtime with an initial screen size. Eager runtimes execute
+    /// their script immediately; secondary screen runtimes may defer script and
+    /// asset initialization until first use. Supplying the intended render size
+    /// keeps screen-dependent top-level Lua expressions correct in either mode.
     /// </summary>
     public SkinRuntime(
         string skinDirectory,
@@ -2298,7 +2413,8 @@ public sealed class SkinRuntime : IDisposable
         int initialScreenWidth,
         int initialScreenHeight,
         Effect? skinSparklesEffect = null,
-        Effect? skinQuad3DEffect = null)
+        Effect? skinQuad3DEffect = null,
+        bool deferInitialLoad = false)
     {
         _gameConfig = gameConfig ?? new GameConfig();
         _gameConfigPath = gameConfigPath ?? UserDataPaths.GameConfigPath;
@@ -2326,7 +2442,10 @@ public sealed class SkinRuntime : IDisposable
         _graphics = graphics;
         _skinSparklesEffect = skinSparklesEffect;
         _skinQuad3DEffect = skinQuad3DEffect;
-        _skin3DWhiteTexture = new Texture2D(graphics, 1, 1, false, SurfaceFormat.Color);
+        _initialLoadDeferred = deferInitialLoad;
+        _skin3DWhiteTexture = NativeResourceDiagnostics.TrackTexture(
+            new Texture2D(graphics, 1, 1, false, SurfaceFormat.Color),
+            NativeResourceCategory.Skin);
         _skin3DWhiteTexture.SetData(new[] { XnaColor.White });
         _skin3DEffect = new BasicEffect(graphics)
         {
@@ -2345,7 +2464,8 @@ public sealed class SkinRuntime : IDisposable
             Math.Max(1, initialScreenWidth),
             Math.Max(1, initialScreenHeight));
 
-        Reload();
+        if (!_initialLoadDeferred)
+            Reload();
     }
 
     private void SaveGameConfig()
@@ -2362,10 +2482,15 @@ public sealed class SkinRuntime : IDisposable
 
     public bool Reload()
     {
+        _initialLoadDeferred = false;
         LastError = null;
         LastCallback = "none";
         CallbackCount = 0;
         _assets.Dispose();
+        // _assets.Dispose() invalidates every SkinAssetHandle previously exposed
+        // through game.album/game.album_big. Recreate them now, before loading the
+        // new Lua environment, so top-level code and init() see live textures.
+        RefreshResultSongInfoAssets();
         _fonts.Dispose();
         _fonts = new SkinFontStore(_graphics, _skinDirectory, _defaultSkinDirectory);
         UIConfig = SkinUIConfig.CreateDefault();
@@ -2405,6 +2530,20 @@ public sealed class SkinRuntime : IDisposable
         LastError = string.Join(Environment.NewLine + Environment.NewLine, failures);
         WriteLog($"[skin] no working Lua script; using the built-in C# implementation. {LastError}");
         return false;
+    }
+
+    /// <summary>
+    /// Loads a deferred screen script on first use. Gameplay's primary skin is
+    /// eager, while pause/result/editor scripts can wait until their screen is
+    /// actually opened so they do not delay ordinary gameplay startup.
+    /// </summary>
+    internal bool EnsureLoaded()
+    {
+        if (IsLoaded)
+            return true;
+        if (!_initialLoadDeferred)
+            return false;
+        return Reload();
     }
 
     private IReadOnlyList<string> GetScriptCandidatePaths()
@@ -2533,6 +2672,11 @@ public sealed class SkinRuntime : IDisposable
                 CallbackCount++;
                 script.Call(init);
             }
+
+            // Chart/panel data can be supplied before a deferred runtime has a
+            // Lua environment. Re-publish the retained C# data after every
+            // successful initialization and reload.
+            RebuildPendingPanelTracks();
 
             if (LastError is not null)
             {
@@ -2841,7 +2985,25 @@ public sealed class SkinRuntime : IDisposable
     /// </summary>
     public void SetPanelTracks(AresChart chart, TempoMap tempo)
     {
+        _pendingPanelTrackChart = chart;
+        _pendingPanelTrackTempo = tempo;
         _game.SetElement(chart.Element);
+        if (_initialLoadDeferred)
+            return;
+
+        RebuildPanelTrackData(chart, tempo);
+    }
+
+    private void RebuildPendingPanelTracks()
+    {
+        if (_pendingPanelTrackChart is not null && _pendingPanelTrackTempo is not null)
+            RebuildPanelTrackData(_pendingPanelTrackChart, _pendingPanelTrackTempo);
+        else
+            RefreshPanelTracksGlobal();
+    }
+
+    private void RebuildPanelTrackData(AresChart chart, TempoMap tempo)
+    {
         _panelTrackEvents.Clear();
         for (var track = 17; track <= 20; track++)
             _panelTrackEvents[track] = new List<SkinPanelEventData>();
@@ -2883,6 +3045,9 @@ public sealed class SkinRuntime : IDisposable
     {
         if (ev.Track is < 17 or > 20 ||
             !string.Equals(ev.Kind, "Note", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (_initialLoadDeferred)
             return;
 
         if (!_panelTrackEvents.TryGetValue(ev.Track, out var output))
@@ -3008,12 +3173,36 @@ public sealed class SkinRuntime : IDisposable
         byte[]? albumBytes = null,
         byte[]? albumBigBytes = null)
     {
-        var album = _assets.LoadExternal(albumPath)
-            ?? _assets.LoadExternalBytes(albumBytes, "album");
-        var albumBig = _assets.LoadExternal(albumBigPath)
-            ?? _assets.LoadExternalBytes(albumBigBytes, "album_big")
+        _resultSongName = songName;
+        _resultArtist = artist;
+        _resultDifficulty = difficulty;
+        _resultLevel = level;
+        _resultAlbumPath = albumPath;
+        _resultAlbumBigPath = albumBigPath;
+        _resultAlbumBytes = albumBytes;
+        _resultAlbumBigBytes = albumBigBytes;
+        _hasResultSongInfo = true;
+        if (!_initialLoadDeferred)
+            RefreshResultSongInfoAssets();
+    }
+
+    private void RefreshResultSongInfoAssets()
+    {
+        if (!_hasResultSongInfo)
+            return;
+
+        var album = _assets.LoadExternal(_resultAlbumPath)
+            ?? _assets.LoadExternalBytes(_resultAlbumBytes, "album");
+        var albumBig = _assets.LoadExternal(_resultAlbumBigPath)
+            ?? _assets.LoadExternalBytes(_resultAlbumBigBytes, "album_big")
             ?? album;
-        _game.SetSongInfo(songName, artist, difficulty, level, album, albumBig);
+        _game.SetSongInfo(
+            _resultSongName,
+            _resultArtist,
+            _resultDifficulty,
+            _resultLevel,
+            album,
+            albumBig);
     }
 
     /// <summary>Updates the mode tag exposed to skin.lua as game.editor_mode.</summary>
@@ -4300,21 +4489,22 @@ public sealed class SkinRuntime : IDisposable
 
         var width = Math.Max(1, asset.Texture.Width);
         var height = Math.Max(1, asset.Texture.Height);
-        var source = new XnaColor[checked(width * height)];
-        asset.Texture.GetData(source);
-
-        var result = new XnaColor[source.Length];
+        // Composite in-place. The previous implementation allocated both a
+        // source and result Color[] (8 bytes per texel combined) just to upload
+        // one texture. Reusing the source buffer halves this large temporary.
+        var pixels = new XnaColor[checked(width * height)];
+        asset.Texture.GetData(pixels);
         var bgAlpha = background.A / 255f;
 
-        for (var i = 0; i < source.Length; i++)
+        for (var i = 0; i < pixels.Length; i++)
         {
-            var src = source[i];
+            var src = pixels[i];
             var srcAlpha = src.A / 255f;
             var outAlpha = srcAlpha + bgAlpha * (1f - srcAlpha);
 
             if (outAlpha <= 0.0001f)
             {
-                result[i] = XnaColor.Transparent;
+                pixels[i] = XnaColor.Transparent;
                 continue;
             }
 
@@ -4325,22 +4515,32 @@ public sealed class SkinRuntime : IDisposable
             var g = (src.G * srcAlpha + background.G * backgroundWeight) * invOutAlpha;
             var b = (src.B * srcAlpha + background.B * backgroundWeight) * invOutAlpha;
 
-            result[i] = new XnaColor(
+            pixels[i] = new XnaColor(
                 (byte)Math.Clamp(MathF.Round(r), 0f, 255f),
                 (byte)Math.Clamp(MathF.Round(g), 0f, 255f),
                 (byte)Math.Clamp(MathF.Round(b), 0f, 255f),
                 (byte)Math.Clamp(MathF.Round(outAlpha * 255f), 0f, 255f));
         }
 
-        var composite = new Texture2D(
-            _graphics,
-            width,
-            height,
-            false,
-            SurfaceFormat.Color);
-        composite.SetData(result);
-        _skin3DBackgroundTextures[key] = composite;
-        return composite;
+        var composite = NativeResourceDiagnostics.TrackTexture(
+            new Texture2D(
+                _graphics,
+                width,
+                height,
+                false,
+                SurfaceFormat.Color),
+            NativeResourceCategory.Skin);
+        try
+        {
+            composite.SetData(pixels);
+            _skin3DBackgroundTextures[key] = composite;
+            return composite;
+        }
+        catch
+        {
+            composite.Dispose();
+            throw;
+        }
     }
 
     private void DisposeSkin3DBackgroundTextures()
@@ -4398,15 +4598,17 @@ public sealed class SkinRuntime : IDisposable
                 $"draw.sparkles() bake is too large for the {maxAtlasDimension}×{maxAtlasDimension} atlas limit " +
                 $"({atlasWidth}×{atlasHeight}). Lower bake_width, bake_height, or fps.");
         }
-        var atlas = new RenderTarget2D(
-            _graphics,
-            atlasWidth,
-            atlasHeight,
-            false,
-            SurfaceFormat.Color,
-            DepthFormat.None,
-            0,
-            RenderTargetUsage.PreserveContents);
+        var atlas = NativeResourceDiagnostics.TrackTexture(
+            new RenderTarget2D(
+                _graphics,
+                atlasWidth,
+                atlasHeight,
+                false,
+                SurfaceFormat.Color,
+                DepthFormat.None,
+                0,
+                RenderTargetUsage.PreserveContents),
+            NativeResourceCategory.Skin);
 
         var graphics = _graphics;
         var oldTarget = graphics.GetRenderTargets();
@@ -5255,6 +5457,7 @@ public sealed class SkinRuntime : IDisposable
             // Use this for assets that belong to a skin and must not silently use a
             // separate loose file beside the game, such as the main-menu logo.
             var skinOnly = args.Count > 1 && args[1].Type == DataType.Boolean && args[1].Boolean;
+
             var asset = _assets.Load(requested, skinOnly);
             if (asset is null)
             {
@@ -5381,7 +5584,6 @@ public sealed class SkinRuntime : IDisposable
                     result = DynValue.Nil;
 
                 _importCache[fullPath] = result;
-                WriteLog($"[skin] imported: {Path.GetRelativePath(_skinDirectory, fullPath).Replace(Path.DirectorySeparatorChar, '/')}");
                 return result;
             }
             catch (Exception ex)
@@ -5503,8 +5705,16 @@ public sealed class SkinRuntime : IDisposable
         table.Set("enabled", DynValue.NewBoolean(false));
         table.Set("begin", DynValue.NewCallback(BeginSkinPerfSection));
         table.Set("stop", DynValue.NewCallback(StopSkinPerfSection));
+        table.Set("init_begin", DynValue.NewCallback(BeginSkinInitProfile));
+        table.Set("init_end", DynValue.NewCallback(EndSkinInitProfile));
         return table;
     }
+
+    private static DynValue BeginSkinInitProfile(ScriptExecutionContext _, CallbackArguments args)
+        => DynValue.Nil;
+
+    private static DynValue EndSkinInitProfile(ScriptExecutionContext _, CallbackArguments args)
+        => DynValue.Nil;
 
     private DynValue BeginSkinPerfSection(ScriptExecutionContext _, CallbackArguments args)
     {
@@ -6297,6 +6507,7 @@ public sealed class SkinRuntime : IDisposable
         try { var fn = _script.Globals.Get(functionName); if (fn.Type != DataType.Function) return 0; var v = _script.Call(fn); return v.Type == DataType.Number ? Math.Clamp(v.Number, 0, 30) : 0; }
         catch (Exception ex) { HandleScriptRuntimeFailure(ex, functionName); return 0; }
     }
+    public void PrepareGameplayAnimationFonts() => InvokeOptional("prepare_gameplay_animation_fonts", true, DynValue.NewBoolean(true));
     public void OnGameplayPreparing() => InvokeOptional("on_gameplay_preparing", true);
     public void OnIntroStart() => InvokeOptional("on_intro_start", true);
     public void OnOutroStart() => InvokeOptional("on_outro_start", true);

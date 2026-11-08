@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using Concentus;
@@ -8,6 +9,8 @@ namespace TSC.Rendering;
 
 public sealed class OpusAudioPlayer : IDisposable
 {
+    private readonly record struct DecodeResult(byte[] Pcm, long AllocatedBytes, double ElapsedMs);
+
     private const int SampleRate = 48_000;
     private const int Channels = 2;
     private const int BytesPerSample = 2;
@@ -19,6 +22,9 @@ public sealed class OpusAudioPlayer : IDisposable
     // Keep the compact encoded stream so a full OpenAL context restart can
     // recreate the native SoundEffect even when the decoded PCM copy was released.
     private byte[]? _opusData;
+    private Task<DecodeResult>? _initialDecodeTask;
+    private CancellationTokenSource? _initialDecodeCancellation;
+    private long _initialDecodeStartedTimestamp;
     private Task<byte[]>? _recoveryPcmTask;
     private double _durationSeconds;
     private bool _isLooped;
@@ -27,6 +33,9 @@ public sealed class OpusAudioPlayer : IDisposable
     private SoundEffectInstance? _instance;
 
     public bool IsLoaded => _durationSeconds > 0.0 && (_pcm is not null || _effect is not null || _opusData is not null);
+    public bool IsLoading => _initialDecodeTask is not null;
+    public bool IsDecodeCompletionReady => _initialDecodeTask?.IsCompleted == true;
+    public bool HasAudioData => IsLoaded || IsLoading;
     public bool IsPlaying => _instance?.State == SoundState.Playing;
     /// <summary>Whether newly created playback instances should loop.</summary>
     public bool IsLooped
@@ -66,24 +75,152 @@ public sealed class OpusAudioPlayer : IDisposable
         _durationSeconds = _pcm.Length / (double)(SampleRate * Channels * BytesPerSample);
     }
 
-    private static byte[] DecodeOpus(byte[] opusData)
+    /// <summary>
+    /// Starts decoding on a worker thread. The decoded PCM is only handed back to
+    /// MonoGame on the game thread by TryCompletePendingLoad, because creating a
+    /// SoundEffect touches the active audio device/context.
+    /// </summary>
+    public void BeginLoadOpus(byte[] opusData)
+    {
+        ArgumentNullException.ThrowIfNull(opusData);
+        Stop();
+        DisposeLoadedAudio();
+        if (opusData.Length == 0)
+            throw new InvalidDataException("The FPK music.opus file is empty.");
+
+        // The chart loader owns this freshly extracted byte array and does not
+        // mutate it after handing it to the player. Keep the same immutable
+        // buffer for device recovery instead of allocating another full copy.
+        _opusData = opusData;
+        _initialDecodeCancellation = new CancellationTokenSource();
+        var cancellationToken = _initialDecodeCancellation.Token;
+        var encoded = _opusData;
+        _initialDecodeStartedTimestamp = Stopwatch.GetTimestamp();
+        // Use a dedicated worker for a potentially long-running full-song decode.
+        // A normal thread-pool work item can be delayed by unrelated game tasks;
+        // editor loading must not wait forever for a worker that was never scheduled.
+        _initialDecodeTask = Task.Factory.StartNew(() =>
+        {
+            var workerStarted = Stopwatch.GetTimestamp();
+            var allocatedAtStart = GC.GetAllocatedBytesForCurrentThread();
+            try
+            {
+                var pcm = DecodeOpus(encoded, cancellationToken);
+                var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedAtStart;
+                var elapsedMs = Stopwatch.GetElapsedTime(workerStarted).TotalMilliseconds;
+                TSC.Program.LogRuntime(
+                    $"AUDIO_DECODE_BACKGROUND_WORKER_DONE workerElapsedMs={elapsedMs:0.00} " +
+                    $"workerAllocatedBytes={allocatedBytes} pcmBytes={pcm.Length}");
+                return new DecodeResult(pcm, allocatedBytes, elapsedMs);
+            }
+            catch (Exception ex)
+            {
+                TSC.Program.LogRuntime(
+                    $"AUDIO_DECODE_BACKGROUND_WORKER_FAILED type={ex.GetType().Name} message={ex.Message}");
+                throw;
+            }
+        }, cancellationToken, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        TSC.Program.LogRuntime($"AUDIO_DECODE_BACKGROUND_BEGIN encodedBytes={encoded.Length} worker=dedicated");
+    }
+
+    /// <summary>
+    /// Completes a background decode on the calling (game) thread and creates its
+    /// native SoundEffect. Returns false while decoding is still in progress.
+    /// Once true is returned, an optional error explains a failed decode/setup.
+    /// </summary>
+    public bool TryCompletePendingLoad(bool retainPcmForSeeking, out Exception? error)
+    {
+        error = null;
+        var decodeTask = _initialDecodeTask;
+        if (decodeTask is null)
+            return true;
+        if (!decodeTask.IsCompleted)
+            return false;
+
+        _initialDecodeTask = null;
+        var elapsedMs = _initialDecodeStartedTimestamp > 0
+            ? Stopwatch.GetElapsedTime(_initialDecodeStartedTimestamp).TotalMilliseconds
+            : 0.0;
+        _initialDecodeStartedTimestamp = 0;
+        try
+        {
+            var decodeResult = decodeTask.GetAwaiter().GetResult();
+            _pcm = decodeResult.Pcm;
+            if (_pcm.Length == 0)
+                throw new InvalidDataException("The FPK music.opus did not decode to any audio samples.");
+
+            _durationSeconds = _pcm.Length / (double)(SampleRate * Channels * BytesPerSample);
+            TSC.Program.LogRuntime(
+                $"AUDIO_DECODE_BACKGROUND_DONE elapsedMs={elapsedMs:0.00} workerElapsedMs={decodeResult.ElapsedMs:0.00} " +
+                $"workerAllocatedBytes={decodeResult.AllocatedBytes} pcmBytes={_pcm.Length} durationSeconds={_durationSeconds:0.000}");
+            PrepareInitialPlayback(retainPcmForSeeking);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+            Clear();
+            return true;
+        }
+        finally
+        {
+            _initialDecodeCancellation?.Dispose();
+            _initialDecodeCancellation = null;
+        }
+    }
+
+    private static byte[] DecodeOpus(byte[] opusData, CancellationToken cancellationToken = default)
     {
         using var input = new MemoryStream(opusData, writable: false);
         var decoder = OpusCodecFactory.CreateDecoder(SampleRate, Channels);
         var reader = new OpusOggReadStream(decoder, input);
-        using var pcmStream = new MemoryStream();
 
-        while (reader.HasNextPacket)
+        // The Ogg granule count gives us a close estimate of the decoded sample
+        // count. Pre-sizing avoids MemoryStream's repeated doubling/copying as a
+        // long song is decoded. The stream can still grow if a file has unusual
+        // padding or inaccurate granule metadata.
+        var estimatedBytes = reader.TotalTime.TotalSeconds * SampleRate * Channels * BytesPerSample;
+        var initialCapacity = double.IsFinite(estimatedBytes) && estimatedBytes > 0
+            ? (int)Math.Clamp(Math.Ceiling(estimatedBytes), 64 * 1024, 256L * 1024 * 1024)
+            : (int)Math.Clamp((long)opusData.Length * 8, 64 * 1024, 8L * 1024 * 1024);
+        using var pcmStream = new MemoryStream(initialCapacity);
+
+        // Use Concentus' optimized Ogg packet reader. A custom raw-packet loop
+        // reduced a small amount of allocation but was materially slower on real
+        // songs. Pre-sizing the output stream retains the useful allocation
+        // reduction without replacing the library's packet decoding path.
+        try
         {
-            var packet = reader.DecodeNextPacket();
-            if (packet is null)
-                break;
-            var bytes = new byte[packet.Length * sizeof(short)];
-            Buffer.BlockCopy(packet, 0, bytes, 0, bytes.Length);
-            pcmStream.Write(bytes, 0, bytes.Length);
-        }
+            while (reader.HasNextPacket)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var packetPcm = reader.DecodeNextPacket();
+                if (packetPcm is null)
+                    break;
 
-        return pcmStream.ToArray();
+                pcmStream.Write(MemoryMarshal.AsBytes(packetPcm.AsSpan()));
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!string.IsNullOrWhiteSpace(reader.LastError))
+                throw new InvalidDataException($"Could not read the Ogg Opus stream: {reader.LastError}");
+
+            // If the estimate was exact, reuse the MemoryStream's owned array
+            // instead of allocating another full-song copy via ToArray().
+            if (pcmStream.TryGetBuffer(out var pcmBuffer) &&
+                pcmBuffer.Offset == 0 &&
+                pcmBuffer.Array is { } pcmArray &&
+                pcmBuffer.Count == pcmArray.Length)
+            {
+                return pcmArray;
+            }
+
+            return pcmStream.ToArray();
+        }
+        finally
+        {
+            reader.Close();
+        }
     }
 
     public void Warmup()
@@ -103,8 +240,8 @@ public sealed class OpusAudioPlayer : IDisposable
         // song at the exact moment playback began. On songs whose audio origin is
         // near tick 0, that work could become a visible startup hitch and leave
         // the software chart clock ahead of the audio.
-        _effect = new SoundEffect(_pcm!, SampleRate, AudioChannels.Stereo);
-        _instance = _effect.CreateInstance();
+        _effect = CreateTrackedSoundBuffer(_pcm!);
+        _instance = CreateTrackedSoundSource(_effect);
         _instance.IsLooped = _isLooped;
         _instance.Volume = _volume;
 
@@ -185,11 +322,11 @@ public sealed class OpusAudioPlayer : IDisposable
         var oldInstance = _instance;
         _instance = null;
         try { oldInstance?.Stop(); } catch { }
-        try { oldInstance?.Dispose(); } catch { }
+        try { DisposeTrackedSoundSource(oldInstance); } catch { }
 
         var oldEffect = _effect;
         _effect = null;
-        try { oldEffect?.Dispose(); } catch { }
+        try { DisposeTrackedSoundBuffer(oldEffect); } catch { }
     }
 
     /// <summary>Recreates the sound effect after an OpenAL context reset.</summary>
@@ -215,8 +352,8 @@ public sealed class OpusAudioPlayer : IDisposable
         SoundEffectInstance? newInstance = null;
         try
         {
-            newEffect = new SoundEffect(pcm, SampleRate, AudioChannels.Stereo);
-            newInstance = newEffect.CreateInstance();
+            newEffect = CreateTrackedSoundBuffer(pcm);
+            newInstance = CreateTrackedSoundSource(newEffect);
             newInstance.IsLooped = _isLooped;
             newInstance.Volume = _volume;
             _effect = newEffect;
@@ -228,8 +365,8 @@ public sealed class OpusAudioPlayer : IDisposable
         }
         catch
         {
-            try { newInstance?.Dispose(); } catch { }
-            try { newEffect?.Dispose(); } catch { }
+            try { DisposeTrackedSoundSource(newInstance); } catch { }
+            try { DisposeTrackedSoundBuffer(newEffect); } catch { }
             _instance = null;
             _effect = null;
             throw;
@@ -249,7 +386,7 @@ public sealed class OpusAudioPlayer : IDisposable
         _instance = null;
         try
         {
-            oldInstance?.Dispose();
+            DisposeTrackedSoundSource(oldInstance);
         }
         catch
         {
@@ -257,7 +394,7 @@ public sealed class OpusAudioPlayer : IDisposable
             // disconnect. Still proceed and allocate a fresh source below.
         }
 
-        _instance = _effect.CreateInstance();
+        _instance = CreateTrackedSoundSource(_effect);
         _instance.IsLooped = _isLooped;
         _instance.Volume = _volume;
 
@@ -302,6 +439,34 @@ public sealed class OpusAudioPlayer : IDisposable
             TSC.Program.LogRuntime($"{logPrefix}_OFFSET_EXCEPTION {ex.Message}");
             return false;
         }
+    }
+
+    private static SoundEffect CreateTrackedSoundBuffer(byte[] pcm)
+    {
+        var effect = new SoundEffect(pcm, SampleRate, AudioChannels.Stereo);
+        return NativeResourceDiagnostics.TrackAudioBuffer(effect, pcm.LongLength, NativeAudioCategory.Music);
+    }
+
+    private static SoundEffectInstance CreateTrackedSoundSource(SoundEffect effect)
+    {
+        var instance = effect.CreateInstance();
+        return NativeResourceDiagnostics.TrackAudioInstance(instance, NativeAudioCategory.Music);
+    }
+
+    private static void DisposeTrackedSoundSource(SoundEffectInstance? instance)
+    {
+        if (instance is null)
+            return;
+        NativeResourceDiagnostics.Release(instance);
+        instance.Dispose();
+    }
+
+    private static void DisposeTrackedSoundBuffer(SoundEffect? effect)
+    {
+        if (effect is null)
+            return;
+        NativeResourceDiagnostics.Release(effect);
+        effect.Dispose();
     }
 
     private static class NativeAl
@@ -397,7 +562,7 @@ public sealed class OpusAudioPlayer : IDisposable
         }
         try
         {
-            oldInstance?.Dispose();
+            DisposeTrackedSoundSource(oldInstance);
         }
         catch
         {
@@ -405,15 +570,15 @@ public sealed class OpusAudioPlayer : IDisposable
         }
 
         var oldEffect = _effect;
-        var replacementEffect = new SoundEffect(slice, SampleRate, AudioChannels.Stereo);
-        var replacementInstance = replacementEffect.CreateInstance();
+        var replacementEffect = CreateTrackedSoundBuffer(slice);
+        var replacementInstance = CreateTrackedSoundSource(replacementEffect);
         replacementInstance.IsLooped = _isLooped;
         replacementInstance.Volume = _volume;
         _effect = replacementEffect;
         _instance = replacementInstance;
         try
         {
-            oldEffect?.Dispose();
+            DisposeTrackedSoundBuffer(oldEffect);
         }
         catch
         {
@@ -424,12 +589,30 @@ public sealed class OpusAudioPlayer : IDisposable
 
     private void DisposeLoadedAudio()
     {
+        var pendingDecode = _initialDecodeTask;
+        try { _initialDecodeCancellation?.Cancel(); } catch { }
+        if (pendingDecode is not null)
+        {
+            // A chart can be replaced while its decode is still running. Observe
+            // any late worker failure even though the player no longer needs its
+            // result, so cancellation/replacement cannot surface as an
+            // UnobservedTaskException later during garbage collection.
+            _ = pendingDecode.ContinueWith(
+                static task => { _ = task.Exception; },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+        _initialDecodeCancellation?.Dispose();
+        _initialDecodeCancellation = null;
+        _initialDecodeTask = null;
+        _initialDecodeStartedTimestamp = 0;
         _pcm = null;
         _opusData = null;
         _recoveryPcmTask = null;
-        _instance?.Dispose();
+        DisposeTrackedSoundSource(_instance);
         _instance = null;
-        _effect?.Dispose();
+        DisposeTrackedSoundBuffer(_effect);
         _effect = null;
         _durationSeconds = 0.0;
     }

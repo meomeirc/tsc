@@ -1009,7 +1009,7 @@ public sealed partial class Playfield
             else
             {
                 _editorTimelineScrubbing = false;
-                if (_editorTimelineResumeAfterScrub)
+                if (_editorTimelineResumeAfterScrub && CanStartEditorChartPlayback())
                 {
                     _playing = true;
                     _audioResyncPending = true;
@@ -4354,8 +4354,7 @@ public sealed partial class Playfield
         switch (actionId)
         {
             case EditorActionPlay:
-                _playing = !_playing;
-                _statusMessage = _playing ? "Preview playing." : "Preview paused.";
+                TryToggleEditorChartPlayback();
                 break;
             case EditorActionEditorPreview:
                 SetEditorPreviewMode(!_editorPreviewMode);

@@ -251,6 +251,60 @@ public static class UnicodeTextRenderer
         return HasGlyph(GetFontInfo(font), new Rune(character));
     }
 
+    /// <summary>
+    /// Releases cached fallback text textures associated with one SpriteFont.
+    /// SkinFontStore owns the SpriteFont atlas lifetime, so the fallback textures
+    /// generated from that font must not outlive the corresponding font runtime.
+    /// The cache key holds SpriteFont strongly; without this invalidation, disposed
+    /// skin fonts and their generated GPU textures can remain rooted until the
+    /// global LRU evicts them or the graphics device itself is disposed.
+    /// </summary>
+    public static (int EntryCount, long TextureBytes) ReleaseFont(SpriteFont font)
+    {
+        if (font is null)
+            return (0, 0);
+
+        lock (Sync)
+        {
+            var keys = TextCache.Keys
+                .Where(key => ReferenceEquals(key.Font, font))
+                .ToArray();
+            long textureBytes = 0;
+            foreach (var key in keys)
+            {
+                if (!TextCache.Remove(key, out var entry))
+                    continue;
+
+                if (entry.Node is not null)
+                {
+                    TextLru.Remove(entry.Node);
+                    entry.Node = null;
+                }
+
+                if (entry.Texture is { } texture)
+                {
+                    try
+                    {
+                        if (!texture.IsDisposed)
+                        {
+                            textureBytes += (long)texture.Width * texture.Height * 4L;
+                            texture.Dispose();
+                        }
+                    }
+                    catch
+                    {
+                        // A stale device/resource must not prevent the owning
+                        // skin runtime from releasing the rest of its resources.
+                    }
+                    entry.Texture = null;
+                }
+            }
+
+            FontInfos.Remove(font);
+            return (keys.Length, textureBytes);
+        }
+    }
+
     /// <summary>Release generated textures when a graphics device is disposed.</summary>
     public static void Dispose(GraphicsDevice graphicsDevice)
     {
@@ -447,9 +501,19 @@ public static class UnicodeTextRenderer
         }
 
         var pixels = ReadPremultipliedPixels(bitmap);
-        var texture = new Texture2D(spriteFont.Texture.GraphicsDevice, width, height, false, SurfaceFormat.Color);
-        texture.SetData(pixels);
-        return texture;
+        var texture = NativeResourceDiagnostics.TrackTexture(
+            new Texture2D(spriteFont.Texture.GraphicsDevice, width, height, false, SurfaceFormat.Color),
+            NativeResourceCategory.Font);
+        try
+        {
+            texture.SetData(pixels);
+            return texture;
+        }
+        catch
+        {
+            texture.Dispose();
+            throw;
+        }
     }
 
     private static string[] SplitLines(string text)

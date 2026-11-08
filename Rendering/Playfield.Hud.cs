@@ -194,7 +194,11 @@ public sealed partial class Playfield
 #else
             ? "EDITOR: Ctrl+S TSC  Ctrl+Shift+S ARES  Ctrl+Alt+S FPK. Select a tool and tap a lane to place notes."
 #endif
-            : "Click note/beat = inspect tick   Right-click = clear   Space Play/Pause   F4 Gameplay   F9 SuperFlick Debug   F11 Aux Tracks   B Beat Lines   F2 FPK   F3 ARES   R Restart   F1 Settings";
+#if DEBUG
+            : "Click note/beat = inspect tick   Right-click = clear   Space Play/Pause   F4 Gameplay   F6 Orbit   F7 Flash   F8 Performance   F9 SuperFlick   F11 Aux Tracks   B Beat Lines   F2 FPK   F3 ARES   R Restart   F1 Settings";
+#else
+            : "Click note/beat = inspect tick   Right-click = clear   Space Play/Pause   F4 Gameplay   B Beat Lines   F2 FPK   F3 ARES   R Restart   F1 Settings";
+#endif
         mode = FontSafeText(_font, mode);
         hudLine = FontSafeText(_font, hudLine);
         selectionLine = FontSafeText(_font, selectionLine);

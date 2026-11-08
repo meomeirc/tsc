@@ -11,6 +11,7 @@ using System.Globalization;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Reflection;
+using System.Runtime;
 
 namespace TSC.Rendering;
 
@@ -22,11 +23,6 @@ public sealed partial class Playfield
     private float _debugOrbitLineAreaPx;
     private int _debugOrbitLineDrawCalls;
     private int _debugOrbitLineVertices;
-    private float _debugTransitionFlashAreaPx;
-    private int _debugTransitionFlashDrawCalls;
-    private float _debugLaneHighlightAreaPx;
-    private float _debugSuperFlickHighlightAreaPx;
-    private int _debugSuperFlickHighlightDrawCalls;
     // Primitive utilities, performance diagnostics, and low-level fallback drawing.
 
     private void AddQuad(List<VertexPositionColor> vertices, Vector2 tl, Vector2 tr, Vector2 br, Vector2 bl, Color color)
@@ -81,11 +77,6 @@ public sealed partial class Playfield
         _debugDrawNotesMs = 0;
         _debugAutoLinkBuildMs = 0;
         _debugGameplayLinkBuildMs = 0;
-        _debugAutoLinkStateMs = 0;
-        _debugAutoLinkProjectionMs = 0;
-        _debugAutoLinkBodyGeomMs = 0;
-        _debugAutoLinkConnectorGeomMs = 0;
-        _debugAutoLinkCullingMs = 0;
         _debugTexturedDrawMs = 0;
         _debugTexturedSortMs = 0;
         _debugTexturedSubmitMs = 0;
@@ -95,9 +86,7 @@ public sealed partial class Playfield
         _debugAllocBeatTempoBytes = 0;
         _debugAllocNotesBytes = 0;
         _debugAllocFeedbackHudBytes = 0;
-        _debugAutoLinkAllocatedBytes = 0;
         _debugAllocatedBytes = 0;
-        _debugVisibleAutoLinks = 0;
         _debugVisibleGameplayChains = 0;
         _debugGameplayLinkSegments = 0;
         _debugLinkBodyQuads = 0;
@@ -133,11 +122,6 @@ public sealed partial class Playfield
         _debugOrbitLineAreaPx = 0;
         _debugOrbitLineDrawCalls = 0;
         _debugOrbitLineVertices = 0;
-        _debugTransitionFlashAreaPx = 0;
-        _debugTransitionFlashDrawCalls = 0;
-        _debugLaneHighlightAreaPx = 0;
-        _debugSuperFlickHighlightAreaPx = 0;
-        _debugSuperFlickHighlightDrawCalls = 0;
         _debugPrimitiveDrawCalls = 0;
         _debugPrimitiveVertices = 0;
     }
@@ -164,79 +148,14 @@ public sealed partial class Playfield
     {
         const int left = 12;
         const int top = 12;
-        const int width = 980;
+        const int width = 1240;
         const int lineHeight = 18;
 
         var now = Stopwatch.GetTimestamp();
         if (string.IsNullOrEmpty(_performanceDebugOverlayText) ||
             now >= _performanceDebugOverlayNextRefreshTimestamp)
         {
-            // Keep both performance views visible: CPU-bound throughput estimates
-            // how many frames the renderer could produce without presentation waits,
-            // while cadence FPS shows the actual spacing between Draw() calls.
-            // Never replace the instantaneous value with the average; the average is
-            // supplemental and can otherwise hide a drop.
-            var cpuBoundFps = _debugFrameMs > 0.001 ? 1000.0 / _debugFrameMs : 0.0;
-            var instantCadenceFps = _debugDrawIntervalMs > 0.001 ? 1000.0 / _debugDrawIntervalMs : 0.0;
-            var averageCadenceFps = _debugDrawFpsAverage > 0.001
-                ? _debugDrawFpsAverage
-                : instantCadenceFps;
-            var maxInterval = _debugDrawIntervalCompletedWindowMaxMs > 0.001
-                ? _debugDrawIntervalCompletedWindowMaxMs
-                : _debugDrawIntervalMaxWindowMs;
-            var lateIntervals = _debugDrawFpsAverage > 0.001
-                ? _debugDrawLateIntervalsLastWindow
-                : _debugDrawLateIntervalsInWindow;
-            var memory = GetMemoryDebug();
-            var lines = new[]
-            {
-                $"MEMORY   PCM {_audio.PcmBytes / (1024.0 * 1024.0):0.0} MB   managed {memory.ManagedMb:0.0} MB   private {memory.PrivateMb:0.0} MB   working {memory.WorkingSetMb:0.0} MB",
-                $"PERFORMANCE   CPU-bound {cpuBoundFps:0} FPS   cadence {instantCadenceFps:0.0} FPS now / {averageCadenceFps:0.0} avg   interval {_debugDrawIntervalMs:0.00} ms   max1s {maxInterval:0.00} ms   late>20ms {lateIntervals}   CPU draw {_debugFrameMs:0.00} ms   Alloc {_debugAllocatedBytes / 1024.0:0.0} KB",
-                $"HOST CPU  update batch/max1s {FrameLoopDiagnostics.MaxUpdateCpuMsSinceLastDraw:0.00}/{FrameLoopDiagnostics.MaxUpdateCpuMsOneSecond:0.00} ms   draw now/max1s {FrameLoopDiagnostics.LastDrawCpuMs:0.00}/{FrameLoopDiagnostics.MaxDrawCpuMsOneSecond:0.00} ms   delta {FrameLoopDiagnostics.LastDrawIntervalMs:0.00} ms",
-                $"HOST STATE updates/draw {FrameLoopDiagnostics.UpdateCallsSinceLastDraw}   slow {(FrameLoopDiagnostics.RunningSlowlySinceLastDraw ? "YES" : "NO")}   dt {FrameLoopDiagnostics.LastUpdateElapsedGameMs:0.00} ms   alloc U {FrameLoopDiagnostics.UpdateAllocatedBytesSinceLastDraw / 1024.0:0.0} KB D {FrameLoopDiagnostics.LastDrawAllocatedBytes / 1024.0:0.0} KB",
-                $"HOST GC   update G0/G1/G2 {FrameLoopDiagnostics.UpdateGc0SinceLastDraw}/{FrameLoopDiagnostics.UpdateGc1SinceLastDraw}/{FrameLoopDiagnostics.UpdateGc2SinceLastDraw}   draw G0/G1/G2 {FrameLoopDiagnostics.LastDrawGc0}/{FrameLoopDiagnostics.LastDrawGc1}/{FrameLoopDiagnostics.LastDrawGc2}",
-                $"SKIN         build {_debugSkinBuildMs:0.00} ms   draw {_debugSkinDrawMs:0.00} ms   GC/frame G0 {_debugGc0Delta} G1 {_debugGc1Delta} G2 {_debugGc2Delta}",
-                $"SKIN API  spr {_skinRuntime.DebugLastSpriteApiAllocatedBytes / 1024.0:0.0}/{_skinRuntime.DebugLastSpriteApiCalls} quad {_skinRuntime.DebugLastQuad3DApiAllocatedBytes / 1024.0:0.0}/{_skinRuntime.DebugLastQuad3DApiCalls}/{_skinRuntime.DebugLastQuad3DApiMilliseconds:0.000}ms spark {_skinRuntime.DebugLastSparkleApiAllocatedBytes / 1024.0:0.0}/{_skinRuntime.DebugLastSparkleApiCalls}",
-                $"          text {_skinRuntime.DebugLastTextApiAllocatedBytes / 1024.0:0.0}/{_skinRuntime.DebugLastTextApiCalls} rect {_skinRuntime.DebugLastRectApiAllocatedBytes / 1024.0:0.0}/{_skinRuntime.DebugLastRectApiCalls} line {_skinRuntime.DebugLastLineApiAllocatedBytes / 1024.0:0.0}/{_skinRuntime.DebugLastLineApiCalls} shadow {_skinRuntime.DebugLastShadowApiAllocatedBytes / 1024.0:0.0}/{_skinRuntime.DebugLastShadowApiCalls}",
-                $"SKIN MEM  pool {_skinRuntime.DebugDrawCommandPoolCount} cmds   render {_skinRuntime.DebugLastRenderCallAllocatedBytes / 1024.0:0.0} KB   layout {_skinRuntime.DebugLastResolveLayoutAllocatedBytes / 1024.0:0.0} KB/{_skinRuntime.DebugLastResolveLayoutMilliseconds:0.00} ms   sort {_skinRuntime.DebugLastRenderSortAllocatedBytes / 1024.0:0.0} KB",
-                $"SKIN PART bg {_skinRuntime.GetDebugSkinSectionAllocatedBytes(1) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(1):0.00} ms   cards {_skinRuntime.GetDebugSkinSectionAllocatedBytes(2) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(2):0.00} ms   stage {_skinRuntime.GetDebugSkinSectionAllocatedBytes(3) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(3):0.00} ms   rank {_skinRuntime.GetDebugSkinSectionAllocatedBytes(4) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(4):0.00} ms",
-                $"          clear {_skinRuntime.GetDebugSkinSectionAllocatedBytes(5) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(5):0.00} ms   HUD {_skinRuntime.GetDebugSkinSectionAllocatedBytes(6) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(6):0.00} ms   hits {_skinRuntime.GetDebugSkinSectionAllocatedBytes(7) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(7):0.00} ms   timing {_skinRuntime.GetDebugSkinSectionAllocatedBytes(8) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(8):0.00} ms",
-                $"SKIN CARD event {_skinRuntime.GetDebugSkinSectionAllocatedBytes(9) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(9):0.00} ms   lights {_skinRuntime.GetDebugSkinSectionAllocatedBytes(10) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(10):0.00} ms",
-                $"          character {_skinRuntime.GetDebugSkinSectionAllocatedBytes(11) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(11):0.00} ms   card-quad {_skinRuntime.GetDebugSkinSectionAllocatedBytes(12) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(12):0.00} ms",
-                $"          batch {_skinRuntime.GetDebugSkinSectionAllocatedBytes(15) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(15):0.00} ms",
-                $"SKIN 3D CPU ms/quads  base {_skinRuntime.GetDebugQuad3DGroupMilliseconds(1):0.00}/{_skinRuntime.GetDebugQuad3DGroupQuadCount(1)}  lights {_skinRuntime.GetDebugQuad3DGroupMilliseconds(2):0.00}/{_skinRuntime.GetDebugQuad3DGroupQuadCount(2)}",
-                $"          chars {_skinRuntime.GetDebugQuad3DGroupMilliseconds(3):0.00}/{_skinRuntime.GetDebugQuad3DGroupQuadCount(3)}  flashes {_skinRuntime.GetDebugQuad3DGroupMilliseconds(4):0.00}/{_skinRuntime.GetDebugQuad3DGroupQuadCount(4)}   batch {_skinRuntime.DebugLastQuad3DBatchedQuads}q/{_skinRuntime.DebugLastQuad3DBatchedRuns} runs; saved {_skinRuntime.DebugLastQuad3DDrawCallsSaved} draws",
-                $"SKIN TIME text {_skinRuntime.GetDebugSkinSectionAllocatedBytes(13) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(13):0.00} ms   hit-bar {_skinRuntime.GetDebugSkinSectionAllocatedBytes(14) / 1024.0:0.0} KB/{_skinRuntime.GetDebugSkinSectionMilliseconds(14):0.00} ms",
-                $"ALLOC      skin-build {_debugAllocSkinBuildBytes / 1024.0:0.0} KB   skin-draw {_debugAllocSkinDrawBytes / 1024.0:0.0} KB   lane {_debugAllocLaneBytes / 1024.0:0.0} KB   notes {_debugAllocNotesBytes / 1024.0:0.0} KB",
-                $"CLEAR PROBE trigger {_debugClearTriggerCount}   frames-left {_debugClearProbeFrames}   max frame {_debugClearMaxFrameMs:0.00} ms   max build {_debugClearMaxSkinBuildMs:0.00} ms   max draw {_debugClearMaxSkinDrawMs:0.00} ms",
-                $"             max alloc {_debugClearMaxAllocBytes / 1024.0:0.0} KB   GC totals G0 {_debugClearGc0} G1 {_debugClearGc1} G2 {_debugClearGc2}",
-                $"           beat/tempo {_debugAllocBeatTempoBytes / 1024.0:0.0} KB   feedback/HUD {_debugAllocFeedbackHudBytes / 1024.0:0.0} KB   other {Math.Max(0L, _debugAllocatedBytes - (_debugAllocSkinBuildBytes + _debugAllocSkinDrawBytes + _debugAllocLaneBytes + _debugAllocBeatTempoBytes + _debugAllocNotesBytes + _debugAllocFeedbackHudBytes)) / 1024.0:0.0} KB",
-                $"DrawNotes {_debugDrawNotesMs:0.00} ms   textured {_debugTexturedDrawMs:0.00} ms   sort {_debugTexturedSortMs:0.00} ms   submit {_debugTexturedSubmitMs:0.00} ms",
-                $"PLAYFIELD textured draws {_debugTexturedDrawCalls} / vertices {_debugTexturedVertices}   primitive {_debugPrimitiveDrawCalls} / {_debugPrimitiveVertices}",
-                $"TEXTURED split lane {_debugTexturedLaneDrawCalls}/{_debugTexturedLaneVertices}  guide {_debugTexturedGuideDrawCalls}/{_debugTexturedGuideVertices}  notes {_debugTexturedNoteDrawCalls}/{_debugTexturedNoteVertices}  feedback {_debugTexturedFeedbackDrawCalls}/{_debugTexturedFeedbackVertices}",
-                $"Commands heads {_debugHeadCommands} +3D {_debug3DHeadCommands}   bodies {_debugBodyCommands} +3D {_debug3DBodyCommands}   connectors {_debugConnectorCommands}   flicks {_debugSuperFlickCommands}",
-                $"Body duplicate sources skipped {_debugDuplicateBodySourceSkips}",
-                "",
-                $"REAL 3D   ON   laneRotation {_projection.LaneRotationDegrees:0.##} deg   stand {_projection.NoteStandAngleDegrees:0.##} deg",
-                $"Far camera {_projection.LaneFarCameraDistance:0.##}   laneLength {_projection.LaneLength:0.##}   endLength {_projection.LaneEndLength:0.##}",
-                $"Perspective speed {_projection.PerspectiveSpeedCompensation:0.##}%   size {_projection.PerspectiveSizeCompensation:0.##}%",
-                $"Perspective distance {_projection.FocalDistance:0.##}   track { _projection.LaneTrackWidth:0.##}   bank {_projection.LaneBankWidth:0.##}",
-                $"Render ahead {_projection.GetRenderDistanceAhead():0.##}",
-                $"Render behind {_projection.GetRenderDistanceBehind():0.##}",
-                $"SCENE   notes {_debugVisibleRenderableNotes}   holds {_debugVisibleHolds}   3D planes {_debugVisible3DPlanes}",
-                $"Projection calls base {_projection.DebugProjectCalls}   travel {_projection.DebugProjectSideTravelCalls}",
-                $"Projection frames side {_projection.DebugProjectSideTravelFrameCalls}   tick {_projection.DebugProjectAtTicksCalls}   travel {_projection.DebugProjectAtTravelCalls}",
-                $"Scroll calls {_projection.DebugScrollPixelsCalls}   tick {_projection.DebugScrollPixelsAtTicksCalls}",
-                $"LINKS   auto {_debugVisibleAutoLinks}   gameplay chains {_debugVisibleGameplayChains}   segments {_debugGameplayLinkSegments}",
-                $"Link body {_debugLinkBodyQuads} connector {_debugLinkConnectorQuads} tail {_debugLinkTailEndQuads} | chains {_debugLinkChainCalls} cmds {_debugLinkGeneratedCommands} verts {_debugLinkGeneratedVertices} max-one {_debugLinkMaxVerticesPerChain}",
-                $"Link build auto {_debugAutoLinkBuildMs:0.00} ms   gameplay {_debugGameplayLinkBuildMs:0.00} ms",
-                $"Link stages state {_debugAutoLinkStateMs:0.00}  projection {_debugAutoLinkProjectionMs:0.00}  body {_debugAutoLinkBodyGeomMs:0.00}",
-                $"Link connector {_debugAutoLinkConnectorGeomMs:0.00}  cull {_debugAutoLinkCullingMs:0.00}  alloc {_debugAutoLinkAllocatedBytes / 1024.0:0.0} KB",
-                $"RUNTIME   mode {(_gameplayMode ? "GAMEPLAY" : "AUTOPLAY")}   paused {(_gameplayPaused ? "YES" : "NO")}   t {_playSeconds:0.000}s   F6 orbit {(_disableOrbitLaneTransition ? "OFF" : "ON")}   F7 flash {(_disableTransitionFlash ? "OFF" : "ON")}",
-                "F8 toggles this overlay",
-            };
-
-            _performanceDebugOverlayText = string.Join("\n", lines);
+            _performanceDebugOverlayText = BuildPerformanceDebugOverlayText();
             _performanceDebugOverlayNextRefreshTimestamp =
                 now + Math.Max(1L, Stopwatch.Frequency / 10);
         }
@@ -254,6 +173,133 @@ public sealed partial class Playfield
         UnicodeTextRenderer.DrawString(_spriteBatch, _font, _performanceDebugOverlayText, new Vector2(left, top), Color.White);
         _spriteBatch.End();
     }
+
+
+    private string BuildPerformanceDebugOverlayText()
+    {
+        // Keep F8 focused on the values useful for investigating memory
+        // retention and frame pacing. Detailed skin, geometry, and link
+        // instrumentation remains in the runtime diagnostics/logging paths.
+        var cpuBoundFps = _debugFrameMs > 0.001 ? 1000.0 / _debugFrameMs : 0.0;
+        var instantCadenceFps = _debugDrawIntervalMs > 0.001 ? 1000.0 / _debugDrawIntervalMs : 0.0;
+        var averageCadenceFps = _debugDrawFpsAverage > 0.001
+            ? _debugDrawFpsAverage
+            : instantCadenceFps;
+        var maxInterval = _debugDrawIntervalCompletedWindowMaxMs > 0.001
+            ? _debugDrawIntervalCompletedWindowMaxMs
+            : _debugDrawIntervalMaxWindowMs;
+        var lateIntervals = _debugDrawFpsAverage > 0.001
+            ? _debugDrawLateIntervalsLastWindow
+            : _debugDrawLateIntervalsInWindow;
+        var memory = GetMemoryDebug();
+        var native = NativeResourceDiagnostics.GetSnapshot();
+        const double bytesToMb = 1.0 / (1024.0 * 1024.0);
+        var lines = new[]
+        {
+            $"MEMORY  Managed used* {memory.ManagedUsedMb:0.0} MB   GC heap {memory.GcHeapMb:0.0} MB   GC committed {memory.GcCommittedMb:0.0} MB",
+            $"GC      Fragmented {memory.GcFragmentedMb:0.0} MB   LOH {memory.LohMb:0.0} MB (last GC)   PCM {_audio.PcmBytes * bytesToMb:0.0} MB",
+            $"PROCESS Commit {memory.ProcessCommitMb:0.0} MB   outside GC ~{memory.NonGcCommittedMb:0.0} MB   Working set {memory.WorkingSetMb:0.0} MB",
+            $"GPU     Textures {native.TextureCount} / {native.TextureBytes * bytesToMb:0.0} MB   skin {native.SkinTextureBytes * bytesToMb:0.0}   font {native.FontTextureBytes * bytesToMb:0.0}   game {native.GameplayTextureBytes * bytesToMb:0.0}   editor {native.EditorTextureBytes * bytesToMb:0.0}",
+            $"GPU     Render targets {native.RenderTargetCount} / {native.RenderTargetBytes * bytesToMb:0.0} MB   menu textures {native.MenuTextureBytes * bytesToMb:0.0} MB",
+            $"AUDIO   Buffers {native.AudioBufferCount} / {native.AudioBufferBytes * bytesToMb:0.0} MB   music {native.MusicBufferBytes * bytesToMb:0.0}   SFX {native.SoundEffectBufferBytes * bytesToMb:0.0}   instances {native.AudioInstanceCount} (music {native.MusicInstanceCount} / SFX {native.SoundEffectInstanceCount})",
+            $"PERF    FPS {instantCadenceFps:0.0} now / {averageCadenceFps:0.0} avg   CPU-only {cpuBoundFps:0} FPS   draw {_debugFrameMs:0.00} ms   max gap {maxInterval:0.00} ms   late {lateIntervals}",
+            "*GPU/audio are TSC-owned estimates; GPU uses width×height×4, audio uses PCM bytes; internal driver allocations are excluded.",
+            "*Managed used is an estimate; GC heap/fragmentation/LOH are last-GC snapshots.",
+            "Ctrl+Shift+F8 copy   Ctrl+F8 compacting full GC   F8 hide",
+        };
+
+        return string.Join("\n", lines);
+    }
+
+#if DEBUG
+    private void CopyPerformanceDebugOverlayToClipboard()
+    {
+        if (!_showPerformanceDebug)
+        {
+            _statusMessage = "Enable F8 diagnostics before copying";
+            return;
+        }
+
+        try
+        {
+            // Rebuild the snapshot at the moment of the request so the copied
+            // values are current, rather than up to 100 ms older than the screen.
+            var snapshot = BuildPerformanceDebugOverlayText();
+            System.Windows.Forms.Clipboard.SetText(snapshot, System.Windows.Forms.TextDataFormat.UnicodeText);
+            _performanceDebugOverlayText = snapshot;
+            _performanceDebugOverlayNextRefreshTimestamp =
+                Stopwatch.GetTimestamp() + Math.Max(1L, Stopwatch.Frequency / 10);
+            _statusMessage = "F8 diagnostics copied to clipboard";
+            Program.LogRuntime("DEBUG_PERFORMANCE_OVERLAY_COPIED");
+        }
+        catch (Exception ex)
+        {
+            _statusMessage = $"Could not copy F8 diagnostics: {ex.GetType().Name}";
+            Program.LogRuntime($"DEBUG_PERFORMANCE_OVERLAY_COPY_FAILED error={ex.GetType().Name}:{ex.Message}");
+        }
+    }
+#endif
+
+#if DEBUG
+    private void ForceFullGcDiagnostic()
+    {
+        // This is deliberately a manual Debug-only probe. A full blocking GC can
+        // pause the game, so it must never run automatically during gameplay.
+        var before = GetMemoryDebug();
+        var nativeBefore = NativeResourceDiagnostics.GetSnapshot();
+        var beforeGen0 = GC.CollectionCount(0);
+        var beforeGen1 = GC.CollectionCount(1);
+        var beforeGen2 = GC.CollectionCount(2);
+        var startTimestamp = Stopwatch.GetTimestamp();
+        Exception? failure = null;
+
+        try
+        {
+            // Request one LOH compaction as part of the next full blocking Gen2
+            // collection. The second collection reclaims objects finalized by
+            // the first collection and gives the post-GC snapshot a stable view.
+            GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+        }
+        catch (Exception ex)
+        {
+            failure = ex;
+            GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.Default;
+        }
+
+        var after = GetMemoryDebug();
+        var nativeAfter = NativeResourceDiagnostics.GetSnapshot();
+        var elapsedMs = (Stopwatch.GetTimestamp() - startTimestamp) * 1000.0 / Stopwatch.Frequency;
+        var gen0Collections = GC.CollectionCount(0) - beforeGen0;
+        var gen1Collections = GC.CollectionCount(1) - beforeGen1;
+        var gen2Collections = GC.CollectionCount(2) - beforeGen2;
+
+        Program.LogRuntime(
+            $"DEBUG_FORCE_FULL_GC elapsedMs={elapsedMs:0.00} " +
+            $"beforeManagedMb={before.ManagedUsedMb:0.0} afterManagedMb={after.ManagedUsedMb:0.0} reclaimedManagedMb={before.ManagedUsedMb - after.ManagedUsedMb:0.0} " +
+            $"beforeHeapMb={before.GcHeapMb:0.0} afterHeapMb={after.GcHeapMb:0.0} " +
+            $"beforeGcCommittedMb={before.GcCommittedMb:0.0} afterGcCommittedMb={after.GcCommittedMb:0.0} " +
+            $"beforeFragmentedMb={before.GcFragmentedMb:0.0} afterFragmentedMb={after.GcFragmentedMb:0.0} " +
+            $"beforeLohMb={before.LohMb:0.0} afterLohMb={after.LohMb:0.0} " +
+            $"beforeProcessCommitMb={before.ProcessCommitMb:0.0} afterProcessCommitMb={after.ProcessCommitMb:0.0} " +
+            $"beforeWorkingSetMb={before.WorkingSetMb:0.0} afterWorkingSetMb={after.WorkingSetMb:0.0} " +
+            $"gpuTextures={nativeBefore.TextureCount}/{nativeAfter.TextureCount} gpuTextureBytes={nativeBefore.TextureBytes}/{nativeAfter.TextureBytes} " +
+            $"renderTargets={nativeBefore.RenderTargetCount}/{nativeAfter.RenderTargetCount} renderTargetBytes={nativeBefore.RenderTargetBytes}/{nativeAfter.RenderTargetBytes} " +
+            $"audioBuffers={nativeBefore.AudioBufferCount}/{nativeAfter.AudioBufferCount} audioBufferBytes={nativeBefore.AudioBufferBytes}/{nativeAfter.AudioBufferBytes} " +
+            $"audioInstances={nativeBefore.AudioInstanceCount}/{nativeAfter.AudioInstanceCount} " +
+            $"gcCollections={gen0Collections}/{gen1Collections}/{gen2Collections} " +
+            $"success={(failure is null)}" +
+            (failure is null ? string.Empty : $" error={failure.GetType().Name}:{failure.Message}"));
+
+        _performanceDebugOverlayText = string.Empty;
+        _performanceDebugOverlayNextRefreshTimestamp = 0;
+        _statusMessage = failure is null
+            ? $"Full GC complete: reclaimed {Math.Max(0.0, before.ManagedUsedMb - after.ManagedUsedMb):0.0} MB managed"
+            : $"Full GC diagnostic failed: {failure.GetType().Name}";
+    }
+#endif
 
     private void DrawCircle(SpriteBatch batch, Vector2 center, float radius, Color color)
     {

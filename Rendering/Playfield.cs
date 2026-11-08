@@ -21,10 +21,27 @@ namespace TSC.Rendering;
 
 public sealed partial class Playfield
 {
+    private sealed class LoadTimingScope : IDisposable
+    {
+        private readonly string _stage;
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private readonly long _allocatedBytesAtStart = GC.GetAllocatedBytesForCurrentThread();
+        private readonly long _managedBytesAtStart = GC.GetTotalMemory(forceFullCollection: false);
+
+        public LoadTimingScope(string stage) => _stage = stage;
+
+        public void Dispose()
+        {
+            var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - _allocatedBytesAtStart;
+            var managedDeltaBytes = GC.GetTotalMemory(forceFullCollection: false) - _managedBytesAtStart;
+            Program.LogRuntime(
+                $"LOAD_TIMING stage={_stage} elapsedMs={_stopwatch.Elapsed.TotalMilliseconds:0.00} " +
+                $"allocatedBytes={allocatedBytes} managedDeltaBytes={managedDeltaBytes}");
+        }
+    }
 
     public event Action? OpenFpkRequested;
     public event Action? OpenAresRequested;
-    public event Action? EditEditorMetadataRequested;
     public event Action? ImportEditorSongRequested;
     public event Action<string>? EditorMediaPickRequested;
     public event Action? EditorExitRequested;
@@ -36,6 +53,8 @@ public sealed partial class Playfield
         public string? SourcePath { get; set; }
         public required string SourceName { get; set; }
         public string? FpkChartName { get; set; }
+        // Compressed song data is immutable after extraction and shared by all
+        // difficulty states; never mutate this buffer in place.
         public byte[]? MusicBytes { get; set; }
         public bool ImportedSongAudio { get; set; }
         public bool HasSourceChart { get; set; }
@@ -320,7 +339,6 @@ public sealed partial class Playfield
     private ChartBundleTemplate _editorBundleTemplate = ChartBundleTemplate.Tsc;
     private readonly Dictionary<string, (double PerfectPlusMs, double PerfectMs, double GoodMs)> _bundleJudgementWindows = new(StringComparer.OrdinalIgnoreCase);
     private string? _bundleSeries;
-    private bool _showPerspectiveSettings;
     private bool _scoreDebugEnabled = false;
     private bool _showPerformanceDebug;
     private bool _showAuxTrackDebug;
@@ -362,32 +380,21 @@ public sealed partial class Playfield
     private double _debugDrawNotesMs;
     private double _debugAutoLinkBuildMs;
     private double _debugGameplayLinkBuildMs;
-    private double _debugAutoLinkStateMs;
-    private double _debugAutoLinkProjectionMs;
-    private double _debugAutoLinkBodyGeomMs;
-    private double _debugAutoLinkConnectorGeomMs;
-    private double _debugAutoLinkCullingMs;
     private double _debugTexturedDrawMs;
     private double _debugTexturedSortMs;
-    private long _debugAllocSetupBytes;
-    private long _debugAllocWarmupBytes;
-    private long _debugAllocStateBytes;
     private long _debugAllocSkinBuildBytes;
     private long _debugAllocSkinDrawBytes;
     private long _debugAllocLaneBytes;
     private long _debugAllocBeatTempoBytes;
     private long _debugAllocNotesBytes;
     private long _debugAllocFeedbackHudBytes;
-    private long _debugAllocPauseBytes;
     private double _debugTexturedSubmitMs;
-    private long _debugAutoLinkAllocatedBytes;
     private long _debugAllocatedBytes;
     private double _debugLastGameplayDtMs;
     private double _debugLastTimingOffsetMs;
     private readonly double[] _debugTimingOffsets = new double[12];
     private int _debugTimingOffsetWriteIndex;
     private int _debugTimingOffsetCount;
-    private int _debugVisibleAutoLinks;
     private int _debugVisibleGameplayChains;
     private int _debugGameplayLinkSegments;
     private int _debugLinkBodyQuads;
@@ -421,11 +428,13 @@ public sealed partial class Playfield
     private int _debugPrimitiveVertices;
     private bool _audioResyncPending;
     private bool _audioStartedForCurrentRun;
+    private bool _audioLoadFailed;
     private int _lastAudioRecoveryGeneration;
     private double _pendingAudioRecoveryClockCorrectionSeconds;
     private long _nextUnexpectedAudioResyncAt;
     private bool _playbackStartPending;
     private double _startupWarmupRemainingSeconds;
+    private long _startupWarmupLastTimestamp;
     private double _skinIntroRemainingSeconds;
     private double _skinOutroRemainingSeconds;
     private bool _skinIntroStarted;
@@ -449,6 +458,35 @@ public sealed partial class Playfield
     // starting the chart/audio clocks. This is intentionally non-blocking: the
     // game keeps drawing during the warm-up instead of sleeping the thread.
     private const double StartupWarmupSeconds = 1.0;
+
+    private void BeginGameplayStartupWarmup()
+    {
+        _startupWarmupRemainingSeconds = StartupWarmupSeconds;
+        _startupWarmupLastTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    private void AdvanceGameplayStartupWarmup(GameTime gameTime)
+    {
+        var now = Stopwatch.GetTimestamp();
+        var previous = _startupWarmupLastTimestamp;
+        _startupWarmupLastTimestamp = now;
+
+        var elapsedSeconds = previous > 0
+            ? Stopwatch.GetElapsedTime(previous, now).TotalSeconds
+            : Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
+        if (!double.IsFinite(elapsedSeconds) || elapsedSeconds < 0.0)
+            elapsedSeconds = 0.0;
+
+        // Startup updates run once per drawn transition frame, while GameTime may
+        // still advance by the configured fixed-step interval (for example 2 ms
+        // at a 500 FPS cap). Use real time between those frames so the one-second
+        // warm-up remains one second regardless of the FPS cap or display refresh.
+        // Cap unusually long gaps so a debugger pause/native stall does not consume
+        // the entire warm-up in one update.
+        elapsedSeconds = Math.Min(elapsedSeconds, 0.25);
+        _startupWarmupRemainingSeconds = Math.Max(0.0, _startupWarmupRemainingSeconds - elapsedSeconds);
+    }
+
     private string? _lastLoadedSourceName;
     private GearState _gameplayState = new();
     private readonly HashSet<ChartEventKey> _hitEvents = new();
@@ -459,6 +497,15 @@ public sealed partial class Playfield
     private string? _tstsWorkingDirectory;
     private bool _loadingTstsBundleChart;
     private string? _loadedFpkChartName;
+    private FpkPackage? _cachedFpkPackage;
+    private string? _cachedFpkPackagePath;
+    private long _cachedFpkPackageLength = -1;
+    private long _cachedFpkPackageLastWriteUtcTicks = -1;
+    private byte[]? _cachedFpkSongJsonBytes;
+    private bool _cachedFpkSongJsonLoaded;
+    private FpkPackage? _loadedFpkPackage;
+    private byte[]? _loadedFpkSongJsonBytes;
+    private bool _loadedFpkSongJsonLoaded;
     private byte[]? _loadedMusicBytes;
     // Keep the untouched session source separately from any file produced by a
     // save/export. Media-volume edits affect the live playback gain only; exported
@@ -477,6 +524,10 @@ public sealed partial class Playfield
     // resizing the window does not require a manual F10 refresh.
     private int _lastRenderConfigVirtualWidth = -1;
     private int _lastRenderConfigVirtualHeight = -1;
+    // Lua scripts capture screen dimensions during execution. Track those separately
+    // from renderConfig so startup can skip a redundant second script execution.
+    private int _lastSkinScriptVirtualWidth = -1;
+    private int _lastSkinScriptVirtualHeight = -1;
     private bool _topDownViewEnabled;
     private RenderConfig _editorRenderConfig = new();
     private KeyboardState _previousKeyboard;
@@ -1003,7 +1054,8 @@ public sealed partial class Playfield
     // The destination can leave the opaque PREPARING transition as soon as the
     // hidden renderer/audio warm-up is done. Playback remains pending until the
     // transition has fully faded away and the skin intro has finished.
-    public bool StartupWarmupComplete => _startupWarmupRemainingSeconds <= 0.0;
+    public bool StartupWarmupComplete =>
+        _startupWarmupRemainingSeconds <= 0.0 && _textures.PendingHitAnimationFrames == 0;
     public AresChart? Chart => _chart;
     public bool ChartEditorMode => _chartEditorMode;
     public bool EditorTextInputActive => _chartEditorMode &&
@@ -1332,6 +1384,11 @@ public sealed partial class Playfield
             // Refresh both render configs and the Lua skin against the current
             // viewport instead of relying on whatever dimensions were cached
             // when this Playfield instance was first created.
+            // The editor interface script is intentionally deferred during
+            // gameplay startup; load it before refreshing editor layout/config.
+            using (new LoadTimingScope("skin_runtime_editor_activation"))
+                _chartEditorInterfaceRuntime.EnsureLoaded();
+            RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
             var editorStatus = _statusMessage;
             ReloadSkinForCurrentViewport();
             _statusMessage = editorStatus;
@@ -1405,6 +1462,8 @@ public sealed partial class Playfield
         _skinRuntime.SetEditorPreviewMode(_editorPreviewMode);
         _editorHoverCacheValid = false;
         RefreshSkinGameState();
+        if (enabled)
+            PrewarmGameplayAnimationFontsIfActive();
     }
 
     public void SetStatusMessage(string? message) => _statusMessage = message;
@@ -1548,8 +1607,29 @@ public sealed partial class Playfield
         ApplyEditorMusicPlaybackVolume();
     }
 
+    private void PrewarmGameplayAnimationFontsIfActive()
+    {
+        // The editor's gameplay preview uses the same rank-up and clear
+        // animations as normal gameplay. Prepare their atlases when the editor
+        // first loads, rather than waiting for the user to enter preview mode.
+        if (!_lockMenuPlayMode && !_editorPreviewMode && !_chartEditorMode)
+            return;
+
+        var timingStage = _editorPreviewMode
+            ? "skin_gameplay_animation_font_prepare_editor_preview"
+            : _chartEditorMode
+                ? "skin_gameplay_animation_font_prepare_editor_startup"
+                : "skin_gameplay_animation_font_prepare";
+        using (new LoadTimingScope(timingStage))
+            _skinRuntime.PrepareGameplayAnimationFonts();
+    }
+
     /// <summary>Notifies the skin that gameplay is preparing.</summary>
-    public void OnGameplayPreparing() => _skinRuntime.OnGameplayPreparing();
+    public void OnGameplayPreparing()
+    {
+        PrewarmGameplayAnimationFontsIfActive();
+        _skinRuntime.OnGameplayPreparing();
+    }
 
     public void SetScoreRecordPath(string? chartPath)
     {
@@ -1562,7 +1642,11 @@ public sealed partial class Playfield
     {
         _resultArtworkAlbumPathOverride = albumPath;
         _resultArtworkAlbumBigPathOverride = albumBigPath;
-        RefreshResultSongInfo();
+        // Song Select supplies artwork for the next chart before gameplay starts.
+        // Resolve/convert and upload it only when the result screen is actually
+        // opened; replacing the selection must not launch FFmpeg during startup.
+        if (_gameplayResultActive)
+            RefreshResultSongInfo();
     }
 
     public string? SourceName => _sourceName;
@@ -1587,7 +1671,8 @@ public sealed partial class Playfield
         string SourcePath,
         string ChartName,
         byte[] ChartBytes,
-        byte[]? MusicBytes);
+        byte[]? MusicBytes,
+        FpkPackage Package);
 
 
 
@@ -2080,7 +2165,6 @@ public sealed partial class Playfield
         _compact = true;
         _projection.Compact = true;
         _scoreDebugEnabled = false;
-        _showPerspectiveSettings = false;
         _showAuxTrackDebug = false;
         // Keep the performance/memory overlay available in locked menu-play mode.
         _superFlickDebugEnabled = false;
@@ -2099,6 +2183,7 @@ public sealed partial class Playfield
 
     public Playfield(GraphicsDevice graphics, SpriteFont font, SkinContext skin, Effect laneLineEffect, Effect? skinSparklesEffect = null, Effect? skinQuad3DEffect = null)
     {
+        using var loadTiming = new LoadTimingScope("playfield_constructor");
         _graphics = graphics;
         _skin = skin;
         _skinSparklesEffect = skinSparklesEffect;
@@ -2106,16 +2191,19 @@ public sealed partial class Playfield
         _laneLineEffect = laneLineEffect ?? throw new ArgumentNullException(nameof(laneLineEffect));
         var gameConfigPath = UserDataPaths.GameConfigPath;
         var (initialVirtualWidth, initialVirtualHeight) = GetVirtualResolution(graphics.Viewport.Width, graphics.Viewport.Height);
-        _skinRuntime = new SkinRuntime(
-            skin.SkinDirectory,
-            graphics,
-            "skin.lua",
-            skin.GameConfig,
-            gameConfigPath,
-            initialVirtualWidth,
-            initialVirtualHeight,
-            skinSparklesEffect: skinSparklesEffect,
-            skinQuad3DEffect: skinQuad3DEffect);
+        _lastSkinScriptVirtualWidth = initialVirtualWidth;
+        _lastSkinScriptVirtualHeight = initialVirtualHeight;
+        using (new LoadTimingScope("skin_runtime_gameplay"))
+            _skinRuntime = new SkinRuntime(
+                skin.SkinDirectory,
+                graphics,
+                "skin.lua",
+                skin.GameConfig,
+                gameConfigPath,
+                initialVirtualWidth,
+                initialVirtualHeight,
+                skinSparklesEffect: skinSparklesEffect,
+                skinQuad3DEffect: skinQuad3DEffect);
         _pauseSkinRuntime = new SkinRuntime(
             skin.SkinDirectory,
             graphics,
@@ -2125,7 +2213,8 @@ public sealed partial class Playfield
             initialVirtualWidth,
             initialVirtualHeight,
             skinSparklesEffect: skinSparklesEffect,
-            skinQuad3DEffect: skinQuad3DEffect);
+            skinQuad3DEffect: skinQuad3DEffect,
+            deferInitialLoad: true);
         _resultSkinRuntime = new SkinRuntime(
             skin.SkinDirectory,
             graphics,
@@ -2135,42 +2224,52 @@ public sealed partial class Playfield
             initialVirtualWidth,
             initialVirtualHeight,
             skinSparklesEffect: skinSparklesEffect,
-            skinQuad3DEffect: skinQuad3DEffect);
+            skinQuad3DEffect: skinQuad3DEffect,
+            deferInitialLoad: true);
         _chartEditorInterfaceRuntime = CreateSkinRuntime(
             skin, "chartEditorInterface.lua", initialVirtualWidth, initialVirtualHeight);
         RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
         _skin.UIConfig = _skinRuntime.UIConfig;
         var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
         var defaultAudioDirectory = Path.Combine(defaultSkinDirectory, "audio");
-        _hitSounds = new HitSoundPlayer(skin.AudioDirectory, defaultAudioDirectory);
-        _spriteBatch = new SpriteBatch(graphics);
-        _primitiveEffect = new BasicEffect(graphics)
+        using (new LoadTimingScope("skin_resource_initialization"))
         {
-            VertexColorEnabled = true,
-            TextureEnabled = false,
-            LightingEnabled = false
-        };
-        _textureEffect = new BasicEffect(graphics)
+            _hitSounds = new HitSoundPlayer(skin.AudioDirectory, defaultAudioDirectory);
+            _textures = new NoteTextures(
+                graphics,
+                skin.TextureDirectory,
+                Path.Combine(defaultSkinDirectory, "textures"));
+        }
+        using (new LoadTimingScope("playfield_graphics_resource_initialization"))
         {
-            VertexColorEnabled = true,
-            TextureEnabled = true,
-            LightingEnabled = false
-        };
-        _pixel = new Texture2D(graphics, 1, 1);
-        _pixel.SetData(new[] { Color.White });
-        _circle = CreateCircleTexture(graphics, 64);
+            _spriteBatch = new SpriteBatch(graphics);
+            _primitiveEffect = new BasicEffect(graphics)
+            {
+                VertexColorEnabled = true,
+                TextureEnabled = false,
+                LightingEnabled = false
+            };
+            _textureEffect = new BasicEffect(graphics)
+            {
+                VertexColorEnabled = true,
+                TextureEnabled = true,
+                LightingEnabled = false
+            };
+            _pixel = NativeResourceDiagnostics.TrackTexture(new Texture2D(graphics, 1, 1), NativeResourceCategory.Gameplay);
+            _pixel.SetData(new[] { Color.White });
+            _circle = CreateCircleTexture(graphics, 64);
+        }
         _font = font;
-        _textures = new NoteTextures(
-            graphics,
-            skin.TextureDirectory,
-            Path.Combine(defaultSkinDirectory, "textures"));
-        _textures.PreloadHitAnimations(
-            ("regular", skin.RenderConfig.HitAnimation.Regular.FrameCount),
-            ("multi", skin.RenderConfig.HitAnimation.Multi.FrameCount),
-            ("long", skin.RenderConfig.HitAnimation.Long.FrameCount),
-            ("superFlickOuter", skin.RenderConfig.HitAnimation.SuperFlick.Outer.FrameCount),
-            ("superFlickInner", skin.RenderConfig.HitAnimation.SuperFlick.Inner.FrameCount));
-        _projection.LoadRenderConfig(skin.RenderConfig);
+        using (new LoadTimingScope("playfield_skin_config_apply"))
+        {
+            _textures.QueueHitAnimationPreload(
+                ("regular", skin.RenderConfig.HitAnimation.Regular.FrameCount),
+                ("multi", skin.RenderConfig.HitAnimation.Multi.FrameCount),
+                ("long", skin.RenderConfig.HitAnimation.Long.FrameCount),
+                ("superFlickOuter", skin.RenderConfig.HitAnimation.SuperFlick.Outer.FrameCount),
+                ("superFlickInner", skin.RenderConfig.HitAnimation.SuperFlick.Inner.FrameCount));
+            _projection.LoadRenderConfig(skin.RenderConfig);
+        }
         // The top-down/editor view has its own skin-local config. It is created
         // from the built-in defaults when missing, and can be tuned independently
         // without changing the normal renderConfig.lua view. Keep a valid fallback
@@ -2185,8 +2284,9 @@ public sealed partial class Playfield
         SyncEditorConstantScrollMode();
         var (virtualWidth, virtualHeight) = GetVirtualResolution(graphics.Viewport.Width, graphics.Viewport.Height);
         _projection.Resize(virtualWidth, virtualHeight);
-        _lastRenderConfigVirtualWidth = virtualWidth;
-        _lastRenderConfigVirtualHeight = virtualHeight;
+        // SkinContext.RenderConfig may have been parsed before the current
+        // viewport was established. Let the first viewport refresh reload and
+        // apply renderConfig.lua before gameplay/editor rendering begins.
     }
     public void CreateEmptyEditorChart(string difficulty = "Expert", ChartBundleTemplate template = ChartBundleTemplate.Tsc)
     {
@@ -2263,83 +2363,6 @@ public sealed partial class Playfield
         _editorMetaPanelOpen = true;
         MarkEditorDirty(auxiliaryChange: true);
         _statusMessage = $"Empty {GetEditorDifficultyName(difficultyCode)} chart created. Use META → MEDIA → MUSIC to choose audio.";
-    }
-
-    public void UpdateEditorMetadata(
-        string? name,
-        string? artist,
-        string? series,
-        string? difficulty,
-        int? level,
-        string? previewPath,
-        string? albumPath,
-        string? albumBigPath,
-        double initialTempo,
-        int ticksPerMeasure,
-        int initialGearAttr,
-        double playTime,
-        int audioOriginTick)
-    {
-        if (!_chartEditorMode || _chart is null)
-            throw new InvalidOperationException("No chart is open in Chart Editor.");
-        if (!double.IsFinite(initialTempo) || initialTempo < 1.0 || initialTempo > float.MaxValue)
-            throw new ArgumentOutOfRangeException(nameof(initialTempo), "BPM must be at least 1 and fit the chart's numeric format.");
-        if (ticksPerMeasure < 1 || ticksPerMeasure > 3840)
-            throw new ArgumentOutOfRangeException(nameof(ticksPerMeasure), "Ticks per measure must be between 1 and 3840.");
-        if (initialGearAttr is not (0 or 2 or 4 or 6))
-            throw new ArgumentOutOfRangeException(nameof(initialGearAttr), "Start gear must be 1K, 2K, or 3K.");
-        if (audioOriginTick < 0 || !double.IsFinite(playTime) || playTime < 0)
-            throw new ArgumentOutOfRangeException(nameof(playTime), "Audio origin tick and play time cannot be negative.");
-
-        _chart.Name = NormalizeEditorMetaValue(name);
-        _chart.Artist = NormalizeEditorMetaValue(artist);
-        _chart.Series = _editorBundleTemplate == ChartBundleTemplate.Tsts ? null : NormalizeEditorMetaValue(series);
-        _chart.Difficulty = GetEditorDifficultyName(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(difficulty, _sourceName));
-        _chart.Level = level;
-        ApplyFixedMediaPaths(_chart, _editorBundleTemplate);
-        _chart.InitialTempo = initialTempo;
-        _chart.TicksPerMeasure = ticksPerMeasure;
-        _chart.InitialGearAttr = initialGearAttr;
-        var resolvedPlayTime = playTime <= 0.000001
-            ? (_loadedMusicBytes is { Length: > 0 } && double.IsFinite(_audio.DurationSeconds) ? Math.Max(0.0, _audio.DurationSeconds) : 0.0)
-            : playTime;
-        _chart.PlayTime = resolvedPlayTime;
-        _chart.AudioOriginTick = audioOriginTick;
-
-        _tempo = new TempoMap(_chart);
-        _chart.PlayTick = CalculatePlayTickForPlayTime(_tempo, _chart.PlayTime, _chart.AudioOriginTick);
-        ReconcilePlayTickAndPlayTime();
-        AresLoader.SynchronizePlayTickMarker(_chart);
-        _editorBpmInputText = _tempo.BpmAt(0).ToString("0.##", CultureInfo.InvariantCulture);
-        _editorBpmInputFocused = false;
-        _editorBpmInputReplaceOnNextKey = false;
-        _editorBpmPlacementPending = false;
-        _editorSelectedTempoEvent = null;
-        _editorMetaStatsCache = null;
-        _editorMetaStatsCacheChart = null;
-        _gear = new GearTimeline(_chart);
-        _editorPreviewGearState = CreateEditorPreviewInitialState();
-        _gameplayState = _editorPreviewGearState.Copy();
-        SyncEditorPreviewBankIndicators(_editorPreviewGearState);
-        ResetEditorTimelineRouteHistory(_editorPreviewGearState);
-        _skinRuntime.SetPanelTracks(_chart, _tempo);
-        _pauseSkinRuntime.SetPanelTracks(_chart, _tempo);
-        _resultSkinRuntime.SetPanelTracks(_chart, _tempo);
-        _projection.SetTempo(_tempo);
-        _projection.RebuildPrecomputedNoteMotionPaths();
-        _lastPlayableTick = CalculateLastPlayableTick();
-        _lastPlayableTickReached = false;
-        _playSeconds = 0;
-        _playing = false;
-        _playbackStartPending = false;
-        _audioResyncPending = true;
-        _audioStartedForCurrentRun = false;
-        _audio.Stop();
-        InvalidateLaneMeshCache();
-        SyncSharedEditorMetadataToDifficultyStates();
-        StoreActiveEditorDifficulty();
-        MarkEditorDirty();
-        _statusMessage = "Chart metadata updated.";
     }
 
     private static string? NormalizeEditorMetaValue(string? value)
@@ -2454,7 +2477,7 @@ public sealed partial class Playfield
                 _editorCommittedDeletedDifficultyCodes.Clear();
                 _editorDifficultySessionActive = true;
                 _editorActiveDifficultyCode = currentCode;
-                _editorSharedMusicBytes = _loadedMusicBytes?.ToArray();
+                _editorSharedMusicBytes = _loadedMusicBytes;
                 _editorSharedSongImportedAudio = _editorImportedSongAudio;
                 _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
                 StoreActiveEditorDifficulty();
@@ -2471,7 +2494,7 @@ public sealed partial class Playfield
                 CopySharedEditorMetadata(_chart, nextState.Chart);
                 nextState.Chart.Difficulty = GetEditorDifficultyName(nextCode);
                 if (sharedMusic is { Length: > 0 })
-                    nextState.MusicBytes = sharedMusic.ToArray();
+                    nextState.MusicBytes = sharedMusic;
                 if (_editorSharedSongImportedAudio)
                     nextState.ImportedSongAudio = true;
                 _editorDifficultyStates[nextCode] = nextState;
@@ -2481,7 +2504,7 @@ public sealed partial class Playfield
                 CopySharedEditorMetadata(_chart, nextState.Chart);
                 nextState.Chart.Difficulty = GetEditorDifficultyName(nextCode);
                 if (sharedMusic is { Length: > 0 } && (nextState.MusicBytes is null || _editorSharedSongImportedAudio))
-                    nextState.MusicBytes = sharedMusic.ToArray();
+                    nextState.MusicBytes = sharedMusic;
                 if (_editorSharedSongImportedAudio)
                     nextState.ImportedSongAudio = true;
             }
@@ -2528,7 +2551,7 @@ public sealed partial class Playfield
                 RecordEditorTimelineRouteState(_playSeconds, intendedState);
             }
             _editorImportedSongAudio = nextState.ImportedSongAudio || _editorSharedSongImportedAudio;
-            _editorSharedMusicBytes = nextState.MusicBytes?.ToArray() ?? sharedMusic?.ToArray();
+            _editorSharedMusicBytes = nextState.MusicBytes ?? sharedMusic;
             _editorActiveDifficultyCode = nextCode;
             _editorDifficultySessionActive = true;
             _editorMetaPanelOpen = true;
@@ -2592,7 +2615,7 @@ public sealed partial class Playfield
                 _editorCommittedDeletedDifficultyCodes.Clear();
                 _editorDifficultySessionActive = true;
                 _editorActiveDifficultyCode = GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
-                _editorSharedMusicBytes = _loadedMusicBytes?.ToArray();
+                _editorSharedMusicBytes = _loadedMusicBytes;
                 _editorSharedSongImportedAudio = _editorImportedSongAudio;
                 _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
                 StoreActiveEditorDifficulty();
@@ -2605,7 +2628,7 @@ public sealed partial class Playfield
             CopySharedEditorMetadata(_chart, newState.Chart);
             newState.Chart.Difficulty = GetEditorDifficultyName(code);
             if (sharedMusic is { Length: > 0 })
-                newState.MusicBytes = sharedMusic.ToArray();
+                newState.MusicBytes = sharedMusic;
             if (_editorSharedSongImportedAudio)
                 newState.ImportedSongAudio = true;
 
@@ -2671,7 +2694,7 @@ public sealed partial class Playfield
         if (!File.Exists(fullPackagePath))
             throw new FileNotFoundException("The source FPK bundle could not be found.", fullPackagePath);
 
-        var package = FpkPackage.Load(fullPackagePath);
+        var package = GetOrLoadFpkPackage(fullPackagePath);
         var explicitlyDisabled = code == "xt"
             ? !_editorExtraDifficultyEnabled
             : _editorDisabledDifficultyCodes.Contains(code);
@@ -2692,6 +2715,10 @@ public sealed partial class Playfield
         {
             FpkWriter.Save(temporaryPath, entries, package);
             File.Move(temporaryPath, fullPackagePath, overwrite: true);
+            InvalidateFpkPackageCache(fullPackagePath);
+            _loadedFpkPackage = null;
+            _loadedFpkSongJsonBytes = null;
+            _loadedFpkSongJsonLoaded = false;
             state.SourcePath = fullPackagePath;
             state.SourceName = logicalName;
             state.FpkChartName = logicalName;
@@ -2719,7 +2746,7 @@ public sealed partial class Playfield
             SourcePath = _loadedSourcePath,
             SourceName = _sourceName ?? $"{code}.tsc",
             FpkChartName = _loadedFpkChartName,
-            MusicBytes = (_loadedMusicBytes ?? _editorSharedMusicBytes)?.ToArray(),
+            MusicBytes = _loadedMusicBytes ?? _editorSharedMusicBytes,
             ImportedSongAudio = _editorImportedSongAudio || _editorSharedSongImportedAudio,
             HasSourceChart = hasSourceChart,
             AresHeaderTemplate = _loadedAresHeaderTemplate?.ToArray()
@@ -2745,7 +2772,7 @@ public sealed partial class Playfield
         {
             CopySharedEditorMetadata(_chart, state.Chart);
             if (_editorSharedMusicBytes is { Length: > 0 })
-                state.MusicBytes = _editorSharedMusicBytes.ToArray();
+                state.MusicBytes = _editorSharedMusicBytes;
             if (_editorSharedSongImportedAudio)
                 state.ImportedSongAudio = true;
         }
@@ -2873,7 +2900,7 @@ public sealed partial class Playfield
                 _ => $"{GetTscDifficultyStem(code)}.tsc"
             },
             FpkChartName = null,
-            MusicBytes = sharedMusic?.ToArray(),
+            MusicBytes = sharedMusic,
             ImportedSongAudio = _editorSharedSongImportedAudio
         };
     }
@@ -2888,7 +2915,8 @@ public sealed partial class Playfield
         var extension = Path.GetExtension(logicalSourcePath);
         if (string.Equals(extension, ".fpk", StringComparison.OrdinalIgnoreCase))
         {
-            var package = FpkPackage.Load(sourcePath);
+            using var loadTiming = new LoadTimingScope($"editor_sibling_fpk_{code}");
+            var package = _loadedFpkPackage ?? GetOrLoadFpkPackage(sourcePath);
             var targetNames = code == "xt"
                 ? new[] { "pattern_xt.ares", "pattern_sc.ares", "pattern_xt.ares.disabled", "pattern_sc.ares.disabled" }
                 : new[] { $"pattern_{code}.ares", $"pattern_{code}.ares.disabled" };
@@ -2898,9 +2926,14 @@ public sealed partial class Playfield
                 return null;
             var bytes = package.Extract(entry);
             var music = package.FindMusic();
-            var chart = AresLoader.LoadBytes(bytes);
+            AresChart chart;
+            using (new LoadTimingScope($"ares_sibling_parse_{code}"))
+                chart = AresLoader.LoadBytes(bytes);
             ApplyBundleMetadataToChart(chart, code);
-            ApplyBundleJsonMetadataToChart(chart, package, bytes, code);
+            var songJsonBytes = ReferenceEquals(package, _loadedFpkPackage) && _loadedFpkSongJsonLoaded
+                ? _loadedFpkSongJsonBytes
+                : GetFpkSongJsonBytes(package);
+            ApplyBundleJsonMetadataToChart(chart, bytes, code, songJsonBytes);
             return new EditorDifficultyState
             {
                 Chart = chart,
@@ -2908,7 +2941,9 @@ public sealed partial class Playfield
                 SourceName = entry.Name,
                 HasSourceChart = true,
                 FpkChartName = entry.Name,
-                MusicBytes = music is null ? sharedMusic?.ToArray() : package.Extract(music),
+                MusicBytes = sharedMusic is { Length: > 0 }
+                    ? sharedMusic
+                    : music is null ? null : package.Extract(music),
                 ImportedSongAudio = _editorSharedSongImportedAudio,
                 AresHeaderTemplate = bytes.Length >= 28 && bytes.AsSpan(0, 4).SequenceEqual("ARES"u8) ? bytes.AsSpan(0, 28).ToArray() : null
             };
@@ -2922,9 +2957,9 @@ public sealed partial class Playfield
             var chart = TscLoader.Load(siblingPath);
             ApplyFixedMediaPaths(chart, ChartBundleTemplate.Tsc);
             var assetDirectory = GetSongAssetDirectoryForChartPath(siblingPath);
-            byte[]? musicBytes = sharedMusic?.ToArray();
+            byte[]? musicBytes = sharedMusic is { Length: > 0 } ? sharedMusic : null;
             var candidate = Path.Combine(assetDirectory, "music.opus");
-            if (File.Exists(candidate)) musicBytes = File.ReadAllBytes(candidate);
+            if (musicBytes is null && File.Exists(candidate)) musicBytes = File.ReadAllBytes(candidate);
             return new EditorDifficultyState
             {
                 Chart = chart, SourcePath = siblingPath, SourceName = Path.GetFileName(siblingPath), HasSourceChart = true,
@@ -2945,10 +2980,10 @@ public sealed partial class Playfield
             if (hasSongJson)
                 TscLoader.ApplySongJsonMetadata(chart, siblingPath);
             ApplyFixedMediaPaths(chart, _editorBundleTemplate);
-            byte[]? musicBytes = sharedMusic?.ToArray();
+            byte[]? musicBytes = sharedMusic is { Length: > 0 } ? sharedMusic : null;
             var musicName = _editorBundleTemplate == ChartBundleTemplate.Tsts ? "song.opus" : "music.opus";
             var musicPath = Path.Combine(assetDirectory, musicName);
-            if (File.Exists(musicPath)) musicBytes = File.ReadAllBytes(musicPath);
+            if (musicBytes is null && File.Exists(musicPath)) musicBytes = File.ReadAllBytes(musicPath);
             return new EditorDifficultyState
             {
                 Chart = chart, SourcePath = siblingPath, SourceName = Path.GetFileName(siblingPath), HasSourceChart = true,
@@ -2965,9 +3000,10 @@ public sealed partial class Playfield
         if (!_chartEditorMode || _chart is null)
             return;
 
+        using var loadTiming = new LoadTimingScope("editor_difficulty_session_total");
         var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
         var extraDifficultyHasDisabledFile = HasDisabledExtraDifficultySibling(
-            _loadedSourcePath ?? _editorDifficultyDiscoverySourcePath, _editorBundleTemplate);
+            _loadedSourcePath ?? _editorDifficultyDiscoverySourcePath, _editorBundleTemplate, _loadedFpkPackage);
         // A .disabled chart file is authoritative over stale enabled metadata.
         // The user can still re-enable it explicitly from the Info button.
         _editorExtraDifficultyEnabled = extraDifficultyHasDisabledFile
@@ -2984,7 +3020,7 @@ public sealed partial class Playfield
         _editorDisabledDifficultyCodes.Clear();
         _editorDifficultySessionActive = true;
         _editorActiveDifficultyCode = activeCode;
-        _editorSharedMusicBytes = _loadedMusicBytes?.ToArray();
+        _editorSharedMusicBytes = _loadedMusicBytes;
         _editorSharedSongImportedAudio = _editorImportedSongAudio;
         _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
         StoreActiveEditorDifficulty();
@@ -3003,6 +3039,7 @@ public sealed partial class Playfield
             EditorDifficultyState? state;
             try
             {
+                using var siblingTiming = new LoadTimingScope($"editor_difficulty_prepare_{code}");
                 state = TryLoadSiblingEditorDifficulty(code, sharedMusic);
             }
             catch (Exception ex) when (ex is IOException or InvalidDataException or JsonException or UnauthorizedAccessException)
@@ -3024,7 +3061,7 @@ public sealed partial class Playfield
             EnsureEditorTickZeroTempoEvent(state.Chart, state.Chart.InitialTempo);
             MaterializeReconstructedEditorNotes(state.Chart);
             if (sharedMusic is { Length: > 0 })
-                state.MusicBytes = sharedMusic.ToArray();
+                state.MusicBytes = sharedMusic;
             state.ImportedSongAudio = _editorSharedSongImportedAudio || state.ImportedSongAudio;
             _editorDifficultyStates[code] = state;
         }
@@ -3114,6 +3151,7 @@ public sealed partial class Playfield
         // Decode first so invalid output does not replace the current chart audio.
         _audio.LoadOpus(opusBytes);
         _audio.PrepareInitialPlayback(retainPcmForSeeking: true);
+        _audioLoadFailed = false;
         _loadedMusicBytes = opusBytes.ToArray();
         _editorOriginalMusicOpusBytes = opusBytes.ToArray();
         var hasOriginalSourceFileBytes = originalSourceBytes is { Length: > 0 };
@@ -3281,6 +3319,7 @@ public sealed partial class Playfield
 
     public void LoadChart(string path)
     {
+        using var loadTiming = new LoadTimingScope("chart_file_load_total");
         StopEditorLanTest();
         var fullInputPath = Path.GetFullPath(path);
         // Reopening a chart file from the current extracted TSTS workspace must
@@ -3345,10 +3384,7 @@ public sealed partial class Playfield
                 _tstsWorkingDirectory = extractDirectory;
                 _editorBundleTemplate = ChartBundleTemplate.Tsts;
                 if (_chart is not null)
-                {
                     _chart.Series = null;
-                    RefreshResultSongInfo();
-                }
                 _statusMessage = $"TSTS bundle opened: {Path.GetFileName(fullInputPath)}";
                 return;
             }
@@ -3361,6 +3397,10 @@ public sealed partial class Playfield
             }
         }
         _loadedSourcePath = fullInputPath;
+        _loadedFpkPackage = null;
+        _loadedFpkSongJsonBytes = null;
+        _loadedFpkSongJsonLoaded = false;
+        InvalidateFpkPackageCache();
         if (string.Equals(Path.GetExtension(path), ".tsc", StringComparison.OrdinalIgnoreCase))
         {
             LoadTsc(path);
@@ -3385,7 +3425,9 @@ public sealed partial class Playfield
         _editorMetaScrollOffset = 0;
 
         var bytes = File.ReadAllBytes(fullPath);
-        var chart = AresLoader.LoadBytes(bytes);
+        AresChart chart;
+        using (new LoadTimingScope("ares_chart_parse"))
+            chart = AresLoader.LoadBytes(bytes);
         if (hasSongJson)
             TscLoader.ApplySongJsonMetadata(chart, fullPath);
         LoadEditorJudgementWindowEnablementFromSongJson(songJsonPath, GetEditorDifficultyCode(chart.Difficulty, fullPath));
@@ -3411,7 +3453,7 @@ public sealed partial class Playfield
             _playing = false;
             _playbackStartPending = true;
             _audioResyncPending = true;
-            _startupWarmupRemainingSeconds = StartupWarmupSeconds;
+            BeginGameplayStartupWarmup();
             RefreshSkinGameState();
         }
     }
@@ -3633,7 +3675,10 @@ public sealed partial class Playfield
         };
     }
 
-    private static bool HasDisabledExtraDifficultySibling(string? sourcePath, ChartBundleTemplate template)
+    private bool HasDisabledExtraDifficultySibling(
+        string? sourcePath,
+        ChartBundleTemplate template,
+        FpkPackage? loadedPackage = null)
     {
         if (string.IsNullOrWhiteSpace(sourcePath))
             return false;
@@ -3642,7 +3687,8 @@ public sealed partial class Playfield
         {
             try
             {
-                return FpkPackage.Load(full).Entries.Any(entry => IsExtraDifficultyFileName(entry.Name) &&
+                var package = loadedPackage ?? GetOrLoadFpkPackage(full);
+                return package.Entries.Any(entry => IsExtraDifficultyFileName(entry.Name) &&
                     entry.Name.EndsWith(".disabled", StringComparison.OrdinalIgnoreCase));
             }
             catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException) { }
@@ -3896,6 +3942,11 @@ public sealed partial class Playfield
 
     public void LoadTsc(string path)
     {
+        using var loadTiming = new LoadTimingScope("tsc_load_total");
+        _loadedFpkPackage = null;
+        _loadedFpkSongJsonBytes = null;
+        _loadedFpkSongJsonLoaded = false;
+        InvalidateFpkPackageCache();
         StopEditorPreviewPlayback();
         _editorSharedPreviewBytes = null;
         InvalidateEditorSavedPreviewDuration();
@@ -3915,7 +3966,9 @@ public sealed partial class Playfield
         _editorMetaCategory = "SONG";
         _editorMetaScroll.Reset();
         _editorMetaScrollOffset = 0;
-        var chart = TscLoader.Load(path);
+        AresChart chart;
+        using (new LoadTimingScope("tsc_chart_parse"))
+            chart = TscLoader.Load(path);
         var songJsonPath = Path.Combine(assetDirectory, "song.json");
         LoadEditorJudgementWindowEnablementFromSongJson(songJsonPath, GetEditorDifficultyCode(chart.Difficulty, path));
         LoadEditorExtraDifficultyStateFromSongJson(songJsonPath);
@@ -3938,18 +3991,84 @@ public sealed partial class Playfield
             _playing = false;
             _playbackStartPending = true;
             _audioResyncPending = true;
-            _startupWarmupRemainingSeconds = StartupWarmupSeconds;
+            BeginGameplayStartupWarmup();
             RefreshSkinGameState();
         }
     }
+    private FpkPackage GetOrLoadFpkPackage(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var file = new FileInfo(fullPath);
+        if (!file.Exists)
+            throw new FileNotFoundException("The FPK package could not be found.", fullPath);
+
+        var length = file.Length;
+        var lastWriteTicks = file.LastWriteTimeUtc.Ticks;
+        if (_cachedFpkPackage is not null &&
+            string.Equals(_cachedFpkPackagePath, fullPath, StringComparison.OrdinalIgnoreCase) &&
+            _cachedFpkPackageLength == length &&
+            _cachedFpkPackageLastWriteUtcTicks == lastWriteTicks)
+        {
+            Program.LogRuntime($"FPK_PACKAGE_CACHE_HIT path={Path.GetFileName(fullPath)} bytes={length}");
+            return _cachedFpkPackage;
+        }
+
+        using var loadTiming = new LoadTimingScope("fpk_package_read_parse");
+        var package = FpkPackage.Load(fullPath);
+        _cachedFpkPackage = package;
+        _cachedFpkPackagePath = fullPath;
+        _cachedFpkPackageLength = length;
+        _cachedFpkPackageLastWriteUtcTicks = lastWriteTicks;
+        _cachedFpkSongJsonBytes = null;
+        _cachedFpkSongJsonLoaded = false;
+        return package;
+    }
+
+    private void InvalidateFpkPackageCache(string? path = null)
+    {
+        if (path is not null && !string.Equals(
+                _cachedFpkPackagePath,
+                Path.GetFullPath(path),
+                StringComparison.OrdinalIgnoreCase))
+            return;
+
+        _cachedFpkPackage = null;
+        _cachedFpkPackagePath = null;
+        _cachedFpkPackageLength = -1;
+        _cachedFpkPackageLastWriteUtcTicks = -1;
+        _cachedFpkSongJsonBytes = null;
+        _cachedFpkSongJsonLoaded = false;
+    }
+
+    private byte[]? GetFpkSongJsonBytes(FpkPackage package)
+    {
+        if (!ReferenceEquals(package, _cachedFpkPackage))
+        {
+            var entry = package.Entries.FirstOrDefault(item =>
+                string.Equals(Path.GetFileName(item.Name), "song.json", StringComparison.OrdinalIgnoreCase));
+            return entry is null ? null : package.Extract(entry);
+        }
+
+        if (_cachedFpkSongJsonLoaded)
+            return _cachedFpkSongJsonBytes;
+
+        var songJsonEntry = package.Entries.FirstOrDefault(item =>
+            string.Equals(Path.GetFileName(item.Name), "song.json", StringComparison.OrdinalIgnoreCase));
+        _cachedFpkSongJsonBytes = songJsonEntry is null ? null : package.Extract(songJsonEntry);
+        _cachedFpkSongJsonLoaded = true;
+        return _cachedFpkSongJsonBytes;
+    }
+
     public IReadOnlyList<string> GetFpkChartNames(string path)
     {
-        var package = FpkPackage.Load(path);
+        using var loadTiming = new LoadTimingScope("fpk_chart_discovery");
+        var package = GetOrLoadFpkPackage(path);
         return package.FindAresCharts().Select(e => e.Name).ToList();
     }
     public PreparedFpkLoad PrepareFpk(string path, string chartName)
     {
-        var package = FpkPackage.Load(path);
+        using var loadTiming = new LoadTimingScope("fpk_chart_prepare");
+        var package = GetOrLoadFpkPackage(path);
         var charts = package.FindAresCharts();
         if (charts.Count == 0)
             throw new InvalidDataException("The FPK contains no .ares charts.");
@@ -3961,10 +4080,11 @@ public sealed partial class Playfield
         var musicEntry = package.FindMusic();
         var chartBytes = package.Extract(chartEntry);
         var musicBytes = musicEntry is null ? null : package.Extract(musicEntry);
-        return new PreparedFpkLoad(path, chartEntry.Name, chartBytes, musicBytes);
+        return new PreparedFpkLoad(path, chartEntry.Name, chartBytes, musicBytes, package);
     }
     public void LoadPreparedFpk(PreparedFpkLoad prepared)
     {
+        using var loadTiming = new LoadTimingScope("fpk_load_prepared_total");
         StopEditorPreviewPlayback();
         _editorSharedPreviewBytes = null;
         InvalidateEditorSavedPreviewDuration();
@@ -3973,21 +4093,32 @@ public sealed partial class Playfield
         ReleaseTstsWorkingDirectory();
         _loadedTstsBundlePath = null;
         _loadedSourcePath = Path.GetFullPath(prepared.SourcePath);
+        _loadedFpkPackage = prepared.Package;
+        _loadedFpkSongJsonBytes = GetFpkSongJsonBytes(prepared.Package);
+        _loadedFpkSongJsonLoaded = true;
+        var songJsonBytes = _loadedFpkSongJsonBytes;
         _editorBundleTemplate = ChartBundleTemplate.Bold;
-        LoadBundleMetadataFromFpk(prepared.SourcePath, prepared.ChartName);
+        LoadBundleMetadataFromFpk(prepared.Package, prepared.ChartName, songJsonBytes);
         LoadChartBytes(prepared.ChartBytes, prepared.ChartName, prepared.MusicBytes);
         _loadedFpkChartName = prepared.ChartName;
         if (_chart is not null)
         {
             ApplyBundleMetadataToChart(_chart, GetEditorDifficultyCode(prepared.ChartName, prepared.ChartName));
-            ApplyBundleJsonMetadataToChart(_chart, FpkPackage.Load(prepared.SourcePath), prepared.ChartBytes,
-                GetEditorDifficultyCode(prepared.ChartName, prepared.ChartName));
+            ApplyBundleJsonMetadataToChart(_chart, prepared.ChartBytes,
+                GetEditorDifficultyCode(prepared.ChartName, prepared.ChartName), songJsonBytes);
             ApplyFixedMediaPaths(_chart, ChartBundleTemplate.Bold);
             if (_chartEditorMode)
                 _projection.SongBaseBpm = _chart.MetadataBpm;
-            RefreshResultSongInfo();
         }
         InitializeEditorDifficultySession();
+        // Keep the parsed package only through chart preparation and sibling
+        // difficulty discovery. The editor states retain the decoded chart data;
+        // keeping the full compressed FPK buffer for the whole session would only
+        // increase steady-state memory usage.
+        _loadedFpkPackage = null;
+        _loadedFpkSongJsonBytes = null;
+        _loadedFpkSongJsonLoaded = false;
+        InvalidateFpkPackageCache(prepared.SourcePath);
         // FPK metadata is applied after the ARES payload is decoded. Refresh the
         // saved baseline only after those bundle-level fields and media paths have
         // been applied, so they are treated as part of the opened file.
@@ -4005,7 +4136,7 @@ public sealed partial class Playfield
             _playing = false;
             _playbackStartPending = true;
             _audioResyncPending = true;
-            _startupWarmupRemainingSeconds = StartupWarmupSeconds;
+            BeginGameplayStartupWarmup();
             RefreshSkinGameState();
         }
     }
@@ -4018,7 +4149,9 @@ public sealed partial class Playfield
     }
     private void LoadChartBytes(byte[] chartBytes, string sourceName, byte[]? musicBytes)
     {
-        var chart = AresLoader.LoadBytes(chartBytes);
+        AresChart chart;
+        using (new LoadTimingScope("ares_chart_parse"))
+            chart = AresLoader.LoadBytes(chartBytes);
         LoadChartObject(chart, sourceName, musicBytes, chartBytes);
     }
 
@@ -4213,6 +4346,7 @@ public sealed partial class Playfield
 
     private void RefreshResultSongInfo()
     {
+        using var loadTiming = new LoadTimingScope("result_song_artwork_prepare");
         if (_chart is null)
             return;
 
@@ -4244,6 +4378,7 @@ public sealed partial class Playfield
 
     private void LoadChartObject(AresChart chart, string sourceName, byte[]? musicBytes, byte[]? chartBytes = null, bool preservePlayback = false)
     {
+        using var loadTiming = new LoadTimingScope("chart_object_setup_total");
         if (!_switchingEditorDifficulty)
             CancelCreateEditorDifficulty();
         var preservedPlaySeconds = _playSeconds;
@@ -4253,21 +4388,28 @@ public sealed partial class Playfield
         var preservedAudioResyncPending = _audioResyncPending;
         var preservedAutoSoundSeconds = _autoSoundSeconds;
         var reuseCurrentAudio = preservePlayback && AudioBytesEqual(_loadedMusicBytes, musicBytes) &&
-            ((musicBytes is null && !_audio.IsLoaded) || (musicBytes is { Length: > 0 } && _audio.IsLoaded));
+            ((musicBytes is null && !_audio.HasAudioData) || (musicBytes is { Length: > 0 } && _audio.HasAudioData));
         if (!reuseCurrentAudio)
         {
             _audio.Stop();
             if (musicBytes is not null)
             {
-                _audio.LoadOpus(musicBytes);
-                // Prepare audio before note reconstruction so duration-derived
-                // editor settings never have to consult the previous song.
-                _audio.PrepareInitialPlayback(retainPcmForSeeking: !_lockMenuPlayMode);
+                _audioLoadFailed = false;
+                // Ogg/Opus decoding is CPU-heavy and does not touch MonoGame
+                // resources. Run it while chart reconstruction and startup
+                // warm-up proceed; TryCompletePendingLoad creates the native
+                // SoundEffect later on the game thread.
+                _audio.BeginLoadOpus(musicBytes);
             }
             else
             {
                 _audio.Clear();
+                _audioLoadFailed = false;
             }
+        }
+        else if (musicBytes is null)
+        {
+            _audioLoadFailed = false;
         }
 
         if (!_switchingEditorDifficulty)
@@ -4278,12 +4420,15 @@ public sealed partial class Playfield
             _editorCommittedDeletedDifficultyCodes.Clear();
             _editorDifficultySessionActive = false;
             _editorActiveDifficultyCode = null;
-            _editorSharedMusicBytes = musicBytes is null ? null : musicBytes.ToArray();
+            // InitializeEditorDifficultySession assigns the shared bytes only
+            // for editor sessions. Gameplay does not need a second full copy of
+            // the compressed song just to support sibling-difficulty switching.
+            _editorSharedMusicBytes = null;
             _editorSharedSongImportedAudio = false;
             _editorDifficultyDiscoverySourcePath = _loadedSourcePath;
             _editorOriginalMusicOpusBytes = _chartEditorMode && musicBytes is { Length: > 0 }
-                ? musicBytes.ToArray() : null;
-            _editorOriginalMusicSourceBytes = _editorOriginalMusicOpusBytes?.ToArray();
+                ? musicBytes : null;
+            _editorOriginalMusicSourceBytes = _editorOriginalMusicOpusBytes;
             _editorOriginalMusicSourceExtension = ".opus";
             _editorMusicVolumePercent = 100;
             _editorMusicVolumePendingPercent = 100;
@@ -4295,7 +4440,10 @@ public sealed partial class Playfield
         }
         _loadedFpkChartName = null;
         _lastLoadedSourceName = sourceName;
-        _loadedMusicBytes = musicBytes is null ? null : musicBytes.ToArray();
+        // These bytes came from a fresh file read or package extraction and are
+        // treated as immutable for the lifetime of the loaded chart. Keep the
+        // original buffer rather than duplicating the entire encoded song.
+        _loadedMusicBytes = musicBytes;
         _editorImportedSongAudio = false;
         if (chartBytes is not null)
         {
@@ -4350,16 +4498,21 @@ public sealed partial class Playfield
         _scoreSavedForCurrentRun = false;
         if (_chartEditorMode)
         {
-            var materializedCount = MaterializeReconstructedEditorNotes(_chart);
+            int materializedCount;
+            using (new LoadTimingScope("editor_note_materialization"))
+                materializedCount = MaterializeReconstructedEditorNotes(_chart);
             if (materializedCount > 0)
             {
                 MarkEditorDirty();
                 _statusMessage = $"Converted {materializedCount:N0} reconstructed notes into editable timeline notes.";
             }
         }
-        RebuildLinkRootMap();
-        RebuildLinkAdjacencyCache();
-        _tempo = new TempoMap(_chart);
+        using (new LoadTimingScope("chart_link_root_cache"))
+            RebuildLinkRootMap();
+        using (new LoadTimingScope("chart_link_adjacency_cache"))
+            RebuildLinkAdjacencyCache();
+        using (new LoadTimingScope("chart_tempo_map"))
+            _tempo = new TempoMap(_chart);
         var playRangeAdjustedOnLoad = _chartEditorMode && ReconcilePlayTickAndPlayTime();
         if (_chartEditorMode)
             AresLoader.SynchronizePlayTickMarker(_chart);
@@ -4378,13 +4531,16 @@ public sealed partial class Playfield
         _skinRuntime.SetPanelTracks(_chart, _tempo);
         _pauseSkinRuntime.SetPanelTracks(_chart, _tempo);
         _resultSkinRuntime.SetPanelTracks(_chart, _tempo);
-        RefreshResultSongInfo();
-        RebuildRenderEventCache();
+        // Result artwork discovery/conversion is deferred until the result screen
+        // opens; it is not needed for chart parsing or the first gameplay frame.
+        using (new LoadTimingScope("chart_render_event_cache"))
+            RebuildRenderEventCache();
         _simultaneousCountsCache.Clear();
         InvalidateLaneMeshCache();
         _editorMetaStatsCache = null;
         _editorMetaStatsCacheChart = null;
-        _gear = new GearTimeline(_chart);
+        using (new LoadTimingScope("chart_gear_timeline"))
+            _gear = new GearTimeline(_chart);
         _editorPreviewGearState = null;
         _gameplayState = _gear.Initial;
         if (_chartEditorMode)
@@ -4394,7 +4550,8 @@ public sealed partial class Playfield
             SyncEditorPreviewBankIndicators(_editorPreviewGearState);
             ResetEditorTimelineRouteHistory(_editorPreviewGearState);
         }
-        BuildScoreModel();
+        using (new LoadTimingScope("chart_score_model"))
+            BuildScoreModel();
         _hitEvents.Clear();
         _hitAnimations.Clear();
         _combo = 0;
@@ -4412,7 +4569,8 @@ public sealed partial class Playfield
         _hoverTrack = null;
         _editorHoverCacheValid = false;
         _projection.SetTempo(_tempo);
-        _projection.RebuildPrecomputedNoteMotionPaths();
+        using (new LoadTimingScope("chart_projection_motion_paths"))
+            _projection.RebuildPrecomputedNoteMotionPaths();
         _playSeconds = preservePlayback ? preservedPlaySeconds : 0;
         _autoSoundSeconds = preservePlayback ? preservedAutoSoundSeconds : 0;
         _skinIntroRemainingSeconds = 0;
@@ -4977,7 +5135,7 @@ public sealed partial class Playfield
 
         if (isFpkSource)
         {
-            sourcePackage = FpkPackage.Load(_loadedSourcePath!);
+            sourcePackage = GetOrLoadFpkPackage(_loadedSourcePath!);
             var sourceChartEntryName = _loadedFpkChartName;
             if (string.IsNullOrWhiteSpace(sourceChartEntryName))
                 throw new InvalidOperationException("The original FPK chart entry name is not available.");
@@ -5083,6 +5241,13 @@ public sealed partial class Playfield
                 musicPathOverride: musicBytesForExport is { Length: > 0 } ? "music.opus" : _chart.MusicPath,
                 hasScChartInBundle: exportedScChartExists)));
             FpkWriter.Save(fullTarget, entries, sourcePackage);
+            InvalidateFpkPackageCache(fullTarget);
+            if (string.Equals(_loadedSourcePath, fullTarget, StringComparison.OrdinalIgnoreCase))
+            {
+                _loadedFpkPackage = null;
+                _loadedFpkSongJsonBytes = null;
+                _loadedFpkSongJsonLoaded = false;
+            }
         }
         finally
         {
@@ -5114,7 +5279,7 @@ public sealed partial class Playfield
         var sourceIsFpk = !string.IsNullOrWhiteSpace(sourcePath) &&
                           string.Equals(Path.GetExtension(sourcePath), ".fpk", StringComparison.OrdinalIgnoreCase) &&
                           File.Exists(sourcePath);
-        FpkPackage? sourcePackage = sourceIsFpk ? FpkPackage.Load(sourcePath!) : null;
+        FpkPackage? sourcePackage = sourceIsFpk ? GetOrLoadFpkPackage(sourcePath!) : null;
         var entries = new List<FpkWriteEntry>();
         var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var exportedCodes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -5227,6 +5392,13 @@ public sealed partial class Playfield
                     .Select(state => state.Value), exportableStates.First().Value.Chart, schema: 3, supportsSeries: true,
                 musicPathOverride: musicBytes is { Length: > 0 } ? "music.opus" : _chart.MusicPath)));
             FpkWriter.Save(fullTarget, entries, sourcePackage);
+            InvalidateFpkPackageCache(fullTarget);
+            if (string.Equals(_loadedSourcePath, fullTarget, StringComparison.OrdinalIgnoreCase))
+            {
+                _loadedFpkPackage = null;
+                _loadedFpkSongJsonBytes = null;
+                _loadedFpkSongJsonLoaded = false;
+            }
         }
         finally
         {
@@ -5761,18 +5933,21 @@ public sealed partial class Playfield
     private static (double PerfectPlusMs, double PerfectMs, double GoodMs) GetJudgementWindows(AresChart chart)
         => (chart.PerfectPlusWindowMs, chart.PerfectWindowMs, chart.GoodWindowMs);
 
-    private static void ApplyBundleJsonMetadataToChart(AresChart chart, FpkPackage package, byte[] chartBytes, string difficultyCode)
+    private static void ApplyBundleJsonMetadataToChart(
+        AresChart chart,
+        byte[] chartBytes,
+        string difficultyCode,
+        byte[]? songJsonBytes)
     {
-        var jsonEntry = package.Entries.FirstOrDefault(entry =>
-            string.Equals(Path.GetFileName(entry.Name), "song.json", StringComparison.OrdinalIgnoreCase));
-        if (jsonEntry is null) return;
+        if (songJsonBytes is null)
+            return;
         var directory = Path.Combine(Path.GetTempPath(), "TSC-FPK-json-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         try
         {
             var chartPath = Path.Combine(directory, $"pattern_{difficultyCode}.ares");
             File.WriteAllBytes(chartPath, chartBytes);
-            File.WriteAllBytes(Path.Combine(directory, "song.json"), package.Extract(jsonEntry));
+            File.WriteAllBytes(Path.Combine(directory, "song.json"), songJsonBytes);
             TscLoader.ApplySongJsonMetadata(chart, chartPath);
         }
         finally
@@ -5793,7 +5968,10 @@ public sealed partial class Playfield
             chart.Series = _bundleSeries;
     }
 
-    private void LoadBundleMetadataFromFpk(string path, string? activeChartName = null)
+    private void LoadBundleMetadataFromFpk(
+        FpkPackage package,
+        string? activeChartName = null,
+        byte[]? songJsonBytes = null)
     {
         _bundleJudgementWindows.Clear();
         _bundleSeries = null;
@@ -5804,14 +5982,11 @@ public sealed partial class Playfield
         _editorMetaCategory = "SONG";
         _editorMetaScroll.Reset();
         _editorMetaScrollOffset = 0;
-        var package = FpkPackage.Load(path);
-        var songJsonEntry = package.Entries.FirstOrDefault(item =>
-            string.Equals(Path.GetFileName(item.Name), "song.json", StringComparison.OrdinalIgnoreCase));
-        if (songJsonEntry is not null)
+        if (songJsonBytes is not null)
         {
             try
             {
-                using var json = JsonDocument.Parse(package.Extract(songJsonEntry));
+                using var json = JsonDocument.Parse(songJsonBytes);
                 ApplyEditorJudgementWindowEnablementFromJson(json.RootElement, GetEditorDifficultyCode(activeChartName, activeChartName));
                 if (json.RootElement.ValueKind == JsonValueKind.Object &&
                     json.RootElement.TryGetProperty("extra_difficulty_enabled", out var extraEnabled) &&
@@ -6254,18 +6429,26 @@ public sealed partial class Playfield
                 _chart.InitialGearAttr = nextInitialGearAttr;
                 break;
             case "play_time":
+                var useAudioDuration = value.Length == 0;
+                var requestedPlayTime = 0.0;
+                if (!useAudioDuration)
+                {
+                    if (!TryDouble(out requestedPlayTime) || requestedPlayTime < 0)
+                    {
+                        _statusMessage = "Play time must be empty or a number greater than or equal to 0.";
+                        return;
+                    }
+                    useAudioDuration = requestedPlayTime <= 0.000001;
+                }
+                if (useAudioDuration && _loadedMusicBytes is { Length: > 0 } && _audio.IsLoading)
+                {
+                    _statusMessage = "Music is still being prepared. Set Play Time again once audio loading finishes.";
+                    return;
+                }
                 var audioLength = _loadedMusicBytes is { Length: > 0 } && double.IsFinite(_audio.DurationSeconds)
                     ? Math.Max(0.0, _audio.DurationSeconds)
                     : 0.0;
-                if (value.Length == 0)
-                {
-                    _chart.PlayTime = audioLength;
-                }
-                else if (TryDouble(out var playTime) && playTime >= 0)
-                {
-                    _chart.PlayTime = playTime <= 0.000001 ? audioLength : playTime;
-                }
-                else { _statusMessage = "Play time must be empty or a number greater than or equal to 0."; return; }
+                _chart.PlayTime = useAudioDuration ? audioLength : requestedPlayTime;
                 _tempo ??= new TempoMap(_chart);
                 _chart.PlayTick = CalculatePlayTickForPlayTime(_tempo, _chart.PlayTime, _chart.AudioOriginTick);
                 _lastPlayableTick = CalculateLastPlayableTick();
@@ -10586,11 +10769,14 @@ public sealed partial class Playfield
         RefreshSkinGameState();
         try
         {
-            if (_pauseSkinRuntime.IsLoaded)
+            using (new LoadTimingScope("skin_runtime_pause_activation"))
             {
-                _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, true, _pauseSelection);
-                _pauseSkinRuntime.UpdateScreen(_graphics.Viewport.Width, _graphics.Viewport.Height);
-                _pauseSkinRuntime.InvokeOptionalPauseOpen();
+                if (_pauseSkinRuntime.EnsureLoaded() && _pauseSkinRuntime.IsLoaded)
+                {
+                    _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, true, _pauseSelection);
+                    _pauseSkinRuntime.UpdateScreen(_graphics.Viewport.Width, _graphics.Viewport.Height);
+                    _pauseSkinRuntime.InvokeOptionalPauseOpen();
+                }
             }
         }
         catch (Exception ex)
@@ -10686,6 +10872,8 @@ public sealed partial class Playfield
         _gameplayResultTransitionPending = false;
         _gameplayResultActive = true;
         RefreshResultSongInfo();
+        using (new LoadTimingScope("skin_runtime_result_activation"))
+            _resultSkinRuntime.EnsureLoaded();
         _resultSkinRuntime.SetClearType(IsAutoplayRun ? "AUTOPLAY" : GetClearType());
         _gameplayPaused = false;
         _pauseBackRequested = false;
@@ -10913,7 +11101,7 @@ public sealed partial class Playfield
             _projection.ScrollSpeedScale = _skin.GameConfig.ScrollSpeedScale;
             _playing = false;
             _playbackStartPending = true;
-            _startupWarmupRemainingSeconds = StartupWarmupSeconds;
+            BeginGameplayStartupWarmup();
             _audioResyncPending = true;
             _audioStartedForCurrentRun = false;
             // A retry follows the same startup route as a fresh play: warm-up,
@@ -11130,7 +11318,7 @@ public sealed partial class Playfield
         _projection.LoadRenderConfig(activeConfig);
         _projection.Compact = _compact;
         _projection.RebuildPrecomputedNoteMotionPaths();
-        _textures.PreloadHitAnimations(
+        _textures.QueueHitAnimationPreload(
             ("regular", activeConfig.HitAnimation.Regular.FrameCount),
             ("multi", activeConfig.HitAnimation.Multi.FrameCount),
             ("long", activeConfig.HitAnimation.Long.FrameCount),
@@ -11211,14 +11399,15 @@ public sealed partial class Playfield
         return true;
     }
 
-    private void RefreshRenderConfigForViewportIfNeeded(int virtualWidth, int virtualHeight)
+    private bool RefreshRenderConfigForViewportIfNeeded(int virtualWidth, int virtualHeight)
     {
         if (virtualWidth == _lastRenderConfigVirtualWidth &&
             virtualHeight == _lastRenderConfigVirtualHeight)
-            return;
+            return true;
 
-        // This is deliberately renderConfig-only. skin.lua is not reloaded here,
-        // so resizing the window cannot reset HUD state or trigger script reloads.
+        // Playfield camera/lane perspective is configured by renderConfig.lua,
+        // independently of the stateful gameplay skin Lua runtime. Refresh and
+        // apply it without re-executing skin.lua or its imported modules.
         if (!SkinConfigStore.ReloadRenderConfig(
                 _skin,
                 _graphics.Viewport.Width,
@@ -11226,58 +11415,62 @@ public sealed partial class Playfield
                 out var error))
         {
             _statusMessage = $"Automatic render config refresh failed: {error}";
-            return;
+            return false;
         }
 
-        if (!ReloadEditorRenderConfig(out var editorConfigError))
+        var editorConfigOk = ReloadEditorRenderConfig(out var editorConfigError);
+        if (!editorConfigOk)
             _statusMessage = $"editorRenderConfig.lua refresh failed: {editorConfigError}";
-        ApplyActiveViewRenderConfig();
 
-        // Keep hit-animation configuration in sync with the newly loaded render
-        // config just like the manual F10 path does.
-        _textures.PreloadHitAnimations(
-            ("regular", _skin.RenderConfig.HitAnimation.Regular.FrameCount),
-            ("multi", _skin.RenderConfig.HitAnimation.Multi.FrameCount),
-            ("long", _skin.RenderConfig.HitAnimation.Long.FrameCount),
-            ("superFlickOuter", _skin.RenderConfig.HitAnimation.SuperFlick.Outer.FrameCount),
-            ("superFlickInner", _skin.RenderConfig.HitAnimation.SuperFlick.Inner.FrameCount));
+        ApplyActiveViewRenderConfig();
 
         _lastRenderConfigVirtualWidth = virtualWidth;
         _lastRenderConfigVirtualHeight = virtualHeight;
+        return editorConfigOk;
     }
 
-    private void RefreshSkinUiConfig()
+    private void RefreshSkinUiConfig(bool reloadRenderConfig = true)
     {
-        var renderOk = SkinConfigStore.ReloadRenderConfig(
-            _skin,
-            _graphics.Viewport.Width,
-            _graphics.Viewport.Height,
-            out var renderError);
-        var editorRenderOk = ReloadEditorRenderConfig(out var editorRenderError);
-        if (renderOk && editorRenderOk)
+        var renderOk = true;
+        var editorRenderOk = true;
+        string? renderError = null;
+        string? editorRenderError = null;
+        if (reloadRenderConfig)
         {
-            ApplyActiveViewRenderConfig();
-            _textures.PreloadHitAnimations(
-                ("regular", _skin.RenderConfig.HitAnimation.Regular.FrameCount),
-                ("multi", _skin.RenderConfig.HitAnimation.Multi.FrameCount),
-                ("long", _skin.RenderConfig.HitAnimation.Long.FrameCount),
-                ("superFlickOuter", _skin.RenderConfig.HitAnimation.SuperFlick.Outer.FrameCount),
-                ("superFlickInner", _skin.RenderConfig.HitAnimation.SuperFlick.Inner.FrameCount));
-            var (virtualWidth, virtualHeight) = GetVirtualResolution(
-                _graphics.Viewport.Width, _graphics.Viewport.Height);
-            _lastRenderConfigVirtualWidth = virtualWidth;
-            _lastRenderConfigVirtualHeight = virtualHeight;
+            renderOk = SkinConfigStore.ReloadRenderConfig(
+                _skin,
+                _graphics.Viewport.Width,
+                _graphics.Viewport.Height,
+                out renderError);
+            editorRenderOk = ReloadEditorRenderConfig(out editorRenderError);
+            if (renderOk && editorRenderOk)
+            {
+                ApplyActiveViewRenderConfig();
+                var (virtualWidth, virtualHeight) = GetVirtualResolution(
+                    _graphics.Viewport.Width, _graphics.Viewport.Height);
+                _lastRenderConfigVirtualWidth = virtualWidth;
+                _lastRenderConfigVirtualHeight = virtualHeight;
+            }
         }
 
+        var (scriptVirtualWidth, scriptVirtualHeight) = GetVirtualResolution(
+            _graphics.Viewport.Width,
+            _graphics.Viewport.Height);
+        _skinRuntime.UpdateScreen(scriptVirtualWidth, scriptVirtualHeight);
+        _pauseSkinRuntime.UpdateScreen(scriptVirtualWidth, scriptVirtualHeight);
+        _resultSkinRuntime.UpdateScreen(scriptVirtualWidth, scriptVirtualHeight);
+        _chartEditorInterfaceRuntime.UpdateScreen(scriptVirtualWidth, scriptVirtualHeight);
         var scriptOk = _skinRuntime.Reload();
         var scriptError = _skinRuntime.LastError;
-        var pauseScriptOk = _pauseSkinRuntime.Reload();
+        var pauseScriptOk = _pauseSkinRuntime.IsInitialLoadDeferred || _pauseSkinRuntime.Reload();
         var pauseScriptError = _pauseSkinRuntime.LastError;
-        var resultScriptOk = _resultSkinRuntime.Reload();
+        var resultScriptOk = _resultSkinRuntime.IsInitialLoadDeferred || _resultSkinRuntime.Reload();
         var resultScriptError = _resultSkinRuntime.LastError;
-        var editorInterfaceScriptOk = _chartEditorInterfaceRuntime.Reload();
+        var editorInterfaceScriptOk = _chartEditorInterfaceRuntime.IsInitialLoadDeferred || _chartEditorInterfaceRuntime.Reload();
         var editorInterfaceScriptError = _chartEditorInterfaceRuntime.LastError;
         RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
+        _lastSkinScriptVirtualWidth = scriptVirtualWidth;
+        _lastSkinScriptVirtualHeight = scriptVirtualHeight;
         if (scriptOk)
         {
             _skin.UIConfig = _skinRuntime.UIConfig;
@@ -11304,20 +11497,57 @@ public sealed partial class Playfield
         }
     }
     /// <summary>
-    /// Refreshes renderConfig.lua and all gameplay skin scripts using the
-    /// viewport that exists now. This is the startup equivalent of pressing F10.
+    /// Ensures render configuration matches the current viewport. Gameplay skin
+    /// scripts are only re-executed when their captured screen dimensions differ
+    /// or a runtime previously failed to load. F10 remains the full manual reload.
     /// </summary>
     public bool ReloadSkinForCurrentViewport()
     {
         try
         {
-            Program.LogRuntime("PLAYFIELD_STARTUP_SKIN_RELOAD_BEGIN");
-            RefreshSkinUiConfig();
-            var ok = _skinRuntime.LastError is null &&
-                     _pauseSkinRuntime.LastError is null &&
-                     _resultSkinRuntime.LastError is null &&
-                     _chartEditorInterfaceRuntime.LastError is null;
-            Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_DONE ok={ok}");
+            var (virtualWidth, virtualHeight) = GetVirtualResolution(
+                _graphics.Viewport.Width,
+                _graphics.Viewport.Height);
+            var scriptsAlreadyMatchViewport =
+                virtualWidth == _lastSkinScriptVirtualWidth &&
+                virtualHeight == _lastSkinScriptVirtualHeight &&
+                _skinRuntime.LastError is null &&
+                _pauseSkinRuntime.LastError is null &&
+                _resultSkinRuntime.LastError is null &&
+                _chartEditorInterfaceRuntime.LastError is null;
+            // Refresh the playfield's camera/lane configuration independently
+            // from Lua. The SkinContext may have been loaded before the current
+            // viewport was established, so its cached perspective values are not
+            // assumed valid until this check has run once.
+            var renderConfigOk = RefreshRenderConfigForViewportIfNeeded(virtualWidth, virtualHeight);
+            if (scriptsAlreadyMatchViewport)
+            {
+                // This is also the initial editor-entry path when the skin was
+                // already loaded for the song-select/gameplay Playfield. Make
+                // sure preview-only animation fonts are ready before preview is
+                // entered, even though no Lua reload was needed.
+                PrewarmGameplayAnimationFontsIfActive();
+                return renderConfigOk;
+            }
+
+            Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_BEGIN viewport={virtualWidth}x{virtualHeight}");
+            // The render config was already refreshed above. Only re-execute Lua
+            // when its screen dimensions actually changed or a runtime failed.
+            var renderConfigStatus = _statusMessage;
+            RefreshSkinUiConfig(reloadRenderConfig: false);
+            if (!renderConfigOk)
+                _statusMessage = renderConfigStatus;
+            _lastSkinScriptVirtualWidth = virtualWidth;
+            _lastSkinScriptVirtualHeight = virtualHeight;
+            RefreshSkinGameState();
+            var scriptsOk = _skinRuntime.LastError is null &&
+                            _pauseSkinRuntime.LastError is null &&
+                            _resultSkinRuntime.LastError is null &&
+                            _chartEditorInterfaceRuntime.LastError is null;
+            if (scriptsOk)
+                PrewarmGameplayAnimationFontsIfActive();
+            var ok = renderConfigOk && scriptsOk;
+            Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_DONE ok={ok} scripts={scriptsOk} renderConfig={renderConfigOk}");
             return ok;
         }
         catch (Exception ex)
@@ -11332,16 +11562,27 @@ public sealed partial class Playfield
         try
         {
             Program.LogRuntime("PLAYFIELD_SKIN_SCRIPTS_RELOAD_BEGIN");
+            var (virtualWidth, virtualHeight) = GetVirtualResolution(
+                _graphics.Viewport.Width,
+                _graphics.Viewport.Height);
+            _skinRuntime.UpdateScreen(virtualWidth, virtualHeight);
+            _pauseSkinRuntime.UpdateScreen(virtualWidth, virtualHeight);
+            _resultSkinRuntime.UpdateScreen(virtualWidth, virtualHeight);
+            _chartEditorInterfaceRuntime.UpdateScreen(virtualWidth, virtualHeight);
             var scriptOk = _skinRuntime.Reload();
-            var pauseOk = _pauseSkinRuntime.Reload();
-            var resultOk = _resultSkinRuntime.Reload();
-            var editorInterfaceOk = _chartEditorInterfaceRuntime.Reload();
+            var pauseOk = _pauseSkinRuntime.IsInitialLoadDeferred || _pauseSkinRuntime.Reload();
+            var resultOk = _resultSkinRuntime.IsInitialLoadDeferred || _resultSkinRuntime.Reload();
+            var editorInterfaceOk = _chartEditorInterfaceRuntime.IsInitialLoadDeferred || _chartEditorInterfaceRuntime.Reload();
             RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
+            _lastSkinScriptVirtualWidth = virtualWidth;
+            _lastSkinScriptVirtualHeight = virtualHeight;
 
             if (scriptOk)
                 _skin.UIConfig = _skinRuntime.UIConfig;
 
             RefreshSkinGameState();
+            if (scriptOk)
+                PrewarmGameplayAnimationFontsIfActive();
             var ok = scriptOk && pauseOk && resultOk && editorInterfaceOk;
             Program.LogRuntime($"PLAYFIELD_SKIN_SCRIPTS_RELOAD_DONE ok={ok} main={scriptOk} pause={pauseOk} result={resultOk} chartEditor={editorInterfaceOk}");
             return ok;
@@ -11364,7 +11605,9 @@ public sealed partial class Playfield
             width,
             height,
             skinSparklesEffect: _skinSparklesEffect,
-            skinQuad3DEffect: _skinQuad3DEffect);
+            skinQuad3DEffect: _skinQuad3DEffect,
+            deferInitialLoad: !string.Equals(
+                Path.GetFileName(scriptFileName), "skin.lua", StringComparison.OrdinalIgnoreCase));
 
         if (string.Equals(scriptFileName, "chartEditorInterface.lua", StringComparison.OrdinalIgnoreCase))
         {
@@ -11455,6 +11698,12 @@ public sealed partial class Playfield
         _resultSkinRuntime.SetEditorMode(editorModeForGameplaySkin);
         _chartEditorInterfaceRuntime.SetEditorMode(_chartEditorMode);
         _skinRuntime.SetEditorPreviewMode(_editorPreviewMode);
+        if (_gameplayPaused)
+            _pauseSkinRuntime.EnsureLoaded();
+        if (_gameplayResultActive)
+            _resultSkinRuntime.EnsureLoaded();
+        if (_chartEditorMode)
+            _chartEditorInterfaceRuntime.EnsureLoaded();
 
         _activeGaugeType = GameConfig.NormalizeGaugeType(skin.GameConfig.Gauge);
         _projection.ScrollSpeedScale = skin.GameConfig.ScrollSpeedScale;
@@ -11500,15 +11749,19 @@ public sealed partial class Playfield
             _skinRuntime.SetPanelTracks(_chart, _tempo);
             _pauseSkinRuntime.SetPanelTracks(_chart, _tempo);
             _resultSkinRuntime.SetPanelTracks(_chart, _tempo);
-            RefreshResultSongInfo();
+            if (_gameplayResultActive)
+                RefreshResultSongInfo();
         }
         RefreshSkinGameState();
+        PrewarmGameplayAnimationFontsIfActive();
 
         var (currentVirtualWidth, currentVirtualHeight) = GetVirtualResolution(
             _graphics.Viewport.Width,
             _graphics.Viewport.Height);
         _lastRenderConfigVirtualWidth = currentVirtualWidth;
         _lastRenderConfigVirtualHeight = currentVirtualHeight;
+        _lastSkinScriptVirtualWidth = currentVirtualWidth;
+        _lastSkinScriptVirtualHeight = currentVirtualHeight;
 
         var mainSkinError = _skinRuntime.LastError ?? "none";
         var pauseSkinError = _pauseSkinRuntime.LastError ?? "none";
@@ -11532,8 +11785,44 @@ public sealed partial class Playfield
     private void OpenAresDialog() => OpenAresRequested?.Invoke();
     public void Update(GameTime gameTime)
     {
+        // Upload hit-effect textures in small batches while the screen is hidden
+        // during startup. The transition readiness check keeps gameplay from
+        // becoming visible until the requested animation frames are available.
+        _textures.ProcessPendingHitAnimationPreload(maxFrames: 6, budgetMilliseconds: 14.0);
         RefreshChartEditorInterfaceLayoutForActiveScript();
         ApplyLiveGameConfigSettings();
+
+        // Decode Ogg/Opus away from the game thread. Only the final SoundEffect
+        // creation is performed here, where MonoGame's active audio context is
+        // valid. The one-second gameplay warm-up naturally overlaps the decode.
+        if (_audio.IsDecodeCompletionReady)
+        {
+            bool audioLoadCompleted;
+            Exception? audioLoadError;
+            using (new LoadTimingScope("opus_native_audio_prepare"))
+            {
+                audioLoadCompleted = _audio.TryCompletePendingLoad(
+                    retainPcmForSeeking: !_lockMenuPlayMode,
+                    out audioLoadError);
+            }
+
+            if (audioLoadCompleted && audioLoadError is not null)
+            {
+                _audioLoadFailed = true;
+                _playing = false;
+                _playbackStartPending = false;
+                _audioResyncPending = false;
+                _audioStartedForCurrentRun = false;
+                _audio.Stop();
+                _statusMessage = $"Music could not be decoded: {audioLoadError.Message}";
+                Program.LogRuntime($"AUDIO_DECODE_BACKGROUND_FAILED {audioLoadError}");
+                NotifyEditorSourceAudioPreparationFailed(audioLoadError);
+            }
+            else if (audioLoadCompleted && _audio.IsLoaded)
+            {
+                NotifyEditorSourceAudioPrepared();
+            }
+        }
 
         if (_hardGaugeGameOverActive)
         {
@@ -11573,6 +11862,21 @@ public sealed partial class Playfield
         var editorRestartPressed = _chartEditorMode && !EditorTextInputActive && !_editorPreviewEditorOpen &&
             KeybindSettings.IsPressed("editor_restart_preview");
         HandleInput(keyboard, gameTime);
+        if (_audioLoadFailed && (_playing || _playbackStartPending))
+        {
+            // A failed asynchronous decode must not silently turn a music-backed
+            // chart into a no-audio run. Loading with no music at all remains a
+            // valid silent chart; this guard only applies after a real decode error.
+            _playing = false;
+            _playbackStartPending = false;
+            _audioResyncPending = false;
+            _audio.Stop();
+            _statusMessage = "Music could not be decoded. Reload or reimport the song audio before playing.";
+            RefreshSkinGameState();
+            _skinRuntime.Update((float)gameTime.ElapsedGameTime.TotalSeconds);
+            _previousKeyboard = keyboard;
+            return;
+        }
         if (_gameplayResultActive || _gameplayResultTransitionPending)
         {
             // A result transition request stops the gameplay update before this
@@ -11618,10 +11922,33 @@ public sealed partial class Playfield
         // no audio is played during this period.
         if (_playbackStartPending && _startupWarmupRemainingSeconds > 0)
         {
-            _startupWarmupRemainingSeconds = Math.Max(
-                0,
-                _startupWarmupRemainingSeconds - gameTime.ElapsedGameTime.TotalSeconds);
+            AdvanceGameplayStartupWarmup(gameTime);
+            RefreshSkinGameState();
+            _skinRuntime.Update((float)gameTime.ElapsedGameTime.TotalSeconds);
+            _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
+            _previousKeyboard = keyboard;
+            return;
+        }
 
+        // Do not start the chart clock if decoding outlasts the normal startup
+        // warm-up. Keep the gameplay skin alive while waiting; once the task
+        // completes, audio starts before the chart advances as before.
+        if (_playbackStartPending && (_audio.IsLoading || _textures.PendingHitAnimationFrames > 0))
+        {
+            if (_textures.PendingHitAnimationFrames > 0 && !_audio.IsLoading)
+                _statusMessage = "Preparing gameplay effects...";
+            RefreshSkinGameState();
+            _skinRuntime.Update((float)gameTime.ElapsedGameTime.TotalSeconds);
+            _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
+            _previousKeyboard = keyboard;
+            return;
+        }
+
+        // Editor preview can be started before a long song finishes decoding.
+        // Keep its chart clock frozen too, rather than allowing silent playback
+        // to advance ahead of the audio that will eventually be attached.
+        if (_playing && _audio.IsLoading)
+        {
             RefreshSkinGameState();
             _skinRuntime.Update((float)gameTime.ElapsedGameTime.TotalSeconds);
             _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
@@ -11653,6 +11980,12 @@ public sealed partial class Playfield
             RefreshSkinGameState();
             _skinRuntime.Update((float)introDt);
             _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
+            _previousKeyboard = keyboard;
+            return;
+        }
+
+        if (_playbackStartPending && _chart is not null && !CanStartEditorChartPlayback())
+        {
             _previousKeyboard = keyboard;
             return;
         }
@@ -11835,6 +12168,58 @@ public sealed partial class Playfield
         _skinRuntime.Update((float)uiDt);
         _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
     }
+    internal bool IsAudioDecodePending => _audio.IsLoading;
+
+    private bool IsEditorChartPlaybackBlocked => _chartEditorMode &&
+        (_audio.IsLoading || (_audioLoadFailed && _loadedMusicBytes is { Length: > 0 }));
+
+    private bool CanStartEditorChartPlayback()
+    {
+        if (!_chartEditorMode)
+            return true;
+
+        if (_audio.IsLoading)
+        {
+            _statusMessage = "Music is still being prepared. Playback will be available shortly.";
+            return false;
+        }
+
+        if (_textures.PendingHitAnimationFrames > 0)
+        {
+            _statusMessage = "Gameplay effects are still being prepared. Playback will be available shortly.";
+            return false;
+        }
+
+        if (_audioLoadFailed && _loadedMusicBytes is { Length: > 0 })
+        {
+            _statusMessage = "Music could not be prepared. Re-import the song audio before playing.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private void TryToggleEditorChartPlayback()
+    {
+        if (!_playing && !CanStartEditorChartPlayback())
+            return;
+
+        _playing = !_playing;
+        _statusMessage = _playing ? "Preview playing." : "Preview paused.";
+    }
+
+    private void NotifyEditorSourceAudioPrepared()
+    {
+        if (_chartEditorMode)
+            OnEditorSourceAudioPrepared();
+    }
+
+    private void NotifyEditorSourceAudioPreparationFailed(Exception error)
+    {
+        if (_chartEditorMode)
+            OnEditorSourceAudioPreparationFailed(error);
+    }
+
     private void ApplyLiveGameConfigSettings()
     {
         ApplyEditorMusicPlaybackVolume();
@@ -12259,13 +12644,37 @@ public sealed partial class Playfield
         }
         DrawPolyline(batch, points, width, color);
     }
-    private (double ManagedMb, double PrivateMb, double WorkingSetMb) GetMemoryDebug()
+    private (double ManagedUsedMb, double GcHeapMb, double GcCommittedMb, double GcFragmentedMb,
+        double LohMb, double ProcessCommitMb, double WorkingSetMb, double NonGcCommittedMb) GetMemoryDebug()
     {
-        var managed = GC.GetTotalMemory(false) / (1024.0 * 1024.0);
+        const double bytesToMb = 1.0 / (1024.0 * 1024.0);
+
+        var managedUsedBytes = GC.GetTotalMemory(forceFullCollection: false);
+        var gcInfo = GC.GetGCMemoryInfo();
+        var gcCommittedBytes = Math.Max(0L, gcInfo.TotalCommittedBytes);
+        var generations = gcInfo.GenerationInfo;
+        // Generation 3 is the Large Object Heap. SizeAfterBytes is the most
+        // recent collection snapshot, not a live walk of every LOH segment.
+        var lohBytes = generations.Length > 3
+            ? Math.Max(0L, generations[3].SizeAfterBytes)
+            : 0L;
+
         _debugProcess.Refresh();
-        var privateMb = _debugProcess.PrivateMemorySize64 / (1024.0 * 1024.0);
-        var workingSetMb = _debugProcess.WorkingSet64 / (1024.0 * 1024.0);
-        return (managed, privateMb, workingSetMb);
+        var processCommitBytes = Math.Max(0L, _debugProcess.PrivateMemorySize64);
+        var workingSetBytes = Math.Max(0L, _debugProcess.WorkingSet64);
+        // This is an estimate of committed process memory not accounted for by
+        // the GC's committed heap; it includes native allocations and runtime data.
+        var nonGcCommittedBytes = Math.Max(0L, processCommitBytes - gcCommittedBytes);
+
+        return (
+            managedUsedBytes * bytesToMb,
+            Math.Max(0L, gcInfo.HeapSizeBytes) * bytesToMb,
+            gcCommittedBytes * bytesToMb,
+            Math.Max(0L, gcInfo.FragmentedBytes) * bytesToMb,
+            lohBytes * bytesToMb,
+            processCommitBytes * bytesToMb,
+            workingSetBytes * bytesToMb,
+            nonGcCommittedBytes * bytesToMb);
     }
 
     public void Dispose()
@@ -12300,7 +12709,7 @@ public sealed partial class Playfield
     }
     private static Texture2D CreateCircleTexture(GraphicsDevice device, int size)
     {
-        var texture = new Texture2D(device, size, size);
+        var texture = NativeResourceDiagnostics.TrackTexture(new Texture2D(device, size, size), NativeResourceCategory.Gameplay);
         var pixels = new Color[size * size];
         var center = (size - 1) * 0.5f;
         var radius = center;

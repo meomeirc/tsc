@@ -1860,15 +1860,17 @@ public sealed partial class Playfield
             _editorConnectorPreviewRenderTarget.Height != height)
         {
             _editorConnectorPreviewRenderTarget?.Dispose();
-            _editorConnectorPreviewRenderTarget = new RenderTarget2D(
-                _graphics,
-                width,
-                height,
-                false,
-                SurfaceFormat.Color,
-                DepthFormat.None,
-                0,
-                RenderTargetUsage.DiscardContents);
+            _editorConnectorPreviewRenderTarget = NativeResourceDiagnostics.TrackTexture(
+                new RenderTarget2D(
+                    _graphics,
+                    width,
+                    height,
+                    false,
+                    SurfaceFormat.Color,
+                    DepthFormat.None,
+                    0,
+                    RenderTargetUsage.DiscardContents),
+                NativeResourceCategory.Editor);
         }
 
         var originalTargets = _graphics.GetRenderTargets();

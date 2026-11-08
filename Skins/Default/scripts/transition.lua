@@ -5,7 +5,7 @@ local UI = import("uiStyle")
 
 function init()
     transition.out_duration = 0.30
-    transition.in_duration = 0.75
+    transition.in_duration = transition.out_duration
 
 -- Easing can be a built-in name or a custom Lua function(t).
     transition.out_easing = "ease_in_out"

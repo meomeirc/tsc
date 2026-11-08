@@ -282,6 +282,7 @@ local BOLD_FONT = "Roboto-Bold.ttf"
 local BLACKITALIC_FONT = "Roboto-BlackItalic.ttf"
 local RANK_UP_BLACK_FONT = "Roboto-Black.ttf"
 local RANK_UP_REGULAR_FONT = "Roboto-Regular.ttf"
+local RANK_UP_BLACK_CHARS = "RANKUPCBASP+"
 
 -- Score / accuracy
 
@@ -614,8 +615,51 @@ local function build_rank_gradient_colors()
     end
 end
 
+local function ensure_rank_up_fonts()
+    if rank_up_font == nil then
+        rank_up_font = fonts.raster(RANK_UP_BLACK_FONT, RANK_UP_RASTER_SIZE, RANK_UP_BLACK_CHARS)
+    end
+    -- Both rank text and the grade use the same atlas. Keep one handle rather
+    -- than requesting the identical raster twice.
+    rank_up_grade_font = rank_up_font
+    if rank_up_label_font == nil then
+        rank_up_label_font = fonts.raster(RANK_UP_REGULAR_FONT, RANK_UP_RASTER_SIZE, "RANK")
+    end
+    if rank_up_grade_shadow == nil and rank_up_grade_font ~= nil then
+        rank_up_grade_shadow = fonts.shadow(rank_up_grade_font, 20, 10)
+    end
+end
+
+local function ensure_clear_fonts()
+    if clear_font == nil then
+        clear_font = fonts.raster(BLACKITALIC_FONT, CLEAR_RASTER_SIZE, " ABCDEFGHIJKLMNOPQRSTUVWXYZ+")
+    end
+    if clear_shadow == nil and clear_font ~= nil then
+        clear_shadow = fonts.shadow(clear_font, 20, 10)
+    end
+end
+
+-- Called during hidden gameplay startup and editor initialization. The editor
+-- hides gameplay HUD elements in its normal view, but its gameplay preview uses
+-- the regular gameplay display configuration. Use the base gameplay switches
+-- here so preview fonts are ready before the user first enters preview mode.
+-- Keep the atlases lazy for skins/configurations that disable the animations.
+function prepare_gameplay_animation_fonts(use_gameplay_display)
+    refresh_display_config()
+    local font_display = use_gameplay_display == true and display or resolved_display
+    if font_display.rank_up ~= false then
+        ensure_rank_up_fonts()
+    end
+    if font_display.clear ~= false then
+        ensure_clear_fonts()
+    end
+end
+
 local function start_rank_up(new_grade)
     rank_up_grade = tostring(new_grade or "")
+    if rank_up_grade ~= "" then
+        ensure_rank_up_fonts()
+    end
     play_sound_unless_editor("grade.wav")
     if rank_up_grade == "A" then play_sound_unless_editor("challenge.wav") end
     rank_up_elapsed = 0
@@ -630,34 +674,23 @@ function init()
     sound.preload("challenge.wav")
     sound.preload("clear.wav")
     sound.preload("failed.wav")
+    -- The stage font is needed by the first gameplay intro. Clear and rank-up
+    -- fonts are prepared in the hidden warm-up/editor startup path.
     stage_font = fonts.raster("Roboto-Black.ttf", RANK_UP_RASTER_SIZE, " ONSTAGEGAMEOVER")
-    clear_font = fonts.raster(BLACKITALIC_FONT, CLEAR_RASTER_SIZE, " ABCDEFGHIJKLMNOPQRSTUVWXYZ+")
-    clear_shadow = fonts.shadow(clear_font, 20, 10)
-
-    rank_up_font = fonts.raster(RANK_UP_BLACK_FONT, RANK_UP_RASTER_SIZE, "RANKUP")
-    rank_up_grade_font = fonts.raster(RANK_UP_BLACK_FONT, RANK_UP_RASTER_SIZE, "CBASP+")
-    rank_up_label_font = fonts.raster(RANK_UP_REGULAR_FONT, RANK_UP_RASTER_SIZE, "RANK")
-    rank_up_grade_shadow = fonts.shadow(rank_up_grade_font, 20, 10)
     build_rank_gradient_colors()
-
     judgement_texture.perfect_plus = assets.load("judgement/perfect-plus.png")
     judgement_texture.perfect = assets.load("judgement/perfect.png")
     judgement_texture.good = assets.load("judgement/good.png")
     judgement_texture.miss = assets.load("judgement/miss.png")
-
     light_top_texture = assets.load("light-top.png")
     rank_gradient_texture = assets.load("gradient2.png")
-
     for digit = 0, 9 do
         combo_texture[digit] = assets.load("combo/" .. tostring(digit) .. ".png")
     end
-
     gauge_background = assets.load("gauge-bg.png")
     gauge_fill = assets.load("gauge-fill.png")
     gauge_frame = assets.load("gauge-frame.png")
-
     reset_state()
-
     print("[skin] scripted UI loaded")
 end
 
@@ -727,6 +760,7 @@ end
 -- Last playable tick / clear animation
 
 function on_last_playable_tick(clear_type)
+    ensure_clear_fonts()
     if clear_type == "FAILED" then
         play_sound_unless_editor("failed.wav")
     else

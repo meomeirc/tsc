@@ -38,6 +38,58 @@ public sealed partial class Playfield
         // text-field early returns so F10 remains available throughout the editor.
         if (Pressed(keyboard, Keys.F10))
             RefreshSkinUiConfig();
+
+#if DEBUG
+        // Diagnostic hotkeys are intentionally compiled only into Debug builds.
+        // Dispatch them before preview/modal/locked-gameplay early returns so the
+        // same tools remain available in regular gameplay and editor preview.
+        // A focused editor text field and the embedded media-preview modal retain
+        // exclusive keyboard ownership.
+        if (!_editorTextInputOwnsKeyboardThisFrame && !_editorPreviewEditorOpen)
+        {
+            if (Pressed(keyboard, Keys.F6))
+            {
+                _disableOrbitLaneTransition = !_disableOrbitLaneTransition;
+                _statusMessage = $"Orbit lane transitions {(_disableOrbitLaneTransition ? "disabled" : "enabled")}";
+            }
+
+            if (Pressed(keyboard, Keys.F7))
+            {
+                _disableTransitionFlash = !_disableTransitionFlash;
+                _statusMessage = $"Transition flash {(_disableTransitionFlash ? "disabled" : "enabled")}";
+            }
+
+            var controlDown = keyboard.IsKeyDown(Keys.LeftControl) || keyboard.IsKeyDown(Keys.RightControl);
+            var shiftDown = keyboard.IsKeyDown(Keys.LeftShift) || keyboard.IsKeyDown(Keys.RightShift);
+            if (Pressed(keyboard, Keys.F8) && controlDown && shiftDown)
+            {
+                CopyPerformanceDebugOverlayToClipboard();
+            }
+            else if (Pressed(keyboard, Keys.F8) && controlDown)
+            {
+                ForceFullGcDiagnostic();
+            }
+            else if (Pressed(keyboard, Keys.F8))
+            {
+                _showPerformanceDebug = !_showPerformanceDebug;
+                _performanceDebugOverlayText = string.Empty;
+                _performanceDebugOverlayNextRefreshTimestamp = 0;
+                _performanceDebugWasVisible = false;
+                _statusMessage = _showPerformanceDebug ? "Performance diagnostics enabled (F8 to hide)" : "Performance diagnostics disabled";
+            }
+
+            if (Pressed(keyboard, Keys.F9))
+                ToggleSuperFlickDebug();
+
+            // F11 is reserved for the auxiliary-track diagnostic in Debug
+            // gameplay. Shift+F11 remains available for the global window toggle.
+            if (Pressed(keyboard, Keys.F11) &&
+                !keyboard.IsKeyDown(Keys.LeftShift) &&
+                !keyboard.IsKeyDown(Keys.RightShift))
+                ToggleAuxTrackDebug();
+        }
+#endif
+
         // F4 is only a legacy shortcut outside the chart editor. In the editor,
         // gameplay/autoplay is controlled by editor_toggle_gameplay_mode instead.
         if (!_lockMenuPlayMode && !_chartEditorMode && Pressed(keyboard, Keys.F4))
@@ -106,7 +158,7 @@ public sealed partial class Playfield
             else if (KeybindSettings.IsPressed("editor_toggle_play_preview") &&
                      !_editorTimelineScrubbing && !_editorWheelScrollPauseActive)
             {
-                _playing = !_playing;
+                TryToggleEditorChartPlayback();
             }
             else if (KeybindSettings.IsPressed("editor_toggle_gameplay_mode") && !_lockMenuPlayMode)
             {
@@ -114,12 +166,12 @@ public sealed partial class Playfield
             }
         }
 
-        // Main-menu Play is a locked gameplay session. Most editor/debug
-        // controls remain disabled here, but F8 is temporarily allowed so the
-        // memory diagnostics can be inspected during a normal play session.
+        // Main-menu Play is a locked gameplay session. Editor controls remain
+        // disabled here; Debug-only diagnostics above stay available for normal
+        // gameplay inspection and testing.
         if (_lockMenuPlayMode)
         {
-#if !TSC_PUBLISH
+#if DEBUG
             if (Pressed(keyboard, Keys.F12))
                 OpenGameplayResult(manualTrigger: true);
             if (Pressed(keyboard, Keys.F5))
@@ -403,7 +455,7 @@ public sealed partial class Playfield
         var shouldResume = _editorSeekResumePlayback;
         _editorSeekResumePlayback = false;
         if (shouldResume && _chartEditorMode && !_playing &&
-            !_editorTimelineScrubbing && !_editorWheelScrollPauseActive)
+            !_editorTimelineScrubbing && !_editorWheelScrollPauseActive && CanStartEditorChartPlayback())
         {
             _playing = true;
             _audioResyncPending = true;
@@ -425,7 +477,7 @@ public sealed partial class Playfield
         _editorWheelResumeAfterScroll = false;
         _editorWheelScrollIdleRemaining = 0.0;
 
-        if (shouldResume && _chartEditorMode && !_playing)
+        if (shouldResume && _chartEditorMode && !_playing && CanStartEditorChartPlayback())
         {
             _playing = true;
             _audioResyncPending = true;

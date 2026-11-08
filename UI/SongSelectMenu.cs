@@ -6,6 +6,7 @@ using System.IO.Compression;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -152,12 +153,15 @@ public sealed class SongSelectMenu : IDisposable
     private readonly Dictionary<string, LinkedListNode<string>> _artLruNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<string> _artworkLoadQueue = new();
     private readonly HashSet<string> _artworkQueued = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _artworkWanted = new(StringComparer.OrdinalIgnoreCase);
+    private Task<DecodedArtwork>? _artworkDecodeTask;
+    private string? _artworkDecodePath;
     // Failed artwork must not be retried every frame. Unsupported formats such as
     // WebP can otherwise generate an unbounded stream of load errors when FFmpeg
     // is unavailable. Keep failures cached for this Song Select instance.
     private readonly HashSet<string> _artworkFailed = new(StringComparer.OrdinalIgnoreCase);
     private const int MaxCachedArtwork = 32;
-    private const int ArtworkLoadsPerUpdate = 1;
+    private const int MaxArtworkDecodeDimension = 768;
 
     private int _packIndex;
     private int _selectedSongIndex;
@@ -214,6 +218,13 @@ public sealed class SongSelectMenu : IDisposable
         public List<SongEntry> Songs { get; } = new();
         public List<string> Packs { get; } = new();
         public bool LoadedFromCache { get; set; }
+    }
+
+    private sealed class DecodedArtwork
+    {
+        public required int Width { get; init; }
+        public required int Height { get; init; }
+        public required XnaColor[] Pixels { get; init; }
     }
 
     private sealed class ScanResult
@@ -325,7 +336,7 @@ public sealed class SongSelectMenu : IDisposable
         _skinSparklesEffect = skinSparklesEffect;
         _skinQuad3DEffect = skinQuad3DEffect;
         _spriteBatch = new SpriteBatch(graphics);
-        _pixel = new Texture2D(graphics, 1, 1);
+        _pixel = NativeResourceDiagnostics.TrackTexture(new Texture2D(graphics, 1, 1), NativeResourceCategory.Menu);
         _pixel.SetData(new[] { XnaColor.White });
         _songsRoot = FindSongsRoot();
         _songSelectStateDirectory = FindSongSelectStateDirectory(_songsRoot);
@@ -378,6 +389,7 @@ public sealed class SongSelectMenu : IDisposable
         _packs.Clear();
         _artworkLoadQueue.Clear();
         _artworkQueued.Clear();
+        _artworkWanted.Clear();
         _artHandleCache.Clear();
         StopPreviewAudioAndRelease();
         _previewSelectionPath = null;
@@ -1254,6 +1266,9 @@ public sealed class SongSelectMenu : IDisposable
         _searchQuery = string.Empty;
         _searchEditor.Begin(string.Empty);
         _searchMouseSelecting = false;
+        _artworkLoadQueue.Clear();
+        _artworkQueued.Clear();
+        _artworkWanted.Clear();
         _packExpanded = false;
         _sortExpanded = false;
         _initialLoadInProgress = false;
@@ -1262,6 +1277,10 @@ public sealed class SongSelectMenu : IDisposable
 
     public void Draw()
     {
+        // Rebuild requests from the cards that are actually being drawn. This
+        // drops queued work from rows the user has already scrolled past.
+        BeginArtworkRequestFrame();
+
         var viewport = _graphics.Viewport;
         var width = viewport.Width;
         var height = viewport.Height;
@@ -3360,6 +3379,7 @@ public sealed class SongSelectMenu : IDisposable
             _galleryDragging = false;
             _artworkLoadQueue.Clear();
             _artworkQueued.Clear();
+            _artworkWanted.Clear();
             return;
         }
 
@@ -3437,6 +3457,7 @@ public sealed class SongSelectMenu : IDisposable
         SnapGalleryToSelection();
         _artworkLoadQueue.Clear();
         _artworkQueued.Clear();
+        _artworkWanted.Clear();
         WarmVisibleArtwork();
         _restoreLastSelectionPending = false;
     }
@@ -3950,6 +3971,14 @@ public sealed class SongSelectMenu : IDisposable
         var bufferRows = visibleRows + 3;
         var galleryEnd = Math.Min(_visibleSongs.Count, galleryStart + columns * bufferRows);
         var visibleItems = new List<SkinSongSelectItem>(Math.Max(0, galleryEnd - galleryStart));
+        var selectedSong = SelectedSong;
+        var selectedChart = SelectedChart ?? selectedSong?.RepresentativeChart;
+        // The large selected artwork is shown outside the scrolling grid, so
+        // give it first place in the small just-in-time decode queue.
+        QueueArtwork(selectedSong is null
+            ? null
+            : GetArtworkPath(selectedChart ?? selectedSong.RepresentativeChart, preferBig: true));
+
         for (var i = galleryStart; i < galleryEnd; i++)
         {
             var song = _visibleSongs[i];
@@ -3990,8 +4019,6 @@ public sealed class SongSelectMenu : IDisposable
         // one song can therefore occupy several indices, one for each chart.
         var galleryFractionalPixels = _galleryScrollPixels - galleryStartRow * safePitch;
 
-        var selectedSong = SelectedSong;
-        var selectedChart = SelectedChart ?? selectedSong?.RepresentativeChart;
         var searchScale = Math.Max(0.01f, Math.Min(_graphics.Viewport.Width / 1920f, _graphics.Viewport.Height / 1080f));
         var searchAvailableWidth = 400f * searchScale;
         if (_skinRuntime!.TryGetUiButtonBounds("song_search_input", out var searchBounds))
@@ -4110,35 +4137,249 @@ public sealed class SongSelectMenu : IDisposable
         return null;
     }
 
+    private void BeginArtworkRequestFrame()
+    {
+        _artworkLoadQueue.Clear();
+        _artworkQueued.Clear();
+        _artworkWanted.Clear();
+    }
+
     private void QueueArtwork(string? path)
     {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
             return;
 
         path = Path.GetFullPath(path);
-        if (_artCache.ContainsKey(path) || _artworkFailed.Contains(path) || !_artworkQueued.Add(path))
+        if (_artCache.ContainsKey(path) || _artworkFailed.Contains(path))
             return;
 
-        _artworkLoadQueue.Enqueue(path);
+        _artworkWanted.Add(path);
+        if (string.Equals(_artworkDecodePath, path, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (_artworkQueued.Add(path))
+            _artworkLoadQueue.Enqueue(path);
     }
 
     private void PumpArtworkLoads()
     {
-        var loaded = 0;
-        while (loaded < ArtworkLoadsPerUpdate && _artworkLoadQueue.Count > 0)
+        // The worker only reads and decodes pixels. Texture creation and upload
+        // stay on the game thread because they touch the GraphicsDevice.
+        if (_artworkDecodeTask is { IsCompleted: true } completedTask)
+        {
+            var path = _artworkDecodePath;
+            _artworkDecodeTask = null;
+            _artworkDecodePath = null;
+
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                try
+                {
+                    var decoded = completedTask.GetAwaiter().GetResult();
+                    if (decoded is not null && _artworkWanted.Contains(path) && !_artCache.ContainsKey(path))
+                        UploadArtwork(path, decoded);
+                }
+                catch (Exception ex)
+                {
+                    _artworkFailed.Add(path);
+                    Program.LogRuntime($"SONG_SELECT_ARTWORK_LOAD_FAILED {path} :: {ex.GetBaseException().Message}");
+                }
+            }
+        }
+
+        if (_artworkDecodeTask is not null)
+            return;
+
+        while (_artworkLoadQueue.Count > 0)
         {
             var path = _artworkLoadQueue.Dequeue();
             _artworkQueued.Remove(path);
-
-            if (_artCache.ContainsKey(path) || !File.Exists(path))
+            if (!_artworkWanted.Contains(path) || _artCache.ContainsKey(path) ||
+                _artworkFailed.Contains(path) || !File.Exists(path))
                 continue;
 
-            // Texture decoding/creation is deliberately spread across frames.
-            // Entering song-select must not synchronously decode a page of large
-            // album images on the same frame that the screen is opened.
-            _ = GetArtwork(path);
-            loaded++;
+            _artworkDecodePath = path;
+            _artworkDecodeTask = Task.Run(() => DecodeArtwork(path));
+            break;
         }
+    }
+
+    private void UploadArtwork(string path, DecodedArtwork decoded)
+    {
+        Texture2D? texture = null;
+        try
+        {
+            texture = new Texture2D(_graphics, decoded.Width, decoded.Height, false, SurfaceFormat.Color);
+            texture.SetData(decoded.Pixels);
+            texture = NativeResourceDiagnostics.TrackTexture(texture, NativeResourceCategory.Menu);
+
+            _artCache[path] = texture;
+            var node = _artLru.AddFirst(path);
+            _artLruNodes[path] = node;
+            TrimArtworkCache();
+        }
+        catch
+        {
+            texture?.Dispose();
+            throw;
+        }
+    }
+
+    private static DecodedArtwork DecodeArtwork(string path)
+    {
+        Exception? nativeDecodeException = null;
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var image = System.Drawing.Image.FromStream(
+                stream,
+                useEmbeddedColorManagement: true,
+                validateImageData: true);
+            return DecodeArtworkPixels(image);
+        }
+        catch (Exception ex)
+        {
+            nativeDecodeException = ex;
+        }
+
+        // GDI+ does not decode every format (notably WebP). Keep the existing
+        // FFmpeg fallback, but run the process and the second decode off-thread.
+        var ffmpeg = FindFfmpegExecutable();
+        if (ffmpeg is null)
+        {
+            throw new InvalidDataException(
+                $"Native image decoding failed ({nativeDecodeException!.Message}); FFmpeg is unavailable.",
+                nativeDecodeException);
+        }
+
+        var temporaryDirectory = Path.Combine(
+            Path.GetTempPath(), "TSC-SongSelectArtwork-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(temporaryDirectory);
+            var outputPath = Path.Combine(temporaryDirectory, "artwork.png");
+            var start = new ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            foreach (var argument in new[]
+            {
+                "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                "-map", "0:v:0", "-frames:v", "1", "-f", "image2", outputPath
+            })
+            {
+                start.ArgumentList.Add(argument);
+            }
+
+            using var process = Process.Start(start)
+                ?? throw new InvalidOperationException("Could not start FFmpeg.");
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0 || !File.Exists(outputPath) || new FileInfo(outputPath).Length <= 0)
+            {
+                var detail = string.IsNullOrWhiteSpace(stderr)
+                    ? "FFmpeg did not create a PNG image."
+                    : stderr.Trim();
+                if (detail.Length > 1000)
+                    detail = detail[..1000];
+                throw new InvalidDataException(
+                    $"FFmpeg conversion failed (exit code {process.ExitCode}): {detail}");
+            }
+
+            using var convertedStream = File.OpenRead(outputPath);
+            using var convertedImage = System.Drawing.Image.FromStream(
+                convertedStream,
+                useEmbeddedColorManagement: true,
+                validateImageData: true);
+            return DecodeArtworkPixels(convertedImage);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidDataException(
+                $"Native image loading failed ({nativeDecodeException!.Message}); FFmpeg fallback failed: {ex.Message}",
+                ex);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(temporaryDirectory))
+                    Directory.Delete(temporaryDirectory, recursive: true);
+            }
+            catch
+            {
+                // Temporary artwork is best-effort cleanup; do not hide the load result.
+            }
+        }
+    }
+
+    private static DecodedArtwork DecodeArtworkPixels(System.Drawing.Image source)
+    {
+        if (source.Width <= 0 || source.Height <= 0)
+            throw new InvalidDataException("Artwork has invalid dimensions.");
+
+        var scale = Math.Min(1.0, MaxArtworkDecodeDimension / (double)Math.Max(source.Width, source.Height));
+        var width = Math.Max(1, (int)Math.Round(source.Width * scale));
+        var height = Math.Max(1, (int)Math.Round(source.Height * scale));
+
+        // Song cards are never displayed at source resolution. Downsample large
+        // covers before creating a GPU texture so a single oversized image cannot
+        // cause a long upload or occupy many megabytes in the small LRU cache.
+        using var bitmap = new System.Drawing.Bitmap(
+            width,
+            height,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
+        {
+            graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+            graphics.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+            graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            graphics.DrawImage(source, new System.Drawing.Rectangle(0, 0, width, height));
+        }
+
+        var pixels = new XnaColor[checked(width * height)];
+        var bounds = new System.Drawing.Rectangle(0, 0, width, height);
+        var bitmapData = bitmap.LockBits(
+            bounds,
+            System.Drawing.Imaging.ImageLockMode.ReadOnly,
+            System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try
+        {
+            var rowBytes = checked(width * 4);
+            var row = new byte[rowBytes];
+            for (var y = 0; y < height; y++)
+            {
+                var rowAddress = IntPtr.Add(bitmapData.Scan0, y * bitmapData.Stride);
+                Marshal.Copy(rowAddress, row, 0, rowBytes);
+                var pixelIndex = y * width;
+                for (var x = 0; x < width; x++)
+                {
+                    var sourceIndex = x * 4;
+                    // Format32bppArgb is stored as BGRA in memory on Windows;
+                    // MonoGame's Color constructor takes channels in RGBA order.
+                    pixels[pixelIndex + x] = new XnaColor(
+                        row[sourceIndex + 2],
+                        row[sourceIndex + 1],
+                        row[sourceIndex],
+                        row[sourceIndex + 3]);
+                }
+            }
+        }
+        finally
+        {
+            bitmap.UnlockBits(bitmapData);
+        }
+
+        return new DecodedArtwork
+        {
+            Width = width,
+            Height = height,
+            Pixels = pixels
+        };
     }
 
     private void DrawBackground(int width, int height)
@@ -4434,133 +4675,6 @@ public sealed class SongSelectMenu : IDisposable
         return null;
     }
 
-    private Texture2D? GetArtwork(string? path)
-    {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
-            return null;
-
-        path = Path.GetFullPath(path);
-
-        if (_artCache.TryGetValue(path, out var existing))
-        {
-            TouchArtwork(path);
-            return existing;
-        }
-
-        if (_artworkFailed.Contains(path))
-            return null;
-
-        try
-        {
-            Texture2D texture;
-            try
-            {
-                using var stream = File.OpenRead(path);
-                texture = Texture2D.FromStream(_graphics, stream);
-            }
-            catch (Exception decodeException)
-            {
-                // MonoGame's image loader does not support WebP. Song Select must
-                // use the same FFmpeg fallback as the editor instead of failing
-                // even when FFmpeg has already been detected and installed.
-                texture = LoadArtworkWithFfmpeg(path, decodeException);
-            }
-
-            if (texture.Width <= 0 || texture.Height <= 0)
-            {
-                texture.Dispose();
-                _artworkFailed.Add(path);
-                Program.LogRuntime($"SONG_SELECT_ARTWORK_INVALID {path}");
-                return null;
-            }
-
-            _artCache[path] = texture;
-            var node = _artLru.AddFirst(path);
-            _artLruNodes[path] = node;
-            TrimArtworkCache();
-            return texture;
-        }
-        catch (Exception ex)
-        {
-            // Remember failed paths so unsupported formats are attempted and
-            // logged only once, rather than being re-queued every frame until
-            // the log or memory grows without bound.
-            _artworkFailed.Add(path);
-            Program.LogRuntime($"SONG_SELECT_ARTWORK_LOAD_FAILED {path} :: {ex.Message}");
-            return null;
-        }
-    }
-
-    private Texture2D LoadArtworkWithFfmpeg(string path, Exception nativeDecodeException)
-    {
-        var ffmpeg = FindFfmpegExecutable();
-        if (ffmpeg is null)
-        {
-            throw new InvalidDataException(
-                $"Native image decoding failed ({nativeDecodeException.Message}); FFmpeg is unavailable.",
-                nativeDecodeException);
-        }
-
-        var temporaryDirectory = Path.Combine(
-            Path.GetTempPath(), "TSC-SongSelectArtwork-" + Guid.NewGuid().ToString("N"));
-        try
-        {
-            Directory.CreateDirectory(temporaryDirectory);
-            var outputPath = Path.Combine(temporaryDirectory, "artwork.png");
-            var start = new ProcessStartInfo
-            {
-                FileName = ffmpeg,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                CreateNoWindow = true
-            };
-            foreach (var argument in new[]
-            {
-                "-hide_banner", "-loglevel", "error", "-y", "-i", path,
-                "-map", "0:v:0", "-frames:v", "1", "-f", "image2", outputPath
-            })
-            {
-                start.ArgumentList.Add(argument);
-            }
-
-            using var process = Process.Start(start)
-                ?? throw new InvalidOperationException("Could not start FFmpeg.");
-            var stderr = process.StandardError.ReadToEnd();
-            process.WaitForExit();
-            if (process.ExitCode != 0 || !File.Exists(outputPath) || new FileInfo(outputPath).Length <= 0)
-            {
-                var detail = string.IsNullOrWhiteSpace(stderr)
-                    ? "FFmpeg did not create a PNG image."
-                    : stderr.Trim();
-                if (detail.Length > 1000)
-                    detail = detail[..1000];
-                throw new InvalidDataException(
-                    $"FFmpeg conversion failed (exit code {process.ExitCode}): {detail}");
-            }
-
-            using var convertedStream = File.OpenRead(outputPath);
-            return Texture2D.FromStream(_graphics, convertedStream);
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidDataException(
-                $"Native image loading failed ({nativeDecodeException.Message}); FFmpeg fallback failed: {ex.Message}",
-                ex);
-        }
-        finally
-        {
-            try
-            {
-                if (Directory.Exists(temporaryDirectory))
-                    Directory.Delete(temporaryDirectory, recursive: true);
-            }
-            catch
-            {
-                // Temporary artwork is best-effort cleanup; do not hide the load result.
-            }
-        }
-    }
-
     private void TouchArtwork(string path)
     {
         if (!_artLruNodes.TryGetValue(path, out var node))
@@ -4846,6 +4960,7 @@ public sealed class SongSelectMenu : IDisposable
         _artHandleCache.Clear();
         _artworkLoadQueue.Clear();
         _artworkQueued.Clear();
+        _artworkWanted.Clear();
         _artworkFailed.Clear();
         _initialLoadTask = null;
         _initialLoadInProgress = false;

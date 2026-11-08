@@ -34,12 +34,67 @@ local function merge_theme(defaults, overrides)
         end
     end
     for key, override_value in pairs(overrides or {}) do
-        if merged[key] == nil then merged[key] = override_value end
+        if merged[key] == nil then
+            -- Preserve deep-copy semantics for override-only tables too; this
+            -- keeps the merged configuration independent of imported modules.
+            merged[key] = type(override_value) == "table"
+                and merge_theme({}, override_value)
+                or override_value
+        end
     end
     return merged
 end
 
-local PANEL_THEME = merge_theme(merge_theme(FALLBACK_THEME, imported_theme_defaults), theme_overrides)
+local function has_complete_panel_theme(theme)
+    if type(theme) ~= "table" then return false end
+    local assets = theme.assets
+    local colors = theme.colors
+    local geometry = theme.geometry
+    local animation = theme.animation
+    if type(assets) ~= "table"
+        or type(assets.panel_base) ~= "string"
+        or type(assets.characters) ~= "table"
+        or type(assets.light) ~= "string"
+        or type(colors) ~= "table"
+        or type(colors.by_element) ~= "table"
+        or type(geometry) ~= "table"
+        or type(geometry.depths) ~= "table"
+        or type(geometry.yaws_degrees) ~= "table"
+        or type(animation) ~= "table"
+        or type(animation.character) ~= "table"
+        or type(animation.light) ~= "table"
+        or type(animation.specialCycle) ~= "table" then
+        return false
+    end
+
+    local character = animation.character
+    local light = animation.light
+    if type(character.neutralBreathing) ~= "table"
+        or type(light.neutral) ~= "table"
+        or type(light.presentation) ~= "table" then
+        return false
+    end
+
+    for index = 101, 108 do
+        if type(character[index]) ~= "table" or type(light[index]) ~= "table" then
+            return false
+        end
+    end
+    return true
+end
+
+-- The bundled defaults are complete and treated as read-only below. Reuse the
+-- imported table directly instead of recursively cloning its many animation
+-- tables. Partial/custom defaults still receive the fallback merge.
+local base_panel_theme = has_complete_panel_theme(imported_theme_defaults)
+    and imported_theme_defaults
+    or merge_theme(FALLBACK_THEME, imported_theme_defaults)
+
+-- The Default panelTheme.lua returns the exact cached panelThemeDefaults table.
+-- Skip a second deep clone when there are no actual overrides.
+local PANEL_THEME = theme_overrides == imported_theme_defaults
+    and base_panel_theme
+    or merge_theme(base_panel_theme, theme_overrides)
 
 local PANEL_BASE_PATH = PANEL_THEME.assets.panel_base or FALLBACK_THEME.assets.panel_base
 local CHARACTER_PATHS = PANEL_THEME.assets.characters or FALLBACK_THEME.assets.characters

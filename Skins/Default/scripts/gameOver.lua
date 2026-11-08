@@ -1,4 +1,28 @@
-local UI = import("uiStyle")
+-- The game-over screen only needs two theme values. Importing uiStyle here
+-- also loads every UI component (buttons, rows, popups, layout), even during
+-- ordinary gameplay when this screen is never shown. Read the small theme
+-- tables directly instead of constructing the full UI assembly.
+local theme_defaults = {}
+local theme_overrides = {}
+local defaults_ok, defaults_value = pcall(import, "ui/themeDefaults")
+if defaults_ok and type(defaults_value) == "table" then theme_defaults = defaults_value end
+local overrides_ok, overrides_value = pcall(import, "ui/theme")
+if overrides_ok and type(overrides_value) == "table" then theme_overrides = overrides_value end
+
+local function theme_value(section, key, fallback)
+    local overrides_section = theme_overrides[section]
+    if type(overrides_section) == "table" and overrides_section[key] ~= nil then
+        return overrides_section[key]
+    end
+    local defaults_section = theme_defaults[section]
+    if type(defaults_section) == "table" and defaults_section[key] ~= nil then
+        return defaults_section[key]
+    end
+    return fallback
+end
+
+local GAME_OVER_FONT = theme_value("fonts", "regular", "Roboto-Regular.ttf")
+local GAME_OVER_MUTED = theme_value("colors", "muted", "#A7A7A7")
 
 local active = false
 local elapsed = 0
@@ -15,7 +39,7 @@ end
 
 local function fit_text_size(value, base_size, max_width, font)
     local measured = draw.measure_text(tostring(value or ""), {
-        font = font or UI.fonts.regular,
+        font = font or GAME_OVER_FONT,
         size = base_size,
     })
     if measured <= 0 or measured <= max_width then return base_size end
@@ -68,11 +92,11 @@ function render(continue_keybind, retry_keybind)
     local retry_key = string.upper(tostring(retry_keybind or "R"))
     local hint = continue_key .. "  CONTINUE     " .. retry_key .. "  RETRY"
     local size = math.min(FOOTER_SIZE * ref, height * FOOTER_HEIGHT_RATIO)
-    size = fit_text_size(hint, size, width * 0.92, UI.fonts.regular)
+    size = fit_text_size(hint, size, width * 0.92, GAME_OVER_FONT)
     draw.text(hint, {
         x = width * 0.5, y = height * 0.965,
-        size = size, color = UI.colors.muted, alpha = 1,
-        font = UI.fonts.regular, anchor = "center", align = "center", layer = 10002,
+        size = size, color = GAME_OVER_MUTED, alpha = 1,
+        font = GAME_OVER_FONT, anchor = "center", align = "center", layer = 10002,
         shadow = { x = 0, y = 0, color = "#000000", alpha = 0.66 },
     })
 end

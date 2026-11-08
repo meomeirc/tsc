@@ -59,26 +59,44 @@ public sealed partial class Playfield
     private readonly EditorArtworkTextureCache _editorAlbumBigArtworkCache = new();
 
     private double EditorPreviewSourceDurationSeconds
-    {
-        get
-        {
-            if (double.IsFinite(_audio.DurationSeconds) && _audio.DurationSeconds > 0)
-                return _audio.DurationSeconds;
+        => _audio.IsLoaded && double.IsFinite(_audio.DurationSeconds)
+            ? Math.Max(0, _audio.DurationSeconds)
+            : 0;
 
-            var music = GetEditorPreviewMusicBytes();
-            if (music is not { Length: > 0 })
-                return 0;
-            try
-            {
-                using var probe = new OpusAudioPlayer();
-                probe.LoadOpus(music);
-                return Math.Max(0, probe.DurationSeconds);
-            }
-            catch
-            {
-                return 0;
-            }
+    private void OnEditorSourceAudioPrepared()
+    {
+        if (!_editorPreviewEditorOpen || !_audio.IsLoaded)
+            return;
+
+        var duration = EditorPreviewSourceDurationSeconds;
+        if (duration <= 0)
+            return;
+
+        if (!_editorPreviewRangeInitialized)
+        {
+            _editorPreviewStartSeconds = 0;
+            _editorPreviewEndSeconds = Math.Min(30.0, duration);
+            _editorPreviewRangeInitialized = true;
         }
+        _editorPreviewStartSeconds = Math.Clamp(_editorPreviewStartSeconds, 0, duration);
+        _editorPreviewEndSeconds = Math.Clamp(_editorPreviewEndSeconds, _editorPreviewStartSeconds, duration);
+        if (_editorPreviewEndSeconds <= _editorPreviewStartSeconds)
+        {
+            _editorPreviewStartSeconds = 0;
+            _editorPreviewEndSeconds = Math.Min(30.0, duration);
+        }
+        SyncEditorPreviewTimeTexts();
+        _editorPreviewDialogMessage = null;
+        Program.LogRuntime($"EDITOR_PREVIEW_SOURCE_AUDIO_READY durationSeconds={duration:0.000}");
+    }
+
+    private void OnEditorSourceAudioPreparationFailed(Exception error)
+    {
+        if (!_editorPreviewEditorOpen)
+            return;
+
+        _editorPreviewDialogMessage = $"Music could not be prepared: {error.Message}";
+        Program.LogRuntime($"EDITOR_PREVIEW_SOURCE_AUDIO_FAILED type={error.GetType().Name} message={error.Message}");
     }
 
     private static string FormatEditorPreviewSeconds(double seconds)
@@ -156,24 +174,35 @@ public sealed partial class Playfield
         PauseChartPlaybackForPreviewEditor();
         StopEditorPreviewPlayback();
         var duration = EditorPreviewSourceDurationSeconds;
-        if (!_editorPreviewRangeInitialized)
+        if (duration > 0)
         {
-            _editorPreviewStartSeconds = 0;
-            _editorPreviewEndSeconds = Math.Min(30.0, duration);
-            _editorPreviewRangeInitialized = true;
+            if (!_editorPreviewRangeInitialized)
+            {
+                _editorPreviewStartSeconds = 0;
+                _editorPreviewEndSeconds = Math.Min(30.0, duration);
+                _editorPreviewRangeInitialized = true;
+            }
+            _editorPreviewStartSeconds = Math.Clamp(_editorPreviewStartSeconds, 0, duration);
+            _editorPreviewEndSeconds = Math.Clamp(_editorPreviewEndSeconds, _editorPreviewStartSeconds, duration);
+            if (_editorPreviewEndSeconds <= _editorPreviewStartSeconds)
+            {
+                _editorPreviewStartSeconds = 0;
+                _editorPreviewEndSeconds = Math.Min(30.0, duration);
+            }
         }
-        _editorPreviewStartSeconds = Math.Clamp(_editorPreviewStartSeconds, 0, duration);
-        _editorPreviewEndSeconds = Math.Clamp(_editorPreviewEndSeconds, _editorPreviewStartSeconds, duration);
-        if (_editorPreviewEndSeconds <= _editorPreviewStartSeconds && duration > 0)
+        else
         {
             _editorPreviewStartSeconds = 0;
-            _editorPreviewEndSeconds = Math.Min(30.0, duration);
+            _editorPreviewEndSeconds = 0;
+            _editorPreviewRangeInitialized = false;
         }
         SyncEditorPreviewTimeTexts();
         _editorPreviewFocusedField = -1;
-        _editorPreviewDialogMessage = duration > 0
-            ? null
-            : "Import the full song audio before creating a preview.";
+        _editorPreviewDialogMessage = _audio.IsLoading
+            ? "Music is still being prepared. Preview controls will be available shortly."
+            : _audioLoadFailed && _loadedMusicBytes is { Length: > 0 }
+                ? "Music could not be prepared. Re-import the song audio to try again."
+                : duration > 0 ? null : "Import the full song audio before creating a preview.";
         _editorPreviewEditorOpen = true;
         _editorMetaEditingField = null;
         _statusMessage = "Music preview editor opened. Playback is paused.";
@@ -233,7 +262,7 @@ public sealed partial class Playfield
         {
             try
             {
-                var package = FpkPackage.Load(_loadedSourcePath);
+                var package = GetOrLoadFpkPackage(_loadedSourcePath);
                 var entry = package.FindMusic();
                 if (entry is not null)
                     return package.Extract(entry);
@@ -284,7 +313,7 @@ public sealed partial class Playfield
         {
             try
             {
-                var package = FpkPackage.Load(_loadedSourcePath);
+                var package = GetOrLoadFpkPackage(_loadedSourcePath);
                 var requestedName = string.IsNullOrWhiteSpace(_chart?.PreviewPath)
                     ? "preview.opus"
                     : Path.GetFileName(_chart.PreviewPath);
@@ -515,6 +544,8 @@ public sealed partial class Playfield
         if (_chart is null || !_chartEditorMode)
             return false;
         var duration = EditorPreviewSourceDurationSeconds;
+        if (_audio.IsLoading)
+            throw new InvalidOperationException("Music is still being prepared. Preview controls will be available shortly.");
         if (duration <= 0)
             throw new InvalidOperationException("Import the full song audio before creating a preview.");
         if (!TryReadEditorPreviewRange(out var startSeconds, out var endSeconds, out var validationMessage,
@@ -545,6 +576,8 @@ public sealed partial class Playfield
             return false;
 
         var duration = EditorPreviewSourceDurationSeconds;
+        if (_audio.IsLoading)
+            throw new InvalidOperationException("Music is still being prepared. Preview controls will be available shortly.");
         if (duration <= 0)
             throw new InvalidOperationException("Import the full song audio before creating a preview.");
         if (!TryReadEditorPreviewRange(out var startSeconds, out var endSeconds, out var validationMessage,
@@ -600,6 +633,11 @@ public sealed partial class Playfield
         startSeconds = _editorPreviewStartSeconds;
         endSeconds = _editorPreviewEndSeconds;
         message = string.Empty;
+        if (_audio.IsLoading)
+        {
+            message = "Music is still being prepared. Preview controls will be available shortly.";
+            return false;
+        }
         if (!double.TryParse(_editorPreviewStartText.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out startSeconds) || !double.IsFinite(startSeconds))
         {
             message = "Start time must be a valid number of seconds.";
@@ -691,6 +729,13 @@ public sealed partial class Playfield
 
     private void HandleEditorPreviewEditorInput(KeyboardState keyboard, KeyboardState previousKeyboard)
     {
+        if (_audio.IsLoading && _editorPreviewFocusedField >= 0)
+        {
+            _editorPreviewFocusedField = -1;
+            _editorPreviewInputReplaceOnNextKey = false;
+            EndEditorTextFieldMouseSelection();
+            _editorPreviewDialogMessage = "Music is still being prepared. Preview controls will be available shortly.";
+        }
         UpdateEditorTextFieldMouseDrag();
 
         if (_editorPreviewFocusedField >= 0)
@@ -800,6 +845,25 @@ public sealed partial class Playfield
             }
         }
         var dialog = GetEditorPreviewEditorDialogBounds(virtualWidth, virtualHeight);
+
+        if (_audio.IsLoading)
+        {
+            _editorPreviewFocusedField = -1;
+            _editorPreviewDraggingStart = false;
+            _editorPreviewDraggingEnd = false;
+            if (leftPressed && GetEditorPreviewCloseActionButtonBounds(virtualWidth, virtualHeight).Contains(point))
+            {
+                CloseEditorPreviewEditor();
+                return;
+            }
+            if (leftPressed && GetEditorPreviewPlayButtonBounds(virtualWidth, virtualHeight).Contains(point) &&
+                _editorPreviewPlayer?.IsPlaying == true)
+            {
+                StopEditorPreviewPlayback();
+                _editorPreviewDialogMessage = "Preview playback stopped. Chart playback remains paused.";
+            }
+            return;
+        }
 
         if (_editorPreviewFocusedField >= 0)
         {
@@ -1376,7 +1440,7 @@ public sealed partial class Playfield
             // store WebP covers, which MonoGame does not decode; fall back to FFmpeg
             // only for those formats (or any other unsupported image type).
             using var stream = File.OpenRead(path);
-            cache.Texture = Texture2D.FromStream(_graphics, stream);
+            cache.Texture = NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Editor);
         }
         catch
         {
@@ -1412,7 +1476,7 @@ public sealed partial class Playfield
         try
         {
             using var stream = new MemoryStream(bytes, writable: false);
-            return Texture2D.FromStream(_graphics, stream);
+            return NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Editor);
         }
         catch
         {
@@ -1428,7 +1492,7 @@ public sealed partial class Playfield
             try
             {
                 using var normalizedStream = new MemoryStream(normalizedPng, writable: false);
-                return Texture2D.FromStream(_graphics, normalizedStream);
+                return NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, normalizedStream), NativeResourceCategory.Editor);
             }
             catch
             {
@@ -1457,7 +1521,7 @@ public sealed partial class Playfield
             if (!File.Exists(outputPath) || new FileInfo(outputPath).Length == 0)
                 return null;
             using var stream = File.OpenRead(outputPath);
-            return Texture2D.FromStream(_graphics, stream);
+            return NativeResourceDiagnostics.TrackTexture(Texture2D.FromStream(_graphics, stream), NativeResourceCategory.Editor);
         }
         catch
         {
@@ -1688,7 +1752,9 @@ public sealed partial class Playfield
         var sourceDuration = EditorPreviewSourceDurationSeconds;
         var subtitle = sourceDuration > 0
             ? $"Choose a section of the full song. Length: {FormatEditorPreviewTimestamp(sourceDuration)}. A subtle fade is added at each end."
-            : "Import the full song audio first to enable preview editing.";
+            : _audio.IsLoading
+                ? "Preparing full song audio. Preview controls will unlock when it is ready."
+                : "Import the full song audio first to enable preview editing.";
         DrawEditorPreviewLabel(subtitle, new Rectangle(panel.X + 28, panel.Y + (int)MathF.Round(76f * unit), panel.Width - (int)MathF.Round(56f * unit), (int)MathF.Round(56f * unit)), Muted, unit);
 
         var slider = GetEditorPreviewSliderBounds(virtualWidth, virtualHeight);
@@ -1733,10 +1799,12 @@ public sealed partial class Playfield
             DrawEditorPreviewLabel(_editorPreviewDialogMessage, messageBounds, messageColor, unit);
         }
 
+        var sourceReady = _audio.IsLoaded && sourceDuration > 0;
         DrawEditorMetaButton(GetEditorPreviewPlayButtonBounds(virtualWidth, virtualHeight),
             _editorPreviewPlayer?.IsPlaying == true ? "STOP" : "PLAY",
-            new Color(28, 28, 30, 250), Active);
-        var rangeValid = sourceDuration > 0 && TryReadEditorPreviewRange(out _, out _, out _,
+            sourceReady ? new Color(28, 28, 30, 250) : new Color(30, 30, 32, 240),
+            sourceReady ? Active : new Color(105, 105, 107));
+        var rangeValid = sourceReady && TryReadEditorPreviewRange(out _, out _, out _,
             extendEndWhenStartPassesIt: _editorPreviewFocusedField == 0);
         DrawEditorMetaButton(GetEditorPreviewSaveButtonBounds(virtualWidth, virtualHeight), "SAVE",
             rangeValid ? new Color(29, 65, 52, 250) : new Color(30, 30, 32, 240),

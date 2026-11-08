@@ -249,11 +249,15 @@ public sealed partial class Playfield
         foreach (var id in GetVisibleEditorActionIds())
         {
             if (!IsEditorActionVisible(id)) continue;
-            var label = id == EditorActionPlay && _playing ? "PAUSE" : EditorActionLabels[id];
+            var label = id == EditorActionPlay
+                ? _audio.IsLoading ? "WAIT" : _audioLoadFailed && _loadedMusicBytes is { Length: > 0 }
+                    ? "ERROR" : _playing ? "PAUSE" : EditorActionLabels[id]
+                : EditorActionLabels[id];
             var action = EditorUiItem($"right_{id}", label, "editor.action", id,
                 selected: id == EditorActionSelect && _editorMenuSection == EditorMenuSection.Select,
                 enabled: !(id is EditorActionUndo && _editorUndoStack.Count == 0) &&
-                         !(id is EditorActionRedo && _editorRedoStack.Count == 0),
+                         !(id is EditorActionRedo && _editorRedoStack.Count == 0) &&
+                         !(id == EditorActionPlay && IsEditorChartPlaybackBlocked && !_playing),
                 toggle: id == EditorActionSelect);
             if (id == EditorActionDelete) action["variant"] = "danger";
             rightActions.Add(action);
@@ -264,7 +268,8 @@ public sealed partial class Playfield
         {
             var label = id switch
             {
-                EditorActionPlay => _playing ? "PAUSE" : "PLAY",
+                EditorActionPlay => _audio.IsLoading ? "WAIT" : _audioLoadFailed && _loadedMusicBytes is { Length: > 0 }
+                    ? "ERROR" : _playing ? "PAUSE" : "PLAY",
                 EditorActionViewMode => _topDownViewEnabled ? "VIEW 2D" : "VIEW 3D",
                 EditorActionEditorPreview => "PREVIEW",
                 EditorActionGameplayMode => "AUTOPLAY",
@@ -302,7 +307,8 @@ public sealed partial class Playfield
                 EditorActionAttributes or EditorActionPanels or EditorActionSnap or EditorActionTempoLines or EditorActionConstantScroll or
                 EditorActionMetronome or EditorActionMeta or EditorActionEditorPreview or EditorActionGameplayMode;
             var leftAction = EditorUiItem($"left_{id}", label, "editor.action", id, selected,
-                enabled: !(id == EditorActionExpand && !_topDownViewEnabled && _editorPanelsViewEnabled), toggle: toggle);
+                enabled: !(id == EditorActionExpand && !_topDownViewEnabled && _editorPanelsViewEnabled) &&
+                         !(id == EditorActionPlay && IsEditorChartPlaybackBlocked && !_playing), toggle: toggle);
             if (id == EditorActionQuickSave && HasUnsavedEditorChanges)
                 leftAction["variant"] = "warning";
             leftActions.Add(leftAction);
@@ -813,6 +819,9 @@ public sealed partial class Playfield
             ["meta_element_open"] = _editorElementDropdownOpen,
             ["meta_preview_playing"] = _editorPreviewPlayer?.IsPlaying == true,
             ["preview_editor_open"] = _editorPreviewEditorOpen,
+            ["preview_source_loading"] = _audio.IsLoading,
+            ["preview_source_ready"] = _audio.IsLoaded && EditorPreviewSourceDurationSeconds > 0,
+            ["preview_source_failed"] = _audioLoadFailed && _loadedMusicBytes is { Length: > 0 },
             ["preview_duration"] = EditorPreviewSourceDurationSeconds,
             ["preview_start"] = _editorPreviewStartSeconds,
             ["preview_end"] = _editorPreviewEndSeconds,
@@ -831,7 +840,9 @@ public sealed partial class Playfield
             ["preview_end_selection_offset"] = previewEndMetrics.SelectionOffset,
             ["preview_end_selection_width"] = previewEndMetrics.SelectionWidth,
             ["preview_end_text_width"] = previewEndMetrics.TextWidth,
-            ["preview_message"] = _editorPreviewDialogMessage ?? string.Empty,
+            ["preview_message"] = _editorPreviewDialogMessage ?? (_audio.IsLoading
+                ? "Music is still being prepared. Preview controls will be available shortly."
+                : string.Empty),
             ["preview_playing"] = _editorPreviewPlayer?.IsPlaying == true,
             ["meta_element_options"] = new List<object?>
             {
@@ -1205,9 +1216,13 @@ public sealed partial class Playfield
                 OpenEditorPreviewEditor();
                 return true;
             case "editor.preview.focus_start":
-                FocusEditorPreviewInterfaceField(0, width, height); return true;
+                if (!_audio.IsLoading) FocusEditorPreviewInterfaceField(0, width, height);
+                else _editorPreviewDialogMessage = "Music is still being prepared. Preview controls will be available shortly.";
+                return true;
             case "editor.preview.focus_end":
-                FocusEditorPreviewInterfaceField(1, width, height); return true;
+                if (!_audio.IsLoading) FocusEditorPreviewInterfaceField(1, width, height);
+                else _editorPreviewDialogMessage = "Music is still being prepared. Preview controls will be available shortly.";
+                return true;
             case "editor.preview.play":
                 if (_editorPreviewFocusedField >= 0)
                 {
@@ -1375,6 +1390,11 @@ public sealed partial class Playfield
 
     private void UpdateEditorPreviewRangeFromValue(double value)
     {
+        if (_audio.IsLoading)
+        {
+            _editorPreviewDialogMessage = "Music is still being prepared. Preview controls will be available shortly.";
+            return;
+        }
         if (_editorPreviewFocusedField >= 0)
         {
             CommitEditorPreviewFocusedTime();

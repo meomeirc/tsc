@@ -113,6 +113,13 @@ public static class Program
     // All file-based TSC logs share one hard limit, including crash and debug logs.
     internal const int MaxLogBytes = 2 * 1024 * 1024;
 
+    // Leave room after compaction so the logger does not read/rewrite a full 2 MB
+    // file for every subsequent line. This was especially costly during skin load,
+    // where every assets.load() emits nested timing entries.
+    private const int LogCompactionHeadroomBytes = MaxLogBytes / 4;
+    private const int LogRetainedAfterCompactionBytes = MaxLogBytes - LogCompactionHeadroomBytes;
+    private static readonly byte[] LogCopyBuffer = new byte[64 * 1024];
+
     internal static void AppendBoundedLog(string path, string text)
     {
         var bytes = Encoding.UTF8.GetBytes(text + Environment.NewLine);
@@ -123,50 +130,169 @@ public static class Program
             if (!string.IsNullOrEmpty(directory))
                 Directory.CreateDirectory(directory);
 
-            // Normal writes stay on the fast append path. Check the actual file
-            // length after opening it so the limit decision is not based on a
-            // stale FileInfo value from before another process finished a write.
-            if (bytes.Length < MaxLogBytes)
+            // Normal writes stay on the fast append path. Read the length from the
+            // opened stream, then compact only after the file would exceed its cap.
+            // The compacted file is deliberately smaller than the cap, avoiding a
+            // full-file rewrite on every log entry after the first rollover.
+            long existingLength;
+            using (var stream = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.Read))
             {
-                try
+                existingLength = stream.Length;
+                if (bytes.Length < MaxLogBytes && existingLength <= MaxLogBytes - bytes.Length)
                 {
-                    using (var stream = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.Read))
-                    {
-                        if (stream.Length <= MaxLogBytes - bytes.Length)
-                        {
-                            stream.Write(bytes, 0, bytes.Length);
-                            stream.Flush();
-                            return;
-                        }
-                    }
-                }
-                catch
-                {
-                    // Fall through to the bounded path, which will skip safely if
-                    // the current log cannot be read or replaced.
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush();
+                    return;
                 }
             }
 
-            byte[] combined;
-            if (bytes.Length >= MaxLogBytes)
-            {
-                combined = KeepRecentLogBytes(bytes, MaxLogBytes);
-            }
-            else
-            {
-                if (!TryReadLogTail(fullPath, MaxLogBytes, out var existing))
-                    return; // Preserve the existing log if it cannot be read safely.
-                combined = new byte[existing.Length + bytes.Length];
-                Buffer.BlockCopy(existing, 0, combined, 0, existing.Length);
-                Buffer.BlockCopy(bytes, 0, combined, existing.Length, bytes.Length);
-                combined = KeepRecentLogBytes(combined, MaxLogBytes);
-            }
-
-            WriteLogReplacement(fullPath, combined);
+            RewriteRecentLogTail(fullPath, bytes, existingLength);
         }
     }
 
-    /// <summary>Clamps logs from older builds during startup, even if not written this session.</summary>
+    /// <summary>
+    /// Rewrites the recent log tail using a small reusable buffer. The previous
+    /// implementation allocated two multi-megabyte arrays and rewrote the full log
+    /// on every line once the 2 MB cap was reached. That logging overhead polluted
+    /// the allocation profiler and created real LOH churn during asset loading.
+    /// </summary>
+    private static void RewriteRecentLogTail(string path, byte[] appendedBytes, long existingLength)
+    {
+        var combinedLength = existingLength + appendedBytes.LongLength;
+        var desiredStart = Math.Max(0L, combinedLength - LogRetainedAfterCompactionBytes);
+        var tempPath = path + ".trim.tmp";
+
+        try
+        {
+            using (var output = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                if (desiredStart < existingLength && existingLength > 0 && File.Exists(path))
+                {
+                    using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    var copyStart = FindNextLogLineStart(input, desiredStart, existingLength);
+                    if (copyStart < existingLength)
+                    {
+                        input.Position = copyStart;
+                        CopyLogRange(input, output, existingLength - copyStart);
+                        output.Write(appendedBytes, 0, appendedBytes.Length);
+                    }
+                    else if (appendedBytes.Length > 0)
+                    {
+                        // The retained portion of the old file had no complete
+                        // line. Start at the next complete line in the new bytes.
+                        WriteAppendedLogTail(output, appendedBytes, 0);
+                    }
+                    else
+                    {
+                        // Startup cleanup can encounter an older log consisting
+                        // of one very long line. Preserve its tail rather than
+                        // replacing it with an empty file.
+                        var fallbackStart = FindUtf8SafeLogStart(input, desiredStart, existingLength);
+                        input.Position = fallbackStart;
+                        CopyLogRange(input, output, existingLength - fallbackStart);
+                    }
+                }
+                else
+                {
+                    var appendedStart = (int)Math.Clamp(desiredStart - existingLength, 0L, appendedBytes.LongLength);
+                    WriteAppendedLogTail(output, appendedBytes, appendedStart);
+                }
+
+                output.Flush();
+            }
+
+            File.Move(tempPath, path, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            throw;
+        }
+    }
+
+    private static long FindNextLogLineStart(Stream stream, long start, long end)
+    {
+        if (start <= 0)
+            return 0;
+
+        stream.Position = start - 1;
+        if (stream.ReadByte() == (byte)'\n')
+            return start;
+
+        stream.Position = start;
+        var position = start;
+        while (position < end)
+        {
+            var requested = (int)Math.Min(LogCopyBuffer.Length, end - position);
+            var read = stream.Read(LogCopyBuffer, 0, requested);
+            if (read <= 0)
+                break;
+
+            var newline = Array.IndexOf(LogCopyBuffer, (byte)'\n', 0, read);
+            if (newline >= 0)
+                return position + newline + 1;
+
+            position += read;
+        }
+
+        return end;
+    }
+
+    private static long FindUtf8SafeLogStart(Stream input, long start, long end)
+    {
+        input.Position = start;
+        while (start < end)
+        {
+            var value = input.ReadByte();
+            if (value < 0 || (value & 0xC0) != 0x80)
+                break;
+            start++;
+        }
+        return start;
+    }
+
+    private static void CopyLogRange(Stream input, Stream output, long bytesToCopy)
+    {
+        while (bytesToCopy > 0)
+        {
+            var requested = (int)Math.Min(LogCopyBuffer.Length, bytesToCopy);
+            var read = input.Read(LogCopyBuffer, 0, requested);
+            if (read <= 0)
+                break;
+            output.Write(LogCopyBuffer, 0, read);
+            bytesToCopy -= read;
+        }
+    }
+
+    private static void WriteAppendedLogTail(Stream output, byte[] bytes, int start)
+    {
+        start = Math.Clamp(start, 0, bytes.Length);
+        if (start >= bytes.Length)
+            return;
+
+        if (start == 0 || bytes[start - 1] == (byte)'\n')
+        {
+            output.Write(bytes, start, bytes.Length - start);
+            return;
+        }
+
+        var newline = Array.IndexOf(bytes, (byte)'\n', start);
+        if (newline >= 0 && newline < bytes.Length - 1)
+        {
+            var lineStart = newline + 1;
+            output.Write(bytes, lineStart, bytes.Length - lineStart);
+            return;
+        }
+
+        // A single unusually large log entry may exceed the retention window.
+        // Preserve its tail while avoiding a UTF-8 continuation-byte start.
+        var fallbackStart = Math.Max(0, bytes.Length - MaxLogBytes);
+        while (fallbackStart < bytes.Length && (bytes[fallbackStart] & 0xC0) == 0x80)
+            fallbackStart++;
+        output.Write(bytes, fallbackStart, bytes.Length - fallbackStart);
+    }
+
+    /// <summary>Clamps logs from older builds during startup without allocating multi-megabyte arrays.</summary>
     internal static void EnforceExistingLogSizeLimit(string path)
     {
         try
@@ -174,93 +300,19 @@ public static class Program
             var fullPath = Path.GetFullPath(path);
             lock (LogWriteLock)
             {
-                if (!File.Exists(fullPath) || new FileInfo(fullPath).Length <= MaxLogBytes)
+                if (!File.Exists(fullPath))
                     return;
 
-                if (!TryReadLogTail(fullPath, MaxLogBytes + 64 * 1024, out var tail))
+                var length = new FileInfo(fullPath).Length;
+                if (length <= MaxLogBytes)
                     return;
-                WriteLogReplacement(fullPath, KeepRecentLogBytes(tail, MaxLogBytes));
+
+                RewriteRecentLogTail(fullPath, Array.Empty<byte>(), length);
             }
         }
         catch
         {
-            // Log maintenance must never prevent game startup.
-        }
-    }
-
-    private static bool TryReadLogTail(string path, int maxBytes, out byte[] bytes)
-    {
-        bytes = Array.Empty<byte>();
-        try
-        {
-            if (!File.Exists(path))
-                return true;
-
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            var length = (int)Math.Min(Math.Max(0, stream.Length), maxBytes);
-            if (length == 0)
-                return true;
-
-            stream.Seek(-length, SeekOrigin.End);
-            bytes = new byte[length];
-            var read = 0;
-            while (read < length)
-            {
-                var count = stream.Read(bytes, read, length - read);
-                if (count <= 0)
-                    break;
-                read += count;
-            }
-            if (read != length)
-                Array.Resize(ref bytes, read);
-            return true;
-        }
-        catch
-        {
-            bytes = Array.Empty<byte>();
-            return false;
-        }
-    }
-
-    private static byte[] KeepRecentLogBytes(byte[] bytes, int maxBytes)
-    {
-        if (bytes.Length <= maxBytes)
-            return bytes;
-
-        var start = bytes.Length - maxBytes;
-        // Prefer a complete line boundary so retained logs start at a useful
-        // entry rather than halfway through an older diagnostic.
-        var lineStart = start;
-        while (lineStart < bytes.Length && bytes[lineStart] != (byte)'\n')
-            lineStart++;
-        if (lineStart < bytes.Length)
-            start = lineStart + 1;
-
-        // Do not begin on a UTF-8 continuation byte.
-        while (start < bytes.Length && (bytes[start] & 0xC0) == 0x80)
-            start++;
-        if (start >= bytes.Length)
-        {
-            start = bytes.Length - maxBytes;
-            while (start < bytes.Length && (bytes[start] & 0xC0) == 0x80)
-                start++;
-        }
-
-        return bytes.AsSpan(start).ToArray();
-    }
-
-    private static void WriteLogReplacement(string path, byte[] bytes)
-    {
-        var tempPath = path + ".trim.tmp";
-        try
-        {
-            File.WriteAllBytes(tempPath, bytes);
-            File.Move(tempPath, path, overwrite: true);
-        }
-        catch
-        {
-            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
-            throw;
+            // Log maintenance is best-effort and must never prevent startup.
         }
     }
 

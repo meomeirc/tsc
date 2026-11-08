@@ -1960,9 +1960,16 @@ function drawPreviewEditor(state, w, h, layer)
     panel("editor_preview_panel", x, y, panelW, panelH, "MUSIC PREVIEW", layer or 130)
 
     local duration = math.max(0, num(state.preview_duration, 0))
+    local sourceLoading = state.preview_source_loading == true
+    local sourceReady = state.preview_source_ready == true
+    local sourceFailed = state.preview_source_failed == true
     local subtitle = duration > 0
         and ("Choose a section of the full song. Length: " .. tostring(state.preview_duration_label) .. ". A subtle fade is added at each end.")
-        or "Import the full song audio first to enable preview editing."
+        or (sourceLoading
+            and "Preparing full song audio. Preview controls will unlock when it is ready."
+            or sourceFailed
+                and "Music could not be prepared. Re-import the song audio to try again."
+                or "Import the full song audio first to enable preview editing.")
     drawPreviewWrappedText(subtitle, x + 28 * scale, y + 72 * scale,
         panelW - 56 * scale, 56 * scale, fontSize("description"), C.muted,
         (layer or 130) + 3, F.regular)
@@ -1987,9 +1994,11 @@ function drawPreviewEditor(state, w, h, layer)
         width = thumbW, height = 22 * scale, color = C.text, layer = (layer or 130) + 5 })
     draw.rect({ x = sliderX + sliderW * endRatio - thumbW / 2, y = sliderY - 8 * scale,
         width = thumbW, height = 22 * scale, color = C.primary, layer = (layer or 130) + 5 })
-    ui.slider({ id = "editor_preview_range", x = sliderX, y = sliderY - 10 * scale,
-        width = sliderW, height = 26 * scale, min = 0, max = math.max(0.001, duration),
-        action = "editor.preview.scrub" })
+    if sourceReady then
+        ui.slider({ id = "editor_preview_range", x = sliderX, y = sliderY - 10 * scale,
+            width = sliderW, height = 26 * scale, min = 0, max = math.max(0.001, duration),
+            action = "editor.preview.scrub" })
+    end
     local durationLabelClip = {
         left = sliderX, top = sliderY + 20 * scale,
         right = x + panelW - 28 * scale, bottom = y + LAYOUT.preview_input_y * scale - 8 * scale,
@@ -2015,12 +2024,12 @@ function drawPreviewEditor(state, w, h, layer)
         fontSize("small"), C.muted, nil, (layer or 130) + 3, F.regular, endLabelClip)
     drawTextField("editor_preview_start_input", state.preview_start_text or "0.000",
         "editor.preview.focus_start", nil, sliderX, inputY, inputW, 44 * scale,
-        (layer or 130) + 5, state.preview_start_focused == true, true,
+        (layer or 130) + 5, state.preview_start_focused == true, sourceReady,
         state.preview_start_caret_offset, state.preview_start_selection_offset,
         state.preview_start_selection_width, state.preview_start_text_width)
     drawTextField("editor_preview_end_input", state.preview_end_text or "0.000",
         "editor.preview.focus_end", nil, sliderX + inputW + inputGap, inputY, inputW, 44 * scale,
-        (layer or 130) + 5, state.preview_end_focused == true, true,
+        (layer or 130) + 5, state.preview_end_focused == true, sourceReady,
         state.preview_end_caret_offset, state.preview_end_selection_offset,
         state.preview_end_selection_width, state.preview_end_text_width)
 
@@ -2037,16 +2046,16 @@ function drawPreviewEditor(state, w, h, layer)
 
     local buttonPad = 22 * scale
     local buttonW = (panelW - buttonPad * 2 - buttonGap * 2) / 3
-    UI.draw_button({ id = "editor_preview_play", x = x + buttonPad, y = buttonY,
-        width = buttonW, height = 38 * scale, label = state.preview_playing and "STOP" or "PLAY",
-        action = "editor.preview.play", font = F.medium, text_size = fontSize("body"),
-        layer = (layer or 130) + 5 })
-    UI.draw_button({ id = "editor_preview_save", x = x + buttonPad + buttonW + buttonGap, y = buttonY,
-        width = buttonW, height = 38 * scale, label = "SAVE", action = "editor.preview.save",
-        font = F.medium, text_size = fontSize("body"), layer = (layer or 130) + 5 })
-    UI.draw_button({ id = "editor_preview_close", x = x + buttonPad + (buttonW + buttonGap) * 2, y = buttonY,
-        width = buttonW, height = 38 * scale, label = "CLOSE", action = "editor.preview.close",
-        font = F.medium, text_size = fontSize("body"), layer = (layer or 130) + 5 })
+    button({ id = "editor_preview_play", label = state.preview_playing and "STOP" or "PLAY",
+        action = "editor.preview.play", enabled = sourceReady or state.preview_playing == true },
+        x + buttonPad, buttonY, buttonW, 38 * scale,
+        { layer = (layer or 130) + 5, text_size = fontSize("body") })
+    button({ id = "editor_preview_save", label = "SAVE", action = "editor.preview.save",
+        enabled = sourceReady }, x + buttonPad + buttonW + buttonGap, buttonY, buttonW, 38 * scale,
+        { layer = (layer or 130) + 5, text_size = fontSize("body") })
+    button({ id = "editor_preview_close", label = "CLOSE", action = "editor.preview.close",
+        enabled = true }, x + buttonPad + (buttonW + buttonGap) * 2, buttonY, buttonW, 38 * scale,
+        { layer = (layer or 130) + 5, text_size = fontSize("body") })
 end
 
 local function drawInfo(state, x, y, width, problemsY, layer, screenWidth)
