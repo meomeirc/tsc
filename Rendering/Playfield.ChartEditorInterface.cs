@@ -1061,12 +1061,12 @@ public sealed partial class Playfield
             case "editor.meta.close":
                 CancelEditorMetaField();
                 _editorMetaExportExpanded = false;
-                _editorMetaPanelOpen = false;
+                CloseEditorMetaPanel();
                 return true;
             case "editor.meta.exit":
                 CancelEditorMetaField();
                 _editorMetaExportExpanded = false;
-                _editorMetaPanelOpen = false;
+                CloseEditorMetaPanel();
                 EditorExitRequested?.Invoke();
                 return true;
             case "editor.meta.category":

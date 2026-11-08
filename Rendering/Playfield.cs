@@ -1285,7 +1285,7 @@ public sealed partial class Playfield
         _chartEditorInterfaceRuntime.SetEditorMode(enabled);
         if (enabled)
         {
-            _editorMetaPanelOpen = false;
+            CloseEditorMetaPanel();
             _editorMetaBbCodeStripOpen = false;
             _editorMetaBbCodeStripField = null;
             _lockMenuPlayMode = false;
@@ -1350,7 +1350,7 @@ public sealed partial class Playfield
             _editorPreviewPreviousTopDownViewEnabled = _topDownViewEnabled;
             _beatLines = false;
             _tempoLines = false;
-            _editorMetaPanelOpen = false;
+            CloseEditorMetaPanel();
             _editorMetaBbCodeStripOpen = false;
             _editorMetaBbCodeStripField = null;
             _editorElementDropdownOpen = false;
@@ -1409,6 +1409,16 @@ public sealed partial class Playfield
 
     public void SetStatusMessage(string? message) => _statusMessage = message;
 
+    private void CloseEditorMetaPanel()
+    {
+        // The media-tab preview belongs to the INFO panel. Stop and dispose it
+        // whenever that panel closes, regardless of whether it was closed by
+        // Escape, the skin button, or the native fallback controls.
+        if (_editorMetaPanelOpen)
+            StopEditorPreviewPlayback();
+        _editorMetaPanelOpen = false;
+    }
+
     public void ToggleEditorInfoMenu()
     {
         if (!_chartEditorMode)
@@ -1423,13 +1433,16 @@ public sealed partial class Playfield
         if (_editorMetaEditingField is not null)
             CancelEditorMetaField();
 
-        _editorMetaPanelOpen = !_editorMetaPanelOpen;
         if (_editorMetaPanelOpen)
         {
-            _editorMetaScroll.Reset();
-            _editorMetaScrollOffset = 0;
-            _editorElementDropdownOpen = false;
+            CloseEditorMetaPanel();
+            return;
         }
+
+        _editorMetaPanelOpen = true;
+        _editorMetaScroll.Reset();
+        _editorMetaScrollOffset = 0;
+        _editorElementDropdownOpen = false;
     }
 
     private void MarkEditorDirty(bool auxiliaryChange = false)
@@ -4318,7 +4331,7 @@ public sealed partial class Playfield
             _editorClipboardAnchorTickOffset = 0;
             _editorClipboardAnchorTrackOffset = 0;
         }
-        _editorMetaPanelOpen = false;
+        CloseEditorMetaPanel();
         _editorMetaEditingField = null;
         _editorMetaBbCodeStripOpen = false;
         _editorMetaBbCodeStripField = null;

@@ -395,7 +395,7 @@ public sealed partial class Playfield
         _editorPanelsHoverTrack = -1;
         _hoverBeatTick = null;
         _hoverTrack = null;
-        _editorMetaPanelOpen = false;
+        CloseEditorMetaPanel();
         _editorMetaBbCodeStripOpen = false;
         _editorMetaBbCodeStripField = null;
         _editorRectSelecting = false;

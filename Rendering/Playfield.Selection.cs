@@ -3551,7 +3551,7 @@ public sealed partial class Playfield
         {
             CancelEditorMetaField();
             _editorMetaExportExpanded = false;
-            _editorMetaPanelOpen = false;
+            CloseEditorMetaPanel();
             EditorExitRequested?.Invoke();
             return true;
         }
@@ -3559,7 +3559,7 @@ public sealed partial class Playfield
         {
             CancelEditorMetaField();
             _editorMetaExportExpanded = false;
-            _editorMetaPanelOpen = false;
+            CloseEditorMetaPanel();
             return true;
         }
         for (var i = 0; i < EditorDifficultyCodes.Length; i++)
@@ -4401,9 +4401,13 @@ public sealed partial class Playfield
             case EditorActionDeselect: DeselectEditorSelection(); break;
             case EditorActionMeta:
                 CancelEditorMetaField();
-                _editorMetaPanelOpen = !_editorMetaPanelOpen;
                 if (_editorMetaPanelOpen)
+                    CloseEditorMetaPanel();
+                else
+                {
+                    _editorMetaPanelOpen = true;
                     _editorMetaScroll.Reset();
+                }
                 _editorMetaScrollOffset = 0;
                 break;
             case EditorActionSnap:
