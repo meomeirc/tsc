@@ -2376,14 +2376,22 @@ function render()
             local boxH = #options * rowH + 8 * scale
             local x = anchorX
             local y = anchorY - boxH - 4 * scale
+            -- The INFO metadata panel is a modal overlay. Keep the snap/metronome
+            -- popup above the editor chrome, but below INFO while that panel is open
+            -- so it cannot paint over the panel or intercept clicks through it.
+            local popupUnderInfo = s.meta_open == true
+            local popupLayer = popupUnderInfo and 90 or 120
+            local popupShieldPriority = popupUnderInfo and -1 or 50
+            local popupOptionPriority = popupUnderInfo and -1 or 60
             ui.button({ id = "editor_popup_shield", x = x, y = y, width = boxW, height = boxH,
-                action = "editor.block", hit_test_priority = 50 })
+                action = "editor.block", hit_test_priority = popupShieldPriority })
             draw.rect({ x = x, y = y, width = boxW, height = boxH, color = C.panel,
-                alpha = 0.97, layer = 120 })
+                alpha = 0.97, layer = popupLayer })
             for i, item in ipairs(options) do
                 button(item, x, y + 4 * scale + (i - 1) * rowH,
                     boxW, rowH - 4 * scale,
-                    { layer = 122, text_size = fontSize("body"), hit_test_priority = 60 })
+                    { layer = popupLayer + 2, text_size = fontSize("body"),
+                        hit_test_priority = popupOptionPriority })
             end
         end
     end
