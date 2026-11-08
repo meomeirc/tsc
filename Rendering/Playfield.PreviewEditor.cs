@@ -432,6 +432,7 @@ public sealed partial class Playfield
             _editorPreviewPlayer = new OpusAudioPlayer();
             _editorPreviewPlayer.LoadOpus(bytes);
             _editorPreviewPlayer.Volume = GetEditorMusicPlaybackVolume();
+            _editorPreviewPlayer.IsLooped = true;
             _editorPreviewPlayer.PrepareInitialPlayback(retainPcmForSeeking: true);
             _editorPreviewPlayer.SyncToChartTime(0.0, 0.0);
             _editorPreviewPlaybackDurationSeconds = _editorPreviewPlayer.DurationSeconds;
@@ -463,7 +464,9 @@ public sealed partial class Playfield
         if (_editorPreviewPlaybackStartTimestamp == 0 || _editorPreviewPlaybackDurationSeconds <= 0)
             return 0;
         var elapsed = (Stopwatch.GetTimestamp() - _editorPreviewPlaybackStartTimestamp) / (double)Stopwatch.Frequency;
-        return Math.Clamp(elapsed, 0, _editorPreviewPlaybackDurationSeconds);
+        if (!double.IsFinite(elapsed) || elapsed <= 0)
+            return 0;
+        return elapsed % _editorPreviewPlaybackDurationSeconds;
     }
 
     private byte[] CreateBakedEditorPreviewBytes(double startSeconds, double endSeconds)
@@ -514,7 +517,8 @@ public sealed partial class Playfield
         var duration = EditorPreviewSourceDurationSeconds;
         if (duration <= 0)
             throw new InvalidOperationException("Import the full song audio before creating a preview.");
-        if (!TryReadEditorPreviewRange(out var startSeconds, out var endSeconds, out var validationMessage))
+        if (!TryReadEditorPreviewRange(out var startSeconds, out var endSeconds, out var validationMessage,
+                extendEndWhenStartPassesIt: _editorPreviewFocusedField == 0))
             throw new InvalidOperationException(validationMessage);
 
         // PLAY uses a temporary in-memory clip made from the current selection.
@@ -525,6 +529,7 @@ public sealed partial class Playfield
         _editorPreviewPlayer = new OpusAudioPlayer();
         _editorPreviewPlayer.LoadOpus(bakedBytes);
         _editorPreviewPlayer.Volume = GetEditorMusicPlaybackVolume();
+        _editorPreviewPlayer.IsLooped = true;
         _editorPreviewPlayer.PrepareInitialPlayback(retainPcmForSeeking: true);
         _editorPreviewPlayer.SyncToChartTime(0.0, 0.0);
         _editorPreviewPlaybackDurationSeconds = _editorPreviewPlayer.DurationSeconds;
@@ -542,7 +547,8 @@ public sealed partial class Playfield
         var duration = EditorPreviewSourceDurationSeconds;
         if (duration <= 0)
             throw new InvalidOperationException("Import the full song audio before creating a preview.");
-        if (!TryReadEditorPreviewRange(out var startSeconds, out var endSeconds, out var validationMessage))
+        if (!TryReadEditorPreviewRange(out var startSeconds, out var endSeconds, out var validationMessage,
+                extendEndWhenStartPassesIt: _editorPreviewFocusedField == 0))
             throw new InvalidOperationException(validationMessage);
 
         StopEditorPreviewPlayback();
@@ -588,7 +594,8 @@ public sealed partial class Playfield
         return true;
     }
 
-    private bool TryReadEditorPreviewRange(out double startSeconds, out double endSeconds, out string message)
+    private bool TryReadEditorPreviewRange(out double startSeconds, out double endSeconds, out string message,
+        bool extendEndWhenStartPassesIt = false)
     {
         startSeconds = _editorPreviewStartSeconds;
         endSeconds = _editorPreviewEndSeconds;
@@ -604,11 +611,29 @@ public sealed partial class Playfield
             return false;
         }
         var sourceDuration = EditorPreviewSourceDurationSeconds;
-        if (startSeconds < 0 || endSeconds < 0 || startSeconds >= endSeconds)
+        if (sourceDuration <= 0)
         {
-            message = "Preview start must be at least 0 and earlier than preview end.";
+            message = "Import the full song audio before creating a preview.";
             return false;
         }
+        if (startSeconds < 0 || startSeconds >= sourceDuration)
+        {
+            message = $"Preview start must be between 0 and the song length ({sourceDuration:0.###} seconds).";
+            return false;
+        }
+
+        if (extendEndWhenStartPassesIt && startSeconds >= endSeconds)
+        {
+            // Keep the selected start and move the end to 10 seconds later,
+            // limited by the actual remaining song length.
+            endSeconds = Math.Min(startSeconds + 10.0, sourceDuration);
+        }
+        else if (endSeconds < 0 || startSeconds >= endSeconds)
+        {
+            message = "Preview start must be earlier than preview end.";
+            return false;
+        }
+
         if (endSeconds > sourceDuration + 0.001)
         {
             message = $"Preview end cannot exceed the song length ({sourceDuration:0.###} seconds).";
@@ -628,7 +653,8 @@ public sealed partial class Playfield
     {
         if (_editorPreviewFocusedField < 0)
             return;
-        if (!TryReadEditorPreviewRange(out var start, out var end, out var message))
+        if (!TryReadEditorPreviewRange(out var start, out var end, out var message,
+                extendEndWhenStartPassesIt: _editorPreviewFocusedField == 0))
         {
             _editorPreviewDialogMessage = message;
             return;
@@ -695,7 +721,17 @@ public sealed partial class Playfield
             }
             else if (KeybindSettings.IsPressed("editor_field_next") || KeybindSettings.IsPressed("editor_field_previous"))
             {
-                _editorPreviewFocusedField = 1 - _editorPreviewFocusedField;
+                if (_editorPreviewFocusedField == 0)
+                {
+                    CommitEditorPreviewFocusedTime();
+                    if (_editorPreviewFocusedField >= 0)
+                        return;
+                    _editorPreviewFocusedField = 1;
+                }
+                else
+                {
+                    _editorPreviewFocusedField = 0;
+                }
                 _editorPreviewStartCaret = _editorPreviewStartText.Length;
                 _editorPreviewEndCaret = _editorPreviewEndText.Length;
                 _editorPreviewStartSelectionAnchor = _editorPreviewStartCaret;
@@ -844,6 +880,12 @@ public sealed partial class Playfield
         }
         if (GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Contains(point))
         {
+            if (_editorPreviewFocusedField >= 0 && _editorPreviewFocusedField != 0)
+            {
+                CommitEditorPreviewFocusedTime();
+                if (_editorPreviewFocusedField >= 0)
+                    return;
+            }
             var bounds = GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight);
             _editorPreviewFocusedField = 0;
             _editorPreviewStartCaret = GetEditorPreviewTextCaretIndex(bounds, _editorPreviewStartText, point, _projection.ScalePixels(1f));
@@ -855,6 +897,12 @@ public sealed partial class Playfield
         }
         if (GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Contains(point))
         {
+            if (_editorPreviewFocusedField >= 0 && _editorPreviewFocusedField != 1)
+            {
+                CommitEditorPreviewFocusedTime();
+                if (_editorPreviewFocusedField >= 0)
+                    return;
+            }
             var bounds = GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight);
             _editorPreviewFocusedField = 1;
             _editorPreviewEndCaret = GetEditorPreviewTextCaretIndex(bounds, _editorPreviewEndText, point, _projection.ScalePixels(1f));
@@ -867,7 +915,12 @@ public sealed partial class Playfield
         var slider = GetEditorPreviewSliderBounds(virtualWidth, virtualHeight);
         if (slider.Contains(point))
         {
-            _editorPreviewFocusedField = -1;
+            if (_editorPreviewFocusedField >= 0)
+            {
+                CommitEditorPreviewFocusedTime();
+                if (_editorPreviewFocusedField >= 0)
+                    return;
+            }
             var duration = EditorPreviewSourceDurationSeconds;
             if (duration > 0)
             {
@@ -1683,7 +1736,8 @@ public sealed partial class Playfield
         DrawEditorMetaButton(GetEditorPreviewPlayButtonBounds(virtualWidth, virtualHeight),
             _editorPreviewPlayer?.IsPlaying == true ? "STOP" : "PLAY",
             new Color(28, 28, 30, 250), Active);
-        var rangeValid = sourceDuration > 0 && TryReadEditorPreviewRange(out _, out _, out _);
+        var rangeValid = sourceDuration > 0 && TryReadEditorPreviewRange(out _, out _, out _,
+            extendEndWhenStartPassesIt: _editorPreviewFocusedField == 0);
         DrawEditorMetaButton(GetEditorPreviewSaveButtonBounds(virtualWidth, virtualHeight), "SAVE",
             rangeValid ? new Color(29, 65, 52, 250) : new Color(30, 30, 32, 240),
             rangeValid ? new Color(52, 211, 153) : new Color(105, 105, 107));

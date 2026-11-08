@@ -1355,7 +1355,11 @@ public sealed partial class Playfield
     private void FocusEditorPreviewInterfaceField(int field, int width, int height)
     {
         if (_editorPreviewFocusedField >= 0 && _editorPreviewFocusedField != field)
+        {
             CommitEditorPreviewFocusedTime();
+            if (_editorPreviewFocusedField >= 0)
+                return;
+        }
         _editorPreviewFocusedField = field;
         _editorPreviewInputReplaceOnNextKey = false;
         EndEditorTextFieldMouseSelection();
