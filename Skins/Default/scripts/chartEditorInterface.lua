@@ -38,7 +38,7 @@ local LAYOUT = {
     caption = UI.sizes.small,
     problem_rows = 5,
     preview_width = 860,
-    preview_height = 500,
+    preview_height = 540,
     preview_slider_y = 205,
     preview_input_y = 295,
     preview_side_margin = 62,
@@ -1705,7 +1705,7 @@ local function drawMeta(state, w, h, layer)
             num(state.meta_music_volume, 100)), 0, 100)
         local volumeLabel = audioAvailable
             and ("MUSIC VOLUME  " .. tostring(math.floor(volume + 0.5)) .. "%")
-            or "MUSIC VOLUME  IMPORT AUDIO FIRST"
+            or "MUSIC VOLUME  NO AUDIO"
         label(volumeLabel, x + padding, volumeLabelY, fontSize("small"), C.muted, nil, (layer or 100) + 4)
 
         local volumeSliderY = volumeLabelY + 22 * scale
@@ -1927,6 +1927,24 @@ local function drawCreateDifficultyPopup(state, w, h, layer)
         x + 22 * scale + bw + gap, by, bw, buttonH, { layer = base + 4, hit_test_priority = 190 })
 end
 
+local function drawPreviewWrappedText(text, x, y, width, height, size, color, layer, font)
+    local lines = wrapMeasuredText(text, width, size, font or F.regular)
+    local linePitch = size + 3 * ACTIVE_SCALE
+    local maxLines = math.max(1, math.floor((height + 3 * ACTIVE_SCALE) / linePitch))
+    local clipped = #lines > maxLines
+    while #lines > maxLines do table.remove(lines) end
+    if clipped and #lines > 0 then
+        lines[#lines] = fittedMeasuredText(lines[#lines] .. "...", width, size, font or F.regular)
+    end
+
+    local blockHeight = #lines * size + math.max(0, #lines - 1) * (3 * ACTIVE_SCALE)
+    local textY = y + math.max(0, (height - blockHeight) * 0.5)
+    local clip = { left = x, top = y, right = x + width, bottom = y + height }
+    for index, line in ipairs(lines) do
+        label(line, x, textY + (index - 1) * linePitch, size, color, nil, layer, font or F.regular, clip)
+    end
+end
+
 function drawPreviewEditor(state, w, h, layer)
     if state.preview_editor_open ~= true then return end
     local scale = math.max(0.55, math.min(w / 1920, h / 1080))
@@ -1945,7 +1963,9 @@ function drawPreviewEditor(state, w, h, layer)
     local subtitle = duration > 0
         and ("Choose a section of the full song. Length: " .. tostring(state.preview_duration_label) .. ". A subtle fade is added at each end.")
         or "Import the full song audio first to enable preview editing."
-    label(subtitle, x + 28 * scale, y + 76 * scale, fontSize("description"), C.muted, nil, (layer or 130) + 3)
+    drawPreviewWrappedText(subtitle, x + 28 * scale, y + 72 * scale,
+        panelW - 56 * scale, 56 * scale, fontSize("description"), C.muted,
+        (layer or 130) + 3, F.regular)
 
     local side = LAYOUT.preview_side_margin * scale
     local sliderX = x + side
@@ -1970,16 +1990,29 @@ function drawPreviewEditor(state, w, h, layer)
     ui.slider({ id = "editor_preview_range", x = sliderX, y = sliderY - 10 * scale,
         width = sliderW, height = 26 * scale, min = 0, max = math.max(0.001, duration),
         action = "editor.preview.scrub" })
-    label("00:00.000", sliderX, sliderY + 24 * scale, fontSize("small"), C.muted, nil, (layer or 130) + 3)
-    label(state.preview_duration_label or "00:00.000", sliderX + sliderW, sliderY + 24 * scale,
-        fontSize("small"), C.muted, nil, (layer or 130) + 3)
+    local durationLabelClip = {
+        left = sliderX, top = sliderY + 20 * scale,
+        right = x + panelW - 28 * scale, bottom = y + LAYOUT.preview_input_y * scale - 8 * scale,
+    }
+    label("00:00.000", sliderX, sliderY + 24 * scale, fontSize("small"), C.muted,
+        nil, (layer or 130) + 3, F.regular, durationLabelClip)
+    draw.text(state.preview_duration_label or "00:00.000", {
+        x = sliderX + sliderW, y = sliderY + 24 * scale, size = fontSize("small"),
+        color = C.muted, font = F.regular, anchor = "top-right", clip = durationLabelClip,
+        layer = (layer or 130) + 3,
+    })
 
     local inputY = y + LAYOUT.preview_input_y * scale
     local inputGap = 24 * scale
     local inputW = (panelW - side * 2 - inputGap) / 2
-    label("START TIME (SECONDS)", sliderX, inputY - 30 * scale, fontSize("small"), C.muted, nil, (layer or 130) + 3)
+    local startLabelClip = { left = sliderX, top = inputY - 30 * scale,
+        right = sliderX + inputW, bottom = inputY - 3 * scale }
+    local endLabelClip = { left = sliderX + inputW + inputGap, top = inputY - 30 * scale,
+        right = sliderX + inputW * 2 + inputGap, bottom = inputY - 3 * scale }
+    label("START TIME (SECONDS)", sliderX, inputY - 30 * scale, fontSize("small"), C.muted,
+        nil, (layer or 130) + 3, F.regular, startLabelClip)
     label("END TIME (SECONDS)", sliderX + inputW + inputGap, inputY - 30 * scale,
-        fontSize("small"), C.muted, nil, (layer or 130) + 3)
+        fontSize("small"), C.muted, nil, (layer or 130) + 3, F.regular, endLabelClip)
     drawTextField("editor_preview_start_input", state.preview_start_text or "0.000",
         "editor.preview.focus_start", nil, sliderX, inputY, inputW, 44 * scale,
         (layer or 130) + 5, state.preview_start_focused == true, true,
@@ -1991,13 +2024,17 @@ function drawPreviewEditor(state, w, h, layer)
         state.preview_end_caret_offset, state.preview_end_selection_offset,
         state.preview_end_selection_width, state.preview_end_text_width)
 
-    if state.preview_message ~= nil and state.preview_message ~= "" then
-        label(state.preview_message, x + 28 * scale, inputY + 58 * scale,
-            fontSize("body"), C.text, nil, (layer or 130) + 4)
-    end
-
     local buttonGap = 10 * scale
     local buttonY = y + panelH - 60 * scale
+    if state.preview_message ~= nil and state.preview_message ~= "" then
+        local messageX = x + 28 * scale
+        local messageY = inputY + 58 * scale
+        local messageWidth = panelW - 56 * scale
+        local messageHeight = math.max(1, buttonY - messageY - 8 * scale)
+        drawPreviewWrappedText(state.preview_message, messageX, messageY, messageWidth, messageHeight,
+            fontSize("body"), C.text, (layer or 130) + 4, F.regular)
+    end
+
     local buttonPad = 22 * scale
     local buttonW = (panelW - buttonPad * 2 - buttonGap * 2) / 3
     UI.draw_button({ id = "editor_preview_play", x = x + buttonPad, y = buttonY,

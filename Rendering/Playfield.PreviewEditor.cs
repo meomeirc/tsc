@@ -426,7 +426,7 @@ public sealed partial class Playfield
             {
                 var message = "No existing preview audio was found. Use EDIT, then SAVE to create one.";
                 if (_editorPreviewEditorOpen) _editorPreviewDialogMessage = message;
-                _statusMessage = message;
+                _statusMessage = "No existing music preview was found.";
                 return;
             }
             _editorPreviewPlayer = new OpusAudioPlayer();
@@ -445,7 +445,7 @@ public sealed partial class Playfield
             StopEditorPreviewPlayback();
             var message = $"Could not play preview: {ex.Message}";
             if (_editorPreviewEditorOpen) _editorPreviewDialogMessage = message;
-            _statusMessage = message;
+            _statusMessage = "Could not play music preview. See the preview editor for details.";
         }
     }
 
@@ -530,7 +530,7 @@ public sealed partial class Playfield
         _editorPreviewPlaybackDurationSeconds = _editorPreviewPlayer.DurationSeconds;
         _editorPreviewPlaybackStartTimestamp = Stopwatch.GetTimestamp();
         _editorPreviewDialogMessage = $"Playing selected range ({FormatEditorPreviewTimestamp(startSeconds)}–{FormatEditorPreviewTimestamp(endSeconds)}). Not saved yet.";
-        _statusMessage = _editorPreviewDialogMessage;
+        _statusMessage = "Playing selected music preview. Chart playback is paused.";
         return true;
     }
 
@@ -580,7 +580,11 @@ public sealed partial class Playfield
                 ? $"Saved preview in memory ({FormatEditorPreviewTimestamp(startSeconds)}–{FormatEditorPreviewTimestamp(endSeconds)}). It will be included on export."
                 : $"Saved preview.opus ({FormatEditorPreviewTimestamp(startSeconds)}–{FormatEditorPreviewTimestamp(endSeconds)})."
             : $"Saved preview in memory. It will be included on export; writing beside the source failed: {assetWriteWarning}";
-        _statusMessage = _editorPreviewDialogMessage;
+        _statusMessage = assetWriteWarning is null
+            ? string.IsNullOrWhiteSpace(targetDirectory)
+                ? "Music preview saved in memory and will be included on export."
+                : "Music preview saved."
+            : "Music preview saved in memory; writing beside the source failed. See the preview editor for details.";
         return true;
     }
 
@@ -813,8 +817,8 @@ public sealed partial class Playfield
                 try { PlayEditorPreviewSelection(); }
                 catch (Exception ex)
                 {
-                    _editorPreviewDialogMessage = ex.Message;
-                    _statusMessage = $"Could not play music preview: {ex.Message}";
+                    _editorPreviewDialogMessage = $"Could not play music preview: {ex.Message}";
+                    _statusMessage = "Could not play music preview. See the preview editor for details.";
                 }
             }
             return;
@@ -833,8 +837,8 @@ public sealed partial class Playfield
             try { SaveEditorPreview(); }
             catch (Exception ex)
             {
-                _editorPreviewDialogMessage = ex.Message;
-                _statusMessage = $"Could not save music preview: {ex.Message}";
+                _editorPreviewDialogMessage = $"Could not save music preview: {ex.Message}";
+                _statusMessage = "Could not save music preview. See the preview editor for details.";
             }
             return;
         }
@@ -905,7 +909,7 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        return new Rectangle(content.X, content.Y, content.Width, Math.Max(1, (int)MathF.Round(20f * unit)));
+        return new Rectangle(content.X, content.Y, content.Width, Math.Max(1, (int)MathF.Round(26f * unit)));
     }
 
     private Rectangle GetEditorMediaMusicStatusBounds(int virtualWidth, int virtualHeight)
@@ -914,7 +918,7 @@ public sealed partial class Playfield
         var unit = _projection.ScalePixels(1f);
         var buttonWidth = Math.Max(1, (int)MathF.Round(150f * unit));
         var gap = Math.Max(4, (int)MathF.Round(8f * unit));
-        var y = content.Y + (int)MathF.Round(22f * unit);
+        var y = content.Y + (int)MathF.Round(28f * unit);
         var height = Math.Max(1, (int)MathF.Round(36f * unit));
         return new Rectangle(content.X, y, Math.Max(1, content.Width - buttonWidth - gap), height);
     }
@@ -933,8 +937,8 @@ public sealed partial class Playfield
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var y = content.Y + (int)MathF.Round(131f * unit);
-        return new Rectangle(content.X, y, content.Width, Math.Max(1, (int)MathF.Round(20f * unit)));
+        var y = content.Y + (int)MathF.Round(140f * unit);
+        return new Rectangle(content.X, y, content.Width, Math.Max(1, (int)MathF.Round(26f * unit)));
     }
 
     private Rectangle GetEditorMediaVolumeLabelBounds(int virtualWidth, int virtualHeight)
@@ -942,14 +946,14 @@ public sealed partial class Playfield
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
         var y = content.Y + (int)MathF.Round(79f * unit);
-        return new Rectangle(content.X, y, content.Width, Math.Max(1, (int)MathF.Round(20f * unit)));
+        return new Rectangle(content.X, y, content.Width, Math.Max(1, (int)MathF.Round(26f * unit)));
     }
 
     private Rectangle GetEditorMediaVolumeSliderBounds(int virtualWidth, int virtualHeight)
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var y = content.Y + (int)MathF.Round(102f * unit);
+        var y = content.Y + (int)MathF.Round(108f * unit);
         var height = Math.Max(1, (int)MathF.Round(28f * unit));
         return new Rectangle(content.X, y, content.Width, height);
     }
@@ -1038,7 +1042,7 @@ public sealed partial class Playfield
 
         var volumeLabel = _editorOriginalMusicSourceBytes is { Length: > 0 }
             ? $"MUSIC VOLUME  {_editorMusicVolumePendingPercent}%"
-            : "MUSIC VOLUME  IMPORT AUDIO FIRST";
+            : "MUSIC VOLUME  NO AUDIO";
         DrawEditorPreviewLabel(volumeLabel, GetEditorMediaVolumeLabelBounds(virtualWidth, virtualHeight), Muted, unit);
         DrawEditorMediaVolumeSlider(GetEditorMediaVolumeSliderBounds(virtualWidth, virtualHeight), unit,
             _editorOriginalMusicSourceBytes is { Length: > 0 });
@@ -1148,7 +1152,7 @@ public sealed partial class Playfield
             : "00:00.000 / --:--.---";
         DrawEditorPreviewLabel(timeText,
             new Rectangle(bounds.X + horizontalPadding, bar.Bottom + (int)MathF.Round(2f * unit),
-                Math.Max(1, bounds.Width - horizontalPadding * 2), Math.Max(1, bounds.Bottom - bar.Bottom - (int)MathF.Round(3f * unit))),
+                Math.Max(1, bounds.Width - horizontalPadding * 2), Math.Max(1, bounds.Bottom - bar.Bottom - (int)MathF.Round(2f * unit))),
             Text, unit);
     }
 
@@ -1159,7 +1163,7 @@ public sealed partial class Playfield
         var frame = GetEditorMediaArtworkFrameBounds(isBig, virtualWidth, virtualHeight);
         var label = isBig ? "ALBUM BIG" : "ALBUM";
         DrawEditorPreviewLabel(label,
-            new Rectangle(card.X, card.Y, card.Width, Math.Max(1, (int)MathF.Round(24f * unit))), Muted, unit);
+            new Rectangle(card.X, card.Y, card.Width, Math.Max(1, (int)MathF.Round(26f * unit))), Muted, unit);
 
         _spriteBatch.Draw(_pixel, frame, new Color(12, 12, 13, 250));
         var edge = Math.Max(1, (int)MathF.Round(2f * unit));
@@ -1494,7 +1498,7 @@ public sealed partial class Playfield
         var unit = _projection.ScalePixels(1f);
         var margin = (int)MathF.Round(18f * unit);
         var width = Math.Min(virtualWidth - margin * 2, (int)MathF.Round(860f * unit));
-        var height = Math.Min(virtualHeight - margin * 2, (int)MathF.Round(500f * unit));
+        var height = Math.Min(virtualHeight - margin * 2, (int)MathF.Round(540f * unit));
         width = Math.Max(1, width);
         height = Math.Max(1, height);
         return new Rectangle((virtualWidth - width) / 2, (virtualHeight - height) / 2, width, height);
@@ -1632,7 +1636,7 @@ public sealed partial class Playfield
         var subtitle = sourceDuration > 0
             ? $"Choose a section of the full song. Length: {FormatEditorPreviewTimestamp(sourceDuration)}. A subtle fade is added at each end."
             : "Import the full song audio first to enable preview editing.";
-        DrawEditorPreviewLabel(subtitle, new Rectangle(panel.X + 28, panel.Y + (int)MathF.Round(76f * unit), panel.Width - (int)MathF.Round(56f * unit), (int)MathF.Round(42f * unit)), Muted, unit);
+        DrawEditorPreviewLabel(subtitle, new Rectangle(panel.X + 28, panel.Y + (int)MathF.Round(76f * unit), panel.Width - (int)MathF.Round(56f * unit), (int)MathF.Round(56f * unit)), Muted, unit);
 
         var slider = GetEditorPreviewSliderBounds(virtualWidth, virtualHeight);
         var sliderY = slider.Y + slider.Height / 2;
@@ -1649,25 +1653,31 @@ public sealed partial class Playfield
 
         var minLabel = FontSafeText(labelFont, "00:00.000");
         var maxLabel = FontSafeText(labelFont, FormatEditorPreviewTimestamp(sourceDuration));
-        var minLabelScale = GetEditorDefaultFontScale(minLabel, 16f * unit);
+        var minLabelScale = GetEditorDefaultFontScale(minLabel, 24f * unit);
         UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, minLabel,
             new Vector2(slider.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor,
             0f, Vector2.Zero, minLabelScale, SpriteEffects.None, 0f);
-        var maxLabelScale = GetEditorDefaultFontScale(maxLabel, 16f * unit);
+        var maxLabelScale = GetEditorDefaultFontScale(maxLabel, 24f * unit);
         var maxSize = UnicodeTextRenderer.MeasureString(labelFont, maxLabel) * maxLabelScale;
         UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, maxLabel,
             new Vector2(slider.Right - maxSize.X, slider.Bottom + 8f * unit), interfaceUi.MutedTextColor,
             0f, Vector2.Zero, maxLabelScale, SpriteEffects.None, 0f);
 
-        DrawEditorPreviewLabel("START TIME (SECONDS)", new Rectangle(GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), interfaceUi.MutedTextColor, unit);
-        DrawEditorPreviewLabel("END TIME (SECONDS)", new Rectangle(GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(26f * unit)), interfaceUi.MutedTextColor, unit);
+        DrawEditorPreviewLabel("START TIME (SECONDS)", new Rectangle(GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(28f * unit)), interfaceUi.MutedTextColor, unit);
+        DrawEditorPreviewLabel("END TIME (SECONDS)", new Rectangle(GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).X, GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(30f * unit), GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Width, (int)MathF.Round(28f * unit)), interfaceUi.MutedTextColor, unit);
         DrawEditorPreviewInput(GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight), _editorPreviewStartText, _editorPreviewFocusedField == 0, _editorPreviewStartCaret, unit);
         DrawEditorPreviewInput(GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight), _editorPreviewEndText, _editorPreviewFocusedField == 1, _editorPreviewEndCaret, unit);
 
         if (!string.IsNullOrWhiteSpace(_editorPreviewDialogMessage))
         {
-            var messageBounds = new Rectangle(panel.X + 28, GetEditorPreviewStartInputBounds(virtualWidth, virtualHeight).Bottom + (int)MathF.Round(12f * unit), panel.Width - (int)MathF.Round(56f * unit), (int)MathF.Round(42f * unit));
-            DrawEditorPreviewLabel(_editorPreviewDialogMessage!, messageBounds, _editorPreviewDialogMessage!.StartsWith("Could not", StringComparison.OrdinalIgnoreCase) || _editorPreviewDialogMessage!.StartsWith("Preview ", StringComparison.OrdinalIgnoreCase) ? new Color(252, 165, 165) : new Color(167, 243, 208), unit);
+            var messageY = GetEditorPreviewEndInputBounds(virtualWidth, virtualHeight).Bottom + (int)MathF.Round(12f * unit);
+            var messageBottom = GetEditorPreviewPlayButtonBounds(virtualWidth, virtualHeight).Y - (int)MathF.Round(8f * unit);
+            var messageBounds = new Rectangle(panel.X + 28, messageY, panel.Width - (int)MathF.Round(56f * unit), Math.Max(1, messageBottom - messageY));
+            var messageColor = _editorPreviewDialogMessage.StartsWith("Could not", StringComparison.OrdinalIgnoreCase) ||
+                               _editorPreviewDialogMessage.StartsWith("Preview ", StringComparison.OrdinalIgnoreCase)
+                ? new Color(252, 165, 165)
+                : new Color(167, 243, 208);
+            DrawEditorPreviewLabel(_editorPreviewDialogMessage, messageBounds, messageColor, unit);
         }
 
         DrawEditorMetaButton(GetEditorPreviewPlayButtonBounds(virtualWidth, virtualHeight),
@@ -1692,13 +1702,33 @@ public sealed partial class Playfield
     {
         if (bounds.Width <= 0 || bounds.Height <= 0)
             return;
-        var maxWidth = Math.Max(1f, bounds.Width - 4f * unit);
-        var fitted = FitChartEditorText(rawText, 24f * unit,
-            maxWidth, bounds.Height - 2f * unit);
-        var size = fitted.Measured * fitted.Scale;
-        UnicodeTextRenderer.DrawString(_spriteBatch, fitted.Font, fitted.Text,
-            new Vector2(bounds.X + 2f * unit, bounds.Y + (bounds.Height - size.Y) * 0.5f),
-            color, 0f, Vector2.Zero, fitted.Scale, SpriteEffects.None, 0f);
+
+        // Keep preview-editor text at its normal 24-design-pixel size. Long labels,
+        // subtitles, and FFmpeg errors wrap into the space available instead of
+        // being squeezed down to a tiny single line.
+        var font = _font;
+        var textScale = GetEditorDefaultFontScale(24f * unit);
+        var horizontalPadding = 2f * unit;
+        var maxWidth = Math.Max(1f, bounds.Width - horizontalPadding * 2f) / textScale;
+        var lines = WrapEditorHudText(font, FontSafeText(font, rawText), maxWidth);
+        var lineHeight = 24f * unit;
+        var lineGap = 2f * unit;
+        var linePitch = lineHeight + lineGap;
+        var maxLines = Math.Max(1, (int)MathF.Floor((bounds.Height + lineGap) / linePitch));
+        if (lines.Count > maxLines)
+        {
+            lines.RemoveRange(maxLines, lines.Count - maxLines);
+            lines[^1] = FitHudText(font, lines[^1].TrimEnd() + "...", maxWidth);
+        }
+
+        var blockHeight = lines.Count * lineHeight + Math.Max(0, lines.Count - 1) * lineGap;
+        var startY = bounds.Y + Math.Max(0f, (bounds.Height - blockHeight) * 0.5f);
+        for (var index = 0; index < lines.Count; index++)
+        {
+            var position = new Vector2(bounds.X + horizontalPadding, startY + index * linePitch);
+            UnicodeTextRenderer.DrawString(_spriteBatch, font, lines[index], position, color,
+                0f, Vector2.Zero, new Vector2(textScale, textScale), SpriteEffects.None, 0f);
+        }
     }
 
     private void DrawEditorPreviewInput(Rectangle bounds, string text, bool focused, int caretIndex, float unit)
