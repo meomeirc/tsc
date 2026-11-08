@@ -1,5 +1,17 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.49
+
+- added combo distribution to the chart stats tab and adjusted the note counters to count each bank separately
+- changed music preview playback in the editor to loop
+- changed music preview end time to automatically get adjusted by 10s when the start time input value is higher than the end, instead of blocking the input
+- changed music preview to automatically stop when the song info menu is closed
+- fixed panel and metronome popups to be drawn below the song info menu
+- fixed text overflow in the music preview editor
+- reworked scrolling to use a shared smooth scroll controller
+- optimized main menu info page loading
+- removed minimal pack from release
+
 # 0.0.41
 
 - added BBCode support. right click on text fields to show the options
