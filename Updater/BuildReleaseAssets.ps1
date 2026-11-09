@@ -54,6 +54,8 @@ New-Item -ItemType Directory -Path $work -Force | Out-Null
 
 function Test-ProtectedPath([string]$RelativePath) {
     $p = $RelativePath.Replace('\', '/')
+    # songs is user data, except for this application-owned instruction file.
+    if ($p -ieq 'songs/README.txt') { return $false }
     $parts = $p.Split('/')
     if ($parts[0] -in @('songs', 'save', 'logs', 'state')) { return $true }
     if ($parts[0] -ieq 'Skins' -and ($parts.Count -lt 3 -or $parts[1] -ine 'Default')) { return $true }
@@ -106,7 +108,7 @@ function Remove-ExcludedFiles([string]$Root) {
     foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
         $relative = (Get-RelativePath $Root $file.FullName).Replace('\', '/')
         if ($relative -ieq 'info.md' -or $relative -ieq 'version.txt' -or $relative -ieq '.tsc-package-manifest.json' -or $relative -ieq 'patch-manifest.json' -or (Test-ProtectedPath $relative)) {
-            # Never ship manifests inside a ZIP, user settings, scores, logs, songs,
+            # Never ship manifests inside a ZIP, user settings, scores, logs, user song files,
             # custom skins, or any user's FFmpeg executable.
             Remove-Item -LiteralPath $file.FullName -Force
             continue

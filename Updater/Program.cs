@@ -999,6 +999,9 @@ internal sealed class UpdateEngine
     private static bool IsProtectedPath(string path)
     {
         var normalized = path.Replace('\\', '/');
+        // The songs directory is user data, except for this application-owned help file.
+        // Keep this exact-path exception before the directory-level protection check.
+        if (normalized.Equals("songs/README.txt", StringComparison.OrdinalIgnoreCase)) return false;
         var parts = normalized.Split('/');
         if (parts.Length == 0) return true;
         if (parts[0].Equals("songs", StringComparison.OrdinalIgnoreCase) ||

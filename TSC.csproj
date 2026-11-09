@@ -62,6 +62,13 @@
     <!-- Runtime/user state belongs beside the launcher, never inside data/. Remove stale
          generated State/Logs folders from older publishes; root user data is preserved. -->
     <RemoveDir Directories="$(PublishDir)State;$(PublishDir)Logs" />
+
+    <!-- The songs folder is user-owned except for this application help file.
+         Stage only README.txt beside the launcher so release packages can update it. -->
+    <MakeDir Directories="$(TSCInstallRoot)songs" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\songs\README.txt"
+          DestinationFiles="$(TSCInstallRoot)songs\README.txt"
+          SkipUnchangedFiles="true" />
     <!-- LAN testing is implemented in TSC now; remove helper scripts left by older publishes. -->
     <RemoveDir Directories="$(TSCInstallRoot)data\LanEditorServer;$(PublishDir)LanEditorServer" />
     <!-- Never ship a second copy of the skin under data/. -->
