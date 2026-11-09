@@ -490,12 +490,8 @@ public sealed partial class Playfield
         return (width, height);
     }
 
-    private void PrepareEditorInactiveBankLayer(
-        double currentTick, GearState currentState, int width, int height)
+    private RenderTarget2D EnsureEditorInactiveBankRenderTarget(int width, int height)
     {
-        if (_gameplayRenderTarget is null)
-            return;
-
         if (_editorInactiveBankRenderTarget is null ||
             _editorInactiveBankRenderTarget.Width != width ||
             _editorInactiveBankRenderTarget.Height != height)
@@ -514,8 +510,17 @@ public sealed partial class Playfield
                 NativeResourceCategory.Editor);
         }
 
+        return _editorInactiveBankRenderTarget!;
+    }
+
+    private void PrepareEditorInactiveBankLayer(
+        double currentTick, GearState currentState, int width, int height)
+    {
+        if (_gameplayRenderTarget is null)
+            return;
+
+        var target = EnsureEditorInactiveBankRenderTarget(width, height);
         var mainViewport = _graphics.Viewport;
-        var target = _editorInactiveBankRenderTarget;
         _graphics.SetRenderTarget(target);
         _graphics.Viewport = new Viewport(0, 0, width, height);
         _graphics.Clear(Color.Transparent);
@@ -695,6 +700,94 @@ public sealed partial class Playfield
                 preserveContents ? RenderTargetUsage.PreserveContents : RenderTargetUsage.DiscardContents),
             NativeResourceCategory.Gameplay);
         _gameplayRenderTargetPreservesContents = preserveContents;
+    }
+
+
+    /// <summary>
+    /// Finishes the one-time graphics work that would otherwise be deferred to
+    /// the first visible editor frames. Uploads hit-animation textures in small
+    /// batches, pre-allocates the editor render targets, and primes the feedback
+    /// SpriteBatch/audio path while the loading overlay is still active.
+    /// </summary>
+    internal bool PrepareEditorStartupGraphicsResources()
+    {
+        if (!_chartEditorMode || _chart is null || _tempo is null)
+            return true;
+
+        _textures.ProcessPendingHitAnimationPreload(maxFrames: 6, budgetMilliseconds: 10.0);
+        if (_textures.PendingHitAnimationFrames > 0)
+            return false;
+
+        var (width, height) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
+        EnsureGameplayRenderTarget(width, height);
+
+        var inactiveBankOpacity = Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f);
+        var needsInactiveBankTarget = !_editorPreviewMode && !_compact &&
+            _gear is not null && inactiveBankOpacity > 0.001f && inactiveBankOpacity < 0.999f;
+        if (needsInactiveBankTarget)
+            _ = EnsureEditorInactiveBankRenderTarget(width, height);
+
+        if (!_feedbackRenderWarmupDone)
+        {
+            using var timing = new LoadTimingScope("editor_startup_feedback_render_warmup");
+            WarmFeedbackRenderingOnHiddenTarget(width, height);
+        }
+
+        return _textures.PendingHitAnimationFrames == 0 && _feedbackRenderWarmupDone &&
+               _gameplayRenderTarget is not null &&
+               (!needsInactiveBankTarget || _editorInactiveBankRenderTarget is not null);
+    }
+
+    private void WarmFeedbackRenderingOnHiddenTarget(int width, int height)
+    {
+        if (_gameplayRenderTarget is null || _textures.PendingHitAnimationFrames > 0)
+            return;
+
+        var previousTargets = _graphics.GetRenderTargets();
+        var previousViewport = _graphics.Viewport;
+        var previousScissor = _graphics.ScissorRectangle;
+        var previousBlend = _graphics.BlendState;
+        var previousDepth = _graphics.DepthStencilState;
+        var previousRasterizer = _graphics.RasterizerState;
+        var previousSampler0 = _graphics.SamplerStates[0];
+        var previousSampler1 = _graphics.SamplerStates[1];
+
+        try
+        {
+            _graphics.SetRenderTarget(_gameplayRenderTarget);
+            _graphics.Viewport = new Viewport(0, 0, width, height);
+            _graphics.ScissorRectangle = new Rectangle(0, 0, width, height);
+            _graphics.Clear(Background);
+            WarmFeedbackRenderingIfNeeded();
+        }
+        catch (Exception ex)
+        {
+            // Feedback warm-up is an optimization. A custom driver/device failure
+            // must not make an otherwise valid chart impossible to open.
+            Program.LogFatal("EDITOR_STARTUP_FEEDBACK_WARMUP", ex);
+            _feedbackRenderWarmupDone = true;
+        }
+        finally
+        {
+            try
+            {
+                if (previousTargets.Length == 0)
+                    _graphics.SetRenderTarget(null);
+                else
+                    _graphics.SetRenderTargets(previousTargets);
+                _graphics.Viewport = previousViewport;
+                _graphics.ScissorRectangle = previousScissor;
+                _graphics.BlendState = previousBlend;
+                _graphics.DepthStencilState = previousDepth;
+                _graphics.RasterizerState = previousRasterizer;
+                _graphics.SamplerStates[0] = previousSampler0;
+                _graphics.SamplerStates[1] = previousSampler1;
+            }
+            catch (Exception ex)
+            {
+                Program.LogFatal("EDITOR_STARTUP_FEEDBACK_WARMUP_RESTORE", ex);
+            }
+        }
     }
 
     private void WarmFeedbackRenderingIfNeeded()

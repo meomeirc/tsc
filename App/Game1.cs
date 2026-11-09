@@ -166,6 +166,7 @@ public sealed class Game1 : Game
     private int _chartEditorLoadStage;
     private bool _chartEditorLoadReady;
     private bool _chartEditorLoadFailed;
+    private bool _chartEditorLoadFinalizationPrepared;
     private double _chartEditorLoadProgress;
     private string _chartEditorLoadStageLabel = "PREPARING EDITOR";
     private string _chartEditorLoadItem = string.Empty;
@@ -278,6 +279,12 @@ public sealed class Game1 : Game
         _startupPixel = NativeResourceDiagnostics.TrackTexture(new Texture2D(GraphicsDevice, 1, 1), NativeResourceCategory.Core);
         _startupPixel.SetData(new[] { Color.White });
         Window.TextInput += HandleTextInput;
+
+        // Transition skins are otherwise initialized lazily by the first screen
+        // handoff. Initialize and render the reveal path now, before the first
+        // editor load can enter its transition. This keeps first-use Lua/layout/
+        // text-renderer work from interfering with the initial fade-in.
+        PrewarmTransitionRuntime();
     }
 
     protected override void Update(GameTime gameTime)
@@ -2956,6 +2963,7 @@ public sealed class Game1 : Game
         var activeSkin = SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
         _skin = activeSkin;
         _availableSettingsSkins = GetAvailableSkinNames();
+        PrewarmTransitionRuntime();
         _appliedMaxFrameRate = int.MinValue;
         _appliedVSync = null;
         ApplyMaxFrameRateConfig();
@@ -3325,6 +3333,7 @@ public sealed class Game1 : Game
         _transitionTargetReady = false;
         _transitionError = null;
         _transitionPhase = TransitionPhase.Out;
+        _transitionFrameDrawnSinceUpdate = false;
         ResetTransitionClock();
         UpdateTransitionRuntimeState();
     }
@@ -3347,6 +3356,93 @@ public sealed class Game1 : Game
             skinSparklesEffect: _skinSparklesEffect,
             skinQuad3DEffect: _skinQuad3DEffect);
 
+    }
+
+    private void PrewarmTransitionRuntime()
+    {
+        try
+        {
+            EnsureTransitionRuntime();
+            var runtime = _transitionRuntime;
+            if (runtime is null || !runtime.IsLoaded || _startupSpriteBatch is null ||
+                _startupPixel is null || _font is null)
+                return;
+
+            var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
+            var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
+            if (width <= 0 || height <= 0)
+                return;
+
+            runtime.UpdateScreen(width, height);
+            runtime.UpdateTransitionState(
+                "in", 0.5, 0.15, runtime.GetTransitionDuration("in", 0.35),
+                "menu", "gameplay", "chart_editor_load", true, false, 1.0,
+                string.Empty, string.Empty);
+
+            var previousTargets = GraphicsDevice.GetRenderTargets();
+            var previousViewport = GraphicsDevice.Viewport;
+            var previousScissor = GraphicsDevice.ScissorRectangle;
+            var previousBlend = GraphicsDevice.BlendState;
+            var previousDepth = GraphicsDevice.DepthStencilState;
+            var previousRasterizer = GraphicsDevice.RasterizerState;
+            var previousSampler0 = GraphicsDevice.SamplerStates[0];
+            var previousSampler1 = GraphicsDevice.SamplerStates[1];
+
+            try
+            {
+                GraphicsDevice.SetRenderTarget(null);
+                GraphicsDevice.Viewport = new Viewport(0, 0, width, height);
+                GraphicsDevice.Clear(Color.Black);
+                var rendered = runtime.RenderDrawCommands(
+                    _startupSpriteBatch, _startupPixel, _font, width, height);
+                Program.LogRuntime($"TRANSITION_RUNTIME_PREWARM loaded=true rendered={rendered} size={width}x{height}");
+                // LoadContent runs before the first presented frame. Clear the
+                // temporary warm-up draw so it cannot leak onto the startup menu.
+                GraphicsDevice.Clear(new Color(9, 12, 18));
+            }
+            finally
+            {
+                if (previousTargets.Length == 0)
+                    GraphicsDevice.SetRenderTarget(null);
+                else
+                    GraphicsDevice.SetRenderTargets(previousTargets);
+                GraphicsDevice.Viewport = previousViewport;
+                GraphicsDevice.ScissorRectangle = previousScissor;
+                GraphicsDevice.BlendState = previousBlend;
+                GraphicsDevice.DepthStencilState = previousDepth;
+                GraphicsDevice.RasterizerState = previousRasterizer;
+                GraphicsDevice.SamplerStates[0] = previousSampler0;
+                GraphicsDevice.SamplerStates[1] = previousSampler1;
+            }
+
+            runtime.UpdateTransitionState(
+                "idle", 0.0, 0.0, 0.0,
+                "menu", "menu", string.Empty, false, false, 0.0,
+                string.Empty, string.Empty);
+        }
+        catch (Exception ex)
+        {
+            // Transition prewarming is an optimization. Keep the normal lazy
+            // transition/fallback path available if a custom skin cannot warm.
+            Program.LogRuntime($"TRANSITION_RUNTIME_PREWARM_FAILED error={ex}");
+        }
+    }
+
+    private void BeginTransitionInPhase()
+    {
+        _transitionElapsed = 0.0;
+        _transitionProgress = _transitionDuration <= 0.0 ? 0.0 : 1.0;
+        _transitionPhase = TransitionPhase.In;
+
+        // Publish the destination reveal state immediately. Previously the Lua
+        // runtime could retain its old opaque hold state until the next update,
+        // which made the first destination frame depend on when the runtime was
+        // last synchronized (most noticeable on the first editor open).
+        ResetTransitionClock();
+        UpdateTransitionRuntimeState();
+        Program.LogRuntime(
+            $"TRANSITION_IN_BEGIN to={_transitionToScreen.ToString().ToLowerInvariant()} " +
+            $"reason={_transitionReason} durationMs={_transitionDuration * 1000.0:0.00}");
     }
 
     private void ResetTransitionClock()
@@ -3436,10 +3532,8 @@ public sealed class Game1 : Game
                             _songSelect = null;
                         }
                         _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.35));
-                        _transitionElapsed = 0.0;
-                        _transitionProgress = 1.0;
-                        _transitionPhase = TransitionPhase.In;
                         _startupScreen = _transitionFromScreen;
+                        BeginTransitionInPhase();
                     }
                     else
                     {
@@ -3479,13 +3573,11 @@ public sealed class Game1 : Game
                         _songSelect = null;
                     }
                     _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.35));
-                    _transitionElapsed = 0.0;
-                    _transitionProgress = 1.0;
-                    _transitionPhase = TransitionPhase.In;
                     // Reveal the original screen after a failed preparation,
                     // not the destination that failed to load.
                     _transitionToScreen = _transitionFromScreen;
                     _startupScreen = _transitionFromScreen;
+                    BeginTransitionInPhase();
                     if (_transitionReason == "chart_editor_load" &&
                         _transitionFromScreen != StartupScreen.ChartPicker)
                     {
@@ -3507,9 +3599,7 @@ public sealed class Game1 : Game
                     _transitionTargetCommit?.Invoke();
                     _startupScreen = _transitionToScreen;
                     _transitionDuration = Math.Max(0.0, _transitionRuntime.GetTransitionDuration("in", 0.35));
-                    _transitionElapsed = 0.0;
-                    _transitionProgress = 1.0;
-                    _transitionPhase = TransitionPhase.In;
+                    BeginTransitionInPhase();
                 }
                 break;
 
@@ -3563,6 +3653,7 @@ public sealed class Game1 : Game
         _transitionTargetReady = false;
         _transitionError = null;
         _transitionPhase = TransitionPhase.Out;
+        _transitionFrameDrawnSinceUpdate = false;
         ResetTransitionClock();
     }
 
@@ -3612,9 +3703,7 @@ public sealed class Game1 : Game
                     _transitionTargetCommit?.Invoke();
                     _startupScreen = _transitionToScreen;
                     _transitionDuration = 0.45;
-                    _transitionElapsed = 0.0;
-                    _transitionProgress = 1.0;
-                    _transitionPhase = TransitionPhase.In;
+                    BeginTransitionInPhase();
                 }
                 break;
 
@@ -3652,11 +3741,9 @@ public sealed class Game1 : Game
         _transitionTargetReady = false;
         _transitionTargetStarted = false;
         _transitionDuration = 0.45;
-        _transitionElapsed = 0.0;
-        _transitionProgress = 1.0;
-        _transitionPhase = TransitionPhase.In;
         _transitionToScreen = _transitionFromScreen;
         _startupScreen = _transitionFromScreen;
+        BeginTransitionInPhase();
 
         if (_transitionFromScreen == StartupScreen.SongSelect)
         {
@@ -4589,6 +4676,7 @@ public sealed class Game1 : Game
         _chartEditorLoadStage = 0;
         _chartEditorLoadReady = false;
         _chartEditorLoadFailed = false;
+        _chartEditorLoadFinalizationPrepared = false;
         _chartEditorLoadProgress = 0.02;
         _chartEditorLoadStageLabel = "PREPARING EDITOR";
         _chartEditorLoadItem = item ?? string.Empty;
@@ -4613,6 +4701,7 @@ public sealed class Game1 : Game
         _chartEditorLoadStage = 0;
         _chartEditorLoadReady = false;
         _chartEditorLoadFailed = false;
+        _chartEditorLoadFinalizationPrepared = false;
         _chartEditorLoadProgress = 0.02;
         _chartEditorLoadStageLabel = "PREPARING EDITOR";
         _chartEditorLoadError = null;
@@ -4854,15 +4943,45 @@ public sealed class Game1 : Game
                     if (_chartEditorLoadPlayfield is null)
                         throw new InvalidOperationException("The loaded chart editor is missing.");
 
-                    // Chart preparation is sufficient to enter the editor.
-                    // Opus decoding continues on its dedicated worker; the active
-                    // Playfield.Update completes native audio setup on the game
-                    // thread when the worker is ready. Playback controls remain
-                    // unavailable until that completion has happened.
-                    var finalizeStarted = Stopwatch.GetTimestamp();
-                    _chartEditorLoadPlayfield.ReloadSkinForCurrentViewport();
-                    _chartEditorLoadPlayfield.ConfigureChartEditor(true);
+                    // Finish the editor's one-time skin setup while the loading
+                    // transition is still covering the screen. The Opus decoder
+                    // runs concurrently with chart preparation; wait non-blockingly
+                    // here, then create the native SoundEffect/OpenAL source on the
+                    // game thread before the editor becomes visible. This prevents
+                    // that full-song upload from hitching the first editor frames.
+                    if (!_chartEditorLoadFinalizationPrepared)
+                    {
+                        var preparationStarted = Stopwatch.GetTimestamp();
+                        _chartEditorLoadPlayfield.ReloadSkinForCurrentViewport();
+                        _chartEditorLoadPlayfield.ConfigureChartEditor(true);
+                        _chartEditorLoadFinalizationPrepared = true;
+                        Program.LogRuntime(
+                            $"CHART_EDITOR_FINALIZATION_PREPARED elapsedMs={Stopwatch.GetElapsedTime(preparationStarted).TotalMilliseconds:0.00}");
+                    }
 
+                    // Hit-animation texture uploads, feedback SpriteBatch/JIT setup,
+                    // hit-sound voice warm-up, and editor render-target allocation
+                    // used to happen lazily during the first visible editor frames.
+                    // Complete those small GPU/audio-device tasks under the loading
+                    // overlay, independently of the background Opus decoder.
+                    if (!_chartEditorLoadPlayfield.PrepareEditorStartupGraphicsResources())
+                    {
+                        _chartEditorLoadProgress = Math.Max(_chartEditorLoadProgress, 0.955);
+                        _chartEditorLoadStageLabel = "PREPARING GAMEPLAY RESOURCES";
+                        return;
+                    }
+
+                    if (!_chartEditorLoadPlayfield.TryPrepareAudioForEditorActivation())
+                    {
+                        _chartEditorLoadProgress = Math.Max(_chartEditorLoadProgress, 0.97);
+                        _chartEditorLoadStageLabel = "PREPARING MUSIC";
+                        return;
+                    }
+
+                    Program.LogRuntime(
+                        $"CHART_EDITOR_AUDIO_READY_FOR_ACTIVATION loaded={_chartEditorLoadPlayfield.IsAudioReadyForEditorActivation} " +
+                        $"failed={_chartEditorLoadPlayfield.IsAudioLoadFailed}");
+                    var finalizeStarted = Stopwatch.GetTimestamp();
                     var oldPlayfield = _playfield;
                     _playfield = _chartEditorLoadPlayfield;
                     _chartEditorLoadPlayfield = null;

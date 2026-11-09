@@ -4524,9 +4524,9 @@ public sealed partial class Playfield
             {
                 _audioLoadFailed = false;
                 // Ogg/Opus decoding is CPU-heavy and does not touch MonoGame
-                // resources. Run it while chart reconstruction and startup
-                // warm-up proceed; TryCompletePendingLoad creates the native
-                // SoundEffect later on the game thread.
+                // resources. Run it while chart reconstruction and editor-skin
+                // preparation proceed; the loading transition completes the
+                // native SoundEffect upload before revealing the editor.
                 _audio.BeginLoadOpus(musicBytes);
             }
             else
@@ -11951,37 +11951,11 @@ public sealed partial class Playfield
         RefreshChartEditorInterfaceLayoutForActiveScript();
         ApplyLiveGameConfigSettings();
 
-        // Decode Ogg/Opus away from the game thread. Only the final SoundEffect
-        // creation is performed here, where MonoGame's active audio context is
-        // valid. The one-second gameplay warm-up naturally overlaps the decode.
-        if (_audio.IsDecodeCompletionReady)
-        {
-            bool audioLoadCompleted;
-            Exception? audioLoadError;
-            using (new LoadTimingScope("opus_native_audio_prepare"))
-            {
-                audioLoadCompleted = _audio.TryCompletePendingLoad(
-                    retainPcmForSeeking: !_lockMenuPlayMode,
-                    out audioLoadError);
-            }
-
-            if (audioLoadCompleted && audioLoadError is not null)
-            {
-                _audioLoadFailed = true;
-                _playing = false;
-                _playbackStartPending = false;
-                _audioResyncPending = false;
-                _audioStartedForCurrentRun = false;
-                _audio.Stop();
-                _statusMessage = $"Music could not be decoded: {audioLoadError.Message}";
-                Program.LogRuntime($"AUDIO_DECODE_BACKGROUND_FAILED {audioLoadError}");
-                NotifyEditorSourceAudioPreparationFailed(audioLoadError);
-            }
-            else if (audioLoadCompleted && _audio.IsLoaded)
-            {
-                NotifyEditorSourceAudioPrepared();
-            }
-        }
+        // Finish the native audio upload as soon as the background decode is
+        // ready. Chart-editor transitions call the same method while their
+        // loading overlay is still active, so a large SoundEffect/OpenAL upload
+        // cannot land on the first visible editor frame.
+        CompletePendingAudioLoadIfReady();
 
         if (_hardGaugeGameOverActive)
         {
@@ -12328,7 +12302,53 @@ public sealed partial class Playfield
         _skinRuntime.Update((float)uiDt);
         _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
     }
+    private void CompletePendingAudioLoadIfReady()
+    {
+        if (!_audio.IsDecodeCompletionReady)
+            return;
+
+        bool audioLoadCompleted;
+        Exception? audioLoadError;
+        using (new LoadTimingScope("opus_native_audio_prepare"))
+        {
+            audioLoadCompleted = _audio.TryCompletePendingLoad(
+                retainPcmForSeeking: !_lockMenuPlayMode,
+                out audioLoadError);
+        }
+
+        if (audioLoadCompleted && audioLoadError is not null)
+        {
+            _audioLoadFailed = true;
+            _playing = false;
+            _playbackStartPending = false;
+            _audioResyncPending = false;
+            _audioStartedForCurrentRun = false;
+            _audio.Stop();
+            _statusMessage = $"Music could not be decoded: {audioLoadError.Message}";
+            Program.LogRuntime($"AUDIO_DECODE_BACKGROUND_FAILED {audioLoadError}");
+            NotifyEditorSourceAudioPreparationFailed(audioLoadError);
+        }
+        else if (audioLoadCompleted && _audio.IsLoaded)
+        {
+            NotifyEditorSourceAudioPrepared();
+        }
+    }
+
+    /// <summary>
+    /// Completes the background decode and native audio-device upload while the
+    /// chart editor loading transition is still covering the screen. Returns
+    /// false while Opus decoding is still running, allowing the transition to
+    /// keep drawing its loading state without blocking the game thread.
+    /// </summary>
+    internal bool TryPrepareAudioForEditorActivation()
+    {
+        CompletePendingAudioLoadIfReady();
+        return !_audio.IsLoading;
+    }
+
     internal bool IsAudioDecodePending => _audio.IsLoading;
+    internal bool IsAudioReadyForEditorActivation => !_audio.IsLoading && _audio.IsLoaded;
+    internal bool IsAudioLoadFailed => _audioLoadFailed;
 
     private bool IsEditorChartPlaybackBlocked => _chartEditorMode &&
         (_audio.IsLoading || (_audioLoadFailed && _loadedMusicBytes is { Length: > 0 }));
