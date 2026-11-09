@@ -126,7 +126,7 @@ public sealed partial class Playfield
         _skinRuntime.DebugMeasureApiAllocations = _performanceDebugInstrumentFrame;
         var allocStart = GC.GetAllocatedBytesForCurrentThread();
         var skinBuildStartTimestamp = Stopwatch.GetTimestamp();
-        _skinDrawCommands = _skinRuntime.BuildDrawCommands(virtualWidth, virtualHeight);
+        _skinDrawCommands = _skinRuntime.BuildDrawCommands(virtualWidth, virtualHeight, _font);
         _debugSkinBuildMs = ElapsedMilliseconds(skinBuildStartTimestamp);
         _debugAllocSkinBuildBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
 
@@ -290,7 +290,7 @@ public sealed partial class Playfield
                 try
                 {
                     _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, true, _pauseSelection);
-                    _pauseSkinDrawCommands = _pauseSkinRuntime.BuildDrawCommands(virtualWidth, virtualHeight);
+                    _pauseSkinDrawCommands = _pauseSkinRuntime.BuildDrawCommands(virtualWidth, virtualHeight, _font);
                     if (_pauseSkinRuntime.IsLoaded)
                     {
                         DrawSkinScriptUiLayers(_pauseSkinDrawCommands, false, _pauseSkinRuntime);
@@ -309,7 +309,7 @@ public sealed partial class Playfield
         }
         if (_gameplayResultActive)
         {
-            _resultSkinDrawCommands = _resultSkinRuntime.BuildDrawCommands(virtualWidth, virtualHeight);
+            _resultSkinDrawCommands = _resultSkinRuntime.BuildDrawCommands(virtualWidth, virtualHeight, _font);
             DrawSkinScriptUiLayers(_resultSkinDrawCommands, false, _resultSkinRuntime);
         }
         // The Problems panel belongs to the editor-control layer: put it above
@@ -320,17 +320,25 @@ public sealed partial class Playfield
             var chartEditorLuaDrawn = false;
             try
             {
+                // Artwork is data supplied by the editor; chartEditorInterface.lua
+                // owns where/how it is rendered and registers the matching hitboxes.
+                if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null &&
+                    _editorMetaPanelOpen &&
+                    string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
+                {
+                    _chartEditorInterfaceRuntime.SetEditorMediaArtwork(
+                        GetEditorArtworkAssetPath("album"),
+                        GetEditorArtworkAssetPath("album_big"),
+                        _editorSharedAlbumBytes,
+                        _editorSharedAlbumBigBytes);
+                }
                 _chartEditorInterfaceRuntime.UpdateChartEditorInterfaceState(
                     BuildChartEditorInterfaceState(virtualWidth, virtualHeight));
-                var editorCommands = _chartEditorInterfaceRuntime.BuildDrawCommands(virtualWidth, virtualHeight);
+                var editorCommands = _chartEditorInterfaceRuntime.BuildDrawCommands(virtualWidth, virtualHeight, _font);
                 RefreshChartEditorInterfaceLayoutForActiveScript();
                 if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
                 {
                     DrawSkinScriptUiLayers(editorCommands, false, _chartEditorInterfaceRuntime);
-                    if (_editorMetaPanelOpen && string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase) &&
-                        !_editorPreviewEditorOpen && !_editorMetaExportExpanded && !_editorMetaDeleteConfirmOpen &&
-                        !_editorCreateDifficultyConfirmOpen && !_editorElementDropdownOpen)
-                        DrawEditorMediaArtworkPreviewOverlay(virtualWidth, virtualHeight);
                     chartEditorLuaDrawn = true;
                 }
             }

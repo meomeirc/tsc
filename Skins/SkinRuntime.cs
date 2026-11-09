@@ -208,6 +208,13 @@ public sealed class SkinGameView
         _album = album;
         _albumBig = albumBig;
     }
+
+    /// <summary>Updates only the artwork exposed to editor UI skins.</summary>
+    internal void SetEditorMediaArtwork(SkinAssetHandle? album, SkinAssetHandle? albumBig)
+    {
+        _album = album;
+        _albumBig = albumBig;
+    }
 }
 
 /// <summary>
@@ -1638,6 +1645,7 @@ public enum SkinDrawCommandKind
     Rect,
     Line,
     LineBatch,
+    WaveformBatch,
     Shadow,
     Quad3D,
     Sparkles
@@ -1736,6 +1744,16 @@ public sealed class SkinDrawCommand
     public float LineWidth { get; internal set; } = 1f;
     internal SkinLineSegment[]? LineSegments { get; set; }
     internal int LineSegmentCount { get; set; }
+    internal float[]? WaveformLevels { get; set; }
+    internal float[]? WaveformPrefix { get; set; }
+    internal double WaveformDuration { get; set; }
+    internal double WaveformViewStart { get; set; }
+    internal double WaveformViewDuration { get; set; }
+    internal double WaveformSelectionStart { get; set; }
+    internal double WaveformSelectionEnd { get; set; }
+    internal float WaveformVerticalInset { get; set; }
+    internal XnaColor WaveformNormalColor { get; set; } = XnaColor.White;
+    internal XnaColor WaveformSelectedColor { get; set; } = XnaColor.White;
     public float TextSize { get; internal set; }
     public float TextMaxWidth { get; internal set; }
     public bool TextWrap { get; internal set; }
@@ -1755,6 +1773,9 @@ public sealed class SkinDrawCommand
     public float Fill { get; internal set; } = 1f;
     public SkinNineSlice? NineSlice { get; internal set; }
     public SkinFontHandle? Font { get; internal set; }
+    // Resolved glyph runs are independent of position/color/scale. Keep the
+    // immutable layout with this pooled command so drawing never rebuilds it.
+    internal object? TextLayoutCache { get; set; }
     public SkinTextShadow? Shadow { get; internal set; }
     public SkinBoxShadow? BoxShadow { get; internal set; }
     public SkinTextStroke? Stroke { get; internal set; }
@@ -1789,6 +1810,16 @@ public sealed class SkinDrawCommand
         Alpha = 1f;
         LineWidth = 1f;
         LineSegmentCount = 0;
+        WaveformLevels = null;
+        WaveformPrefix = null;
+        WaveformDuration = 0d;
+        WaveformViewStart = 0d;
+        WaveformViewDuration = 0d;
+        WaveformSelectionStart = 0d;
+        WaveformSelectionEnd = 0d;
+        WaveformVerticalInset = 0f;
+        WaveformNormalColor = XnaColor.White;
+        WaveformSelectedColor = XnaColor.White;
         TextSize = 0f;
         TextMaxWidth = 0f;
         TextWrap = false;
@@ -1804,6 +1835,7 @@ public sealed class SkinDrawCommand
         Fill = 1f;
         NineSlice = null;
         Font = null;
+        TextLayoutCache = null;
         Shadow = null;
         BoxShadow = null;
         Stroke = null;
@@ -1936,6 +1968,24 @@ public sealed class SkinRuntime : IDisposable
     private string? _activeScriptPath;
     private readonly GraphicsDevice _graphics;
     private readonly BasicEffect _skin3DEffect;
+    private readonly BasicEffect _skinWaveformEffect;
+    private VertexPositionColor[] _skinWaveformVertices = new VertexPositionColor[6 * 2048];
+    private int _skinWaveformVertexCount;
+    private float[]? _skinWaveformCachedLevels;
+    private float[]? _skinWaveformCachedPrefix;
+    private int _skinWaveformCachedWidth = -1;
+    private int _skinWaveformCachedHeight = -1;
+    private float _skinWaveformCachedHeightExact = float.NaN;
+    private float _skinWaveformCachedX = float.NaN;
+    private float _skinWaveformCachedY = float.NaN;
+    private double _skinWaveformCachedDuration = double.NaN;
+    private double _skinWaveformCachedViewStart = double.NaN;
+    private double _skinWaveformCachedViewDuration = double.NaN;
+    private double _skinWaveformCachedSelectionStart = double.NaN;
+    private double _skinWaveformCachedSelectionEnd = double.NaN;
+    private float _skinWaveformCachedInset = float.NaN;
+    private XnaColor _skinWaveformCachedNormalColor;
+    private XnaColor _skinWaveformCachedSelectedColor;
     private readonly Effect? _skinSparklesEffect;
     private readonly Effect? _skinQuad3DEffect;
     private double _skinEffectTime;
@@ -1972,9 +2022,21 @@ public sealed class SkinRuntime : IDisposable
     private byte[]? _resultAlbumBytes;
     private byte[]? _resultAlbumBigBytes;
     private bool _hasResultSongInfo;
+    // Chart-editor media artwork is exposed through the same game.album handles
+    // used by result skins. Keep the source references so script reload can
+    // recreate the GPU assets after SkinAssetStore is cleared.
+    private string? _editorMediaAlbumPath;
+    private string? _editorMediaAlbumBigPath;
+    private byte[]? _editorMediaAlbumBytes;
+    private byte[]? _editorMediaAlbumBigBytes;
+    private bool _hasEditorMediaArtwork;
     private readonly SkinScreenView _screen = new();
     private Table? _songSelect;
     private Table? _chartEditor;
+    // Waveform arrays remain native C# buffers. They are intentionally not
+    // expanded into tens of thousands of MoonSharp table entries every load.
+    private float[]? _chartEditorWaveformRmsSource;
+    private float[]? _chartEditorWaveformRmsPrefixSource;
     private Table? _mainMenu;
     private Table? _transition;
     private Table? _skinPerfApi;
@@ -2006,6 +2068,14 @@ public sealed class SkinRuntime : IDisposable
     private readonly List<SkinDrawCommand> _drawCommands = new();
     private readonly List<SkinDrawCommand> _drawCommandPool = new();
     private int _drawCommandPoolIndex;
+    private const int TextLayoutCacheCapacity = 1024;
+    private readonly Dictionary<SkinTextLayoutCacheKey, LinkedListNode<SkinTextLayoutCacheEntry>> _textLayoutCache = new();
+    private readonly LinkedList<SkinTextLayoutCacheEntry> _textLayoutLru = new();
+    private const int UserTextMeasureCacheCapacity = 512;
+    private readonly Dictionary<SkinUserTextMeasureCacheKey, LinkedListNode<SkinUserTextMeasureCacheEntry>> _userTextMeasureCache = new();
+    private readonly LinkedList<SkinUserTextMeasureCacheEntry> _userTextMeasureLru = new();
+    private readonly List<DynValue>[] _chartEditorStateStaleKeyScratch =
+        Enumerable.Range(0, 16).Select(_ => new List<DynValue>(8)).ToArray();
     private readonly Dictionary<string, SkinLayoutNode> _layoutNodes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Comparison<SkinDrawCommand> DrawCommandComparison = static (a, b) =>
     {
@@ -2169,6 +2239,7 @@ public sealed class SkinRuntime : IDisposable
         public object? ActionValue { get; }
         public int HitTestPriority { get; }
         public XnaRectangle? ScissorClip { get; }
+        public bool IsInput { get; }
 
         public SkinUiButton(
             string id,
@@ -2181,7 +2252,8 @@ public sealed class SkinRuntime : IDisposable
             string? action,
             object? actionValue,
             int hitTestPriority,
-            XnaRectangle? scissorClip)
+            XnaRectangle? scissorClip,
+            bool isInput = false)
         {
             Id = id;
             ParentId = parentId;
@@ -2194,6 +2266,7 @@ public sealed class SkinRuntime : IDisposable
             ActionValue = actionValue;
             HitTestPriority = hitTestPriority;
             ScissorClip = scissorClip;
+            IsInput = isInput;
         }
 
         internal void SetResolvedPosition(Vector2 topLeft)
@@ -2454,6 +2527,13 @@ public sealed class SkinRuntime : IDisposable
             LightingEnabled = false,
             FogEnabled = false
         };
+        _skinWaveformEffect = new BasicEffect(graphics)
+        {
+            TextureEnabled = false,
+            VertexColorEnabled = true,
+            LightingEnabled = false,
+            FogEnabled = false
+        };
         _assets = new SkinAssetStore(graphics, _skinDirectory, _defaultSkinDirectory);
         _fonts = new SkinFontStore(graphics, _skinDirectory, _defaultSkinDirectory);
 
@@ -2491,6 +2571,8 @@ public sealed class SkinRuntime : IDisposable
         // through game.album/game.album_big. Recreate them now, before loading the
         // new Lua environment, so top-level code and init() see live textures.
         RefreshResultSongInfoAssets();
+        RefreshEditorMediaArtworkAssets();
+        ClearTextLayoutCache();
         _fonts.Dispose();
         _fonts = new SkinFontStore(_graphics, _skinDirectory, _defaultSkinDirectory);
         UIConfig = SkinUIConfig.CreateDefault();
@@ -3186,6 +3268,50 @@ public sealed class SkinRuntime : IDisposable
             RefreshResultSongInfoAssets();
     }
 
+    /// <summary>
+    /// Supplies chart-editor album artwork to chartEditorInterface.lua through
+    /// game.album/game.album_big. The active skin owns its rendering geometry;
+    /// this method only provides the assets.
+    /// </summary>
+    public void SetEditorMediaArtwork(
+        string? albumPath,
+        string? albumBigPath,
+        byte[]? albumBytes = null,
+        byte[]? albumBigBytes = null)
+    {
+        if (PathEqualsOrNull(_editorMediaAlbumPath, albumPath) &&
+            PathEqualsOrNull(_editorMediaAlbumBigPath, albumBigPath) &&
+            ReferenceEquals(_editorMediaAlbumBytes, albumBytes) &&
+            ReferenceEquals(_editorMediaAlbumBigBytes, albumBigBytes))
+            return;
+
+        _editorMediaAlbumPath = albumPath;
+        _editorMediaAlbumBigPath = albumBigPath;
+        _editorMediaAlbumBytes = albumBytes;
+        _editorMediaAlbumBigBytes = albumBigBytes;
+        _hasEditorMediaArtwork = true;
+        if (!_initialLoadDeferred)
+            RefreshEditorMediaArtworkAssets();
+    }
+
+    private static bool PathEqualsOrNull(string? left, string? right)
+        => string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+
+    private void RefreshEditorMediaArtworkAssets()
+    {
+        if (!_hasEditorMediaArtwork)
+            return;
+
+        // Imported artwork bytes take priority over the previous on-disk path.
+        // The asset store hashes and caches byte sources, so repeated state
+        // updates do not create new textures.
+        var album = _assets.LoadExternalBytes(_editorMediaAlbumBytes, "album")
+            ?? _assets.LoadExternal(_editorMediaAlbumPath);
+        var albumBig = _assets.LoadExternalBytes(_editorMediaAlbumBigBytes, "album_big")
+            ?? _assets.LoadExternal(_editorMediaAlbumBigPath);
+        _game.SetEditorMediaArtwork(album, albumBig);
+    }
+
     private void RefreshResultSongInfoAssets()
     {
         if (!_hasResultSongInfo)
@@ -3296,8 +3422,14 @@ public sealed class SkinRuntime : IDisposable
     /// submitted through draw.*. Calling render() is the only place the example skin
     /// draws its HUD; callbacks are expected to update skin state instead.
     /// </summary>
-    public IReadOnlyList<SkinDrawCommand> BuildDrawCommands(int width, int height)
+    public IReadOnlyList<SkinDrawCommand> BuildDrawCommands(int width, int height, SpriteFont? fallbackFont = null)
     {
+        // Playfield rendering submits commands directly instead of going through
+        // RenderDrawCommands(), so provide its shared fallback font before Lua
+        // submits text. This also lets text layouts be cached at submission time.
+        if (fallbackFont is not null)
+            _defaultFallbackFont = fallbackFont;
+
         // The command pool is reused every frame. Reset its cursor here, not only
         // on skin reload; otherwise each draw command allocates a new pooled
         // object on every frame and the pool grows for the entire song/retry run.
@@ -3391,17 +3523,151 @@ public sealed class SkinRuntime : IDisposable
         return new SkinUiAction(action.String!, ReadUiActionValue(value));
     }
 
-    /// <summary>Replaces the state table consumed by chartEditorInterface.lua.</summary>
+    /// <summary>
+    /// Updates the state consumed by chartEditorInterface.lua without throwing
+    /// away the existing Lua table graph every frame. Stable nested lists and
+    /// dictionaries (especially the Info menu rows) keep their MoonSharp tables;
+    /// only values that actually changed are written.
+    /// </summary>
     public void UpdateChartEditorInterfaceState(IReadOnlyDictionary<string, object?> state)
     {
         if (_chartEditor is null || _script is null)
             return;
 
-        foreach (var key in _chartEditor.Pairs.Select(pair => pair.Key.String).Where(key => key is not null).ToArray())
-            _chartEditor.Set(key!, DynValue.Nil);
+        var staleKeys = _chartEditorStateStaleKeyScratch[0];
+        staleKeys.Clear();
+        foreach (var pair in _chartEditor.Pairs)
+        {
+            if (pair.Key.Type != DataType.String || !state.ContainsKey(pair.Key.String ?? string.Empty))
+                staleKeys.Add(pair.Key);
+        }
+        foreach (var key in staleKeys)
+            _chartEditor.Set(key, DynValue.Nil);
 
         foreach (var (key, value) in state)
-            _chartEditor.Set(key, ToLuaValue(_script, value));
+        {
+            // These buffers are consumed only by draw.waveform_batch_fast. Keeping
+            // them out of the Lua state avoids materializing ~65K boxed Lua numbers.
+            if (key == "preview_waveform_rms" && value is float[] levels)
+            {
+                _chartEditorWaveformRmsSource = levels;
+                continue;
+            }
+            if (key == "preview_waveform_rms_prefix" && value is float[] prefix)
+            {
+                _chartEditorWaveformRmsPrefixSource = prefix;
+                continue;
+            }
+
+            var previous = _chartEditor.Get(key);
+            var updated = UpdateLuaStateValue(_script, previous, value, 1);
+            if (!LuaStateScalarEquals(previous, updated))
+                _chartEditor.Set(key, updated);
+        }
+    }
+
+    private DynValue UpdateLuaStateValue(Script script, DynValue existing, object? value, int depth)
+    {
+        if (value is null) return DynValue.Nil;
+        if (value is DynValue dynValue) return dynValue;
+        if (value is string text)
+            return existing.Type == DataType.String && string.Equals(existing.String, text, StringComparison.Ordinal)
+                ? existing : DynValue.NewString(text);
+        if (value is bool boolean)
+            return existing.Type == DataType.Boolean && existing.Boolean == boolean
+                ? existing : DynValue.NewBoolean(boolean);
+        if (value is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal)
+        {
+            var number = Convert.ToDouble(value, System.Globalization.CultureInfo.InvariantCulture);
+            return existing.Type == DataType.Number && existing.Number.Equals(number)
+                ? existing : DynValue.NewNumber(number);
+        }
+
+        if (value is IDictionary dictionary)
+        {
+            var table = existing.Type == DataType.Table && existing.Table is not null
+                ? existing.Table : new Table(script);
+            var scratchIndex = Math.Min(depth, _chartEditorStateStaleKeyScratch.Length - 1);
+            var stale = _chartEditorStateStaleKeyScratch[scratchIndex];
+            stale.Clear();
+            foreach (var pair in table.Pairs)
+            {
+                if (pair.Key.Type != DataType.String ||
+                    !dictionary.Contains(pair.Key.String ?? string.Empty))
+                    stale.Add(pair.Key);
+            }
+            foreach (var key in stale)
+                table.Set(key, DynValue.Nil);
+
+            foreach (DictionaryEntry entry in dictionary)
+            {
+                if (entry.Key is not string key)
+                    continue;
+                var previous = table.Get(key);
+                var updated = UpdateLuaStateValue(script, previous, entry.Value, depth + 1);
+                if (!LuaStateScalarEquals(previous, updated))
+                    table.Set(key, updated);
+            }
+            return existing.Type == DataType.Table && ReferenceEquals(existing.Table, table)
+                ? existing : DynValue.NewTable(table);
+        }
+
+        if (value is IList list)
+        {
+            var table = existing.Type == DataType.Table && existing.Table is not null
+                ? existing.Table : new Table(script);
+            var scratchIndex = Math.Min(depth, _chartEditorStateStaleKeyScratch.Length - 1);
+            var stale = _chartEditorStateStaleKeyScratch[scratchIndex];
+            stale.Clear();
+            foreach (var pair in table.Pairs)
+            {
+                var isValidIndex = pair.Key.Type == DataType.Number &&
+                    pair.Key.Number >= 1 && pair.Key.Number <= list.Count &&
+                    Math.Truncate(pair.Key.Number) == pair.Key.Number;
+                if (!isValidIndex)
+                    stale.Add(pair.Key);
+            }
+            foreach (var key in stale)
+                table.Set(key, DynValue.Nil);
+
+            for (var i = 0; i < list.Count; i++)
+            {
+                var key = i + 1;
+                var previous = table.Get(key);
+                var updated = UpdateLuaStateValue(script, previous, list[i], depth + 1);
+                if (!LuaStateScalarEquals(previous, updated))
+                    table.Set(key, updated);
+            }
+            return existing.Type == DataType.Table && ReferenceEquals(existing.Table, table)
+                ? existing : DynValue.NewTable(table);
+        }
+
+        if (value is IEnumerable enumerable)
+        {
+            // Preserve the prior ToLuaValue behavior for enumerable collections
+            // that do not expose IList, while letting the reusable list path update
+            // their Lua table in place.
+            var items = new List<object?>();
+            foreach (var item in enumerable)
+                items.Add(item);
+            return UpdateLuaStateValue(script, existing, items, depth);
+        }
+
+        return DynValue.NewString(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty);
+    }
+
+    private static bool LuaStateScalarEquals(DynValue left, DynValue right)
+    {
+        if (left.Type != right.Type) return false;
+        return left.Type switch
+        {
+            DataType.Nil => true,
+            DataType.Boolean => left.Boolean == right.Boolean,
+            DataType.Number => left.Number.Equals(right.Number),
+            DataType.String => string.Equals(left.String, right.String, StringComparison.Ordinal),
+            DataType.Table => ReferenceEquals(left.Table, right.Table),
+            _ => false
+        };
     }
 
     private static DynValue ToLuaValue(Script script, object? value)
@@ -3778,6 +4044,22 @@ public sealed class SkinRuntime : IDisposable
                         continue;
                     commandScissor = clipped;
                 }
+
+                if (command.Kind == SkinDrawCommandKind.WaveformBatch)
+                {
+                    if (batchOpen)
+                    {
+                        spriteBatch.End();
+                        batchOpen = false;
+                        currentBlend = null;
+                        currentSampler = null;
+                        currentScissor = null;
+                    }
+                    _graphics.ScissorRectangle = commandScissor ?? originalScissor;
+                    RenderWaveformBatch(command, width, height);
+                    continue;
+                }
+
                 EnsureBatch(blend, sampler, commandScissor);
 
                 switch (command.Kind)
@@ -3833,7 +4115,9 @@ public sealed class SkinRuntime : IDisposable
                         var userText = command.Kind == SkinDrawCommandKind.UserText;
                         var font = command.Font?.Font ?? fallbackFont;
                         var text = command.Text ?? string.Empty;
-                        var layout = userText ? null : BuildTextLayout(font, fallbackFont, text);
+                        var layout = userText
+                            ? null
+                            : command.TextLayoutCache as SkinTextLayout ?? GetCachedTextLayout(font, fallbackFont, text);
                         var measured = userText
                             ? TSC.Rendering.BbCodeTextRenderer.Measure(font, text)
                             : layout!.Size;
@@ -3895,7 +4179,7 @@ public sealed class SkinRuntime : IDisposable
                                 // that pass an independent fonts.shadow(raster, ...).
                                 var shadowMeasured = userText
                                     ? TSC.Rendering.BbCodeTextRenderer.Measure(shadowFont, text)
-                                    : BuildTextLayout(shadowFont, fallbackFont, text).Size;
+                                    : GetCachedTextLayout(shadowFont, fallbackFont, text).Size;
                                 if (shadowMeasured.X > 0f && shadowMeasured.Y > 0f)
                                 {
                                     shadowScale = new Vector2(
@@ -4020,6 +4304,8 @@ public sealed class SkinRuntime : IDisposable
             SkinDrawCommandKind.Line => Vector2.DistanceSquared(command.Position, command.EndPosition) > 0.000001f &&
                 command.LineWidth > 0f,
             SkinDrawCommandKind.LineBatch => command.LineSegments is not null && command.LineSegmentCount > 0,
+            SkinDrawCommandKind.WaveformBatch => command.WaveformLevels is { Length: > 0 } &&
+                command.WaveformPrefix is { Length: > 1 } && command.Size.X > 0f && command.Size.Y > 0f,
             SkinDrawCommandKind.Shadow => command.BoxShadow is not null && command.Size.X > 0f && command.Size.Y > 0f,
             SkinDrawCommandKind.Quad3D => command.Size.X > 0f && command.Size.Y > 0f,
             SkinDrawCommandKind.Sparkles => command.Sparkles is not null || command.SparkleAnimation is not null,
@@ -4045,6 +4331,109 @@ public sealed class SkinRuntime : IDisposable
         public int LineCount { get; set; }
 
         public SkinTextLayout(SpriteFont primaryFont) => PrimaryFont = primaryFont;
+    }
+
+    private readonly record struct SkinTextLayoutCacheKey(SpriteFont PrimaryFont, SpriteFont FallbackFont, string Text);
+    private readonly record struct SkinUserTextMeasureCacheKey(
+        SpriteFont Font, string Text, float TextSize, float MaxWidth,
+        float ScaleX, float ScaleY, bool LegacySizing, bool Wrapped);
+
+    private sealed class SkinUserTextMeasureCacheEntry
+    {
+        public SkinUserTextMeasureCacheKey Key { get; }
+        public float Value { get; }
+
+        public SkinUserTextMeasureCacheEntry(SkinUserTextMeasureCacheKey key, float value)
+        {
+            Key = key;
+            Value = value;
+        }
+    }
+
+    private bool TryGetCachedUserTextMeasure(SkinUserTextMeasureCacheKey key, out float value)
+    {
+        if (_userTextMeasureCache.TryGetValue(key, out var cached))
+        {
+            if (cached != _userTextMeasureLru.First)
+            {
+                _userTextMeasureLru.Remove(cached);
+                _userTextMeasureLru.AddFirst(cached);
+            }
+            value = cached.Value.Value;
+            return true;
+        }
+        value = 0f;
+        return false;
+    }
+
+    private void CacheUserTextMeasure(SkinUserTextMeasureCacheKey key, float value)
+    {
+        var node = _userTextMeasureLru.AddFirst(new SkinUserTextMeasureCacheEntry(key, value));
+        _userTextMeasureCache[key] = node;
+        if (_userTextMeasureCache.Count <= UserTextMeasureCacheCapacity)
+            return;
+
+        var last = _userTextMeasureLru.Last;
+        if (last is not null)
+        {
+            _userTextMeasureCache.Remove(last.Value.Key);
+            _userTextMeasureLru.RemoveLast();
+        }
+    }
+
+    private sealed class SkinTextLayoutCacheEntry
+    {
+        public SkinTextLayoutCacheKey Key { get; }
+        public SkinTextLayout Layout { get; }
+
+        public SkinTextLayoutCacheEntry(SkinTextLayoutCacheKey key, SkinTextLayout layout)
+        {
+            Key = key;
+            Layout = layout;
+        }
+    }
+
+    private SkinTextLayout GetCachedTextLayout(SpriteFont primaryFont, SpriteFont fallbackFont, string text)
+    {
+        // Very long or empty strings are poor cache candidates. Normal Info-menu
+        // labels and values are short and remain hot across many frames.
+        if (text.Length == 0 || text.Length > 2048)
+            return BuildTextLayout(primaryFont, fallbackFont, text);
+
+        var key = new SkinTextLayoutCacheKey(primaryFont, fallbackFont, text);
+        if (_textLayoutCache.TryGetValue(key, out var cached))
+        {
+            if (cached != _textLayoutLru.First)
+            {
+                _textLayoutLru.Remove(cached);
+                _textLayoutLru.AddFirst(cached);
+            }
+            return cached.Value.Layout;
+        }
+
+        var layout = BuildTextLayout(primaryFont, fallbackFont, text);
+        var entry = new SkinTextLayoutCacheEntry(key, layout);
+        var node = _textLayoutLru.AddFirst(entry);
+        _textLayoutCache[key] = node;
+        if (_textLayoutCache.Count > TextLayoutCacheCapacity)
+        {
+            var last = _textLayoutLru.Last;
+            if (last is not null)
+            {
+                _textLayoutCache.Remove(last.Value.Key);
+                _textLayoutLru.RemoveLast();
+            }
+        }
+        return layout;
+    }
+
+    private void ClearTextLayoutCache()
+    {
+        _textLayoutCache.Clear();
+        _textLayoutLru.Clear();
+        _userTextMeasureCache.Clear();
+        _userTextMeasureLru.Clear();
+        TSC.Rendering.BbCodeTextRenderer.ClearCache();
     }
 
     /// <summary>
@@ -5760,6 +6149,7 @@ public sealed class SkinRuntime : IDisposable
     {
         var table = new Table(script);
         table.Set("button", DynValue.NewCallback(RegisterUiButton));
+        table.Set("input", DynValue.NewCallback(RegisterUiInput));
         table.Set("slider", DynValue.NewCallback(RegisterUiSlider));
         table.Set("scrollbar_thumb", DynValue.NewCallback((_, args) => GetUiScrollbarThumb(script, args)));
         table.Set("state", DynValue.NewCallback(ReadUiState));
@@ -5823,14 +6213,26 @@ public sealed class SkinRuntime : IDisposable
     }
 
     private DynValue RegisterUiButton(ScriptExecutionContext _, CallbackArguments args)
+        => RegisterUiControl(args, isInput: false);
+
+    /// <summary>
+    /// Registers a semantic text-input hitbox using the same layout, clipping,
+    /// hit-testing, and action dispatch as ui.button. The host's shared
+    /// TextInputController owns text editing; skins own the field's appearance.
+    /// </summary>
+    private DynValue RegisterUiInput(ScriptExecutionContext _, CallbackArguments args)
+        => RegisterUiControl(args, isInput: true);
+
+    private DynValue RegisterUiControl(CallbackArguments args, bool isInput)
     {
+        var controlName = isInput ? "ui.input" : "ui.button";
         if (args.Count < 1 || args[0].Type != DataType.Table)
-            throw new ScriptRuntimeException("ui.button(options) expects a table");
+            throw new ScriptRuntimeException($"{controlName}(options) expects a table");
 
         var options = args[0].Table!;
         var id = GetOptionalString(options, "id")?.Trim();
         if (string.IsNullOrWhiteSpace(id))
-            throw new ScriptRuntimeException("ui.button requires a non-empty id");
+            throw new ScriptRuntimeException($"{controlName} requires a non-empty id");
         if (_layoutNodes.ContainsKey(id) || _uiButtons.ContainsKey(id) || _uiSliders.ContainsKey(id))
             throw new ScriptRuntimeException($"ui control '{id}' is already registered this frame");
 
@@ -5841,14 +6243,14 @@ public sealed class SkinRuntime : IDisposable
         var width = GetOptionalNumber(options, "width", 0.0);
         var height = GetOptionalNumber(options, "height", 0.0);
         if (width <= 0 || height <= 0)
-            throw new ScriptRuntimeException($"ui.button '{id}' requires positive width and height");
+            throw new ScriptRuntimeException($"{controlName} '{id}' requires positive width and height");
 
         DynValue? onClick = null;
         var callback = options.Get("on_click");
         if (!callback.IsNil())
         {
             if (callback.Type != DataType.Function)
-                throw new ScriptRuntimeException($"ui.button '{id}' on_click must be a function");
+                throw new ScriptRuntimeException($"{controlName} '{id}' on_click must be a function");
             onClick = callback;
         }
 
@@ -5862,13 +6264,13 @@ public sealed class SkinRuntime : IDisposable
             action = null;
 
         if (onClick is not null && action is not null)
-            throw new ScriptRuntimeException($"ui.button '{id}' cannot use both on_click and action");
+            throw new ScriptRuntimeException($"{controlName} '{id}' cannot use both on_click and action");
 
         if (actionValue.Type != DataType.Nil && action is null)
-            throw new ScriptRuntimeException($"ui.button '{id}' value requires action");
+            throw new ScriptRuntimeException($"{controlName} '{id}' value requires action");
 
         if (onClick is null && action is null)
-            throw new ScriptRuntimeException($"ui.button '{id}' requires either on_click or action");
+            throw new ScriptRuntimeException($"{controlName} '{id}' requires either on_click or action");
 
         object? parsedActionValue = null;
         if (action is not null)
@@ -5880,7 +6282,7 @@ public sealed class SkinRuntime : IDisposable
                 DataType.String => actionValue.String,
                 DataType.Boolean => actionValue.Boolean,
                 _ => throw new ScriptRuntimeException(
-                    $"ui.button '{id}' value must be a number, string, boolean, or nil"),
+                    $"{controlName} '{id}' value must be a number, string, boolean, or nil"),
             };
         }
 
@@ -5896,7 +6298,8 @@ public sealed class SkinRuntime : IDisposable
             action,
             parsedActionValue,
             hitTestPriority,
-            scissorClip);
+            scissorClip,
+            isInput);
         _uiButtons[id] = button;
         RegisterInteractiveLayoutNode(id, parentId, (float)x, (float)y, (float)width, (float)height, button, null);
 
@@ -6160,7 +6563,7 @@ public sealed class SkinRuntime : IDisposable
             return 0f;
 
         var measured = _defaultFallbackFont is { } fallback
-            ? BuildTextLayout(font.Font, fallback, text).Size
+            ? GetCachedTextLayout(font.Font, fallback, text).Size
             : TSC.Rendering.UnicodeTextRenderer.MeasureString(font.Font, GetFontSafeText(font.Font, text));
         if (measured.X <= 0f || measured.Y <= 0f)
             return 0f;
@@ -6176,6 +6579,21 @@ public sealed class SkinRuntime : IDisposable
         {
             bounds = new XnaRectangle((int)MathF.Round(button.X), (int)MathF.Round(button.Y),
                 Math.Max(1, (int)MathF.Round(button.Width)), Math.Max(1, (int)MathF.Round(button.Height)));
+            return true;
+        }
+        bounds = XnaRectangle.Empty;
+        return false;
+    }
+
+    /// <summary>Returns the skin-registered bounds of a semantic text input.
+    /// ui.input controls participate in the same hit-test controller as buttons,
+    /// but remain distinguishable so hosts can obtain the correct text-field bounds.</summary>
+    public bool TryGetUiInputBounds(string id, out XnaRectangle bounds)
+    {
+        if (_uiButtons.TryGetValue(id, out var input) && input.IsInput)
+        {
+            bounds = new XnaRectangle((int)MathF.Round(input.X), (int)MathF.Round(input.Y),
+                Math.Max(1, (int)MathF.Round(input.Width)), Math.Max(1, (int)MathF.Round(input.Height)));
             return true;
         }
         bounds = XnaRectangle.Empty;
@@ -6203,8 +6621,8 @@ public sealed class SkinRuntime : IDisposable
 
     /// <summary>
     /// Dispatches a left-button press against the interactive UI regions declared
-    /// by the current Lua render(). Buttons invoke their action; sliders capture
-    /// the pointer and emit the mapped value immediately.
+    /// by the current Lua render(). Buttons and semantic inputs invoke their action;
+    /// sliders capture the pointer and emit the mapped value immediately.
     /// </summary>
     public bool HandleUiPointerPressed(float x, float y)
     {
@@ -6535,6 +6953,9 @@ public sealed class SkinRuntime : IDisposable
         table.Set("line", DynValue.NewCallback(DrawLine));
         table.Set("line_batch", DynValue.NewCallback(DrawLineBatch));
         table.Set("line_batch_fast", DynValue.NewCallback(DrawLineBatchFast));
+        // Specialized chart-editor waveform path: resolves the cached native audio
+        // envelope and renders every visible column in one triangle-list submission.
+        table.Set("waveform_batch_fast", DynValue.NewCallback(DrawWaveformBatchFast));
         table.Set("shadow", DynValue.NewCallback(DrawShadow));
         return table;
     }
@@ -7543,12 +7964,20 @@ public sealed class SkinRuntime : IDisposable
         var font = _fonts.Load(fontPath, size);
         if (font is null)
             return DynValue.NewNumber(0);
+        var scale = GetScale(options);
+        var cacheKey = new SkinUserTextMeasureCacheKey(font.Font, text, size, 0f,
+            scale.X, 0f, UseLegacyUiTextSizing, Wrapped: false);
+        if (text.Length <= 2048 && TryGetCachedUserTextMeasure(cacheKey, out var cachedWidth))
+            return DynValue.NewNumber(cachedWidth);
+
         var measured = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
         if (measured.X <= 0f || measured.Y <= 0f)
             return DynValue.NewNumber(0);
         var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? measured.Y : font.RasterSize);
-        var scale = GetScale(options);
-        return DynValue.NewNumber(Math.Max(0f, measured.X * (size / sizeBasis) * Math.Abs(scale.X)));
+        var width = Math.Max(0f, measured.X * (size / sizeBasis) * Math.Abs(scale.X));
+        if (text.Length <= 2048)
+            CacheUserTextMeasure(cacheKey, width);
+        return DynValue.NewNumber(width);
     }
 
     private DynValue MeasureUserTextHeight(ScriptExecutionContext _, CallbackArguments args)
@@ -7567,16 +7996,24 @@ public sealed class SkinRuntime : IDisposable
         var font = _fonts.Load(fontPath, size);
         if (font is null)
             return DynValue.NewNumber(0);
+        var transformScale = GetScale(options);
+        var cacheKey = new SkinUserTextMeasureCacheKey(font.Font, text, size, maxWidth,
+            transformScale.X, transformScale.Y, UseLegacyUiTextSizing, Wrapped: true);
+        if (text.Length <= 2048 && TryGetCachedUserTextMeasure(cacheKey, out var cachedHeight))
+            return DynValue.NewNumber(cachedHeight);
+
         var unwrapped = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
         if (unwrapped.Y <= 0f)
             return DynValue.NewNumber(0);
         var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? unwrapped.Y : font.RasterSize);
         var sizeScale = size / sizeBasis;
-        var transformScale = GetScale(options);
         var xScale = Math.Max(0.01f, sizeScale * Math.Abs(transformScale.X));
         var yScale = sizeScale * Math.Abs(transformScale.Y);
         var measured = TSC.Rendering.BbCodeTextRenderer.MeasureWrapped(font.Font, text, maxWidth, xScale);
-        return DynValue.NewNumber(Math.Max(0f, measured.Y * yScale / xScale));
+        var height = Math.Max(0f, measured.Y * yScale / xScale);
+        if (text.Length <= 2048)
+            CacheUserTextMeasure(cacheKey, height);
+        return DynValue.NewNumber(height);
     }
 
     private DynValue DrawTextBatch(ScriptExecutionContext _, CallbackArguments args)
@@ -7663,6 +8100,11 @@ public sealed class SkinRuntime : IDisposable
         var stroke = ParseTextStroke(options.Get("stroke"));
 
         var layoutSize = Vector2.Zero;
+        SkinTextLayout? textLayout = null;
+        var commandFont = font?.Font ?? _defaultFallbackFont;
+        if (!userText && commandFont is not null && _defaultFallbackFont is { } fallbackFont)
+            textLayout = GetCachedTextLayout(commandFont, fallbackFont, text);
+
         if (!string.IsNullOrWhiteSpace(id) && font is not null)
         {
             Vector2 measured;
@@ -7670,8 +8112,8 @@ public sealed class SkinRuntime : IDisposable
                 measured = textWrap && textMaxWidth > 0f
                     ? TSC.Rendering.BbCodeTextRenderer.MeasureWrapped(font.Font, text, textMaxWidth)
                     : TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
-            else if (_defaultFallbackFont is { } fallback)
-                measured = BuildTextLayout(font.Font, fallback, text).Size;
+            else if (textLayout is not null)
+                measured = textLayout.Size;
             else
                 measured = TSC.Rendering.UnicodeTextRenderer.MeasureString(font.Font, GetFontSafeText(font.Font, text));
 
@@ -7691,6 +8133,7 @@ public sealed class SkinRuntime : IDisposable
         var command = AcquireDrawCommand();
         command.Kind = userText ? SkinDrawCommandKind.UserText : SkinDrawCommandKind.Text;
         command.Text = text;
+        command.TextLayoutCache = textLayout;
         command.ScissorClip = GetScissorClip(options);
         command.Id = id;
         command.ParentId = parentId;
@@ -7942,6 +8385,179 @@ public sealed class SkinRuntime : IDisposable
                 DebugLastLineApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
                 DebugLastLineApiCalls += queued;
             }
+        }
+    }
+
+    // The specialized waveform API avoids crossing the Lua/C# boundary once per
+    // bar and consumes the retained native envelope buffers directly. The large
+    // PCM-derived arrays never become MoonSharp tables.
+    private DynValue DrawWaveformBatchFast(ScriptExecutionContext _, CallbackArguments args)
+    {
+        if (args.Count < 1 || args[0].Type != DataType.Table || args[0].Table is null)
+            throw new ScriptRuntimeException("draw.waveform_batch_fast(options) expects an options table");
+
+        if (_chartEditorWaveformRmsSource is not { Length: > 0 } levels ||
+            _chartEditorWaveformRmsPrefixSource is not { Length: > 1 } prefix ||
+            prefix.Length != levels.Length + 1)
+            return DynValue.Nil;
+
+        var options = args[0].Table!;
+        var width = Math.Max(0f, GetNumber(options, "width", 0f));
+        var height = Math.Max(0f, GetNumber(options, "height", 0f));
+        var duration = GetNumber(options, "duration", 0f);
+        var viewDuration = GetNumber(options, "view_duration", 0f);
+        if (width <= 0f || height <= 0f || duration <= 0f || viewDuration <= 0f)
+            return DynValue.Nil;
+
+        var command = AcquireDrawCommand();
+        command.Kind = SkinDrawCommandKind.WaveformBatch;
+        command.Position = new Vector2(
+            GetNumber(options, "x", 0f),
+            GetNumber(options, "y", 0f));
+        command.Size = new Vector2(width, height);
+        command.Layer = (int)Math.Round(GetNumber(options, "layer", 0f));
+        command.Order = _drawOrder++;
+        command.WaveformLevels = levels;
+        command.WaveformPrefix = prefix;
+        command.WaveformDuration = duration;
+        command.WaveformViewStart = Math.Clamp(GetNumber(options, "view_start", 0f), 0d, duration);
+        command.WaveformViewDuration = Math.Clamp(viewDuration, 0d, duration);
+        command.WaveformSelectionStart = GetNumber(options, "selection_start", 0f);
+        command.WaveformSelectionEnd = GetNumber(options, "selection_end", duration);
+        command.WaveformVerticalInset = Math.Max(0f, GetNumber(options, "vertical_inset", 0f));
+        command.WaveformNormalColor = GetColor(options, "normal_color", new XnaColor(135, 155, 176, 225));
+        command.WaveformSelectedColor = GetColor(options, "selected_color", new XnaColor(112, 229, 196, 245));
+        _drawCommands.Add(command);
+        return DynValue.Nil;
+    }
+
+    internal void RenderWaveformBatch(SkinDrawCommand command, int screenWidth, int screenHeight)
+    {
+        var levels = command.WaveformLevels;
+        var prefix = command.WaveformPrefix;
+        if (levels is not { Length: > 0 } || prefix is null || prefix.Length != levels.Length + 1 ||
+            command.WaveformDuration <= 0d || command.WaveformViewDuration <= 0d ||
+            command.Size.X <= 0f || command.Size.Y <= 0f)
+            return;
+
+        var boundsWidth = Math.Clamp((int)MathF.Ceiling(command.Size.X), 1, Math.Max(1, Math.Min(8192, screenWidth * 2)));
+        var boundsHeight = Math.Max(1, (int)MathF.Ceiling(command.Size.Y));
+        var x = command.Position.X;
+        var y = command.Position.Y;
+        var duration = command.WaveformDuration;
+        var viewStart = Math.Clamp(command.WaveformViewStart, 0d, duration);
+        var viewDuration = Math.Clamp(command.WaveformViewDuration, 0d, duration - viewStart);
+        if (viewDuration <= 0d)
+            return;
+
+        var cacheMatches = ReferenceEquals(_skinWaveformCachedLevels, levels) &&
+            ReferenceEquals(_skinWaveformCachedPrefix, prefix) &&
+            _skinWaveformCachedWidth == boundsWidth && _skinWaveformCachedHeight == boundsHeight &&
+            _skinWaveformCachedHeightExact == command.Size.Y &&
+            _skinWaveformCachedX == x && _skinWaveformCachedY == y &&
+            _skinWaveformCachedDuration == duration &&
+            _skinWaveformCachedViewStart == viewStart &&
+            _skinWaveformCachedViewDuration == viewDuration &&
+            _skinWaveformCachedSelectionStart == command.WaveformSelectionStart &&
+            _skinWaveformCachedSelectionEnd == command.WaveformSelectionEnd &&
+            _skinWaveformCachedInset == command.WaveformVerticalInset &&
+            _skinWaveformCachedNormalColor == command.WaveformNormalColor &&
+            _skinWaveformCachedSelectedColor == command.WaveformSelectedColor;
+
+        if (!cacheMatches)
+        {
+            var requiredVertices = boundsWidth * 6;
+            if (_skinWaveformVertices.Length < requiredVertices)
+                Array.Resize(ref _skinWaveformVertices, Math.Max(requiredVertices, _skinWaveformVertices.Length * 2));
+
+            var levelCount = levels.Length;
+            var visibleFirst = Math.Clamp((int)Math.Floor(viewStart / duration * levelCount), 0, levelCount - 1);
+            var visibleAfter = Math.Clamp((int)Math.Ceiling((viewStart + viewDuration) / duration * levelCount),
+                visibleFirst + 1, levelCount);
+            var visibleCount = Math.Max(1, visibleAfter - visibleFirst);
+            var centerY = y + command.Size.Y * 0.5f;
+            var halfHeight = Math.Max(1f, command.Size.Y * 0.5f - command.WaveformVerticalInset);
+
+            for (var column = 0; column < boundsWidth; column++)
+            {
+                var leftRatio = column / (double)boundsWidth;
+                var rightRatio = (column + 1) / (double)boundsWidth;
+                var first = Math.Clamp(visibleFirst + (int)Math.Floor(leftRatio * visibleCount),
+                    visibleFirst, visibleAfter - 1);
+                var after = Math.Clamp(visibleFirst + (int)Math.Ceiling(rightRatio * visibleCount),
+                    first + 1, visibleAfter);
+                var sampleCount = after - first;
+                var normalizedSum = Math.Max(0f, prefix[after] - prefix[first]);
+                var level = Math.Clamp(normalizedSum * levelCount / sampleCount, 0f, 1f);
+                var amplitude = Math.Max(1f, MathF.Floor(level * halfHeight + 0.5f));
+                var left = x + column;
+                var right = x + Math.Min(column + 1f, command.Size.X);
+                var top = centerY - amplitude;
+                var bottom = centerY + amplitude + 1f;
+                var columnStartTime = viewStart + (column / (double)boundsWidth) * viewDuration;
+                var color = columnStartTime >= command.WaveformSelectionStart &&
+                    columnStartTime < command.WaveformSelectionEnd
+                    ? command.WaveformSelectedColor
+                    : command.WaveformNormalColor;
+                var vertex = column * 6;
+                _skinWaveformVertices[vertex] = new VertexPositionColor(new Vector3(left, top, 0f), color);
+                _skinWaveformVertices[vertex + 1] = new VertexPositionColor(new Vector3(right, top, 0f), color);
+                _skinWaveformVertices[vertex + 2] = new VertexPositionColor(new Vector3(right, bottom, 0f), color);
+                _skinWaveformVertices[vertex + 3] = _skinWaveformVertices[vertex];
+                _skinWaveformVertices[vertex + 4] = _skinWaveformVertices[vertex + 2];
+                _skinWaveformVertices[vertex + 5] = new VertexPositionColor(new Vector3(left, bottom, 0f), color);
+            }
+
+            _skinWaveformVertexCount = requiredVertices;
+            _skinWaveformCachedLevels = levels;
+            _skinWaveformCachedPrefix = prefix;
+            _skinWaveformCachedWidth = boundsWidth;
+            _skinWaveformCachedHeight = boundsHeight;
+            _skinWaveformCachedHeightExact = command.Size.Y;
+            _skinWaveformCachedX = x;
+            _skinWaveformCachedY = y;
+            _skinWaveformCachedDuration = duration;
+            _skinWaveformCachedViewStart = viewStart;
+            _skinWaveformCachedViewDuration = viewDuration;
+            _skinWaveformCachedSelectionStart = command.WaveformSelectionStart;
+            _skinWaveformCachedSelectionEnd = command.WaveformSelectionEnd;
+            _skinWaveformCachedInset = command.WaveformVerticalInset;
+            _skinWaveformCachedNormalColor = command.WaveformNormalColor;
+            _skinWaveformCachedSelectedColor = command.WaveformSelectedColor;
+        }
+
+        if (_skinWaveformVertexCount <= 0)
+            return;
+
+        var previousBlendState = _graphics.BlendState;
+        var previousDepthStencilState = _graphics.DepthStencilState;
+        var previousRasterizerState = _graphics.RasterizerState;
+        try
+        {
+            _skinWaveformEffect.World = XnaMatrix.Identity;
+            _skinWaveformEffect.View = XnaMatrix.Identity;
+            _skinWaveformEffect.Projection = XnaMatrix.CreateOrthographicOffCenter(
+                0f, Math.Max(1, screenWidth), Math.Max(1, screenHeight), 0f, 0f, 1f);
+            _graphics.BlendState = BlendState.NonPremultiplied;
+            _graphics.DepthStencilState = DepthStencilState.None;
+            _graphics.RasterizerState = command.ScissorClip.HasValue
+                ? _uiScissorRasterizerState
+                : RasterizerState.CullNone;
+            foreach (var pass in _skinWaveformEffect.CurrentTechnique.Passes)
+            {
+                pass.Apply();
+                _graphics.DrawUserPrimitives(
+                    PrimitiveType.TriangleList,
+                    _skinWaveformVertices,
+                    0,
+                    _skinWaveformVertexCount / 3);
+            }
+        }
+        finally
+        {
+            _graphics.BlendState = previousBlendState;
+            _graphics.DepthStencilState = previousDepthStencilState;
+            _graphics.RasterizerState = previousRasterizerState;
         }
     }
 
@@ -8484,9 +9100,11 @@ public sealed class SkinRuntime : IDisposable
         foreach (var sound in _skinSounds.Values) sound?.Dispose();
         _skinSounds.Clear();
         _assets.Dispose();
+        ClearTextLayoutCache();
         _fonts.Dispose();
         _skin3DWhiteTexture.Dispose();
         _skin3DEffect.Dispose();
+        _skinWaveformEffect.Dispose();
         _uiScissorRasterizerState.Dispose();
         // Content-loaded effects are owned by Game1/ContentManager, so do not dispose _skinQuad3DEffect.
         _drawCommands.Clear();

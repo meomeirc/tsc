@@ -16,6 +16,11 @@
         <Start>&#160;</Start>
         <End>&#255;</End>
       </CharacterRegion>
+      <!-- General punctuation keeps frequently changing hover labels on the native SpriteFont path. -->
+      <CharacterRegion>
+        <Start>&#8192;</Start>
+        <End>&#8303;</End>
+      </CharacterRegion>
     </CharacterRegions>
   </Asset>
 </XnaContent>

@@ -542,6 +542,13 @@ public sealed partial class Playfield
         _editorPanelEventsByKey.Clear();
         _editorPanelEventsByCell.Clear();
         _editorPanelsNextEventIndexByTrack.Clear();
+        foreach (var occupancyBucket in _editorNoteOccupancyByTrack)
+            occupancyBucket.Clear();
+        _editorNoteOccupancyCacheChart = null;
+        _editorNoteOccupancyCacheValid = false;
+        _editorNoteOccupancyCacheGroupEditMode = false;
+        _editorNoteOccupancyCacheGroupId = null;
+        _editorNoteOccupancyCacheInstanceId = null;
         _cachedRenderRangeTick = double.NaN;
         _cachedRenderRangeFirst = 0;
         _cachedRenderRangeLast = 0;
@@ -555,6 +562,7 @@ public sealed partial class Playfield
         _linkChainCache.Clear();
         _linkChainEffectiveEndTickCache.Clear();
         _linkChainRootByMember.Clear();
+        _editorLinkHoverChainCacheComplete = false;
 
         if (_chart is null || _tempo is null)
             return;
@@ -623,6 +631,19 @@ public sealed partial class Playfield
                 ? (terminal.Duration > 6 ? terminal.EndTick : terminal.Tick)
                 : (ev.Duration > 6 ? ev.EndTick : ev.Tick);
         }
+
+        // The fast hover path can use cached root-to-tail chains only when they
+        // represent every authored link edge. Keep the full-edge fallback for
+        // branching, ambiguous, or orphaned link graphs.
+        var cachedLinkEdgeCount = 0;
+        foreach (var chain in _linkChainCache.Values)
+            cachedLinkEdgeCount += Math.Max(0, chain.Count - 1);
+        _editorLinkHoverChainCacheComplete =
+            cachedLinkEdgeCount == _chart.Links.Count && _ambiguousNextLinkHeadKeys.Count == 0;
+
+        // Build the per-track occupancy lookup after link adjacency and chain
+        // caches are ready, so link bodies receive their true connected endpoint.
+        RebuildEditorNoteOccupancyIndex();
 
         for (var eventIndex = 0; eventIndex < _orderedRenderableEvents.Count; eventIndex++)
         {

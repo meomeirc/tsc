@@ -201,6 +201,13 @@ public sealed class AresChart
     public int? Level { get; set; }
     public string? MusicPath { get; set; }
     public string? PreviewPath { get; set; }
+    // The selected source-audio preview range is editor metadata. It is stored
+    // in the reserved-track metadata payload, never in song.json.
+    public int? PreviewStartMilliseconds { get; set; }
+    public int? PreviewEndMilliseconds { get; set; }
+    public bool HasPreviewRange => PreviewStartMilliseconds.HasValue &&
+        PreviewEndMilliseconds.HasValue && PreviewStartMilliseconds.Value >= 0 &&
+        PreviewEndMilliseconds.Value > PreviewStartMilliseconds.Value;
     public string? AlbumPath { get; set; }
     public string? AlbumBigPath { get; set; }
     public uint RawMagic { get; set; }

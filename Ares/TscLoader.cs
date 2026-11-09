@@ -35,6 +35,7 @@ public static class TscLoader
     {
         ArgumentNullException.ThrowIfNull(chart);
         AresMetadataDefaults.Apply(chart);
+        var noteGroupMetadataEvents = NoteGroupMetadataCodec.CreateMetadataEvents(chart, forAresExport: false);
         var lines = new List<string> { "TSC,1", "[meta]" };
 
         void Meta(string key, string? value)
@@ -60,7 +61,7 @@ public static class TscLoader
             RawMagic = chart.RawMagic,
             TrackCount = Math.Max(
                 Math.Clamp(chart.AresTrackCount, 1, byte.MaxValue),
-                chart.NoteGroups.Count > 0 ? NoteGroupMetadataCodec.RequiredTrackCount : 1),
+                noteGroupMetadataEvents.Count > 0 ? NoteGroupMetadataCodec.RequiredTrackCount : 1),
             InstrumentNames = chart.InstrumentNames.ToList(),
             InstrumentNameHuffmanFrequencies = chart.InstrumentNameHuffmanFrequencies.ToList(),
             InstrumentNameReferences = chart.InstrumentNameReferences.ToList(),
@@ -75,7 +76,6 @@ public static class TscLoader
         // stable for equal ticks, but do not promote track number ahead of time.
         // Callback-reconstructed notes are generated from source ARES data;
         // writing them as authored events would duplicate them on the next load.
-        var noteGroupMetadataEvents = NoteGroupMetadataCodec.CreateMetadataEvents(chart, forAresExport: false);
         var authoredEvents = chart.Events
             .Where(ev => !ev.LoopReconstructed && !NoteGroupMetadataCodec.IsMetadataEvent(ev))
             .Concat(noteGroupMetadataEvents)

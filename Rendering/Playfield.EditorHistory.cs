@@ -52,6 +52,8 @@ public sealed partial class Playfield
         public int? Level { get; init; }
         public string? MusicPath { get; init; }
         public string? PreviewPath { get; init; }
+        public int? PreviewStartMilliseconds { get; init; }
+        public int? PreviewEndMilliseconds { get; init; }
         public string? AlbumPath { get; init; }
         public string? AlbumBigPath { get; init; }
         public double MetadataBpm { get; init; }
@@ -267,6 +269,8 @@ public sealed partial class Playfield
             Level = _chart.Level,
             MusicPath = _chart.MusicPath,
             PreviewPath = _chart.PreviewPath,
+            PreviewStartMilliseconds = _chart.PreviewStartMilliseconds,
+            PreviewEndMilliseconds = _chart.PreviewEndMilliseconds,
             AlbumPath = _chart.AlbumPath,
             AlbumBigPath = _chart.AlbumBigPath,
             MetadataBpm = _chart.MetadataBpm,
@@ -486,6 +490,8 @@ public sealed partial class Playfield
             chart.Level != snapshot.Level ||
             !string.Equals(chart.MusicPath, snapshot.MusicPath, StringComparison.Ordinal) ||
             !string.Equals(chart.PreviewPath, snapshot.PreviewPath, StringComparison.Ordinal) ||
+            chart.PreviewStartMilliseconds != snapshot.PreviewStartMilliseconds ||
+            chart.PreviewEndMilliseconds != snapshot.PreviewEndMilliseconds ||
             !string.Equals(chart.AlbumPath, snapshot.AlbumPath, StringComparison.Ordinal) ||
             !string.Equals(chart.AlbumBigPath, snapshot.AlbumBigPath, StringComparison.Ordinal) ||
             chart.MetadataBpm != snapshot.MetadataBpm || chart.InitialTempo != snapshot.InitialTempo ||
@@ -789,6 +795,9 @@ public sealed partial class Playfield
             state.Event.NoteGroupMemberId = state.NoteGroupMemberId;
         }
 
+        _chart.PreviewStartMilliseconds = snapshot.PreviewStartMilliseconds;
+        _chart.PreviewEndMilliseconds = snapshot.PreviewEndMilliseconds;
+        _editorPreviewRangeInitialized = _chart.HasPreviewRange;
         _chart.MetadataBpm = snapshot.MetadataBpm;
         _chart.InitialTempo = snapshot.InitialTempo;
         _chart.PlayTick = snapshot.PlayTick;
@@ -843,6 +852,7 @@ public sealed partial class Playfield
         _editorDragIsHoldEnd = false;
         _editorDragChanged = false;
         RefreshAfterEditorMutation();
+        SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
     }
 

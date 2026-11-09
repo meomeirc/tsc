@@ -98,7 +98,7 @@ local function draw_slider_row(options)
     local field_text = editing and tostring(menu.editing_text or "") or options.value_label
     local field_height = math.min(44, row_height - 4)
     local field_y = (row_height - field_height) * 0.5
-    UI.draw_button({
+    UI.draw_input({
         id = options.control_id .. "_value",
         parent = row_id,
         x = value_x,
@@ -436,9 +436,14 @@ local function draw_keybinds_page(width, height)
     local label_width = row_width * 0.39
     local slot_gap = 12
     local slot_width = math.max(100, (row_width - label_width - slot_gap) / 2)
-    local clear_width = 20
-    local icon_gap = 3
-    local slot_button_width = math.max(44, slot_width - clear_width * 2 - icon_gap * 2)
+    local icon_gap = 5
+    local min_slot_button_width = 44
+    -- Keep Clear/Reset comfortably clickable without letting narrow layouts
+    -- squeeze the actual keybind slot below its minimum usable width.
+    local clear_width = math.min(36, math.max(20,
+        math.floor((slot_width - min_slot_button_width - icon_gap * 2) * 0.5)))
+    local slot_button_width = math.max(min_slot_button_width,
+        slot_width - clear_width * 2 - icon_gap * 2)
     local primary_x = label_width
     local secondary_x = primary_x + slot_width + slot_gap
     draw.text("PRIMARY", {

@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -26,11 +27,15 @@ public sealed class OpusAudioPlayer : IDisposable
     private CancellationTokenSource? _initialDecodeCancellation;
     private long _initialDecodeStartedTimestamp;
     private Task<byte[]>? _recoveryPcmTask;
+    private Task<float[]>? _waveformRmsTask;
+    private CancellationTokenSource? _waveformRmsCancellation;
+    private int _waveformRmsBucketCount;
     private double _durationSeconds;
     private bool _isLooped;
     private float _volume = 1f;
     private SoundEffect? _effect;
     private SoundEffectInstance? _instance;
+    private bool _effectContainsFullSource;
 
     public bool IsLoaded => _durationSeconds > 0.0 && (_pcm is not null || _effect is not null || _opusData is not null);
     public bool IsLoading => _initialDecodeTask is not null;
@@ -50,6 +55,90 @@ public sealed class OpusAudioPlayer : IDisposable
     }
     public double DurationSeconds => _durationSeconds;
     public long PcmBytes => _pcm?.LongLength ?? 0;
+    public int SourceGeneration { get; private set; }
+
+    /// <summary>
+    /// Builds a compact RMS waveform directly from the retained decoded PCM.
+    /// The task holds a reference to the existing buffer and stores only a small
+    /// envelope; it never makes another full-song PCM copy. RMS levels preserve
+    /// musical dynamics better than per-bucket absolute peaks on heavily limited audio.
+    /// </summary>
+    public Task<float[]> GetWaveformRmsEnvelopeAsync(int bucketCount = 32768)
+    {
+        if (_pcm is not { Length: >= 4 } pcm)
+            return Task.FromResult(Array.Empty<float>());
+
+        bucketCount = Math.Clamp(bucketCount, 64, 65536);
+        if (_waveformRmsTask is not null && _waveformRmsBucketCount == bucketCount)
+            return _waveformRmsTask;
+
+        ResetWaveformRmsCache();
+        var cancellation = new CancellationTokenSource();
+        var cancellationToken = cancellation.Token;
+        _waveformRmsCancellation = cancellation;
+        _waveformRmsBucketCount = bucketCount;
+        _waveformRmsTask = Task.Run(() => BuildWaveformRmsEnvelope(pcm, bucketCount, cancellationToken), cancellationToken);
+        return _waveformRmsTask;
+    }
+
+    /// <summary>Releases the cached editor waveform and cancels any unfinished build.</summary>
+    public void ReleaseWaveformRmsEnvelope() => ResetWaveformRmsCache();
+
+    private static float[] BuildWaveformRmsEnvelope(byte[] pcm, int bucketCount, CancellationToken cancellationToken)
+    {
+        var frameCount = pcm.LongLength / (Channels * BytesPerSample);
+        if (frameCount <= 0)
+            return Array.Empty<float>();
+
+        bucketCount = (int)Math.Clamp((long)bucketCount, 1, frameCount);
+        var levels = new float[bucketCount];
+        const double fullScaleSquared = 32768d * 32768d;
+
+        for (var bucket = 0; bucket < bucketCount; bucket++)
+        {
+            var firstFrame = (long)bucket * frameCount / bucketCount;
+            var endFrame = (long)(bucket + 1) * frameCount / bucketCount;
+            long sumSquares = 0;
+            var sampleCount = Math.Max(1L, (endFrame - firstFrame) * Channels);
+
+            for (var frame = firstFrame; frame < endFrame; frame++)
+            {
+                if ((frame & 0x3FFF) == 0)
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                var offset = checked((int)(frame * Channels * BytesPerSample));
+                var left = BinaryPrimitives.ReadInt16LittleEndian(pcm.AsSpan(offset, BytesPerSample));
+                var right = BinaryPrimitives.ReadInt16LittleEndian(pcm.AsSpan(offset + BytesPerSample, BytesPerSample));
+                sumSquares += (long)left * left + (long)right * right;
+            }
+
+            levels[bucket] = (float)Math.Sqrt(sumSquares / (sampleCount * fullScaleSquared));
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // A mastered track can have a very narrow RMS range even though its
+        // beats and fills are musically distinct. Stretch the useful 2nd-98th
+        // percentile range so those differences remain visible, while ignoring
+        // isolated silence and extreme outliers. If the track is truly uniform,
+        // retain its natural RMS levels rather than inventing contrast.
+        if (levels.Length >= 32)
+        {
+            var sortedLevels = (float[])levels.Clone();
+            Array.Sort(sortedLevels);
+            var low = sortedLevels[(int)((sortedLevels.Length - 1) * 0.02f)];
+            var high = sortedLevels[(int)((sortedLevels.Length - 1) * 0.98f)];
+            var range = high - low;
+            if (range >= 0.025f)
+            {
+                var inverseRange = 1f / range;
+                for (var index = 0; index < levels.Length; index++)
+                    levels[index] = Math.Clamp((levels[index] - low) * inverseRange, 0f, 1f);
+            }
+        }
+
+        return levels;
+    }
     public float Volume
     {
         get => _volume;
@@ -73,6 +162,96 @@ public sealed class OpusAudioPlayer : IDisposable
         }
 
         _durationSeconds = _pcm.Length / (double)(SampleRate * Channels * BytesPerSample);
+    }
+
+    /// <summary>Loads already-decoded 48 kHz stereo signed-16-bit PCM without encoding it.</summary>
+    /// <remarks>The supplied array becomes this player's owned PCM buffer.</remarks>
+    public void LoadPcm(byte[] pcm)
+    {
+        ArgumentNullException.ThrowIfNull(pcm);
+        Stop();
+        DisposeLoadedAudio();
+        var bytesPerFrame = Channels * BytesPerSample;
+        if (pcm.Length == 0 || pcm.Length % bytesPerFrame != 0)
+            throw new ArgumentException("PCM must contain complete 48 kHz stereo 16-bit sample frames.", nameof(pcm));
+
+        _pcm = pcm;
+        _durationSeconds = pcm.Length / (double)(SampleRate * bytesPerFrame);
+    }
+
+    /// <summary>
+    /// Copies a range from this player's retained decoded source and applies linear
+    /// sample-level fades at the supplied absolute source positions. The original
+    /// decoded PCM is never modified and no codec/encoder is involved.
+    /// </summary>
+    public byte[] CreateFadedPcmRange(
+        double rangeStartSeconds,
+        double fadeInStartSeconds,
+        double fadeOutEndSeconds,
+        double fadeDurationSeconds)
+    {
+        if (_pcm is not { Length: >= 4 } source)
+            throw new InvalidOperationException("Decoded PCM is not available for real-time preview fading.");
+        if (!double.IsFinite(rangeStartSeconds) || !double.IsFinite(fadeInStartSeconds) ||
+            !double.IsFinite(fadeOutEndSeconds) || !double.IsFinite(fadeDurationSeconds))
+            throw new ArgumentOutOfRangeException(nameof(rangeStartSeconds), "Fade positions must be finite.");
+
+        var bytesPerFrame = Channels * BytesPerSample;
+        var sourceFrameCount = source.Length / bytesPerFrame;
+        var rangeStartFrame = Math.Clamp(
+            (long)Math.Round(rangeStartSeconds * SampleRate, MidpointRounding.AwayFromZero), 0, sourceFrameCount);
+        var fadeInStartFrame = Math.Clamp(
+            (long)Math.Round(fadeInStartSeconds * SampleRate, MidpointRounding.AwayFromZero), 0, sourceFrameCount);
+        var fadeOutEndFrame = Math.Clamp(
+            (long)Math.Round(fadeOutEndSeconds * SampleRate, MidpointRounding.AwayFromZero), 0, sourceFrameCount);
+        if (fadeOutEndFrame <= rangeStartFrame || fadeInStartFrame >= fadeOutEndFrame)
+            throw new ArgumentException("The requested PCM preview range is empty or invalid.");
+
+        var outputFrameCount = fadeOutEndFrame - rangeStartFrame;
+        if (outputFrameCount > int.MaxValue / bytesPerFrame)
+            throw new InvalidOperationException("The selected preview range is too large to prepare in memory.");
+
+        var output = new byte[checked((int)(outputFrameCount * bytesPerFrame))];
+        Buffer.BlockCopy(source, checked((int)(rangeStartFrame * bytesPerFrame)), output, 0, output.Length);
+
+        var fadeFrames = fadeDurationSeconds <= 0
+            ? 0L
+            : Math.Clamp((long)Math.Round(fadeDurationSeconds * SampleRate, MidpointRounding.AwayFromZero), 0, outputFrameCount);
+        if (fadeFrames <= 1)
+            return output;
+
+        var fadeInEndFrame = Math.Min(fadeOutEndFrame, fadeInStartFrame + fadeFrames);
+        var fadeOutStartFrame = Math.Max(fadeInStartFrame, fadeOutEndFrame - fadeFrames);
+        var fadeDenominator = (double)(fadeFrames - 1);
+
+        void ApplyFadeRange(long firstSourceFrame, long endSourceFrame, Func<long, double> getGain)
+        {
+            for (var sourceFrame = firstSourceFrame; sourceFrame < endSourceFrame; sourceFrame++)
+            {
+                var gain = Math.Clamp(getGain(sourceFrame), 0.0, 1.0);
+                var outputOffset = checked((int)((sourceFrame - rangeStartFrame) * bytesPerFrame));
+                for (var channel = 0; channel < Channels; channel++)
+                {
+                    var sampleOffset = outputOffset + channel * BytesPerSample;
+                    var sample = BinaryPrimitives.ReadInt16LittleEndian(output.AsSpan(sampleOffset, BytesPerSample));
+                    var faded = (int)Math.Round(sample * gain, MidpointRounding.AwayFromZero);
+                    BinaryPrimitives.WriteInt16LittleEndian(output.AsSpan(sampleOffset, BytesPerSample),
+                        (short)Math.Clamp(faded, short.MinValue, short.MaxValue));
+                }
+            }
+        }
+
+        // Touch only the two fade windows. The unchanged middle of the preview
+        // remains a single block copy, even for several-minute selections.
+        ApplyFadeRange(
+            Math.Max(rangeStartFrame, fadeInStartFrame),
+            fadeInEndFrame,
+            sourceFrame => (sourceFrame - fadeInStartFrame) / fadeDenominator);
+        ApplyFadeRange(
+            Math.Max(rangeStartFrame, fadeOutStartFrame),
+            fadeOutEndFrame,
+            sourceFrame => (fadeOutEndFrame - 1 - sourceFrame) / fadeDenominator);
+        return output;
     }
 
     /// <summary>
@@ -241,6 +420,7 @@ public sealed class OpusAudioPlayer : IDisposable
         // near tick 0, that work could become a visible startup hitch and leave
         // the software chart clock ahead of the audio.
         _effect = CreateTrackedSoundBuffer(_pcm!);
+        _effectContainsFullSource = true;
         _instance = CreateTrackedSoundSource(_effect);
         _instance.IsLooped = _isLooped;
         _instance.Volume = _volume;
@@ -269,6 +449,38 @@ public sealed class OpusAudioPlayer : IDisposable
     }
 
     public void Pause() => _instance?.Pause();
+
+    /// <summary>
+    /// Seeks within the retained decoded source. It uses the existing full-song
+    /// buffer plus an OpenAL offset when available, with PCM slicing as a fallback.
+    /// </summary>
+    public void SeekToSeconds(double seconds, bool play = true)
+    {
+        if (!IsLoaded || !double.IsFinite(seconds))
+            return;
+        seconds = Math.Clamp(seconds, 0, Math.Max(0, DurationSeconds - 1.0 / SampleRate));
+        if (seconds <= 0.000001)
+        {
+            try { _instance?.Stop(); } catch { }
+            StartAtAudioTime(seconds);
+        }
+        else if (_pcm is not null && _effectContainsFullSource && _instance is not null)
+        {
+            // Keep the prepared full-song buffer in place for preview scrubbing and
+            // loop wraps. OpenAL's second offset avoids allocating another PCM slice
+            // on every seek; fall back to the established slice path if unavailable.
+            try { _instance.Stop(); } catch { }
+            _instance.Play();
+            if (!TrySetOpenAlSourceOffset(_instance, seconds, "AUDIO_PREVIEW_SEEK"))
+                StartAtAudioTime(seconds);
+        }
+        else
+        {
+            StartAtAudioTime(seconds);
+        }
+        if (!play)
+            Pause();
+    }
 
     public void Resume()
     {
@@ -332,7 +544,7 @@ public sealed class OpusAudioPlayer : IDisposable
     /// <summary>Recreates the sound effect after an OpenAL context reset.</summary>
     internal void RecreateAfterAudioSystemReset()
     {
-        if (_durationSeconds <= 0 || _opusData is null)
+        if (_durationSeconds <= 0 || (_opusData is null && _pcm is null))
             return;
         if (_effect is not null && _instance is not null)
             return;
@@ -344,7 +556,7 @@ public sealed class OpusAudioPlayer : IDisposable
         else if (_recoveryPcmTask is not null)
             pcm = _recoveryPcmTask.GetAwaiter().GetResult();
         else
-            pcm = DecodeOpus(_opusData);
+            pcm = DecodeOpus(_opusData!);
         if (pcm.Length == 0)
             throw new InvalidDataException("The retained music.opus could not be decoded during audio recovery.");
 
@@ -357,6 +569,7 @@ public sealed class OpusAudioPlayer : IDisposable
             newInstance.IsLooped = _isLooped;
             newInstance.Volume = _volume;
             _effect = newEffect;
+            _effectContainsFullSource = true;
             _instance = newInstance;
             if (!retainPcm)
                 _pcm = null;
@@ -507,7 +720,8 @@ public sealed class OpusAudioPlayer : IDisposable
         // PCM is retained, so the first Play() does not allocate/copy the full song
         // during gameplay. Other positions use a sliced effect when PCM is present,
         // or an OpenAL source offset when normal gameplay has released the PCM copy.
-        if (seconds <= 0.000001 && _effect is not null && _instance is not null && _pcm is not null)
+        if (seconds <= 0.000001 && _effect is not null && _instance is not null &&
+            _pcm is not null && _effectContainsFullSource)
         {
             if (_instance.State != SoundState.Playing)
                 _instance.Play();
@@ -575,6 +789,7 @@ public sealed class OpusAudioPlayer : IDisposable
         replacementInstance.IsLooped = _isLooped;
         replacementInstance.Volume = _volume;
         _effect = replacementEffect;
+        _effectContainsFullSource = sampleFrame == 0 && length == _pcm.Length;
         _instance = replacementInstance;
         try
         {
@@ -587,8 +802,34 @@ public sealed class OpusAudioPlayer : IDisposable
         _instance.Play();
     }
 
+    private void ResetWaveformRmsCache()
+    {
+        var cancellation = _waveformRmsCancellation;
+        var task = _waveformRmsTask;
+        _waveformRmsCancellation = null;
+        _waveformRmsTask = null;
+        _waveformRmsBucketCount = 0;
+        if (task is not null)
+        {
+            // The editor can close before the background task completes. Observe
+            // any late failure even when no UI remains to consume the result.
+            _ = task.ContinueWith(
+                static completed => { _ = completed.Exception; },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+        if (cancellation is not null)
+        {
+            try { cancellation.Cancel(); } catch { }
+            cancellation.Dispose();
+        }
+    }
+
     private void DisposeLoadedAudio()
     {
+        SourceGeneration++;
+        ResetWaveformRmsCache();
         var pendingDecode = _initialDecodeTask;
         try { _initialDecodeCancellation?.Cancel(); } catch { }
         if (pendingDecode is not null)
@@ -614,6 +855,7 @@ public sealed class OpusAudioPlayer : IDisposable
         _instance = null;
         DisposeTrackedSoundBuffer(_effect);
         _effect = null;
+        _effectContainsFullSource = false;
         _durationSeconds = 0.0;
     }
 

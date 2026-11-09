@@ -37,11 +37,17 @@ local LAYOUT = {
     text_medium = UI.sizes.body,
     caption = UI.sizes.small,
     problem_rows = 5,
-    preview_width = 860,
-    preview_height = 540,
-    preview_slider_y = 205,
-    preview_input_y = 295,
-    preview_side_margin = 62,
+    -- The preview editor is intentionally much larger than the other modal
+    -- panels. Its invisible ui.button hitboxes below are the authoritative
+    -- input geometry consumed by C#; other skins can freely place these regions.
+    preview_width = 1280,
+    preview_height = 820,
+    preview_ruler_y = 145,
+    preview_ruler_height = 48,
+    preview_timeline_y = 198,
+    preview_timeline_height = 300,
+    preview_input_y = 570,
+    preview_side_margin = 76,
 }
 
 local function num(value, fallback)
@@ -292,6 +298,8 @@ local function wrapEditableText(text, maxWidth, size, font)
 end
 
 local function panel(id, x, y, width, height, title, layer)
+    -- Keep the shield ID stable: its registered bounds are the panel's real
+    -- input region, including blank space and areas with no visible controls.
     ui.button({ id = id .. "_shield", x = x, y = y, width = width, height = height,
         action = "editor.block" })
     UI.draw_panel({
@@ -1069,11 +1077,11 @@ end
 -- not shift the value while the user types.
 drawTextField = function(id, value, action, actionValue, x, y, width, height, layer, focused, editable,
     caretOffset, selectionOffset, selectionWidth, measuredTextWidth, centered, wrapValue, caretByteIndex, anchorByteIndex, userText,
-    bbcodeStripOpen, screenWidth, screenHeight, clip)
+    bbcodeStripOpen, screenWidth, screenHeight, clip, textSizeOverride)
     local display = tostring(value or "")
     local textLeft = x + 10 * ACTIVE_SCALE
     local textLimit = math.max(1, width - 20 * ACTIVE_SCALE)
-    local textSize = fontSize("small")
+    local textSize = math.max(fontSize("small"), num(textSizeOverride, 0))
     local lineHeight = math.max(16 * ACTIVE_SCALE, textSize * 1.2)
     if not editable then
         draw.rect({ id = id .. "_readonly", x = x, y = y, width = width, height = height,
@@ -1106,7 +1114,7 @@ drawTextField = function(id, value, action, actionValue, x, y, width, height, la
         end
         return
     end
-    UI.draw_button({
+    UI.draw_input({
         id = id, x = x, y = y, width = width, height = height,
         label = "",
         text_size = textSize, text_color = C.text,
@@ -1242,11 +1250,24 @@ local function textField(item, x, y, width, height, layer, wrapValue, screenWidt
         item.bbcode_strip_open == true, screenWidth, screenHeight, clip)
 end
 
+local metaRowLayoutCache = {}
+
 local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
     local trailing = item.label == "PREVIEW" and (132 * scale) or
         (item.label == "ALBUM" or
             (item.label == "ALBUM BIG" and item.value ~= "Unsupported by TSTS")) and (68 * scale) or (8 * scale)
     local fieldW = math.max(96 * scale, panelW - padding * 2 - trailing - 22 * scale)
+    local textSize = fontSize("small")
+    local cacheIndex = tonumber(item.index) or tostring(item.label or "")
+    local cached = metaRowLayoutCache[cacheIndex]
+    if cached and cached.label == item.label and cached.value == item.value and
+        cached.kind == item.kind and cached.statsKind == item.stats_kind and
+        cached.userText == item.user_text and cached.editing == item.editing and
+        cached.fieldW == fieldW and cached.scale == scale and
+        cached.rowLabelH == rowLabelH and cached.rowLabelGap == rowLabelGap and
+        cached.rowGap == rowGap and cached.textSize == textSize and cached.font == F.regular then
+        return cached.layout
+    end
     -- The bank labels live in one shared header row; each data row only needs
     -- enough height for its single centered value line.
     local fieldH = item.stats_kind == "combo" and (128 * scale)
@@ -1254,7 +1275,6 @@ local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabe
         or item.stats_kind == "bank" and (46 * scale)
         or (46 * scale)
     if item.stats_kind == nil and item.kind ~= "toggle" and item.kind ~= "picker" and item.kind ~= "danger" then
-        local textSize = fontSize("small")
         local textLimit = math.max(1, fieldW - 20 * scale)
         local lineHeight = math.max(16 * scale, textSize * 1.2)
         if item.user_text == true and item.editing ~= true then
@@ -1269,7 +1289,7 @@ local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabe
             fieldH = math.ceil(math.max(fieldH, #lines * lineHeight + 12 * scale))
         end
     end
-    return {
+    local layout = {
         fieldW = fieldW,
         fieldH = fieldH,
         labelH = rowLabelH,
@@ -1277,25 +1297,47 @@ local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabe
         rowGap = rowGap,
         pitch = rowLabelH + rowLabelGap + fieldH + rowGap,
     }
+    metaRowLayoutCache[cacheIndex] = {
+        label = item.label,
+        value = item.value,
+        kind = item.kind,
+        statsKind = item.stats_kind,
+        userText = item.user_text,
+        editing = item.editing,
+        fieldW = fieldW,
+        scale = scale,
+        rowLabelH = rowLabelH,
+        rowLabelGap = rowLabelGap,
+        rowGap = rowGap,
+        textSize = textSize,
+        font = F.regular,
+        layout = layout,
+    }
+    return layout
 end
 
+local metaLayoutsScratch = {}
+
 local function buildMetaRowLayouts(rows, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
-    local layouts = {}
+    local layouts = metaLayoutsScratch
     local totalHeight = 0
     for index, item in ipairs(rows) do
         local layout = getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
+        layout.prefixHeight = totalHeight
         layouts[index] = layout
         totalHeight = totalHeight + layout.pitch
+    end
+    for index = #rows + 1, #layouts do
+        layouts[index] = nil
     end
     return layouts, totalHeight
 end
 
 local function metaPrefixHeight(layouts, endExclusive)
-    local height = 0
-    for index = 1, math.min(endExclusive or 0, #layouts) do
-        height = height + layouts[index].pitch
-    end
-    return height
+    local count = math.min(endExclusive or 0, #layouts)
+    if count <= 0 then return 0 end
+    local last = layouts[count]
+    return (last.prefixHeight or 0) + last.pitch
 end
 
 
@@ -1345,11 +1387,26 @@ local function drawMeta(state, w, h, layer)
     local baseFieldH = 46 * scale
     local rowGap = 8 * scale
     local rowPitch = rowLabelH + rowLabelGap + baseFieldH + rowGap
-    local dynamicLayouts, totalRowsHeight = buildMetaRowLayouts(rows, panelW, padding, scale,
-        rowLabelH, rowLabelGap, rowGap)
     local contentHeight = math.max(0, contentBottom - contentTop)
+    local dynamicLayouts, totalRowsHeight
+    if state.meta_category ~= "MEDIA" and state.meta_category ~= "TEST" then
+        dynamicLayouts, totalRowsHeight = buildMetaRowLayouts(rows, panelW, padding, scale,
+            rowLabelH, rowLabelGap, rowGap)
+    else
+        -- MEDIA uses fixed card positions and TEST lays out its own content. Neither
+        -- consumes variable row layouts, so avoid measuring/wrapping metadata values.
+        -- Preserve the C#-computed scroll maximum without rebuilding unused row layouts.
+        dynamicLayouts = {}
+        totalRowsHeight = num(state.meta_scroll_max, 0) + contentHeight
+    end
     local contentClip = { left = x + padding, top = contentTop,
         right = x + panelW - padding, bottom = contentBottom }
+    -- Expose the exact skin-owned scroll viewport to the editor. C# uses this
+    -- registered rectangle for wheel routing and text-field clipping; it must
+    -- never guess the Info panel's content coordinates independently.
+    ui.button({ id = "editor_meta_scroll_area", x = x + padding, y = contentTop,
+        width = math.max(1, panelW - padding * 2), height = contentHeight,
+        action = "editor.block", hit_test_priority = -1000 })
     -- Metadata rows use the same continuous pixel offset as the shared
     -- SmoothScrollHandler. Variable-height rows are positioned from their prefix
     -- heights, allowing the viewport to show partial rows at either edge.
@@ -1748,21 +1805,49 @@ local function drawMeta(state, w, h, layer)
                 cardHeight - 92 * scale))
             local frameX = cardX + (cardW - frameSize) * 0.5
             local frameY = cardTop + 34 * scale
+            local frameId = buttonId .. "_artwork_frame"
             -- Keep the artwork frame ID distinct from UI.draw_button's generated
             -- `<button id>_frame` ID for the SET/CHANGE IMAGE button below.
-            draw.rect({ id = buttonId .. "_artwork_frame", x = frameX, y = frameY,
-                width = frameSize, height = frameSize, color = C.button, layer = (layer or 100) + 5 })
+            draw.rect({ id = frameId, x = frameX, y = frameY,
+                width = frameSize, height = frameSize, color = C.button,
+                anchor = "top-left", layer = (layer or 100) + 5 })
             local edge = math.max(1, 2 * scale)
-            draw.rect({ x = frameX, y = frameY, width = frameSize, height = edge,
+            local artwork = game.album
+            if buttonId == "editor_meta_album_big" then artwork = game.album_big end
+            if artwork ~= nil then
+                local imageSize = math.max(1, frameSize - edge * 2)
+                local sourceWidth = math.max(1, num(artwork.width, imageSize))
+                local sourceHeight = math.max(1, num(artwork.height, imageSize))
+                local fitScale = math.min(imageSize / sourceWidth, imageSize / sourceHeight)
+                local imageWidth = sourceWidth * fitScale
+                local imageHeight = sourceHeight * fitScale
+                draw.sprite(artwork, {
+                    parent = frameId,
+                    x = edge + (imageSize - imageWidth) * 0.5,
+                    y = edge + (imageSize - imageHeight) * 0.5,
+                    width = imageWidth, height = imageHeight,
+                    anchor = "top-left", layer = (layer or 100) + 5,
+                })
+            else
+                local hasArtwork = tostring(item.value or ""):find("change", 1, true) ~= nil
+                draw.text(hasArtwork and "IMAGE PREVIEW UNAVAILABLE" or "NO IMAGE SET", {
+                    parent = frameId,
+                    x = frameSize * 0.5,
+                    y = frameSize * 0.5,
+                    size = fontSize("small"), color = C.muted,
+                    font = F.regular, anchor = "center", layer = (layer or 100) + 5,
+                })
+            end
+            draw.rect({ parent = frameId, x = 0, y = 0, width = frameSize, height = edge,
                 color = C.accent, layer = (layer or 100) + 6 })
-            draw.rect({ x = frameX, y = frameY + frameSize - edge, width = frameSize, height = edge,
+            draw.rect({ parent = frameId, x = 0, y = frameSize - edge, width = frameSize, height = edge,
                 color = C.accent, layer = (layer or 100) + 6 })
-            draw.rect({ x = frameX, y = frameY, width = edge, height = frameSize,
+            draw.rect({ parent = frameId, x = 0, y = 0, width = edge, height = frameSize,
                 color = C.accent, layer = (layer or 100) + 6 })
-            draw.rect({ x = frameX + frameSize - edge, y = frameY, width = edge, height = frameSize,
+            draw.rect({ parent = frameId, x = frameSize - edge, y = 0, width = edge, height = frameSize,
                 color = C.accent, layer = (layer or 100) + 6 })
-            ui.button({ id = buttonId .. "_frame_input", x = frameX, y = frameY,
-                width = frameSize, height = frameSize, action = action })
+            ui.button({ id = buttonId .. "_frame_input", parent = frameId,
+                x = 0, y = 0, width = frameSize, height = frameSize, action = action })
             UI.draw_button({ id = buttonId, x = cardX + 8 * scale,
                 y = frameY + frameSize + 8 * scale, width = math.max(1, cardW - 16 * scale),
                 height = 34 * scale,
@@ -1945,117 +2030,409 @@ local function drawPreviewWrappedText(text, x, y, width, height, size, color, la
     end
 end
 
+local function previewRulerTime(seconds, includeHours, interval)
+    seconds = math.max(0, num(seconds, 0))
+    if interval ~= nil and interval < 1 then
+        local decimals = interval < 0.1 and 2 or 1
+        local totalMinutes = math.floor(seconds / 60)
+        local secondsInMinute = seconds - totalMinutes * 60
+        local format = decimals == 2 and "%02.2f" or "%02.1f"
+        local secondsText = string.format(format, secondsInMinute)
+        if includeHours then
+            return string.format("%d:%02d:%s", math.floor(totalMinutes / 60), totalMinutes % 60, secondsText)
+        end
+        return tostring(totalMinutes) .. ":" .. secondsText
+    end
+
+    local whole = math.floor(seconds + 0.0001)
+    local minutes = math.floor(whole / 60)
+    local remaining = whole % 60
+    if includeHours then
+        return string.format("%d:%02d:%02d", math.floor(whole / 3600), minutes % 60, remaining)
+    end
+    return tostring(minutes) .. ":" .. string.format("%02d", remaining)
+end
+
+local function previewRulerInterval(duration, width)
+    if duration <= 0 then return 1 end
+    local targetTicks = clamp(width / 105, 3, 12)
+    local raw = math.max(0.05, duration / targetTicks)
+    local magnitude = 10 ^ math.floor(math.log(raw) / math.log(10))
+    local normalized = raw / magnitude
+    local nice = normalized <= 1 and 1 or (normalized <= 2 and 2 or (normalized <= 5 and 5 or 10))
+    return nice * magnitude
+end
+
+local function previewProgressTime(seconds)
+    local milliseconds = math.max(0, math.floor(num(seconds, 0) * 1000 + 0.5))
+    local minutes = math.floor(milliseconds / 60000)
+    local remainingSeconds = math.floor(milliseconds / 1000) % 60
+    local remainingMilliseconds = milliseconds % 1000
+    return string.format("%02d:%02d:%03d", minutes, remainingSeconds, remainingMilliseconds)
+end
+
+local function drawPreviewTimeRuler(x, y, width, height, sourceDuration, viewStart, viewDuration, scale, layer)
+    if sourceDuration <= 0 or width <= 0 or viewDuration <= 0 then return end
+    viewStart = clamp(viewStart, 0, sourceDuration)
+    local viewEnd = math.min(sourceDuration, viewStart + viewDuration)
+    local interval = previewRulerInterval(viewDuration, width)
+    local includeHours = sourceDuration >= 3600
+    local firstTick = math.ceil((viewStart - 0.000001) / interval) * interval
+    local tickCount = math.min(240, math.floor((viewEnd - firstTick) / interval) + 1)
+    local labelSize = math.max(fontSize("small"), 16 * scale)
+    for index = 0, tickCount - 1 do
+        local seconds = firstTick + index * interval
+        if seconds > viewEnd + 0.0001 then break end
+        local tickX = x + width * clamp((seconds - viewStart) / viewDuration, 0, 1)
+        draw.rect({ x = tickX, y = y + height - 10 * scale,
+            width = math.max(2, 2 * scale), height = 10 * scale,
+            color = { r = 112, g = 124, b = 138, a = 235 }, layer = layer })
+        draw.text(previewRulerTime(seconds, includeHours, interval), {
+            x = tickX, y = y + height * 0.38, size = labelSize,
+            color = C.text, font = F.medium, anchor = "center", layer = layer + 1,
+        })
+    end
+end
+
+local function registerPreviewHitbox(id, x, y, width, height)
+    -- Skin hitbox contract consumed by C#:
+    -- editor_preview_dialog_hitbox, editor_preview_ruler_hitbox,
+    -- editor_preview_timeline_hitbox, editor_preview_start_marker_hitbox,
+    -- editor_preview_playhead_marker_hitbox, editor_preview_end_marker_hitbox,
+    -- and editor_preview_{play,pause,stop,save,close}_hitbox. The START and
+    -- END text fields register separately through ui.input().
+    -- A custom skin can place every region independently; C# reads these
+    -- registered rectangles instead of assuming the Default skin's layout.
+    -- These controls draw nothing; the modal handles input before the regular
+    -- chart-editor UI dispatcher gets a chance to see these regions.
+    ui.button({ id = id, x = x, y = y, width = math.max(1, width),
+        height = math.max(1, height), action = "editor.block", hit_test_priority = 1000 })
+end
+
+-- The native waveform path consumes the retained C# envelope directly and
+-- submits all visible columns in one GPU primitive batch. No per-column Lua
+-- tables, MoonSharp property reads, or SpriteBatch.Draw calls are needed.
+local previewWaveformNormalColor = { r = 135, g = 155, b = 176, a = 225 }
+local previewWaveformSelectedColor = { r = 112, g = 229, b = 196, a = 245 }
+
+local function drawPreviewWaveform(state, x, y, width, height, duration, scale, layer)
+    draw.rect({ x = x, y = y, width = width, height = height,
+        color = { r = 9, g = 12, b = 15, a = 255 }, layer = layer })
+
+    local viewStart = clamp(num(state.preview_view_start, 0), 0, math.max(0, duration))
+    local viewDuration = math.max(0.000001, num(state.preview_view_duration, duration))
+    local viewEnd = math.min(duration, viewStart + viewDuration)
+    viewDuration = math.max(0.000001, viewEnd - viewStart)
+    local startSeconds = num(state.preview_start, 0)
+    local endSeconds = num(state.preview_end, duration)
+    local playheadSeconds = num(state.preview_playhead, startSeconds)
+    local startRatio = (startSeconds - viewStart) / viewDuration
+    local endRatio = (endSeconds - viewStart) / viewDuration
+    local playheadRatio = (playheadSeconds - viewStart) / viewDuration
+    local selectionStart = x + width * clamp(startRatio, 0, 1)
+    local selectionEnd = x + width * clamp(endRatio, 0, 1)
+    if endSeconds > viewStart and startSeconds < viewEnd and selectionEnd > selectionStart then
+        draw.rect({ x = selectionStart, y = y, width = selectionEnd - selectionStart, height = height,
+            color = { r = 35, g = 135, b = 112, a = 55 }, layer = layer + 1 })
+    end
+
+    local centerY = y + height * 0.5
+    draw.rect({ x = x, y = centerY, width = width, height = math.max(2, 2 * scale),
+        color = { r = 80, g = 89, b = 99, a = 190 }, layer = layer + 2 })
+
+    if state.preview_waveform_ready == true and duration > 0
+        and type(draw.waveform_batch_fast) == "function" then
+        draw.waveform_batch_fast({
+            x = x, y = y, width = width, height = height,
+            duration = duration, view_start = viewStart, view_duration = viewDuration,
+            selection_start = startSeconds, selection_end = endSeconds,
+            vertical_inset = 8 * scale,
+            normal_color = previewWaveformNormalColor,
+            selected_color = previewWaveformSelectedColor,
+            layer = layer + 3,
+        })
+    else
+        local message = state.preview_waveform_building == true and "BUILDING WAVEFORM..."
+            or (state.preview_source_ready == true and "WAVEFORM UNAVAILABLE" or "WAITING FOR AUDIO...")
+        draw.text(message, { x = x + width * 0.5, y = centerY,
+            size = math.max(fontSize("heading"), 24 * scale), color = C.muted, font = F.medium,
+            anchor = "center", layer = layer + 3 })
+    end
+
+    local startVisible = startSeconds >= viewStart and startSeconds <= viewEnd
+    local endVisible = endSeconds >= viewStart and endSeconds <= viewEnd
+    local playheadVisible = playheadSeconds >= viewStart and playheadSeconds <= viewEnd
+    local startBeforeView = startSeconds < viewStart
+    local startAfterView = startSeconds > viewEnd
+    local endBeforeView = endSeconds < viewStart
+    local endAfterView = endSeconds > viewEnd
+    local startX = x + width * startRatio
+    local endX = x + width * endRatio
+    local playheadX = x + width * playheadRatio
+    local startColor = { r = 251, g = 146, b = 60, a = 255 }
+    local endColor = { r = 239, g = 68, b = 68, a = 255 }
+    local playheadColor = { r = 250, g = 204, b = 21, a = 255 }
+    local markerWidth = math.max(5, 5 * scale)
+    local markerOutline = math.max(2, 2 * scale)
+
+    if startVisible then
+        draw.rect({ x = startX - markerWidth * 0.5 - markerOutline, y = y - 8 * scale,
+            width = markerWidth + markerOutline * 2, height = height + 16 * scale,
+            color = { r = 4, g = 7, b = 10, a = 245 }, layer = layer + 4 })
+        draw.rect({ x = startX - markerWidth * 0.5, y = y - 8 * scale,
+            width = markerWidth, height = height + 16 * scale, color = startColor, layer = layer + 5 })
+    end
+    if endVisible then
+        draw.rect({ x = endX - markerWidth * 0.5 - markerOutline, y = y - 8 * scale,
+            width = markerWidth + markerOutline * 2, height = height + 16 * scale,
+            color = { r = 4, g = 7, b = 10, a = 245 }, layer = layer + 4 })
+        draw.rect({ x = endX - markerWidth * 0.5, y = y - 8 * scale,
+            width = markerWidth, height = height + 16 * scale, color = endColor, layer = layer + 5 })
+    end
+    if playheadVisible then
+        draw.rect({ x = playheadX - 2 * scale, y = y - 8 * scale,
+            width = math.max(4, 4 * scale), height = height + 16 * scale,
+            color = { r = 4, g = 7, b = 10, a = 245 }, layer = layer + 6 })
+        draw.rect({ x = playheadX - 1 * scale, y = y - 8 * scale,
+            width = math.max(2, 2 * scale), height = height + 16 * scale,
+            color = playheadColor, layer = layer + 7 })
+    end
+
+    -- Larger, easy-to-grab marker heads sit just outside the waveform frame.
+    -- When a marker is outside the zoomed window, pin its head to the nearest
+    -- edge so it remains visible and can be dragged back into the current view.
+    local handleW = 34 * scale
+    local handleH = 18 * scale
+    local startHandleX = startVisible and startX
+        or (startBeforeView and (x + handleW * 0.5) or (x + width - handleW * 0.5))
+    local endHandleX = endVisible and endX
+        or (endBeforeView and (x + handleW * 0.5) or (x + width - handleW * 0.5))
+    draw.rect({ x = startHandleX - handleW * 0.5 - markerOutline, y = y - 12 * scale,
+        width = handleW + markerOutline * 2, height = handleH + markerOutline * 2,
+        color = { r = 4, g = 7, b = 10, a = 255 }, layer = layer + 8 })
+    draw.rect({ x = startHandleX - handleW * 0.5, y = y - 12 * scale,
+        width = handleW, height = handleH, color = startColor, layer = layer + 9 })
+    draw.rect({ x = endHandleX - handleW * 0.5 - markerOutline, y = y + height - 6 * scale,
+        width = handleW + markerOutline * 2, height = handleH + markerOutline * 2,
+        color = { r = 4, g = 7, b = 10, a = 255 }, layer = layer + 8 })
+    draw.rect({ x = endHandleX - handleW * 0.5, y = y + height - 6 * scale,
+        width = handleW, height = handleH, color = endColor, layer = layer + 9 })
+    if playheadVisible then
+        draw.rect({ x = playheadX - 7 * scale, y = centerY - 11 * scale,
+            width = 14 * scale, height = 22 * scale,
+            color = { r = 4, g = 7, b = 10, a = 255 }, layer = layer + 9 })
+        draw.rect({ x = playheadX - 5 * scale, y = centerY - 9 * scale,
+            width = 10 * scale, height = 18 * scale, color = playheadColor, layer = layer + 10 })
+    end
+
+    local markerLabelSize = math.max(fontSize("small"), 16 * scale)
+    local startTagY = y + 8 * scale
+    local endTagY = y + height - 30 * scale
+    local startTagText = startBeforeView and "START <" or (startAfterView and "START >" or "START")
+    local endTagText = endBeforeView and "END <" or (endAfterView and "END >" or "END")
+    local startTagWidth = 104 * scale
+    local endTagWidth = 84 * scale
+    local startTagX = clamp(startHandleX, x + startTagWidth * 0.5, x + width - startTagWidth * 0.5)
+    local endTagX = clamp(endHandleX, x + endTagWidth * 0.5, x + width - endTagWidth * 0.5)
+    draw.rect({ x = startTagX - startTagWidth * 0.5, y = startTagY, width = startTagWidth,
+        height = 26 * scale, color = { r = 6, g = 9, b = 12, a = 225 }, layer = layer + 10 })
+    draw.text(startTagText, { x = startTagX, y = startTagY + 13 * scale, size = markerLabelSize,
+        color = startColor, font = F.medium, anchor = "center", layer = layer + 11 })
+    draw.rect({ x = endTagX - endTagWidth * 0.5, y = endTagY, width = endTagWidth,
+        height = 26 * scale, color = { r = 6, g = 9, b = 12, a = 225 }, layer = layer + 10 })
+    draw.text(endTagText, { x = endTagX, y = endTagY + 13 * scale, size = markerLabelSize,
+        color = endColor, font = F.medium, anchor = "center", layer = layer + 11 })
+
+    local timeY = y + height + 12 * scale
+    local timeSize = math.max(fontSize("small"), 16 * scale)
+    -- These outer landmarks always describe the full source song, independent
+    -- of the current zoom/pan window. The ruler above shows the zoomed section.
+    draw.text(previewProgressTime(0), {
+        x = x, y = timeY, size = timeSize, color = C.muted,
+        font = F.medium, anchor = "top-left", layer = layer + 11,
+    })
+    draw.text(previewProgressTime(duration), {
+        x = x + width, y = timeY, size = timeSize, color = C.muted,
+        font = F.medium, anchor = "top-right", layer = layer + 11,
+    })
+    local currentTime = tostring(state.preview_playhead_timecode or previewProgressTime(playheadSeconds))
+    local selectedEndTime = tostring(state.preview_end_timecode or previewProgressTime(endSeconds))
+    draw.text(currentTime .. " / " .. selectedEndTime, {
+        x = x + width * 0.5, y = timeY, size = timeSize,
+        color = playheadColor, font = F.medium, anchor = "top", layer = layer + 12,
+    })
+
+    draw.rect({ x = x, y = y, width = width, height = math.max(2, 2 * scale),
+        color = { r = 61, g = 70, b = 80, a = 255 }, layer = layer + 13 })
+    draw.rect({ x = x, y = y + height - 2 * scale, width = width, height = math.max(2, 2 * scale),
+        color = { r = 61, g = 70, b = 80, a = 255 }, layer = layer + 13 })
+    draw.rect({ x = x, y = y, width = math.max(2, 2 * scale), height = height,
+        color = { r = 61, g = 70, b = 80, a = 255 }, layer = layer + 13 })
+    draw.rect({ x = x + width - 2 * scale, y = y, width = math.max(2, 2 * scale), height = height,
+        color = { r = 61, g = 70, b = 80, a = 255 }, layer = layer + 13 })
+
+    -- Make the marker hit areas wider than the visible heads. They remain tied
+    -- to the pinned edge handles while their actual times are outside the view.
+    local hitWidth = math.min(width, math.max(128 * scale, 72))
+    local startBandH = height / 3
+    local headExtension = 22 * scale
+    local function markerHitX(centerX)
+        return clamp(centerX - hitWidth * 0.5, x, x + width - hitWidth)
+    end
+    registerPreviewHitbox("editor_preview_timeline_hitbox", x, y, width, height)
+    -- START/END hit regions follow their visible heads, including edge-pinned
+    -- handles when the actual marker lies outside the zoomed waveform window.
+    local startHeadHitY = y - headExtension
+    local startHeadHitBottom = math.max(y + startBandH, y + 42 * scale)
+    registerPreviewHitbox("editor_preview_start_marker_hitbox",
+        markerHitX(startHandleX), startHeadHitY, hitWidth, startHeadHitBottom - startHeadHitY)
+    if playheadVisible then
+        registerPreviewHitbox("editor_preview_playhead_marker_hitbox",
+            markerHitX(playheadX), y + startBandH, hitWidth, startBandH)
+    end
+    local endHeadHitY = math.min(endTagY - 10 * scale, y + height - startBandH - 38 * scale)
+    local endHeadHitBottom = y + height + 24 * scale
+    registerPreviewHitbox("editor_preview_end_marker_hitbox",
+        markerHitX(endHandleX), endHeadHitY, hitWidth, endHeadHitBottom - endHeadHitY)
+end
+
 function drawPreviewEditor(state, w, h, layer)
-    if state.preview_editor_open ~= true then return end
+    if state.preview_editor_open ~= true or state.preview_tick_pick_active == true then return end
     local scale = math.max(0.55, math.min(w / 1920, h / 1080))
     local margin = 18 * scale
     local panelW = math.min(w - margin * 2, LAYOUT.preview_width * scale)
     local panelH = math.min(h - margin * 2, LAYOUT.preview_height * scale)
     local x = (w - panelW) * 0.5
     local y = (h - panelH) * 0.5
+    local baseLayer = layer or 130
     ui.button({ id = "editor_preview_backdrop", x = 0, y = 0, width = w, height = h,
         action = "editor.block" })
     draw.rect({ x = 0, y = 0, width = w, height = h,
-        color = { r = 0, g = 0, b = 0, a = 185 }, layer = layer or 130 })
-    panel("editor_preview_panel", x, y, panelW, panelH, "MUSIC PREVIEW", layer or 130)
+        color = { r = 0, g = 0, b = 0, a = 185 }, layer = baseLayer })
+    registerPreviewHitbox("editor_preview_dialog_hitbox", x, y, panelW, panelH)
+    local panelTitle = "MUSIC PREVIEW"
+    panel("editor_preview_panel", x, y, panelW, panelH, panelTitle, baseLayer + 1)
 
     local duration = math.max(0, num(state.preview_duration, 0))
     local sourceLoading = state.preview_source_loading == true
     local sourceReady = state.preview_source_ready == true
     local sourceFailed = state.preview_source_failed == true
     local subtitle = duration > 0
-        and ("Choose a section of the full song. Length: " .. tostring(state.preview_duration_label) .. ". A subtle fade is added at each end.")
+        and "PICK beside START/END selects a chart tick • Drag marker heads to set range • Wheel zoom • Trackpad / Shift+wheel / middle-drag pan • Click waveform to seek • Space play/stop • Shift+Space pause."
         or (sourceLoading
-            and "Preparing full song audio. Preview controls will unlock when it is ready."
+            and "Preparing full song audio. The waveform and preview controls will unlock when it is ready."
             or sourceFailed
                 and "Music could not be prepared. Re-import the song audio to try again."
                 or "Import the full song audio first to enable preview editing.")
-    drawPreviewWrappedText(subtitle, x + 28 * scale, y + 72 * scale,
-        panelW - 56 * scale, 56 * scale, fontSize("description"), C.muted,
-        (layer or 130) + 3, F.regular)
+    drawPreviewWrappedText(subtitle, x + 32 * scale, y + 76 * scale,
+        panelW - 64 * scale, 48 * scale, math.max(fontSize("body"), 18 * scale), C.muted,
+        baseLayer + 3, F.regular)
 
     local side = LAYOUT.preview_side_margin * scale
-    local sliderX = x + side
-    local sliderY = y + LAYOUT.preview_slider_y * scale
-    local sliderW = math.max(1, panelW - side * 2)
-    local startValue = clamp(num(state.preview_start, 0), 0, math.max(0.001, duration))
-    local endValue = clamp(num(state.preview_end, duration), startValue, math.max(startValue, duration))
-    local startRatio = duration > 0 and startValue / duration or 0
-    local endRatio = duration > 0 and endValue / duration or 0
-    draw.rect({ x = sliderX, y = sliderY, width = sliderW, height = 6 * scale,
-        color = C.hover, layer = (layer or 130) + 3 })
-    if endRatio > startRatio then
-        draw.rect({ x = sliderX + sliderW * startRatio, y = sliderY - 2 * scale,
-            width = sliderW * (endRatio - startRatio), height = 10 * scale,
-            color = C.accent, layer = (layer or 130) + 4 })
-    end
-    local thumbW = 14 * scale
-    draw.rect({ x = sliderX + sliderW * startRatio - thumbW / 2, y = sliderY - 8 * scale,
-        width = thumbW, height = 22 * scale, color = C.text, layer = (layer or 130) + 5 })
-    draw.rect({ x = sliderX + sliderW * endRatio - thumbW / 2, y = sliderY - 8 * scale,
-        width = thumbW, height = 22 * scale, color = C.primary, layer = (layer or 130) + 5 })
-    if sourceReady then
-        ui.slider({ id = "editor_preview_range", x = sliderX, y = sliderY - 10 * scale,
-            width = sliderW, height = 26 * scale, min = 0, max = math.max(0.001, duration),
-            action = "editor.preview.scrub" })
-    end
-    local durationLabelClip = {
-        left = sliderX, top = sliderY + 20 * scale,
-        right = x + panelW - 28 * scale, bottom = y + LAYOUT.preview_input_y * scale - 8 * scale,
-    }
-    label("00:00.000", sliderX, sliderY + 24 * scale, fontSize("small"), C.muted,
-        nil, (layer or 130) + 3, F.regular, durationLabelClip)
-    draw.text(state.preview_duration_label or "00:00.000", {
-        x = sliderX + sliderW, y = sliderY + 24 * scale, size = fontSize("small"),
-        color = C.muted, font = F.regular, anchor = "top-right", clip = durationLabelClip,
-        layer = (layer or 130) + 3,
-    })
+    local timelineX = x + 56 * scale
+    local timelineW = math.max(1, panelW - 112 * scale)
+    local rulerY = y + LAYOUT.preview_ruler_y * scale
+    local rulerH = LAYOUT.preview_ruler_height * scale
+    local timelineY = y + LAYOUT.preview_timeline_y * scale
+    local timelineH = LAYOUT.preview_timeline_height * scale
+    drawPreviewTimeRuler(timelineX, rulerY, timelineW, rulerH, duration,
+        num(state.preview_view_start, 0), num(state.preview_view_duration, duration), scale, baseLayer + 3)
+    registerPreviewHitbox("editor_preview_ruler_hitbox", timelineX, rulerY, timelineW, rulerH)
+    drawPreviewWaveform(state, timelineX, timelineY, timelineW, timelineH,
+        duration, scale, baseLayer + 4)
 
     local inputY = y + LAYOUT.preview_input_y * scale
-    local inputGap = 24 * scale
-    local inputW = (panelW - side * 2 - inputGap) / 2
-    local startLabelClip = { left = sliderX, top = inputY - 30 * scale,
-        right = sliderX + inputW, bottom = inputY - 3 * scale }
-    local endLabelClip = { left = sliderX + inputW + inputGap, top = inputY - 30 * scale,
-        right = sliderX + inputW * 2 + inputGap, bottom = inputY - 3 * scale }
-    label("START TIME (SECONDS)", sliderX, inputY - 30 * scale, fontSize("small"), C.muted,
-        nil, (layer or 130) + 3, F.regular, startLabelClip)
-    label("END TIME (SECONDS)", sliderX + inputW + inputGap, inputY - 30 * scale,
-        fontSize("small"), C.muted, nil, (layer or 130) + 3, F.regular, endLabelClip)
+    local inputGap = 32 * scale
+    local inputW = math.max(1, (panelW - side * 2 - inputGap * 2) / 3)
+    local inputH = 56 * scale
+    local labelSize = math.max(fontSize("body"), 18 * scale)
+    local startX = x + side
+    local endX = startX + inputW + inputGap
+    local durationX = endX + inputW + inputGap
+    local labelTop = inputY - 34 * scale
+    local labelBottom = inputY - 3 * scale
+    local pickGap = 8 * scale
+    local pickW = 68 * scale
+    local timeInputW = math.max(1, inputW - pickGap - pickW)
+    local startPickX = startX + timeInputW + pickGap
+    local endPickX = endX + timeInputW + pickGap
+    local startLabelClip = { left = startX, top = labelTop,
+        right = startX + inputW, bottom = labelBottom }
+    local endLabelClip = { left = endX, top = labelTop,
+        right = endX + inputW, bottom = labelBottom }
+    local durationLabelClip = { left = durationX, top = labelTop,
+        right = durationX + inputW, bottom = labelBottom }
+    label("START", startX, labelTop, labelSize, C.muted,
+        nil, baseLayer + 3, F.medium, startLabelClip)
+    label("END", endX, labelTop, labelSize, C.muted,
+        nil, baseLayer + 3, F.medium, endLabelClip)
+    label("DURATION", durationX, labelTop, labelSize, C.muted,
+        nil, baseLayer + 3, F.medium, durationLabelClip)
     drawTextField("editor_preview_start_input", state.preview_start_text or "0.000",
-        "editor.preview.focus_start", nil, sliderX, inputY, inputW, 44 * scale,
-        (layer or 130) + 5, state.preview_start_focused == true, sourceReady,
+        "editor.preview.focus_start", nil, startX, inputY, timeInputW, inputH,
+        baseLayer + 5, state.preview_start_focused == true, sourceReady,
         state.preview_start_caret_offset, state.preview_start_selection_offset,
-        state.preview_start_selection_width, state.preview_start_text_width)
+        state.preview_start_selection_width, state.preview_start_text_width,
+        nil, nil, nil, nil, nil, nil, nil, nil, nil, labelSize)
     drawTextField("editor_preview_end_input", state.preview_end_text or "0.000",
-        "editor.preview.focus_end", nil, sliderX + inputW + inputGap, inputY, inputW, 44 * scale,
-        (layer or 130) + 5, state.preview_end_focused == true, sourceReady,
+        "editor.preview.focus_end", nil, endX, inputY, timeInputW, inputH,
+        baseLayer + 5, state.preview_end_focused == true, sourceReady,
         state.preview_end_caret_offset, state.preview_end_selection_offset,
-        state.preview_end_selection_width, state.preview_end_text_width)
+        state.preview_end_selection_width, state.preview_end_text_width,
+        nil, nil, nil, nil, nil, nil, nil, nil, nil, labelSize)
+    drawTextField("editor_preview_duration_input", state.preview_selected_duration_text or "0.000",
+        nil, nil, durationX, inputY, inputW, inputH,
+        baseLayer + 5, false, false,
+        nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, labelSize)
+    local pickButtonH = inputH
+    local pickButtonW = pickW
+    button({ id = "editor_preview_pick_start", label = "PICK", action = "editor.block", enabled = sourceReady,
+        selected = state.preview_tick_pick_target == "START" },
+        startPickX, inputY, pickButtonW, pickButtonH,
+        { layer = baseLayer + 6, text_size = math.max(fontSize("small"), 15 * scale),
+            hit_test_priority = 1120 })
+    button({ id = "editor_preview_pick_end", label = "PICK", action = "editor.block", enabled = sourceReady,
+        selected = state.preview_tick_pick_target == "END" },
+        endPickX, inputY, pickButtonW, pickButtonH,
+        { layer = baseLayer + 6, text_size = math.max(fontSize("small"), 15 * scale),
+            hit_test_priority = 1120 })
+    registerPreviewHitbox("editor_preview_pick_start_hitbox", startPickX, inputY, pickButtonW, pickButtonH)
+    registerPreviewHitbox("editor_preview_pick_end_hitbox", endPickX, inputY, pickButtonW, pickButtonH)
 
-    local buttonGap = 10 * scale
-    local buttonY = y + panelH - 60 * scale
-    if state.preview_message ~= nil and state.preview_message ~= "" then
-        local messageX = x + 28 * scale
-        local messageY = inputY + 58 * scale
-        local messageWidth = panelW - 56 * scale
-        local messageHeight = math.max(1, buttonY - messageY - 8 * scale)
-        drawPreviewWrappedText(state.preview_message, messageX, messageY, messageWidth, messageHeight,
-            fontSize("body"), C.text, (layer or 130) + 4, F.regular)
+    local buttonGap = 12 * scale
+    local buttonY = y + panelH - 78 * scale
+    local buttonPad = 30 * scale
+    local buttonW = math.floor((panelW - buttonPad * 2 - buttonGap * 4) / 5)
+    local buttonH = 54 * scale
+    local buttons = {
+        { id = "editor_preview_play", label = "PLAY", action = "editor.block", enabled = sourceReady and state.preview_playing ~= true },
+        { id = "editor_preview_pause", label = "PAUSE", action = "editor.block",
+            enabled = sourceReady and state.preview_playing == true, selected = state.preview_playing == true },
+        { id = "editor_preview_stop", label = "STOP", action = "editor.block", enabled = sourceReady },
+        { id = "editor_preview_save", label = "SAVE", action = "editor.block",
+            enabled = sourceReady and num(state.preview_end, duration) > num(state.preview_start, 0) },
+        { id = "editor_preview_close", label = "CLOSE", action = "editor.block", enabled = true },
+    }
+    local hitboxIds = {
+        "editor_preview_play_hitbox", "editor_preview_pause_hitbox", "editor_preview_stop_hitbox",
+        "editor_preview_save_hitbox", "editor_preview_close_hitbox",
+    }
+    for index, item in ipairs(buttons) do
+        local buttonX = x + buttonPad + (index - 1) * (buttonW + buttonGap)
+        button(item, buttonX, buttonY, buttonW, buttonH,
+            { layer = baseLayer + 5, text_size = math.max(fontSize("body"), 20 * scale),
+                hit_test_priority = 1100 })
+        registerPreviewHitbox(hitboxIds[index], buttonX, buttonY, buttonW, buttonH)
     end
 
-    local buttonPad = 22 * scale
-    local buttonW = (panelW - buttonPad * 2 - buttonGap * 2) / 3
-    button({ id = "editor_preview_play", label = state.preview_playing and "STOP" or "PLAY",
-        action = "editor.preview.play", enabled = sourceReady or state.preview_playing == true },
-        x + buttonPad, buttonY, buttonW, 38 * scale,
-        { layer = (layer or 130) + 5, text_size = fontSize("body") })
-    button({ id = "editor_preview_save", label = "SAVE", action = "editor.preview.save",
-        enabled = sourceReady }, x + buttonPad + buttonW + buttonGap, buttonY, buttonW, 38 * scale,
-        { layer = (layer or 130) + 5, text_size = fontSize("body") })
-    button({ id = "editor_preview_close", label = "CLOSE", action = "editor.preview.close",
-        enabled = true }, x + buttonPad + (buttonW + buttonGap) * 2, buttonY, buttonW, 38 * scale,
-        { layer = (layer or 130) + 5, text_size = fontSize("body") })
+    if state.preview_message ~= nil and state.preview_message ~= "" then
+        local messageX = x + 32 * scale
+        local messageY = inputY + inputH + 12 * scale
+        local messageWidth = panelW - 64 * scale
+        local messageHeight = math.max(1, buttonY - messageY - 12 * scale)
+        drawPreviewWrappedText(state.preview_message, messageX, messageY, messageWidth, messageHeight,
+            math.max(fontSize("body"), 17 * scale), C.text, baseLayer + 4, F.regular)
+    end
 end
 
 local function drawInfo(state, x, y, width, problemsY, layer, screenWidth)

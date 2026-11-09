@@ -187,7 +187,7 @@ public sealed class SongSelectMenu : IDisposable
     };
     private readonly Dictionary<string, double> _navigationRepeatRemaining = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _navigationTriggered = new(StringComparer.OrdinalIgnoreCase);
-    private readonly TextFieldEditor _searchEditor = new();
+    private readonly TextInputController _searchEditor = new();
     private bool _searchMouseSelecting;
     private int _searchVisibleStart;
 
@@ -509,7 +509,8 @@ public sealed class SongSelectMenu : IDisposable
         if (_searchActive)
         {
             if (mousePressed && _skinRuntime is not null &&
-                _skinRuntime.TryGetUiButtonBounds("song_search_input", out var searchBounds) &&
+                (_skinRuntime.TryGetUiInputBounds("song_search_input", out var searchBounds) ||
+                 _skinRuntime.TryGetUiButtonBounds("song_search_input", out searchBounds)) &&
                 searchBounds.Contains(mouse.Position))
             {
                 SetSearchCaretFromMouse(mouse.Position.X, extendSelection: false);
@@ -915,7 +916,9 @@ public sealed class SongSelectMenu : IDisposable
 
     private void SetSearchCaretFromMouse(int mouseX, bool extendSelection)
     {
-        if (_skinRuntime is null || !_skinRuntime.TryGetUiButtonBounds("song_search_input", out var bounds))
+        if (_skinRuntime is null ||
+            (!_skinRuntime.TryGetUiInputBounds("song_search_input", out var bounds) &&
+             !_skinRuntime.TryGetUiButtonBounds("song_search_input", out bounds)))
             return;
         var scale = Math.Max(0.01f, Math.Min(_graphics.Viewport.Width / 1920f, _graphics.Viewport.Height / 1080f));
         var textLeft = bounds.X + 120f * scale;
@@ -4021,7 +4024,8 @@ public sealed class SongSelectMenu : IDisposable
 
         var searchScale = Math.Max(0.01f, Math.Min(_graphics.Viewport.Width / 1920f, _graphics.Viewport.Height / 1080f));
         var searchAvailableWidth = 400f * searchScale;
-        if (_skinRuntime!.TryGetUiButtonBounds("song_search_input", out var searchBounds))
+        if (_skinRuntime!.TryGetUiInputBounds("song_search_input", out var searchBounds) ||
+            _skinRuntime.TryGetUiButtonBounds("song_search_input", out searchBounds))
             searchAvailableWidth = Math.Max(1f, searchBounds.Width - 144f * searchScale);
         var searchWindow = GetSearchVisibleWindow(searchAvailableWidth, 24f);
         var safeSearchCaret = Math.Clamp(_searchEditor.Caret, searchWindow.Start, searchWindow.End);

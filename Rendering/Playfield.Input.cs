@@ -31,8 +31,12 @@ public sealed partial class Playfield
     {
         var dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
         _editorTextInputDeltaSeconds = Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
+        var previewTickPickerActive = _chartEditorMode && _editorPreviewEditorOpen &&
+                                     _editorPreviewPendingChartTickTarget >= 0;
+        var tickPickConsumedChartClick = false;
+        var tickPickCancelHandled = false;
         _editorTextInputOwnsKeyboardThisFrame = _chartEditorMode &&
-            (_editorPreviewEditorOpen || EditorTextInputActive);
+            ((_editorPreviewEditorOpen && !previewTickPickerActive) || EditorTextInputActive);
 
         // Skin reload is a global recovery shortcut. Handle it before modal and
         // text-field early returns so F10 remains available throughout the editor.
@@ -43,9 +47,10 @@ public sealed partial class Playfield
         // Diagnostic hotkeys are intentionally compiled only into Debug builds.
         // Dispatch them before preview/modal/locked-gameplay early returns so the
         // same tools remain available in regular gameplay and editor preview.
-        // A focused editor text field and the embedded media-preview modal retain
-        // exclusive keyboard ownership.
-        if (!_editorTextInputOwnsKeyboardThisFrame && !_editorPreviewEditorOpen)
+        // A focused editor text field and the media-preview dialog retain keyboard
+        // ownership, but tick-pick mode deliberately returns to normal editor input.
+        if (!_editorTextInputOwnsKeyboardThisFrame &&
+            (!_editorPreviewEditorOpen || _editorPreviewPendingChartTickTarget >= 0))
         {
             if (Pressed(keyboard, Keys.F6))
             {
@@ -95,14 +100,47 @@ public sealed partial class Playfield
         if (!_lockMenuPlayMode && !_chartEditorMode && Pressed(keyboard, Keys.F4))
             ToggleGameplayMode();
 
-        // The in-game music-preview modal exclusively owns keyboard and pointer
-        // input until it closes. Handle it before editor scroll timers or global
-        // shortcuts so nothing can resume or modify chart playback behind it.
+        // The preview dialog owns input normally. While its tick picker is active,
+        // update its display only and let the complete chart-editor input path run.
         if (_chartEditorMode && _editorPreviewEditorOpen)
         {
-            UpdateEditorSeekPauseState();
-            HandleEditorPreviewEditorInput(keyboard, _previousKeyboard);
-            return;
+            if (_editorPreviewPendingChartTickTarget >= 0)
+            {
+                UpdateEditorPreviewEditorWhileChartTickPicking(dt);
+                tickPickCancelHandled = KeybindSettings.IsPressed("editor_cancel");
+                var tickPickInputHandled = HandleEditorPreviewChartTickPick(keyboard);
+                tickPickConsumedChartClick = tickPickInputHandled && !tickPickCancelHandled;
+            }
+            else
+            {
+                UpdateEditorSeekPauseState();
+                HandleEditorPreviewEditorInput(keyboard, _previousKeyboard, dt);
+                return;
+            }
+        }
+
+        // Safety fallback for an armed chart-tick picker if the preview dialog is
+        // no longer open. Clear the pending mode if the editor was closed or switched away.
+        if (_editorPreviewPendingChartTickTarget >= 0 && !_editorPreviewEditorOpen)
+        {
+            if (!_chartEditorMode)
+            {
+                _editorPreviewPendingChartTickTarget = -1;
+                _editorPreviewRestoreMetaPanelAfterChartTickPick = false;
+                ClearEditorPreviewChartTickPickHover();
+            }
+            else
+            {
+                if (KeybindSettings.IsPressed("editor_cancel"))
+                {
+                    HandleEditorPreviewChartTickPick(keyboard);
+                    tickPickCancelHandled = true;
+                }
+                else
+                {
+                    tickPickConsumedChartClick = HandleEditorPreviewChartTickPick(keyboard);
+                }
+            }
         }
 
         UpdateEditorWheelScrollPause(dt);
@@ -119,9 +157,10 @@ public sealed partial class Playfield
         // or trigger editor actions in the same frame.
         if (_editorTextInputOwnsKeyboardThisFrame)
         {
-            if (_chartEditorMode)
+            if (_chartEditorMode && !tickPickCancelHandled)
                 HandleChartEditorInput(keyboard, _previousKeyboard);
-            HandleMouseSelection();
+            if (!tickPickConsumedChartClick)
+                HandleMouseSelection();
             UpdateLaneHighlights(keyboard, dt);
             return;
         }
@@ -184,7 +223,7 @@ public sealed partial class Playfield
             return;
         }
 
-        if (_chartEditorMode && !_editorPreviewMode)
+        if (_chartEditorMode && !_editorPreviewMode && !tickPickCancelHandled)
             HandleChartEditorInput(keyboard, _previousKeyboard);
 
         // A field may have received focus from a mouse click during this frame.
@@ -195,7 +234,8 @@ public sealed partial class Playfield
             // the initial keyboard-ownership snapshot. Claim it before the rest
             // of the frame captures gameplay or editor keybind edges.
             _editorTextInputOwnsKeyboardThisFrame = true;
-            HandleMouseSelection();
+            if (!tickPickConsumedChartClick)
+                HandleMouseSelection();
             UpdateLaneHighlights(keyboard, dt);
             return;
         }
@@ -203,7 +243,8 @@ public sealed partial class Playfield
         if (_chartEditorMode && !_editorPreviewMode &&
             (keyboard.IsKeyDown(Keys.LeftControl) || keyboard.IsKeyDown(Keys.RightControl)))
         {
-            HandleMouseSelection();
+            if (!tickPickConsumedChartClick)
+                HandleMouseSelection();
             UpdateLaneHighlights(keyboard, dt);
             return;
         }
@@ -215,7 +256,8 @@ public sealed partial class Playfield
             _playing = !_playing;
         // These shortcuts are retained for ordinary gameplay sessions. During
         // chart editing the same actions are reached only through keybinds.
-        HandleMouseSelection();
+        if (!tickPickConsumedChartClick)
+            HandleMouseSelection();
         HandleEditorMouseWheelScroll();
 
         if ((!_chartEditorMode || _editorPreviewMode) && !shift)
@@ -426,7 +468,8 @@ public sealed partial class Playfield
 
         // Text fields and the preview modal own their input; their keys must not
         // pause playback as if they were seek gestures.
-        var textFieldOwnsInput = _editorPreviewEditorOpen || _editorPreviewFocusedField >= 0 ||
+        var previewDialogOwnsInput = _editorPreviewEditorOpen && _editorPreviewPendingChartTickTarget < 0;
+        var textFieldOwnsInput = previewDialogOwnsInput || _editorPreviewFocusedField >= 0 ||
                                  _editorMetaEditingField is not null || _editorDurationInputFocused ||
                                  _editorStutterInputField != EditorStutterInputField.None || _editorBpmInputFocused;
         var physicalSeekHeld = IsEditorSeekKeyDown();
@@ -545,21 +588,29 @@ public sealed partial class Playfield
                     return;
                 }
             }
-            if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+            if (IsChartEditorInterfaceUiActive)
             {
-                var uiOverMetaContent = _editorMetaPanelOpen &&
-                    GetEditorMetaContentBounds(virtualWidth, virtualHeight).Contains(pointer) &&
-                    _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_meta_");
+                var uiOverMetaPanel = _editorMetaPanelOpen &&
+                    (GetEditorMetaPanelBounds(virtualWidth, virtualHeight).Contains(pointer) ||
+                     _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_meta_"));
+                var uiOverMetaContent = uiOverMetaPanel &&
+                    GetEditorMetaContentBounds(virtualWidth, virtualHeight).Contains(pointer);
                 var uiOverProblems = _editorProblemsExpanded &&
                     (_chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problems_") ||
                      _chartEditorInterfaceRuntime.IsUiPointOverControlWithIdPrefix(pointer.X, pointer.Y, "editor_problem_"));
-                if (uiOverMetaContent)
+                if (uiOverMetaPanel)
                 {
-                    var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
-                    _editorMetaScroll.SetMaximum(GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
-                    var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
-                    _editorMetaScroll.HandleWheel(wheelDelta, GetEditorWheelScrollDistance(virtualHeight));
-                    _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
+                    if (uiOverMetaContent)
+                    {
+                        var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0);
+                        _editorMetaScroll.SetMaximum(GetEditorMetaMaxScrollOffset(rows, virtualWidth, virtualHeight));
+                        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+                        _editorMetaScroll.HandleWheel(wheelDelta, GetEditorWheelScrollDistance(virtualHeight));
+                        _editorMetaScrollOffset = GetEditorMetaScrollFirstVisibleRow(layouts);
+                    }
+                    // The skin-defined panel bounds own the entire panel's wheel
+                    // region, including its header and tabs. Never let those areas
+                    // turn into chart-seek input underneath a custom skin.
                     return;
                 }
                 if (uiOverProblems)
@@ -586,7 +637,7 @@ public sealed partial class Playfield
 
         // The INFO panel owns wheel input while the pointer is over it. Only its
         // field list scrolls; difficulty/category tabs and export buttons stay put.
-        if (_chartEditorMode && _editorMetaPanelOpen)
+        if (_chartEditorMode && _editorMetaPanelOpen && !IsChartEditorInterfaceUiActive)
         {
             var viewport = _graphics.Viewport;
             var (virtualWidth, virtualHeight) = GetVirtualResolution(viewport.Width, viewport.Height);

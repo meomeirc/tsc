@@ -423,10 +423,19 @@ public sealed partial class Playfield
         }
 
         var currentTick = _tempo?.SecondsToTick(_playSeconds) ?? 0.0;
-        var metaStats = string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase) && _chart is not null
+        // The Info panel is a relatively expensive part of the editor state: media
+        // rows probe the filesystem and metadata rows allocate nested dictionaries.
+        // Do not build any of it while the panel is closed.
+        var metaPanelOpen = _editorMetaPanelOpen;
+        var activeDifficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+        var metaDifficultyHasChart = metaPanelOpen && HasEditorDifficultyChart(activeDifficultyCode);
+        var metaStats = metaPanelOpen &&
+                        string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase) && _chart is not null
             ? GetEditorMetaStatsData()
             : null;
-        var rows = GetEditorMetaRows(currentTick, metaStats);
+        IReadOnlyList<(string Label, string Value)> rows = metaPanelOpen
+            ? GetEditorMetaRows(currentTick, metaStats, metaDifficultyHasChart)
+            : Array.Empty<(string Label, string Value)>();
         var bpmInputMetrics = GetEditorTextFieldMetrics(_editorBpmInputText, _editorBpmInputCaretIndex, _editorBpmSelectionAnchor);
         var durationInputText = GetEditorDurationFieldDisplayText();
         var durationInputMetrics = GetEditorTextFieldMetrics(durationInputText, _editorDurationInputCaretIndex, _editorDurationSelectionAnchor);
@@ -441,7 +450,16 @@ public sealed partial class Playfield
             EditorStutterInputField.FastTimeBeats => 6,
             _ => -1
         };
-        var metaRows = rows.Select((row, index) =>
+        IReadOnlyList<EditorMetaRowLayout> metaRowLayouts = metaPanelOpen
+            ? GetEditorMetaRowLayouts(rows, width, height)
+            : Array.Empty<EditorMetaRowLayout>();
+        var metaVisibleRows = metaPanelOpen
+            ? GetEditorMetaVisibleRowCount(metaRowLayouts, width, height)
+            : 0;
+        var metaScrollMaximum = metaPanelOpen
+            ? GetEditorMetaMaxScrollOffset(metaRowLayouts, width, height)
+            : 0.0;
+        IReadOnlyList<object?> metaRows = rows.Select((row, index) =>
         {
             var fieldKey = GetEditorMetaFieldKey(row.Label);
             var editing = fieldKey is not null &&
@@ -576,9 +594,11 @@ public sealed partial class Playfield
             }
             return (object?)item;
         }).ToList();
-        var metaCategories = EditorMetaCategories.Select((category, index) =>
-            (object?)EditorUiItem($"meta_category_{index}", category, "editor.meta.category", index,
-                string.Equals(category, _editorMetaCategory, StringComparison.OrdinalIgnoreCase))).ToList();
+        IReadOnlyList<object?> metaCategories = metaPanelOpen
+            ? EditorMetaCategories.Select((category, index) =>
+                (object?)EditorUiItem($"meta_category_{index}", category, "editor.meta.category", index,
+                    string.Equals(category, _editorMetaCategory, StringComparison.OrdinalIgnoreCase))).ToList()
+            : Array.Empty<object?>();
         Dictionary<string, object?> ElementOption(string id, string label, int index, string variant)
         {
             var option = EditorUiItem(id, label, "editor.meta.element_option", index,
@@ -598,22 +618,26 @@ public sealed partial class Playfield
             };
             return option;
         }
-        var difficulties = EditorDifficultyCodes.Select((code, index) =>
-        {
-            var item = EditorUiItem($"difficulty_{index}", GetEditorDifficultyName(code).ToUpperInvariant(), "editor.difficulty", index,
-                string.Equals(code, _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName), StringComparison.OrdinalIgnoreCase));
-            item["enabled"] = true;
-            item["variant"] = "secondary";
-            return (object?)item;
-        }).ToList();
-        var exportOptions = Enumerable.Range(0, GetEditorMetaExportOptionCount()).Select(index =>
-        {
-            var option = GetEditorMetaExportOption(index);
-            var item = EditorUiItem($"meta_export_{index}", option.Label, "editor.meta.export_option", index);
-            item["description"] = option.Description;
-            item["variant"] = "secondary";
-            return (object?)item;
-        }).ToList();
+        IReadOnlyList<object?> difficulties = metaPanelOpen
+            ? EditorDifficultyCodes.Select((code, index) =>
+            {
+                var item = EditorUiItem($"difficulty_{index}", GetEditorDifficultyName(code).ToUpperInvariant(), "editor.difficulty", index,
+                    string.Equals(code, _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName), StringComparison.OrdinalIgnoreCase));
+                item["enabled"] = true;
+                item["variant"] = "secondary";
+                return (object?)item;
+            }).ToList()
+            : Array.Empty<object?>();
+        IReadOnlyList<object?> exportOptions = metaPanelOpen
+            ? Enumerable.Range(0, GetEditorMetaExportOptionCount()).Select(index =>
+            {
+                var option = GetEditorMetaExportOption(index);
+                var item = EditorUiItem($"meta_export_{index}", option.Label, "editor.meta.export_option", index);
+                item["description"] = option.Description;
+                item["variant"] = "secondary";
+                return (object?)item;
+            }).ToList()
+            : Array.Empty<object?>();
 
         var previewState = EnsureEditorPreviewGearState();
         SyncEditorPreviewBankIndicators(previewState);
@@ -801,16 +825,17 @@ public sealed partial class Playfield
             ["meta_music_audio_available"] = _editorOriginalMusicSourceBytes is { Length: > 0 },
             ["meta_music_volume"] = _editorMusicVolumePercent,
             ["meta_music_volume_pending"] = _editorMusicVolumePendingPercent,
-            ["meta_visible_rows"] = GetEditorMetaVisibleRowCount(rows, width, height),
+            ["meta_visible_rows"] = metaVisibleRows,
             ["meta_scroll"] = _editorMetaScroll.Position,
-            ["meta_scroll_max"] = GetEditorMetaMaxScrollOffset(rows, width, height),
+            ["meta_scroll_max"] = metaScrollMaximum,
             ["meta_export_expanded"] = _editorMetaExportExpanded,
             ["meta_export_options"] = exportOptions,
-            ["meta_difficulty_enabled"] = HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName))
-                && IsEditorDifficultyEnabled(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)),
-            ["meta_difficulty_has_chart"] = HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)),
-            ["meta_difficulty_label"] = GetEditorDifficultyName(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)).ToUpperInvariant() + " DIFFICULTY",
-            ["meta_delete_enabled"] = HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)),
+            ["meta_difficulty_enabled"] = metaDifficultyHasChart && IsEditorDifficultyEnabled(activeDifficultyCode),
+            ["meta_difficulty_has_chart"] = metaDifficultyHasChart,
+            ["meta_difficulty_label"] = metaPanelOpen
+                ? GetEditorDifficultyName(activeDifficultyCode).ToUpperInvariant() + " DIFFICULTY"
+                : string.Empty,
+            ["meta_delete_enabled"] = metaDifficultyHasChart,
             ["meta_delete_confirm_open"] = _editorMetaDeleteConfirmOpen,
             ["meta_create_confirm_open"] = _editorCreateDifficultyConfirmOpen,
             ["meta_create_difficulty_label"] = string.IsNullOrWhiteSpace(_editorPendingCreateDifficultyCode)
@@ -819,17 +844,35 @@ public sealed partial class Playfield
             ["meta_element_open"] = _editorElementDropdownOpen,
             ["meta_preview_playing"] = _editorPreviewPlayer?.IsPlaying == true,
             ["preview_editor_open"] = _editorPreviewEditorOpen,
+            ["preview_tick_pick_active"] = _editorPreviewPendingChartTickTarget >= 0,
+            ["preview_tick_pick_target"] = _editorPreviewPendingChartTickTarget == 0 ? "START" :
+                _editorPreviewPendingChartTickTarget == 1 ? "END" : string.Empty,
             ["preview_source_loading"] = _audio.IsLoading,
             ["preview_source_ready"] = _audio.IsLoaded && EditorPreviewSourceDurationSeconds > 0,
             ["preview_source_failed"] = _audioLoadFailed && _loadedMusicBytes is { Length: > 0 },
             ["preview_duration"] = EditorPreviewSourceDurationSeconds,
+            ["preview_view_start"] = GetEditorPreviewTimelineViewStartSeconds(),
+            ["preview_view_duration"] = GetEditorPreviewTimelineViewDurationSeconds(),
             ["preview_start"] = _editorPreviewStartSeconds,
             ["preview_end"] = _editorPreviewEndSeconds,
             ["preview_start_text"] = _editorPreviewStartText,
             ["preview_end_text"] = _editorPreviewEndText,
+            ["preview_selected_duration"] = Math.Max(0, _editorPreviewEndSeconds - _editorPreviewStartSeconds),
+            ["preview_selected_duration_text"] = FormatEditorPreviewSeconds(
+                Math.Max(0, _editorPreviewEndSeconds - _editorPreviewStartSeconds)),
             ["preview_start_label"] = FormatEditorPreviewTimestamp(_editorPreviewStartSeconds),
             ["preview_end_label"] = FormatEditorPreviewTimestamp(_editorPreviewEndSeconds),
             ["preview_duration_label"] = FormatEditorPreviewTimestamp(EditorPreviewSourceDurationSeconds),
+            ["preview_playhead"] = GetEditorPreviewPlayheadSeconds(),
+            ["preview_playhead_timecode"] = FormatEditorProgressTimestamp(GetEditorPreviewPlayheadSeconds()),
+            // Keep the original full-song duration field for older/custom skins;
+            // the Default skin uses preview_end_timecode for its selected-range readout.
+            ["preview_duration_timecode"] = FormatEditorProgressTimestamp(EditorPreviewSourceDurationSeconds),
+            ["preview_end_timecode"] = FormatEditorProgressTimestamp(_editorPreviewEndSeconds),
+            ["preview_waveform_rms"] = _editorPreviewWaveformRms ?? Array.Empty<float>(),
+            ["preview_waveform_rms_prefix"] = _editorPreviewWaveformRmsPrefix ?? Array.Empty<float>(),
+            ["preview_waveform_ready"] = _editorPreviewWaveformRms is { Length: > 0 },
+            ["preview_waveform_building"] = _editorPreviewWaveformTask is { IsCompleted: false },
             ["preview_start_focused"] = _editorPreviewFocusedField == 0,
             ["preview_end_focused"] = _editorPreviewFocusedField == 1,
             ["preview_start_caret_offset"] = previewStartMetrics.CaretOffset,
@@ -843,13 +886,15 @@ public sealed partial class Playfield
             ["preview_message"] = _editorPreviewDialogMessage ?? (_audio.IsLoading
                 ? "Music is still being prepared. Preview controls will be available shortly."
                 : string.Empty),
-            ["preview_playing"] = _editorPreviewPlayer?.IsPlaying == true,
-            ["meta_element_options"] = new List<object?>
-            {
-                ElementOption("meta_element_0", "DANCER", 0, "danger"),
-                ElementOption("meta_element_1", "VOCAL", 1, "info"),
-                ElementOption("meta_element_2", "SESSION", 2, "success"),
-            },
+            ["preview_playing"] = _editorPreviewSelectionPlaying,
+            ["meta_element_options"] = metaPanelOpen
+                ? new object?[]
+                {
+                    ElementOption("meta_element_0", "DANCER", 0, "danger"),
+                    ElementOption("meta_element_1", "VOCAL", 1, "info"),
+                    ElementOption("meta_element_2", "SESSION", 2, "success"),
+                }
+                : Array.Empty<object?>(),
             ["problems_summary"] = summary,
             ["problems_count"] = _editorProblems.Count,
             ["problems_errors"] = errorCount,
@@ -1087,6 +1132,8 @@ public sealed partial class Playfield
                     CancelEditorMetaField();
                     _editorElementDropdownOpen = false;
                     _editorMetaCategory = EditorMetaCategories[categoryIndex];
+                    if (string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
+                        InvalidateEditorMediaAssetCaches();
                     _editorMetaScroll.Reset();
                     _editorMetaScrollOffset = 0;
                 }
@@ -1229,16 +1276,16 @@ public sealed partial class Playfield
                     CommitEditorPreviewFocusedTime();
                     if (_editorPreviewFocusedField >= 0) return true;
                 }
-                if (_editorPreviewPlayer?.IsPlaying == true)
-                {
-                    StopEditorPreviewPlayback();
-                    _editorPreviewDialogMessage = "Preview playback stopped. Chart playback remains paused.";
-                }
-                else
-                {
-                    try { PlayEditorPreviewSelection(); }
-                    catch (Exception ex) { _editorPreviewDialogMessage = ex.Message; _statusMessage = $"Could not play music preview: {ex.Message}"; }
-                }
+                try { PlayEditorPreviewSelectionFromPlayhead(); }
+                catch (Exception ex) { _editorPreviewDialogMessage = ex.Message; _statusMessage = $"Could not play music preview: {ex.Message}"; }
+                return true;
+            case "editor.preview.pause":
+                PauseEditorPreviewSelection();
+                _editorPreviewDialogMessage = "Preview paused. The playhead position was kept.";
+                return true;
+            case "editor.preview.stop":
+                StopEditorPreviewSelectionPlayback();
+                _editorPreviewDialogMessage = "Preview stopped. The playhead returned to the start marker.";
                 return true;
             case "editor.preview.save":
                 if (_editorPreviewFocusedField >= 0)

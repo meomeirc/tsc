@@ -24,25 +24,14 @@ public sealed partial class Playfield
     {
         get
         {
-            if (!_chartEditorInterfaceRuntime.IsLoaded || _chartEditorInterfaceRuntime.LastError is not null ||
-                string.IsNullOrWhiteSpace(_chartEditorInterfaceRuntime.ActiveScriptPath))
+            if (!IsChartEditorInterfaceUiActive)
                 return false;
 
-            // The built-in interface uses uiStyle buttons positioned by its exact
-            // wrapped-text caret. Older custom editor scripts do not know about
-            // that control, so retain the stable C# strip for those scripts.
-            var defaultScript = Path.Combine(
-                SkinScriptPathResolver.DefaultSkinDirectory(_skin.RootDirectory),
-                "scripts", "chartEditorInterface.lua");
-            try
-            {
-                return string.Equals(Path.GetFullPath(_chartEditorInterfaceRuntime.ActiveScriptPath),
-                    Path.GetFullPath(defaultScript), StringComparison.OrdinalIgnoreCase);
-            }
-            catch
-            {
-                return false;
-            }
+            // Detect the skin's semantic formatter surface rather than comparing
+            // script paths. A custom skin can own this control by registering the
+            // same shield/button IDs; older scripts keep the C# compatibility UI.
+            return _chartEditorInterfaceRuntime.TryGetUiButtonBounds(
+                "editor_meta_bbcode_context_shield", out _);
         }
     }
 
@@ -143,7 +132,7 @@ public sealed partial class Playfield
         if (rowIndex < 0)
             return Vector2.Zero;
 
-        var bounds = GetEditorMetaFieldBounds(rowIndex, virtualWidth, virtualHeight);
+        var bounds = GetEditorMetaInterfaceFieldBounds(rowIndex, virtualWidth, virtualHeight);
         if (bounds.IsEmpty)
             return Vector2.Zero;
 

@@ -1607,6 +1607,26 @@ public sealed partial class Playfield
             }
         }
 
+        // While the preview-range picker is armed, show the snapped chart tick
+        // under the pointer across all four panel tracks. This is deliberately
+        // separate from the panel-note hover preview so the active note tool cannot
+        // affect the appearance or behavior of preview-time selection.
+        if (_editorPreviewPendingChartTickTarget >= 0 && _hoverBeatTick.HasValue)
+        {
+            var pickY = GetEditorPanelsTickY(_hoverBeatTick.Value, currentTick, currentState);
+            if (float.IsFinite(pickY) && pickY >= area.Top && pickY < area.Bottom)
+            {
+                var pickColor = _editorPreviewPendingChartTickTarget == 0
+                    ? new Color(251, 146, 60, 235)
+                    : new Color(239, 68, 68, 235);
+                DrawEditorPanelLine(new Vector2(area.Left, pickY), new Vector2(area.Right, pickY),
+                    pickColor, Math.Max(2f, unit * 1.5f));
+                var pickLabel = $"PREVIEW {(_editorPreviewPendingChartTickTarget == 0 ? "START" : "END")} • TICK {_hoverBeatTick.Value} • {GetEditorPreviewAudioTimeLabelAtTick(_hoverBeatTick.Value)}";
+                DrawEditorHoverIndicator(pickLabel, _editorPointerPosition, Math.Max(3f, unit * 2f),
+                    pickColor, Color.White);
+            }
+        }
+
         RefreshEditorDiagnostics();
         var visibleRect = new Rectangle(area.X, area.Y, area.Width, area.Height);
         foreach (var ev in _chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&

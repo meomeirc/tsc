@@ -738,6 +738,7 @@ public sealed partial class Playfield
     private int[] _renderEventMarks = Array.Empty<int>();
     private int _renderEventMarkStamp;
     private Dictionary<ChartEventKey, List<ChartEvent>> _linkChainCache = new();
+    private bool _editorLinkHoverChainCacheComplete;
     private Dictionary<ChartEventKey, int> _linkChainEffectiveEndTickCache = new();
     private Dictionary<ChartEventKey, double> _eventSecondsByKey = new();
     private Dictionary<ChartEventKey, ChartEvent> _eventsByKey = new();
@@ -1476,11 +1477,16 @@ public sealed partial class Playfield
         if (_editorMetaPanelOpen)
             StopEditorPreviewPlayback();
         _editorMetaPanelOpen = false;
+        InvalidateEditorMediaAssetCaches();
     }
 
     public void ToggleEditorInfoMenu()
     {
         if (!_chartEditorMode)
+            return;
+        // The INFO command cancels an active preview tick pick before changing
+        // panels, matching the toolbar action and Escape behavior.
+        if (CancelEditorPreviewChartTickPick())
             return;
         // Let Escape close the modal preview editor and discard only an uncommitted
         // metadata text edit; otherwise it toggles INFO instead of leaving the editor.
@@ -2491,7 +2497,13 @@ public sealed partial class Playfield
             {
                 nextState = TryLoadSiblingEditorDifficulty(nextCode, sharedMusic)
                     ?? CreateBlankEditorDifficultyState(nextCode, _chart, sharedMusic);
+                if (!_chart.HasPreviewRange && nextState.Chart.HasPreviewRange)
+                {
+                    _chart.PreviewStartMilliseconds = nextState.Chart.PreviewStartMilliseconds;
+                    _chart.PreviewEndMilliseconds = nextState.Chart.PreviewEndMilliseconds;
+                }
                 CopySharedEditorMetadata(_chart, nextState.Chart);
+                SyncSharedEditorMetadataToDifficultyStates();
                 nextState.Chart.Difficulty = GetEditorDifficultyName(nextCode);
                 if (sharedMusic is { Length: > 0 })
                     nextState.MusicBytes = sharedMusic;
@@ -2501,7 +2513,13 @@ public sealed partial class Playfield
             }
             else
             {
+                if (!_chart.HasPreviewRange && nextState.Chart.HasPreviewRange)
+                {
+                    _chart.PreviewStartMilliseconds = nextState.Chart.PreviewStartMilliseconds;
+                    _chart.PreviewEndMilliseconds = nextState.Chart.PreviewEndMilliseconds;
+                }
                 CopySharedEditorMetadata(_chart, nextState.Chart);
+                SyncSharedEditorMetadataToDifficultyStates();
                 nextState.Chart.Difficulty = GetEditorDifficultyName(nextCode);
                 if (sharedMusic is { Length: > 0 } && (nextState.MusicBytes is null || _editorSharedSongImportedAudio))
                     nextState.MusicBytes = sharedMusic;
@@ -2791,6 +2809,11 @@ public sealed partial class Playfield
         to.MetadataBpm = from.MetadataBpm;
         to.MusicPath = from.MusicPath;
         to.PreviewPath = from.PreviewPath;
+        // Preview timing is song-wide. Copy nulls as well so undoing or clearing
+        // the range cannot leave stale values on another difficulty. When loading
+        // a session, an existing sibling range is adopted before this copy runs.
+        to.PreviewStartMilliseconds = from.PreviewStartMilliseconds;
+        to.PreviewEndMilliseconds = from.PreviewEndMilliseconds;
         to.AlbumPath = from.AlbumPath;
         to.AlbumBigPath = from.AlbumBigPath;
         // Tempo, measure layout, play range, starting gear, and audio-origin tick
@@ -2870,6 +2893,8 @@ public sealed partial class Playfield
             Level = null,
             MusicPath = basis.MusicPath,
             PreviewPath = basis.PreviewPath,
+            PreviewStartMilliseconds = basis.PreviewStartMilliseconds,
+            PreviewEndMilliseconds = basis.PreviewEndMilliseconds,
             AlbumPath = basis.AlbumPath,
             AlbumBigPath = basis.AlbumBigPath,
             TicksPerMeasure = basis.TicksPerMeasure,
@@ -3053,6 +3078,14 @@ public sealed partial class Playfield
             if (code != "xt" && IsEditorDifficultySourceDisabled(state.SourcePath, state.FpkChartName, state.SourceName))
                 _editorDisabledDifficultyCodes.Add(code);
 
+            // If the selected difficulty predates preview-range metadata, adopt
+            // the first valid range found in a sibling before treating it as the
+            // song-wide value shared by every loaded difficulty.
+            if (!_chart.HasPreviewRange && state.Chart.HasPreviewRange)
+            {
+                _chart.PreviewStartMilliseconds = state.Chart.PreviewStartMilliseconds;
+                _chart.PreviewEndMilliseconds = state.Chart.PreviewEndMilliseconds;
+            }
             CopySharedEditorMetadata(_chart, state.Chart);
             state.Chart.Difficulty = GetEditorDifficultyName(code);
             // PlayTick is authored independently of PlayTime; preserve each
@@ -3066,6 +3099,9 @@ public sealed partial class Playfield
             _editorDifficultyStates[code] = state;
         }
 
+        // A range may have been discovered in a later sibling. Propagate the
+        // adopted value back to every earlier state as well.
+        SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
     }
 
@@ -3081,6 +3117,7 @@ public sealed partial class Playfield
         if (assetBytes.Length == 0)
             throw new InvalidDataException("The selected album asset is empty.");
 
+        InvalidateEditorMediaAssetCaches();
         if (string.Equals(field, "album_big", StringComparison.OrdinalIgnoreCase))
         {
             if (_editorBundleTemplate == ChartBundleTemplate.Tsts)
@@ -3149,6 +3186,8 @@ public sealed partial class Playfield
             throw new InvalidDataException("The converted Opus file is empty.");
 
         // Decode first so invalid output does not replace the current chart audio.
+        InvalidateEditorMediaAssetCaches();
+        DisposeEditorPreviewSelectionPlayer();
         _audio.LoadOpus(opusBytes);
         _audio.PrepareInitialPlayback(retainPcmForSeeking: true);
         _audioLoadFailed = false;
@@ -3902,6 +3941,82 @@ public sealed partial class Playfield
         }
     }
 
+    private List<string> SynchronizePreviewRangeToSiblingChartFiles(string activeChartPath, string activeDifficultyCode)
+    {
+        var failures = new List<string>();
+        if (_chart is null || string.IsNullOrWhiteSpace(activeChartPath))
+            return failures;
+
+        var logicalPath = StripEditorDisabledSuffix(activeChartPath);
+        var extension = Path.GetExtension(logicalPath);
+        var isTsc = extension.Equals(".tsc", StringComparison.OrdinalIgnoreCase);
+        var isAres = extension.Equals(".ares", StringComparison.OrdinalIgnoreCase);
+        if (!isTsc && !isAres)
+            return failures;
+
+        // A missing range is also meaningful: undoing the first preview-range
+        // edit restores the no-metadata state across every sibling difficulty.
+        var startMilliseconds = _chart.HasPreviewRange ? _chart.PreviewStartMilliseconds : null;
+        var endMilliseconds = _chart.HasPreviewRange ? _chart.PreviewEndMilliseconds : null;
+        var activeCode = GetEditorDifficultyCode(activeDifficultyCode);
+        var updatedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var difficultyCode in EditorDifficultyCodes)
+        {
+            if (string.Equals(difficultyCode, activeCode, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            var candidateNames = isTsc
+                ? GetTscSiblingFileNames(difficultyCode)
+                : GetAresSiblingFileNames(difficultyCode, logicalPath, _editorBundleTemplate);
+            var siblingPath = FindRelatedEditorChartFile(logicalPath, candidateNames);
+            if (siblingPath is null || !updatedPaths.Add(siblingPath))
+                continue;
+
+            var temporaryPath = Path.Combine(
+                Path.GetDirectoryName(siblingPath) ?? Directory.GetCurrentDirectory(),
+                $".{Path.GetFileName(siblingPath)}.{Guid.NewGuid():N}.previewtmp");
+            try
+            {
+                if (isTsc)
+                {
+                    var siblingChart = TscLoader.Load(siblingPath);
+                    siblingChart.PreviewStartMilliseconds = startMilliseconds;
+                    siblingChart.PreviewEndMilliseconds = endMilliseconds;
+                    // Preview timing belongs to the embedded chart metadata, never song.json.
+                    TscLoader.Save(temporaryPath, siblingChart, writeSongJsonSidecar: false);
+                }
+                else
+                {
+                    var siblingBytes = File.ReadAllBytes(siblingPath);
+                    var siblingChart = AresLoader.LoadBytes(siblingBytes);
+                    siblingChart.PreviewStartMilliseconds = startMilliseconds;
+                    siblingChart.PreviewEndMilliseconds = endMilliseconds;
+                    AresWriter.Save(temporaryPath, siblingChart);
+                }
+
+                // Write beside the original and replace only after serialization
+                // succeeds, so a failed metadata update cannot truncate a sibling chart.
+                File.Move(temporaryPath, siblingPath, overwrite: true);
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or
+                ArgumentException or FormatException or System.Text.Json.JsonException or NotSupportedException or OverflowException)
+            {
+                failures.Add($"{Path.GetFileName(siblingPath)} ({ex.Message})");
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+                }
+                catch { }
+            }
+        }
+
+        return failures;
+    }
+
     private readonly record struct EditorChartMediaState(
         string? Series,
         string? MusicPath,
@@ -4391,6 +4506,7 @@ public sealed partial class Playfield
             ((musicBytes is null && !_audio.HasAudioData) || (musicBytes is { Length: > 0 } && _audio.HasAudioData));
         if (!reuseCurrentAudio)
         {
+            DisposeEditorPreviewSelectionPlayer();
             _audio.Stop();
             if (musicBytes is not null)
             {
@@ -4694,6 +4810,7 @@ public sealed partial class Playfield
         }
         ApplyDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: false);
         UpdateEditorExtraDifficultySongJson(fullTarget, createIfMissing: writeSongJsonSidecar);
+        var previewRangeSyncFailures = SynchronizePreviewRangeToSiblingChartFiles(fullTarget, activeDifficultyCode);
 
         if (adoptOutputAsSource)
         {
@@ -4708,6 +4825,9 @@ public sealed partial class Playfield
         }
         StoreActiveEditorDifficulty();
         MarkEditorSaved();
+        if (previewRangeSyncFailures.Count > 0)
+            _statusMessage = "Chart saved, but preview timing could not be synchronized to: " +
+                string.Join(", ", previewRangeSyncFailures);
     }
 
     public void SaveEditorSongJson(string path)
@@ -5093,6 +5213,7 @@ public sealed partial class Playfield
         }
         ApplyDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: _editorBundleTemplate != ChartBundleTemplate.Tsc);
         UpdateEditorExtraDifficultySongJson(fullTarget, createIfMissing: _editorBundleTemplate != ChartBundleTemplate.Tsc);
+        var previewRangeSyncFailures = SynchronizePreviewRangeToSiblingChartFiles(fullTarget, activeDifficultyCode);
 
         if (adoptOutputAsSource)
         {
@@ -5106,6 +5227,9 @@ public sealed partial class Playfield
         }
         StoreActiveEditorDifficulty();
         MarkEditorSaved();
+        if (previewRangeSyncFailures.Count > 0)
+            _statusMessage = "Chart saved, but preview timing could not be synchronized to: " +
+                string.Join(", ", previewRangeSyncFailures);
     }
 
 #if !TSC_PUBLISH
@@ -5161,6 +5285,15 @@ public sealed partial class Playfield
                     var entryCode = GetEditorDifficultyCodeFromChartFileName(entry.Name);
                     if (entryCode is not null && !IsEditorDifficultyEnabled(entryCode))
                         continue;
+                    if (entryCode is not null &&
+                        !string.Equals(entryCode, activeCode, StringComparison.OrdinalIgnoreCase) &&
+                        Path.GetExtension(StripEditorDisabledSuffix(entry.Name)).Equals(".ares", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var siblingChart = AresLoader.LoadBytes(entryData);
+                        siblingChart.PreviewStartMilliseconds = _chart.HasPreviewRange ? _chart.PreviewStartMilliseconds : null;
+                        siblingChart.PreviewEndMilliseconds = _chart.HasPreviewRange ? _chart.PreviewEndMilliseconds : null;
+                        entryData = AresWriter.BuildBytes(siblingChart);
+                    }
                     var outputName = entryCode is not null &&
                                      string.Equals(Path.GetExtension(StripEditorDisabledSuffix(entry.Name)), ".ares", StringComparison.OrdinalIgnoreCase)
                         ? StripEditorDisabledSuffix(entry.Name)
@@ -6490,7 +6623,8 @@ public sealed partial class Playfield
         _statusMessage = "Metadata updated.";
     }
 
-    private bool TryGetEditorMetaInputCharacter(KeyboardState keyboard, KeyboardState previousKeyboard, out char character)
+    private bool TryGetEditorMetaInputCharacter(KeyboardState keyboard, KeyboardState previousKeyboard,
+        Func<Keys, bool> isKeyPressed, out char character)
     {
         var shift = keyboard.IsKeyDown(Keys.LeftShift) || keyboard.IsKeyDown(Keys.RightShift);
         var capsLock = false;
@@ -6500,7 +6634,7 @@ public sealed partial class Playfield
         // interval on the same frame (for example, a user starts typing while an
         // arrow key is still held).
         var candidateKeys = keyboard.GetPressedKeys()
-            .Where(key => _editorTextRepeatPulses.Contains(key))
+            .Where(isKeyPressed)
             .OrderByDescending(key => !previousKeyboard.IsKeyDown(key));
         foreach (var key in candidateKeys)
         {
@@ -6640,7 +6774,7 @@ public sealed partial class Playfield
         var indexInRows = rows.FindIndex(row => string.Equals(GetEditorMetaFieldKey(row.Label), fields[next], StringComparison.OrdinalIgnoreCase));
         var (virtualWidth, virtualHeight) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
         _editorTextActiveBounds = indexInRows >= 0
-            ? GetEditorMetaFieldBounds(indexInRows, virtualWidth, virtualHeight)
+            ? GetEditorMetaInterfaceFieldBounds(indexInRows, virtualWidth, virtualHeight)
             : Rectangle.Empty;
         _editorTextMouseSelecting = false;
     }
@@ -11859,7 +11993,8 @@ public sealed partial class Playfield
         var keyboard = Keyboard.GetState();
         var wasPlaying = _playing;
         var timeBeforeInput = _playSeconds;
-        var editorRestartPressed = _chartEditorMode && !EditorTextInputActive && !_editorPreviewEditorOpen &&
+        var editorRestartPressed = _chartEditorMode && !EditorTextInputActive &&
+            (!_editorPreviewEditorOpen || _editorPreviewPendingChartTickTarget >= 0) &&
             KeybindSettings.IsPressed("editor_restart_preview");
         HandleInput(keyboard, gameTime);
         if (_audioLoadFailed && (_playing || _playbackStartPending))
@@ -12382,14 +12517,39 @@ public sealed partial class Playfield
         _resultSkinRuntime.SetResultKeybindHints(continueKeybind, retryKeybind);
     }
 
-    /// <summary>Pre-decodes music on a worker if its PCM copy was released.</summary>
-    internal bool PrepareAudioForDeviceReset() => _audio.PrepareForAudioSystemReset();
+    /// <summary>Pre-decodes song and temporary preview audio before an OpenAL reset.</summary>
+    internal bool PrepareAudioForDeviceReset()
+    {
+        if (!_audio.PrepareForAudioSystemReset())
+            return false;
+        return _editorPreviewSelectionPlayer?.PrepareForAudioSystemReset() ?? true;
+    }
 
-    /// <summary>Releases song audio before the OpenAL context is destroyed.</summary>
-    internal void SuspendAudioForDeviceReset() => _audio.SuspendForAudioSystemReset();
+    /// <summary>Releases song and temporary preview audio before the OpenAL context is destroyed.</summary>
+    internal void SuspendAudioForDeviceReset()
+    {
+        if (_editorPreviewSelectionPlaying)
+        {
+            _editorPreviewPlayheadSeconds = GetEditorPreviewPlayheadSeconds();
+            _editorPreviewSelectionPlaybackTimestamp = 0;
+        }
+        _audio.SuspendForAudioSystemReset();
+        _editorPreviewSelectionPlayer?.SuspendForAudioSystemReset();
+    }
 
-    /// <summary>Rebuilds song audio after the OpenAL context is recreated.</summary>
-    internal void RestoreAudioAfterDeviceReset() => _audio.RecreateAfterAudioSystemReset();
+    /// <summary>Rebuilds song and temporary preview audio after the OpenAL context is recreated.</summary>
+    internal void RestoreAudioAfterDeviceReset()
+    {
+        _audio.RecreateAfterAudioSystemReset();
+        var previewPlayer = _editorPreviewSelectionPlayer;
+        if (previewPlayer is null)
+            return;
+
+        previewPlayer.RecreateAfterAudioSystemReset();
+        var localSeconds = Math.Max(0, _editorPreviewPlayheadSeconds - _editorPreviewPlaybackBufferStartSeconds);
+        previewPlayer.SeekToSeconds(localSeconds, play: _editorPreviewSelectionPlaying);
+        _editorPreviewSelectionPlaybackTimestamp = _editorPreviewSelectionPlaying ? Stopwatch.GetTimestamp() : 0;
+    }
 
     private void SyncAudio(bool wasPlaying)
     {
@@ -12635,14 +12795,13 @@ public sealed partial class Playfield
     }
     private void DrawCircleOutline(SpriteBatch batch, Vector2 center, float radius, float width, Color color)
     {
-        const int segments = 32;
-        var points = new Vector2[segments + 1];
-        for (var i = 0; i <= segments; i++)
-        {
-            var angle = MathHelper.TwoPi * i / segments;
-            points[i] = center + new Vector2(MathF.Cos(angle), MathF.Sin(angle)) * radius;
-        }
-        DrawPolyline(batch, points, width, color);
+        // Reuse the precomputed unit circle and one instance scratch buffer. The
+        // old version allocated an array and evaluated 33 sin/cos pairs for every
+        // hover/selection marker on every frame.
+        for (var i = 0; i < EditorHoverOutlineSegments; i++)
+            _editorHoverOutlinePoints[i] = center + EditorHoverOutlineUnitCircle[i] * radius;
+        _editorHoverOutlinePoints[EditorHoverOutlineSegments] = _editorHoverOutlinePoints[0];
+        DrawPolyline(batch, _editorHoverOutlinePoints, width, color);
     }
     private (double ManagedUsedMb, double GcHeapMb, double GcCommittedMb, double GcFragmentedMb,
         double LohMb, double ProcessCommitMb, double WorkingSetMb, double NonGcCommittedMb) GetMemoryDebug()
@@ -12683,6 +12842,7 @@ public sealed partial class Playfield
         _editorOriginalMusicOpusBytes = null;
         StopEditorLanTest();
         StopEditorPreviewPlayback();
+        DisposeEditorPreviewSelectionPlayer();
         ReleaseTstsWorkingDirectory();
         _audio.Dispose();
         _hitSounds.Dispose();

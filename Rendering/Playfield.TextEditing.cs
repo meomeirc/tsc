@@ -6,8 +6,6 @@ using XnaPoint = Microsoft.Xna.Framework.Point;
 using Microsoft.Xna.Framework.Input;
 using ButtonState = Microsoft.Xna.Framework.Input.ButtonState;
 using TSC.Input;
-using System.Globalization;
-using XnaKeys = Microsoft.Xna.Framework.Input.Keys;
 
 namespace TSC.Rendering;
 
@@ -23,66 +21,12 @@ public sealed partial class Playfield
     private string? _editorTextActiveFieldId;
     private Rectangle _editorTextActiveBounds;
     private bool _editorTextMouseSelecting;
-    private bool _editorTextOverwriteMode;
     private readonly Dictionary<string, int> _editorTextHorizontalScrollStarts = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, Stack<string>> _editorTextUndo = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, Stack<string>> _editorTextRedo = new(StringComparer.Ordinal);
-    private readonly Dictionary<XnaKeys, double> _editorTextRepeatRemaining = new();
-    private readonly HashSet<XnaKeys> _editorTextRepeatHeld = new();
-    private readonly HashSet<XnaKeys> _editorTextRepeatPulses = new();
-    private readonly HashSet<XnaKeys> _editorTextRepeatInitialPulses = new();
+    private readonly Dictionary<string, TextInputController> _editorTextControllers = new(StringComparer.Ordinal);
     private double _editorTextInputDeltaSeconds = 1.0 / 60.0;
     // Set at the start of the update while an editor text field/modal owns the keyboard.
     // Gameplay lane and editor hotkeys must not also consume the same keystrokes.
     private bool _editorTextInputOwnsKeyboardThisFrame;
-    private const double EditorTextRepeatDelaySeconds = 0.32;
-    private const double EditorTextRepeatIntervalSeconds = 0.095;
-
-    private void UpdateEditorTextRepeat(KeyboardState keyboard)
-    {
-        _editorTextRepeatPulses.Clear();
-        _editorTextRepeatInitialPulses.Clear();
-        var deltaSeconds = Math.Clamp(_editorTextInputDeltaSeconds, 0.0, 0.25);
-        var down = keyboard.GetPressedKeys().ToHashSet();
-
-        foreach (var released in _editorTextRepeatHeld.Where(key => !down.Contains(key)).ToArray())
-        {
-            _editorTextRepeatHeld.Remove(released);
-            _editorTextRepeatRemaining.Remove(released);
-        }
-
-        foreach (var key in down)
-        {
-            if (_editorTextRepeatHeld.Add(key))
-            {
-                _editorTextRepeatRemaining[key] = EditorTextRepeatDelaySeconds;
-                _editorTextRepeatPulses.Add(key);
-                _editorTextRepeatInitialPulses.Add(key);
-                continue;
-            }
-
-            var remaining = _editorTextRepeatRemaining.TryGetValue(key, out var stored)
-                ? stored - deltaSeconds
-                : EditorTextRepeatDelaySeconds - deltaSeconds;
-            if (remaining <= 0.0)
-            {
-                _editorTextRepeatPulses.Add(key);
-                remaining += EditorTextRepeatIntervalSeconds;
-                if (remaining <= 0.0)
-                    remaining = EditorTextRepeatIntervalSeconds;
-            }
-            _editorTextRepeatRemaining[key] = remaining;
-        }
-    }
-
-    private static bool EditorControlDown(KeyboardState keyboard)
-        => keyboard.IsKeyDown(XnaKeys.LeftControl) || keyboard.IsKeyDown(XnaKeys.RightControl);
-
-    private static bool EditorShiftDown(KeyboardState keyboard)
-        => keyboard.IsKeyDown(XnaKeys.LeftShift) || keyboard.IsKeyDown(XnaKeys.RightShift);
-
-    private static bool EditorAltDown(KeyboardState keyboard)
-        => keyboard.IsKeyDown(XnaKeys.LeftAlt) || keyboard.IsKeyDown(XnaKeys.RightAlt);
 
     private static (int Start, int End) GetEditorTextSelection(string text, int caret, int anchor)
     {
@@ -91,132 +35,61 @@ public sealed partial class Playfield
         return (Math.Min(caret, anchor), Math.Max(caret, anchor));
     }
 
-    private static bool IsEditorWordCharacter(char c)
-        => char.IsLetterOrDigit(c) || c == '_';
-
-    private static int MoveEditorCaretByWord(string text, int caret, bool backwards)
+    private TextInputController GetOrCreateEditorTextController(string fieldId, string text)
     {
-        caret = Math.Clamp(caret, 0, text.Length);
-        if (backwards)
+        if (!_editorTextControllers.TryGetValue(fieldId, out var controller))
         {
-            while (caret > 0 && char.IsWhiteSpace(text[caret - 1])) caret--;
-            if (caret > 0 && IsEditorWordCharacter(text[caret - 1]))
-                while (caret > 0 && IsEditorWordCharacter(text[caret - 1])) caret--;
-            else if (caret > 0)
-                caret--;
+            controller = new TextInputController();
+            controller.Begin(text);
+            _editorTextControllers[fieldId] = controller;
         }
-        else
-        {
-            while (caret < text.Length && char.IsWhiteSpace(text[caret])) caret++;
-            if (caret < text.Length && IsEditorWordCharacter(text[caret]))
-                while (caret < text.Length && IsEditorWordCharacter(text[caret])) caret++;
-            else if (caret < text.Length)
-                caret++;
-        }
-        return caret;
-    }
-
-    private void PushEditorTextHistory(Dictionary<string, Stack<string>> history, string fieldId, string text)
-    {
-        if (!history.TryGetValue(fieldId, out var stack))
-            history[fieldId] = stack = new Stack<string>();
-        stack.Push(text);
-        // Keep long editing sessions from growing history without bound.
-        if (stack.Count > 100)
-        {
-            var recent = stack.Take(100).Reverse().ToArray();
-            history[fieldId] = new Stack<string>(recent);
-        }
+        return controller;
     }
 
     private void RecordEditorTextChange(string fieldId, string oldText, string newText)
     {
         if (string.Equals(oldText, newText, StringComparison.Ordinal)) return;
-        PushEditorTextHistory(_editorTextUndo, fieldId, oldText);
-        _editorTextRedo.Remove(fieldId);
-    }
-
-    private bool UndoEditorTextChange(string fieldId, ref string text, ref int caret, ref int anchor)
-    {
-        if (!_editorTextUndo.TryGetValue(fieldId, out var stack) || stack.Count == 0) return false;
-        PushEditorTextHistory(_editorTextRedo, fieldId, text);
-        text = stack.Pop();
-        caret = anchor = text.Length;
-        return true;
-    }
-
-    private bool RedoEditorTextChange(string fieldId, ref string text, ref int caret, ref int anchor)
-    {
-        if (!_editorTextRedo.TryGetValue(fieldId, out var stack) || stack.Count == 0) return false;
-        PushEditorTextHistory(_editorTextUndo, fieldId, text);
-        text = stack.Pop();
-        caret = anchor = text.Length;
-        return true;
-    }
-
-    private static bool TryReadEditorClipboard(out string value)
-    {
-        try
+        var controller = GetOrCreateEditorTextController(fieldId, oldText);
+        var caret = newText.Length;
+        var anchor = caret;
+        if (fieldId.StartsWith("meta:", StringComparison.Ordinal))
         {
-            value = System.Windows.Forms.Clipboard.ContainsText() ? System.Windows.Forms.Clipboard.GetText() : string.Empty;
-            return true;
+            caret = _editorMetaInputCaretIndex;
+            anchor = _editorMetaSelectionAnchor;
         }
-        catch
+        else if (fieldId == "bpm")
         {
-            value = string.Empty;
-            return false;
+            caret = _editorBpmInputCaretIndex;
+            anchor = _editorBpmSelectionAnchor;
         }
-    }
-
-    private static void TryWriteEditorClipboard(string value)
-    {
-        try
+        else if (fieldId == "duration")
         {
-            if (value.Length > 0) System.Windows.Forms.Clipboard.SetText(value);
+            caret = _editorDurationInputCaretIndex;
+            anchor = _editorDurationSelectionAnchor;
         }
-        catch
+        else if (fieldId.StartsWith("stutter:", StringComparison.Ordinal))
         {
-            // The editor should remain usable when the desktop clipboard is unavailable.
+            caret = _editorStutterInputCaretIndex;
+            anchor = _editorStutterSelectionAnchor;
         }
-    }
-
-    private void InsertEditorText(
-        string fieldId,
-        ref string text,
-        ref int caret,
-        ref int anchor,
-        ref bool replaceOnNextKey,
-        string inserted,
-        Func<string, char, bool> allowCharacter)
-    {
-        if (string.IsNullOrEmpty(inserted)) return;
-        var original = text;
-        var (start, end) = GetEditorTextSelection(text, caret, anchor);
-        var hadSelection = end > start;
-        if (replaceOnNextKey && start == end)
+        else if (fieldId == "preview-start")
         {
-            start = 0;
-            end = text.Length;
+            caret = _editorPreviewStartCaret;
+            anchor = _editorPreviewStartSelectionAnchor;
         }
-        text = text.Remove(start, end - start);
-        caret = start;
-        foreach (var c in inserted)
+        else if (fieldId == "preview-end")
         {
-            if (char.IsControl(c) || !allowCharacter(text, c)) continue;
-            if (_editorTextOverwriteMode && !hadSelection && caret < text.Length)
-                text = text.Remove(caret, 1);
-            text = text.Insert(caret, c.ToString());
-            caret++;
+            caret = _editorPreviewEndCaret;
+            anchor = _editorPreviewEndSelectionAnchor;
         }
-        anchor = caret;
-        replaceOnNextKey = false;
-        RecordEditorTextChange(fieldId, original, text);
+        controller.RecordExternalChange(oldText, newText, caret, anchor);
     }
 
     /// <summary>
-    /// Shared single-line text editing behavior used by every custom editor text field.
-    /// Returning from the caller still owns Enter/Escape so each field can validate/commit
-    /// or cancel according to its own data rules.
+    /// Routes every chart-editor text field through the same controller used by
+    /// settings and song-search inputs. The host still owns the field's value and
+    /// commit/validation rules; keyboard editing, selection, clipboard, undo/redo,
+    /// overwrite mode and repeat timing are shared.
     /// </summary>
     private bool HandleEditorTextFieldKeyboard(
         string fieldId,
@@ -228,158 +101,19 @@ public sealed partial class Playfield
         KeyboardState previousKeyboard,
         Func<string, char, bool> allowCharacter)
     {
-        UpdateEditorTextRepeat(keyboard);
-        bool Pressed(XnaKeys key) => _editorTextRepeatPulses.Contains(key);
-        bool FirstPressed(XnaKeys key) => _editorTextRepeatInitialPulses.Contains(key);
-        caret = Math.Clamp(caret, 0, text.Length);
-        anchor = Math.Clamp(anchor, 0, text.Length);
-        var control = EditorControlDown(keyboard);
-        var shift = EditorShiftDown(keyboard);
-        var alt = EditorAltDown(keyboard);
-        var selection = GetEditorTextSelection(text, caret, anchor);
-
-        if (FirstPressed(XnaKeys.Insert) && !control && !shift && !alt)
-        {
-            _editorTextOverwriteMode = !_editorTextOverwriteMode;
-            replaceOnNextKey = false;
-            return true;
-        }
-        if (shift && !alt && Pressed(XnaKeys.Insert))
-        {
-            if (TryReadEditorClipboard(out var shiftedPasted) && shiftedPasted.Length > 0)
-                InsertEditorText(fieldId, ref text, ref caret, ref anchor, ref replaceOnNextKey, shiftedPasted, allowCharacter);
-            return true;
-        }
-        if (control && !alt && Pressed(XnaKeys.Insert))
-        {
-            var copyRange = GetEditorTextSelection(text, caret, anchor);
-            if (copyRange.End > copyRange.Start)
-                TryWriteEditorClipboard(text[copyRange.Start..copyRange.End]);
-            return true;
-        }
-        if (shift && !control && !alt && Pressed(XnaKeys.Delete))
-        {
-            var selectionRange = GetEditorTextSelection(text, caret, anchor);
-            if (selectionRange.End > selectionRange.Start)
-            {
-                TryWriteEditorClipboard(text[selectionRange.Start..selectionRange.End]);
-                var beforeCut = text;
-                text = text.Remove(selectionRange.Start, selectionRange.End - selectionRange.Start);
-                caret = anchor = selectionRange.Start;
-                RecordEditorTextChange(fieldId, beforeCut, text);
-            }
-            replaceOnNextKey = false;
-            return true;
-        }
-
-        if (control && !alt)
-        {
-            if (Pressed(XnaKeys.A))
-            {
-                anchor = 0;
-                caret = text.Length;
-                replaceOnNextKey = false;
-                return true;
-            }
-            if (Pressed(XnaKeys.C) || (shift && Pressed(XnaKeys.Insert)))
-            {
-                if (selection.End > selection.Start)
-                    TryWriteEditorClipboard(text[selection.Start..selection.End]);
-                return true;
-            }
-            if (Pressed(XnaKeys.X) || (shift && Pressed(XnaKeys.Delete)))
-            {
-                if (selection.End > selection.Start)
-                {
-                    TryWriteEditorClipboard(text[selection.Start..selection.End]);
-                    var oldText = text;
-                    text = text.Remove(selection.Start, selection.End - selection.Start);
-                    caret = anchor = selection.Start;
-                    RecordEditorTextChange(fieldId, oldText, text);
-                }
-                replaceOnNextKey = false;
-                return true;
-            }
-            if (Pressed(XnaKeys.V) || (shift && Pressed(XnaKeys.Insert)))
-            {
-                if (TryReadEditorClipboard(out var pasted) && pasted.Length > 0)
-                    InsertEditorText(fieldId, ref text, ref caret, ref anchor, ref replaceOnNextKey, pasted, allowCharacter);
-                return true;
-            }
-            if (Pressed(XnaKeys.Z) && !shift)
-            {
-                UndoEditorTextChange(fieldId, ref text, ref caret, ref anchor);
-                replaceOnNextKey = false;
-                return true;
-            }
-            if (Pressed(XnaKeys.Y) || (Pressed(XnaKeys.Z) && shift))
-            {
-                RedoEditorTextChange(fieldId, ref text, ref caret, ref anchor);
-                replaceOnNextKey = false;
-                return true;
-            }
-        }
-
-        if (!alt && (Pressed(XnaKeys.Left) || Pressed(XnaKeys.Right)))
-        {
-            var left = Pressed(XnaKeys.Left);
-            if (!shift && selection.End > selection.Start)
-                caret = left ? selection.Start : selection.End;
-            else
-                caret = control
-                    ? MoveEditorCaretByWord(text, caret, left)
-                    : Math.Clamp(caret + (left ? -1 : 1), 0, text.Length);
-            if (!shift) anchor = caret;
-            replaceOnNextKey = false;
-            return true;
-        }
-        if (Pressed(XnaKeys.Home) || Pressed(XnaKeys.End))
-        {
-            var target = Pressed(XnaKeys.Home) ? 0 : text.Length;
-            caret = target;
-            if (!shift) anchor = caret;
-            replaceOnNextKey = false;
-            return true;
-        }
-        if (Pressed(XnaKeys.Back) || Pressed(XnaKeys.Delete))
-        {
-            var backspace = Pressed(XnaKeys.Back);
-            var oldText = text;
-            if (selection.End > selection.Start)
-            {
-                text = text.Remove(selection.Start, selection.End - selection.Start);
-                caret = anchor = selection.Start;
-            }
-            else if (backspace && caret > 0)
-            {
-                var start = control ? MoveEditorCaretByWord(text, caret, backwards: true) : caret - 1;
-                text = text.Remove(start, caret - start);
-                caret = anchor = start;
-            }
-            else if (!backspace && caret < text.Length)
-            {
-                var end = control ? MoveEditorCaretByWord(text, caret, backwards: false) : caret + 1;
-                text = text.Remove(caret, end - caret);
-                anchor = caret;
-            }
-            RecordEditorTextChange(fieldId, oldText, text);
-            replaceOnNextKey = false;
-            return true;
-        }
-
-        if (control || alt) return false;
-        if (TryGetEditorMetaInputCharacter(keyboard, previousKeyboard, out var typedCharacter))
-        {
-            if (allowCharacter(selection.End > selection.Start
-                    ? text.Remove(selection.Start, selection.End - selection.Start)
-                    : text, typedCharacter))
-            {
-                InsertEditorText(fieldId, ref text, ref caret, ref anchor, ref replaceOnNextKey,
-                    typedCharacter.ToString(), allowCharacter);
-            }
-            return true;
-        }
-        return false;
+        var controller = GetOrCreateEditorTextController(fieldId, text);
+        controller.SynchronizeState(text, caret, anchor, replaceOnNextKey);
+        var handled = controller.HandleKeyDown(
+            keyboard, previousKeyboard, allowCharacter, _editorTextInputDeltaSeconds,
+            typedCharacterProvider: () => TryGetEditorMetaInputCharacter(
+                keyboard, previousKeyboard, controller.IsKeyPressed, out var character)
+                    ? character : null,
+            processTextCharacterRepeat: false);
+        text = controller.Text;
+        caret = controller.Caret;
+        anchor = controller.Anchor;
+        replaceOnNextKey = controller.ReplaceOnNextKey;
+        return handled;
     }
 
     private void BeginEditorTextFieldMouseSelection(string fieldId, Rectangle bounds, int caret, ref int anchor)
@@ -471,10 +205,11 @@ public sealed partial class Playfield
     private void EndEditorTextFieldMouseSelection()
     {
         _editorTextMouseSelecting = false;
-        if (_editorTextActiveFieldId is { } fieldId)
+        if (_editorTextActiveFieldId is { } fieldId &&
+            _editorTextControllers.TryGetValue(fieldId, out var controller))
         {
-            _editorTextUndo.Remove(fieldId);
-            _editorTextRedo.Remove(fieldId);
+            controller.ClearHistory();
+            controller.ResetKeyboardState();
         }
         _editorTextActiveFieldId = null;
         _editorTextActiveBounds = Rectangle.Empty;

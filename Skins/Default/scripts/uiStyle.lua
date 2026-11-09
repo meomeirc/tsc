@@ -176,6 +176,28 @@ if type(UI.draw_button) ~= "function" then
             anchor = "center", layer = (options.layer or 1) + 2 })
     end
 end
+-- Semantic text-input surface. ui.input registers its bounds with the same
+-- pointer hit-test controller as ui.button, while host TextInputController owns
+-- keyboard editing, selection, clipboard, undo/redo, and validation.
+if type(UI.draw_input) ~= "function" then
+    function UI.draw_input(options)
+        options = options or {}
+        local id = assert(options.id, "UI.draw_input requires id")
+        ui.input({ id = id, parent = options.parent, x = options.x or 0, y = options.y or 0,
+            width = options.width, height = options.height, action = options.action, value = options.value,
+            hit_test_priority = options.hit_test_priority, clip = options.clip })
+        local state = ui.state(id)
+        local frame_id = id .. "_frame"
+        draw.rect({ id = frame_id, parent = options.parent, x = options.x or 0, y = options.y or 0,
+            width = options.width, height = options.height,
+            color = options.background_color or UI.button_color(state, options.selected == true),
+            alpha = options.alpha == nil and 1 or options.alpha, layer = options.layer or 1 })
+        draw.text(tostring(options.label or ""), { parent = frame_id, x = (options.width or 1) * 0.5,
+            y = (options.height or 1) * 0.5, size = options.text_size or UI.sizes.button,
+            color = options.text_color or UI.colors.text, font = options.font or UI.fonts.medium,
+            anchor = "center", layer = (options.layer or 1) + 2 })
+    end
+end
 if type(UI.draw_row) ~= "function" then
     function UI.draw_row(options)
         options = options or {}

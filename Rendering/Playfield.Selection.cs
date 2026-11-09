@@ -34,7 +34,35 @@ public sealed partial class Playfield
     private readonly record struct EditorHoverHit(
         ChartEvent Event, EditorHoverHitKind Kind, int Tick, int Track);
 
+    private readonly record struct EditorNoteOccupancyEntry(
+        ChartEvent Event, int HitEndTick, int PrefixMaxEndTick);
+
+    private static List<EditorNoteOccupancyEntry>[] CreateEditorNoteOccupancyBuckets()
+    {
+        var buckets = new List<EditorNoteOccupancyEntry>[16];
+        for (var track = 0; track < buckets.Length; track++)
+            buckets[track] = new List<EditorNoteOccupancyEntry>();
+        return buckets;
+    }
+
+    // Per-lane occupancy is rebuilt with the render-event cache. Hovering while
+    // playback scrolls now uses a binary search plus the overlapping-note window,
+    // instead of scanning every chart event on every frame.
+    private readonly List<EditorNoteOccupancyEntry>[] _editorNoteOccupancyByTrack =
+        CreateEditorNoteOccupancyBuckets();
+    private AresChart? _editorNoteOccupancyCacheChart;
+    private bool _editorNoteOccupancyCacheValid;
+    private bool _editorNoteOccupancyCacheGroupEditMode;
+    private int? _editorNoteOccupancyCacheGroupId;
+    private int? _editorNoteOccupancyCacheInstanceId;
+
     private EditorHoverHit? _editorHoverHit;
+    private const int EditorHoverOutlineSegments = 24;
+    private static readonly Vector2[] EditorHoverOutlineUnitCircle = CreateEditorHoverOutlineUnitCircle();
+    private readonly Vector2[] _editorHoverOutlinePoints = new Vector2[EditorHoverOutlineSegments + 1];
+    private string? _editorHoverIndicatorSourceText;
+    private string _editorHoverIndicatorText = string.Empty;
+    private Vector2 _editorHoverIndicatorMeasuredSize;
     private static readonly Color EditorHoverEmptyColor = new(255, 255, 255, 88);
     private static readonly Color EditorHoverOverNoteColor = new(255, 220, 0, 170);
     private bool _editorTimelineScrubbing;
@@ -47,6 +75,19 @@ public sealed partial class Playfield
     private static Color GetEditorSelectedNoteHighlightColor(ChartEvent note)
         => note.NoteGroupId.HasValue ? EditorGroupSelectedColor : EditorSelectedColor;
     private static readonly Color EditorEndingColor = Color.Cyan;
+
+    private static Vector2[] CreateEditorHoverOutlineUnitCircle()
+    {
+        var points = new Vector2[EditorHoverOutlineSegments + 1];
+        for (var i = 0; i < EditorHoverOutlineSegments; i++)
+        {
+            var angle = MathHelper.TwoPi * i / EditorHoverOutlineSegments;
+            points[i] = new Vector2(MathF.Cos(angle), MathF.Sin(angle));
+        }
+        points[EditorHoverOutlineSegments] = points[0];
+        return points;
+    }
+
     // Selection and Local Test segment geometry is drawn on the real 3D lane surfaces.
     // Reuse the vertex buffer each frame rather than creating short-lived arrays.
     private static readonly (int First, int Last)[] EditorLanTestSegmentBanks =
@@ -2848,8 +2889,15 @@ public sealed partial class Playfield
             Math.Max(1, anchor.Y - gap - firstChild.Y));
     }
 
+    private bool IsChartEditorInterfaceUiActive =>
+        _chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null;
+
     private Rectangle GetEditorMetaPanelBounds(int virtualWidth, int virtualHeight)
     {
+        if (IsChartEditorInterfaceUiActive)
+            return _chartEditorInterfaceRuntime.TryGetUiButtonBounds("editor_meta_shield", out var skinBounds)
+                ? skinBounds : Rectangle.Empty;
+
         var unit = _projection.ScalePixels(1f);
         var margin = (int)MathF.Round((float)_chartEditorInterfaceLayout.MetadataPanelMargin * unit);
         var desiredWidth = (int)MathF.Round((float)_chartEditorInterfaceLayout.MetadataPanelWidth * unit);
@@ -2922,6 +2970,10 @@ public sealed partial class Playfield
 
     private Rectangle GetEditorMetaContentBounds(int virtualWidth, int virtualHeight)
     {
+        if (IsChartEditorInterfaceUiActive)
+            return _chartEditorInterfaceRuntime.TryGetUiButtonBounds("editor_meta_scroll_area", out var skinBounds)
+                ? skinBounds : Rectangle.Empty;
+
         var panel = GetEditorMetaPanelBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
         var padding = (int)MathF.Round(12f * unit);
@@ -3021,16 +3073,31 @@ public sealed partial class Playfield
     private int GetEditorMetaRowGap(float unit)
         => Math.Max(1, (int)MathF.Round(8f * unit));
 
+    private List<EditorMetaRowLayout>? _editorMetaRowLayoutCache;
+    private string[]? _editorMetaRowLayoutCacheValues;
+    private int _editorMetaRowLayoutCacheWidth = -1;
+    private int _editorMetaRowLayoutCacheHeight = -1;
+    private int _editorMetaRowLayoutCacheContentWidth = -1;
+    private float _editorMetaRowLayoutCacheUnit;
+    private float _editorMetaRowLayoutCacheTextScale;
+    private SpriteFont? _editorMetaRowLayoutCacheFont;
+    private string? _editorMetaRowLayoutCacheEditingField;
+    private string? _editorMetaRowLayoutCacheEditingText;
+
     private List<EditorMetaRowLayout> GetEditorMetaRowLayouts(
         IReadOnlyList<(string Label, string Value)> rows, int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var font = _font;
+        var fieldTextScale = GetEditorTextFieldFontScale(GetEditorMetaFieldHeight(unit), unit);
+        if (EditorMetaRowLayoutsCacheMatches(rows, virtualWidth, virtualHeight,
+                content.Width, unit, fieldTextScale, font))
+            return _editorMetaRowLayoutCache!;
+
         // Match the Lua field's actual text width. The skin reserves a different
         // trailing area for PREVIEW and artwork rows, then keeps a 20px inner
         // text inset in addition to its 22px control/scrollbar allowance.
-        var font = _font;
-        var fieldTextScale = GetEditorTextFieldFontScale(GetEditorMetaFieldHeight(unit), unit);
         var lineHeight = Math.Max(16f * unit,
             UnicodeTextRenderer.GetLogicalLineSpacing(font) * fieldTextScale * 1.2f);
         var layouts = new List<EditorMetaRowLayout>(rows.Count);
@@ -3075,7 +3142,50 @@ public sealed partial class Playfield
                 GetEditorMetaLabelHeight(unit), GetEditorMetaLabelGap(unit),
                 fieldHeight, GetEditorMetaRowGap(unit)));
         }
+
+        var snapshot = new string[rows.Count * 2];
+        for (var index = 0; index < rows.Count; index++)
+        {
+            snapshot[index * 2] = rows[index].Label;
+            snapshot[index * 2 + 1] = rows[index].Value;
+        }
+        _editorMetaRowLayoutCache = layouts;
+        _editorMetaRowLayoutCacheValues = snapshot;
+        _editorMetaRowLayoutCacheWidth = virtualWidth;
+        _editorMetaRowLayoutCacheHeight = virtualHeight;
+        _editorMetaRowLayoutCacheContentWidth = content.Width;
+        _editorMetaRowLayoutCacheUnit = unit;
+        _editorMetaRowLayoutCacheTextScale = fieldTextScale;
+        _editorMetaRowLayoutCacheFont = font;
+        _editorMetaRowLayoutCacheEditingField = _editorMetaEditingField;
+        _editorMetaRowLayoutCacheEditingText = _editorMetaInputText;
         return layouts;
+    }
+
+    private bool EditorMetaRowLayoutsCacheMatches(
+        IReadOnlyList<(string Label, string Value)> rows, int virtualWidth, int virtualHeight,
+        int contentWidth, float unit, float fieldTextScale, SpriteFont font)
+    {
+        var snapshot = _editorMetaRowLayoutCacheValues;
+        if (_editorMetaRowLayoutCache is null || snapshot is null ||
+            _editorMetaRowLayoutCacheWidth != virtualWidth ||
+            _editorMetaRowLayoutCacheHeight != virtualHeight ||
+            _editorMetaRowLayoutCacheContentWidth != contentWidth ||
+            !_editorMetaRowLayoutCacheUnit.Equals(unit) ||
+            !_editorMetaRowLayoutCacheTextScale.Equals(fieldTextScale) ||
+            !ReferenceEquals(_editorMetaRowLayoutCacheFont, font) ||
+            !string.Equals(_editorMetaRowLayoutCacheEditingField, _editorMetaEditingField, StringComparison.Ordinal) ||
+            !string.Equals(_editorMetaRowLayoutCacheEditingText, _editorMetaInputText, StringComparison.Ordinal) ||
+            snapshot.Length != rows.Count * 2 || _editorMetaRowLayoutCache.Count != rows.Count)
+            return false;
+
+        for (var index = 0; index < rows.Count; index++)
+        {
+            if (!string.Equals(snapshot[index * 2], rows[index].Label, StringComparison.Ordinal) ||
+                !string.Equals(snapshot[index * 2 + 1], rows[index].Value, StringComparison.Ordinal))
+                return false;
+        }
+        return true;
     }
 
     private static int GetEditorMetaPrefixHeight(IReadOnlyList<EditorMetaRowLayout> layouts, int endExclusive)
@@ -3091,6 +3201,8 @@ public sealed partial class Playfield
         var viewport = _graphics.Viewport;
         var (virtualWidth, virtualHeight) = GetVirtualResolution(viewport.Width, viewport.Height);
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        if (content.IsEmpty)
+            return 0.0;
         var totalHeight = GetEditorMetaPrefixHeight(layouts, layouts.Count);
         return Math.Clamp(_editorMetaScroll.Position, 0.0, Math.Max(0.0, totalHeight - content.Height));
     }
@@ -3113,8 +3225,18 @@ public sealed partial class Playfield
     {
         if (rows.Count == 0)
             return 0.0;
+        return GetEditorMetaMaxScrollOffset(GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight),
+            virtualWidth, virtualHeight);
+    }
+
+    private double GetEditorMetaMaxScrollOffset(IReadOnlyList<EditorMetaRowLayout> layouts,
+        int virtualWidth, int virtualHeight)
+    {
+        if (layouts.Count == 0)
+            return 0.0;
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
-        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+        if (content.IsEmpty)
+            return 0.0;
         var totalHeight = GetEditorMetaPrefixHeight(layouts, layouts.Count);
         return Math.Max(0.0, totalHeight - content.Height);
     }
@@ -3124,8 +3246,18 @@ public sealed partial class Playfield
     {
         if (rows.Count == 0)
             return 0;
+        return GetEditorMetaVisibleRowCount(GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight),
+            virtualWidth, virtualHeight);
+    }
+
+    private int GetEditorMetaVisibleRowCount(IReadOnlyList<EditorMetaRowLayout> layouts,
+        int virtualWidth, int virtualHeight)
+    {
+        if (layouts.Count == 0)
+            return 0;
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
-        var layouts = GetEditorMetaRowLayouts(rows, virtualWidth, virtualHeight);
+        if (content.IsEmpty)
+            return 0;
         var scrollTop = _editorMetaScroll.Position;
         var scrollBottom = scrollTop + content.Height;
         var rowTop = 0.0;
@@ -3434,8 +3566,16 @@ public sealed partial class Playfield
 
     private Rectangle GetEditorMetaInterfaceFieldBounds(int rowIndex, int virtualWidth, int virtualHeight)
     {
-        if (_chartEditorInterfaceRuntime.TryGetUiButtonBounds($"editor_meta_row_{rowIndex}", out var bounds))
-            return bounds;
+        if (IsChartEditorInterfaceUiActive)
+        {
+            // An active skin owns this field's placement and hitbox. Do not invent
+            // a second C# rectangle when it has not registered the semantic field.
+            if (_chartEditorInterfaceRuntime.TryGetUiInputBounds($"editor_meta_row_{rowIndex}", out var inputBounds))
+                return inputBounds;
+            return _chartEditorInterfaceRuntime.TryGetUiButtonBounds($"editor_meta_row_{rowIndex}", out var legacyBounds)
+                ? legacyBounds : Rectangle.Empty;
+        }
+
         return GetEditorMetaFieldBounds(rowIndex, virtualWidth, virtualHeight);
     }
 
@@ -3580,6 +3720,8 @@ public sealed partial class Playfield
             CancelEditorMetaField();
             _editorElementDropdownOpen = false;
             _editorMetaCategory = EditorMetaCategories[i];
+            if (string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
+                InvalidateEditorMediaAssetCaches();
             _editorMetaScroll.Reset();
             _editorMetaScrollOffset = 0;
             return true;
@@ -4354,7 +4496,10 @@ public sealed partial class Playfield
         switch (actionId)
         {
             case EditorActionPlay:
-                TryToggleEditorChartPlayback();
+                if (_editorPreviewPendingChartTickTarget >= 0)
+                    ToggleChartPlaybackForPreviewTickPick();
+                else
+                    TryToggleEditorChartPlayback();
                 break;
             case EditorActionEditorPreview:
                 SetEditorPreviewMode(!_editorPreviewMode);
@@ -4399,6 +4544,12 @@ public sealed partial class Playfield
                 break;
             case EditorActionDeselect: DeselectEditorSelection(); break;
             case EditorActionMeta:
+                // INFO is also the escape hatch while choosing a preview tick.
+                // Treat it exactly like cancelling the picker so the preview editor
+                // overlay becomes visible again instead of opening INFO behind it.
+                if (CancelEditorPreviewChartTickPick())
+                    break;
+
                 CancelEditorMetaField();
                 if (_editorMetaPanelOpen)
                     CloseEditorMetaPanel();
@@ -8114,9 +8265,69 @@ public sealed partial class Playfield
         if (_chart is null)
             return null;
 
-        // Hover resolution calls this while the playhead is moving. Keep the
-        // occupied-cell search allocation-free rather than building an ordered
-        // LINQ pipeline every frame.
+        if (track is < 0 or > 15)
+            return FindEditorNoteAtGridCellUnindexed(tick, track);
+
+        if (!_editorNoteOccupancyCacheValid ||
+            !ReferenceEquals(_editorNoteOccupancyCacheChart, _chart) ||
+            _editorNoteOccupancyCacheGroupEditMode != _editorNoteGroupEditMode ||
+            _editorNoteOccupancyCacheGroupId != _editorEditingNoteGroupId ||
+            _editorNoteOccupancyCacheInstanceId != _editorEditingNoteGroupInstanceId)
+            RebuildEditorNoteOccupancyIndex();
+
+        var entries = _editorNoteOccupancyByTrack[track];
+        if (entries.Count == 0)
+            return null;
+
+        // Find the first entry whose note starts after the requested tick.
+        var low = 0;
+        var high = entries.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) >> 1);
+            if (entries[middle].Event.Tick <= tick)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        ChartEvent? best = null;
+        var bestExactTick = false;
+        var bestRawNote = false;
+        for (var index = low - 1; index >= 0; index--)
+        {
+            var entry = entries[index];
+            // No earlier entry can cover this tick once the prefix maximum has
+            // ended. This makes ordinary point-note lanes effectively O(log n).
+            if (entry.PrefixMaxEndTick < tick)
+                break;
+
+            var ev = entry.Event;
+            var exactTick = ev.Tick == tick;
+            if (!exactTick && entry.HitEndTick < tick)
+                continue;
+
+            var rawNote = ev.RawType == 1;
+            if (best is null ||
+                (exactTick && !bestExactTick) ||
+                (exactTick == bestExactTick && rawNote && !bestRawNote) ||
+                (exactTick == bestExactTick && rawNote == bestRawNote &&
+                 (ev.Tick < best.Tick || (ev.Tick == best.Tick && ev.EventIndex < best.EventIndex))))
+            {
+                best = ev;
+                bestExactTick = exactTick;
+                bestRawNote = rawNote;
+            }
+        }
+
+        return best;
+    }
+
+    private ChartEvent? FindEditorNoteAtGridCellUnindexed(int tick, int track)
+    {
+        if (_chart is null)
+            return null;
+
         ChartEvent? best = null;
         var bestExactTick = false;
         var bestRawNote = false;
@@ -8144,7 +8355,50 @@ public sealed partial class Playfield
                 bestRawNote = rawNote;
             }
         }
+
         return best;
+    }
+
+    private void RebuildEditorNoteOccupancyIndex()
+    {
+        foreach (var bucket in _editorNoteOccupancyByTrack)
+            bucket.Clear();
+
+        var chart = _chart;
+        if (chart is null)
+            return;
+
+        foreach (var ev in chart.Events)
+        {
+            if (ev.Kind != "Note" || ev.Track is < 0 or > 15)
+                continue;
+
+            _editorNoteOccupancyByTrack[ev.Track].Add(
+                new EditorNoteOccupancyEntry(ev, GetEditorNoteHitEndTick(ev), int.MinValue));
+        }
+
+        foreach (var bucket in _editorNoteOccupancyByTrack)
+        {
+            bucket.Sort(static (a, b) =>
+            {
+                var tickCompare = a.Event.Tick.CompareTo(b.Event.Tick);
+                return tickCompare != 0 ? tickCompare : a.Event.EventIndex.CompareTo(b.Event.EventIndex);
+            });
+
+            var prefixMaxEndTick = int.MinValue;
+            for (var index = 0; index < bucket.Count; index++)
+            {
+                var entry = bucket[index];
+                prefixMaxEndTick = Math.Max(prefixMaxEndTick, entry.HitEndTick);
+                bucket[index] = entry with { PrefixMaxEndTick = prefixMaxEndTick };
+            }
+        }
+
+        _editorNoteOccupancyCacheChart = chart;
+        _editorNoteOccupancyCacheGroupEditMode = _editorNoteGroupEditMode;
+        _editorNoteOccupancyCacheGroupId = _editorEditingNoteGroupId;
+        _editorNoteOccupancyCacheInstanceId = _editorEditingNoteGroupInstanceId;
+        _editorNoteOccupancyCacheValid = true;
     }
 
     private int GetEditorHoverMarkerTrack(int track)
@@ -8202,7 +8456,8 @@ public sealed partial class Playfield
             var gridPoint = _projection.ProjectAtTicks(gridTrack, tick, currentTick, currentState);
             if (!OutsideNoteView(gridPoint, gridPoint))
             {
-                var linkBody = FindClickedLinkChainBody(gridPoint.Position, currentTick, currentState, tick);
+                var linkBody = FindClickedLinkChainBody(
+                    gridPoint.Position, currentTick, currentState, tick, candidates, candidateCount);
                 if (linkBody is not null)
                     return new EditorHoverHit(linkBody, EditorHoverHitKind.LinkBody, tick, gridTrack);
             }
@@ -8212,7 +8467,8 @@ public sealed partial class Playfield
     }
 
     private ChartEvent? FindClickedLinkChainBody(
-        Vector2 point, double currentTick, GearState currentState, int? snappedHoverTick = null)
+        Vector2 point, double currentTick, GearState currentState, int? snappedHoverTick = null,
+        IReadOnlyList<int>? candidateIndices = null, int candidateCount = -1)
     {
         if (_chart is null || (_chart.Links.Count == 0 && !_editorNoteGroupEditMode))
             return null;
@@ -8220,72 +8476,107 @@ public sealed partial class Playfield
         ChartEvent? bestNode = null;
         var bestDistance = float.MaxValue;
         var hitDistance = Math.Max(6f, _projection.ScalePixels(10f));
-        IEnumerable<(ChartEvent Head, ChartEvent Tail)> hitEdges;
+
         if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int groupId &&
             _editorEditingNoteGroupInstanceId is int instanceId)
         {
             EnsureEditorSelectionGroupChainCache(groupId, instanceId);
-            hitEdges = _editorSelectionGroupChains
-                .SelectMany(chain => Enumerable.Range(0, Math.Max(0, chain.Nodes.Count - 1))
-                    .Select(index => (Head: chain.Nodes[index], Tail: chain.Nodes[index + 1])));
+            foreach (var chain in _editorSelectionGroupChains)
+            {
+                for (var index = 0; index + 1 < chain.Nodes.Count; index++)
+                {
+                    TestEditorLinkBodyHoverEdge(chain.Nodes[index], chain.Nodes[index + 1],
+                        point, currentTick, currentState, snappedHoverTick, hitDistance,
+                        ref bestNode, ref bestDistance);
+                }
+            }
+        }
+        else if (candidateIndices is not null && _editorLinkHoverChainCacheComplete)
+        {
+            // The normal mouse-hover path already has a render-window candidate
+            // list. Reuse it to visit only visible link chains, and read their
+            // prebuilt node lists instead of walking every link in the chart or
+            // allocating a new chain list while the playhead advances.
+            var count = Math.Clamp(candidateCount, 0, candidateIndices.Count);
+            for (var candidateIndex = 0; candidateIndex < count; candidateIndex++)
+            {
+                var eventIndex = candidateIndices[candidateIndex];
+                var root = _orderedRenderableEvents[eventIndex];
+                if (root.NoteType != NoteType.LinkHead ||
+                    !_linkChainCache.TryGetValue(KeyOf(root), out var nodes))
+                    continue;
+
+                for (var index = 0; index + 1 < nodes.Count; index++)
+                {
+                    TestEditorLinkBodyHoverEdge(nodes[index], nodes[index + 1],
+                        point, currentTick, currentState, snappedHoverTick, hitDistance,
+                        ref bestNode, ref bestDistance);
+                }
+            }
         }
         else
         {
-            hitEdges = _chart.Links.Select(link => (Head: link.Head, Tail: link.Tail));
+            // Ambiguous chains and direct touch hit-tests keep the exact edge
+            // fallback. Cull each edge in tick-space before doing 3D projection.
+            foreach (var link in _chart.Links)
+            {
+                TestEditorLinkBodyHoverEdge(link.Head, link.Tail, point, currentTick,
+                    currentState, snappedHoverTick, hitDistance, ref bestNode, ref bestDistance);
+            }
         }
 
-        foreach (var link in hitEdges)
-        {
-            if (!ShouldRenderInCurrentBank(link.Head, currentState) ||
-                !ShouldRenderInCurrentBank(link.Tail, currentState))
-                continue;
-            if (link.Head.NoteType != NoteType.LinkHead && link.Head.NoteType != NoteType.LinkTail)
-                continue;
-            if (link.Tail.NoteType != NoteType.LinkTail)
-                continue;
-
-            // A same-tick edge is a horizontal connector only. It has no body
-            // extending into later ticks on the terminal LinkTail's lane. Keep the
-            // screen-space connector radius from bleeding into the next snapped
-            // cell (especially +6 ticks, where a default-duration LinkTail must be
-            // treated as a point rather than a six-tick hold).
-            if (snappedHoverTick.HasValue && link.Head.Tick == link.Tail.Tick &&
-                snappedHoverTick.Value != link.Tail.Tick)
-                continue;
-
-            var head = _projection.ProjectAtTicks(link.Head.Track, link.Head.Tick, currentTick, currentState);
-            var bodyEnd = _projection.ProjectAtTicks(
-                link.Head.Track, link.Tail.Tick, currentTick, currentState);
-            var tail = _projection.ProjectAtTicks(link.Tail.Track, link.Tail.Tick, currentTick, currentState);
-            if (OutsideNoteView(head, bodyEnd) && OutsideNoteView(bodyEnd, tail))
-                continue;
-
-            // DrawLinkChainUnified does not render a straight diagonal from one
-            // note point to the next. It draws the segment body down the source
-            // lane, then a separate connector across the lanes at the destination
-            // tick. Hit-test those same two pieces; the old endpoint-to-endpoint
-            // diagonal could make an empty middle cell appear occupied (notably at
-            // the midpoint of a zig-zag chain).
-            var bodyDistance = OutsideNoteView(head, bodyEnd)
-                ? float.MaxValue
-                : PointToSegmentDistance(point, head.Position, bodyEnd.Position);
-            var connectorDistance = OutsideNoteView(bodyEnd, tail)
-                ? float.MaxValue
-                : PointToSegmentDistance(point, bodyEnd.Position, tail.Position);
-            var distance = Math.Min(bodyDistance, connectorDistance);
-            if (distance > hitDistance || distance >= bestDistance)
-                continue;
-
-            // The lane body belongs to its source note. The cross-lane connector
-            // selects its nearest endpoint, while the whole chain remains selected.
-            bestNode = bodyDistance <= connectorDistance
-                ? link.Head
-                : Vector2.DistanceSquared(point, head.Position) <= Vector2.DistanceSquared(point, tail.Position)
-                    ? link.Head
-                    : link.Tail;
-            bestDistance = distance;
-        }
         return bestNode;
+    }
+
+    private void TestEditorLinkBodyHoverEdge(
+        ChartEvent headNote, ChartEvent tailNote, Vector2 point, double currentTick,
+        GearState currentState, int? snappedHoverTick, float hitDistance,
+        ref ChartEvent? bestNode, ref float bestDistance)
+    {
+        if (headNote.NoteType is not (NoteType.LinkHead or NoteType.LinkTail) ||
+            tailNote.NoteType != NoteType.LinkTail)
+            return;
+
+        // A same-tick edge is a horizontal connector only. It has no body
+        // extending into later ticks on the terminal LinkTail's lane.
+        if (snappedHoverTick.HasValue && headNote.Tick == tailNote.Tick &&
+            snappedHoverTick.Value != tailNote.Tick)
+            return;
+
+        var headTravel = (float)_projection.ScrollPixelsAtTicks(headNote.Tick, currentTick);
+        var tailTravel = (float)_projection.ScrollPixelsAtTicks(tailNote.Tick, currentTick);
+        if (!_projection.RenderIntervalIntersects(headTravel, tailTravel))
+            return;
+        if (!ShouldRenderInCurrentBank(headNote, currentState) ||
+            !ShouldRenderInCurrentBank(tailNote, currentState))
+            return;
+
+        var head = _projection.ProjectAtTicks(headNote.Track, headNote.Tick, currentTick, currentState);
+        var bodyEnd = _projection.ProjectAtTicks(
+            headNote.Track, tailNote.Tick, currentTick, currentState);
+        var tail = _projection.ProjectAtTicks(tailNote.Track, tailNote.Tick, currentTick, currentState);
+        if (OutsideNoteView(head, bodyEnd) && OutsideNoteView(bodyEnd, tail))
+            return;
+
+        // DrawLinkChainUnified draws the body down the source lane, then a
+        // connector across lanes at the destination tick. Hit-test those same two
+        // pieces instead of a diagonal from endpoint to endpoint.
+        var bodyDistance = OutsideNoteView(head, bodyEnd)
+            ? float.MaxValue
+            : PointToSegmentDistance(point, head.Position, bodyEnd.Position);
+        var connectorDistance = OutsideNoteView(bodyEnd, tail)
+            ? float.MaxValue
+            : PointToSegmentDistance(point, bodyEnd.Position, tail.Position);
+        var distance = Math.Min(bodyDistance, connectorDistance);
+        if (distance > hitDistance || distance >= bestDistance)
+            return;
+
+        bestNode = bodyDistance <= connectorDistance
+            ? headNote
+            : Vector2.DistanceSquared(point, head.Position) <= Vector2.DistanceSquared(point, tail.Position)
+                ? headNote
+                : tailNote;
+        bestDistance = distance;
     }
 
     private void BeginEditorDrag(ChartEvent ev, bool holdEnd, bool startedByTouch,
@@ -8401,10 +8692,15 @@ public sealed partial class Playfield
                 !ShouldRenderInCurrentBank(ev, currentState))
                 continue;
 
+            var travel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, currentTick);
+            if (!_projection.WithinRenderDistance(travel))
+                continue;
+
             var projected = _projection.ProjectAtTicks(ev.Track, ev.Tick, currentTick, currentState);
             if (OutsideNoteView(projected, projected))
                 continue;
-            var radius = GetEditorMarkerRadius(ev.Track, ev.Tick, currentTick, currentState, out var center, ev);
+            var center = projected.Position;
+            var radius = GetEditorHoverMarkerRadius(projected, ev);
             var distance = Vector2.Distance(point, center);
             var visibleOutline = Math.Clamp(radius * 0.16f, 1f, 2.25f);
             if (distance <= radius + visibleOutline + 1f && distance < bestDistance)
@@ -8460,8 +8756,10 @@ public sealed partial class Playfield
             if (!_projection.WithinRenderDistance((float)endpointTravel))
                 continue;
 
-            var radius = GetEditorMarkerRadius(
-                endpointTrack, endpointTick, currentTick, currentState, out var endpointCenter, ev);
+            var endpointProjected = _projection.ProjectAtTicks(
+                endpointTrack, endpointTick, currentTick, currentState);
+            var endpointCenter = endpointProjected.Position;
+            var radius = GetEditorHoverMarkerRadius(endpointProjected, ev);
             var distance = Vector2.Distance(point, endpointCenter);
             // Match the visible endpoint highlighter. Its outline can extend slightly
             // beyond the radius, but the hit area must not reach far into the link body
@@ -9420,6 +9718,17 @@ public sealed partial class Playfield
             var selectionWidth = ev.IsFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
             if (selectionTexture is not null)
             {
+                // Most visible notes are nowhere near the pointer. Reject them
+                // using a generous projected bounding circle before constructing
+                // their exact 3D card vertices for the final point-in-quad test.
+                var aspect = selectionTexture.Height / (float)Math.Max(1, selectionTexture.Width);
+                var projectedScale = start.Scale * start.LaneRotationDepthScale;
+                var halfWidth = selectionWidth * projectedScale * 0.5f;
+                var halfHeight = selectionWidth * aspect * projectedScale * 0.5f;
+                var coarseRadius = MathF.Sqrt(halfWidth * halfWidth + halfHeight * halfHeight) * 2f + 4f;
+                if (Vector2.DistanceSquared(point, start.Position) > coarseRadius * coarseRadius)
+                    continue;
+
                 var pos = GearState.Position(ev.Track);
                 var side = pos?.Side ?? (start.Position.X < _projection.JudgeX ? "left" : "right");
                 var bank = pos?.Bank;
@@ -10120,13 +10429,24 @@ public sealed partial class Playfield
         => GetEditorMarkerRadius(
             track, tick, currentTick, currentState, out markerCenter, note, projected, travel);
 
-    // Used only when there is no authored event/3D basis yet (the group-placement
-    // hover target). Event-backed selection highlights use the exact projected
-    // card geometry above.
+    // Lightweight radius for transient previews. Selection overlays still use
+    // exact projected card geometry; hover rings do not need to reconstruct it.
     private float GetEditorPlacementPreviewMarkerRadius(float noteWidth, ProjectedPoint projected)
     {
         var projectedRadius = noteWidth * projected.Scale * projected.LaneRotationDepthScale * 0.5f;
         return float.IsFinite(projectedRadius) ? Math.Max(1.25f, projectedRadius) : 1.25f;
+    }
+
+    // Hover rings need only the projected note width. Building all six 3D card
+    // vertices just to recover their average width made every pointer frame much
+    // more expensive than the highlight itself. Keep exact card geometry for the
+    // actual note hit-test and selection overlays; use this lightweight estimate
+    // for the transient hover marker.
+    private float GetEditorHoverMarkerRadius(ProjectedPoint projected, ChartEvent? note = null)
+    {
+        var isFlick = note?.IsFlick ?? (_editorAttr is 10 or 50);
+        var noteWidth = isFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
+        return GetEditorPlacementPreviewMarkerRadius(noteWidth, projected);
     }
 
     private static readonly Color EditorGroupLockIndicatorColor = new(255, 180, 64);
@@ -10152,8 +10472,18 @@ public sealed partial class Playfield
     private void DrawEditorHoverIndicator(
         string text, Vector2 markerCenter, float markerRadius, Color borderColor, Color textColor)
     {
-        var safeText = FontSafeText(_font, text);
-        var textSize = UnicodeTextRenderer.MeasureString(_font, safeText);
+        if (!string.Equals(text, _editorHoverIndicatorSourceText, StringComparison.Ordinal))
+        {
+            _editorHoverIndicatorSourceText = text;
+            // UnicodeTextRenderer already handles unsupported glyphs in both its
+            // measure and draw paths. Running FontSafeText here measured the same
+            // changing string a second time before measuring it again for layout.
+            _editorHoverIndicatorText = text;
+            _editorHoverIndicatorMeasuredSize = UnicodeTextRenderer.MeasureString(_font, text);
+        }
+
+        var displayText = _editorHoverIndicatorText;
+        var textSize = _editorHoverIndicatorMeasuredSize;
         var padding = Math.Max(4f, _projection.ScalePixels(6f));
         var labelWidth = (int)MathF.Ceiling(textSize.X + padding * 2);
         var labelHeight = (int)MathF.Ceiling(textSize.Y + padding * 2);
@@ -10172,7 +10502,7 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Bottom - thickness, labelBounds.Width, thickness), borderColor);
         _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.X, labelBounds.Y, thickness, labelBounds.Height), borderColor);
         _spriteBatch.Draw(_pixel, new Rectangle(labelBounds.Right - thickness, labelBounds.Y, thickness, labelBounds.Height), borderColor);
-        UnicodeTextRenderer.DrawString(_spriteBatch, _font, safeText,
+        UnicodeTextRenderer.DrawString(_spriteBatch, _font, displayText,
             new Vector2(labelBounds.X + padding, labelBounds.Y + padding), textColor);
     }
 
@@ -10869,16 +11199,17 @@ public sealed partial class Playfield
         if (!_editorPanelsViewEnabled && _chartEditorMode && _editorMouseHoverActive &&
             _editorHoverCacheValid)
         {
-            if (_editorHoverHit is { } hoverHit)
+            // Tick picking needs its tick/time label even when the pointer is
+            // directly over an existing note. Suppress the normal yellow
+            // over-note highlight in this mode and draw the tick-pick marker below.
+            if (_editorPreviewPendingChartTickTarget < 0 && _editorHoverHit is { } hoverHit)
             {
                 var hitPoint = _projection.ProjectAtTicks(
                     hoverHit.Track, hoverHit.Tick, currentTick, currentState);
                 if (!OutsideNoteView(hitPoint, hitPoint))
                 {
-                    var hitTravel = (float)_projection.ScrollPixelsAtTicks(hoverHit.Tick, currentTick);
-                    var hitRadius = GetEditorMarkerRadius(
-                        hoverHit.Track, hoverHit.Tick, currentTick, currentState,
-                        out var hitCenter, hoverHit.Event, hitPoint, hitTravel);
+                    var hitCenter = hitPoint.Position;
+                    var hitRadius = GetEditorHoverMarkerRadius(hitPoint, hoverHit.Event);
                     if (hoverHit.Kind == EditorHoverHitKind.HoldEndMarker ||
                         hoverHit.Event.NoteType == NoteType.LinkTail)
                         hitRadius *= 0.5f;
@@ -10894,9 +11225,18 @@ public sealed partial class Playfield
                 var point = _projection.ProjectAtTicks(markerTrack, _hoverBeatTick.Value, currentTick, currentState);
                 if (!OutsideNoteView(point, point))
                 {
-                    var radius = GetEditorMarkerRadius(markerTrack, _hoverBeatTick.Value,
-                        currentTick, currentState, out var markerCenter);
-                    if (_editorSuperFlickTool == EditorSuperFlickTool.Place &&
+                    var markerCenter = point.Position;
+                    var radius = GetEditorHoverMarkerRadius(point);
+                    if (_editorPreviewPendingChartTickTarget >= 0)
+                    {
+                        var pickColor = _editorPreviewPendingChartTickTarget == 0
+                            ? new Color(251, 146, 60)
+                            : new Color(239, 68, 68);
+                        DrawEditorMarker(markerCenter, radius, pickColor, 0.24f);
+                        var pickLabel = $"PREVIEW {(_editorPreviewPendingChartTickTarget == 0 ? "START" : "END")} • TICK {_hoverBeatTick.Value} • {GetEditorPreviewAudioTimeLabelAtTick(_hoverBeatTick.Value)}";
+                        DrawEditorHoverIndicator(pickLabel, markerCenter, radius, pickColor, Color.White);
+                    }
+                    else if (_editorSuperFlickTool == EditorSuperFlickTool.Place &&
                         _editorPlacementEnabled && !groupPlacementHover)
                     {
                         var position = GearState.Position(markerTrack);
@@ -10908,7 +11248,7 @@ public sealed partial class Playfield
                             "Forward" => "1K", "Center" => "2K", "Backward" => "3K", _ => "?K"
                         };
                         var previewText = validSource
-                            ? $"SUPERFLICK SOURCE {position!.Value.Side.ToUpperInvariant()} {mode} — CLICK, THEN CHOOSE TARGET"
+                            ? $"SUPERFLICK SOURCE {position!.Value.Side.ToUpperInvariant()} {mode} | CLICK, THEN CHOOSE TARGET"
                             : "SUPERFLICK SOURCE MUST BE ON A LANE";
                         var border = validSource ? OuterSuperFlick : new Color(255, 78, 88);
                         DrawEditorHoverIndicator(previewText, markerCenter, radius, border,

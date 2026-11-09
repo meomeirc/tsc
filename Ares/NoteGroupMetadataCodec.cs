@@ -4,12 +4,12 @@ using System.Text.Json;
 namespace TSC.Ares;
 
 /// <summary>
-/// Stores editor note-group data as inert ordinary note records on reserved
-/// tracks 31-40. The current diagnostic encoding restores the original pair-packed
-/// representation (two payload bytes per event) but distributes records across
-/// ten tracks. This isolates per-track limits from global event-type limits.
-/// Earlier v4 byte-packed records on tracks 31-63 remain readable and are
-/// rewritten using this pair-packed ten-track layout on save.
+/// Stores editor-only metadata as inert ordinary note records on reserved tracks
+/// 31-40. The v5 payload adds the shared audio-preview range while retaining the
+/// established pair-packed representation (two payload bytes per event), spread
+/// across ten tracks to isolate per-track limits from global event-type limits.
+/// Earlier v1-v4 payloads, including the compact v4 encoding on tracks 31-63,
+/// remain readable and are rewritten using this ten-track layout on save.
 /// </summary>
 internal static class NoteGroupMetadataCodec
 {
@@ -28,20 +28,27 @@ internal static class NoteGroupMetadataCodec
     private const int LegacyDataAttribute = 241;
     private const int LegacyFooterAttribute = 242;
 
-    // Current v4 encoding: one byte per event, stored in velocity with pan=0.
+    // Earlier compact v4 encoding: one byte per event, stored in velocity with pan=0.
     // Separate attributes make the format self-identifying without relying on
     // a payload byte or an event-type-table index.
     private const int HeaderAttribute = 243;
     private const int DataAttribute = 244;
     private const int FooterAttribute = 245;
     private const int LegacyMetadataVersion = 1;
-    private const int MetadataVersion = 4;
+    private const int PreviousMetadataVersion = 4;
+    private const int MetadataVersion = 5;
 
     private sealed class Payload
     {
         public Payload() { }
 
         public int Version { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public int? PreviewStartMilliseconds { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+        public int? PreviewEndMilliseconds { get; set; }
         public List<NoteGroupDefinition> Groups { get; set; } = new();
         public List<InstanceData> Instances { get; set; } = new();
         public List<Binding> Bindings { get; set; } = new();
@@ -120,13 +127,16 @@ internal static class NoteGroupMetadataCodec
             ev.Attr is HeaderAttribute or DataAttribute or FooterAttribute;
     }
 
-    public static List<ChartEvent> CreateMetadataEvents(
-        AresChart chart,
-        bool forAresExport,
-        bool muteNativeVolumeTracks = false)
+    public static List<ChartEvent> CreateMetadataEvents(AresChart chart, bool forAresExport)
     {
         ArgumentNullException.ThrowIfNull(chart);
-        if (chart.NoteGroups.Count == 0)
+        var hasPreviewStart = chart.PreviewStartMilliseconds.HasValue;
+        var hasPreviewEnd = chart.PreviewEndMilliseconds.HasValue;
+        if (hasPreviewStart != hasPreviewEnd ||
+            (hasPreviewStart && (chart.PreviewStartMilliseconds!.Value < 0 ||
+                                 chart.PreviewEndMilliseconds!.Value <= chart.PreviewStartMilliseconds.Value)))
+            throw new InvalidDataException("The embedded preview range must contain a non-negative start and a later end time.");
+        if (chart.NoteGroups.Count == 0 && !chart.HasPreviewRange)
             return new List<ChartEvent>();
 
         var bindings = new List<Binding>();
@@ -137,15 +147,6 @@ internal static class NoteGroupMetadataCodec
                 .OrderBy(ev => ev.Tick)
                 .ThenBy(ev => ev.EventIndex)
                 .ToList();
-
-            // Local Test replaces all existing Volume automation with one tick-zero
-            // silence event. Apply that exact transformation before assigning the
-            // note-group bindings' per-track event indices; otherwise the added or
-            // removed Volume records shift those indices and the reserved metadata
-            // fails its own round-trip validation.
-            if (muteNativeVolumeTracks && gameplayTrack.TrackIndex < 32)
-                VolumeEventTools.ReplaceTrackVolumeWithSilence(serialized, gameplayTrack.TrackIndex);
-
             for (var index = 0; index < serialized.Count; index++)
             {
                 var ev = serialized[index];
@@ -169,6 +170,8 @@ internal static class NoteGroupMetadataCodec
         var payload = new Payload
         {
             Version = MetadataVersion,
+            PreviewStartMilliseconds = chart.PreviewStartMilliseconds,
+            PreviewEndMilliseconds = chart.PreviewEndMilliseconds,
             Groups = chart.NoteGroups.OrderBy(group => group.Id)
                 .Select(CloneGroup).ToList(),
             Instances = chart.NoteGroupInstances.OrderBy(instance => instance.GroupId)
@@ -272,7 +275,7 @@ internal static class NoteGroupMetadataCodec
             var compressed = new List<byte>(compressedLength);
             if (isCurrentEncoding)
             {
-                // Current v4 encoding: exactly one byte in Velocity per data event.
+                // Compact v4 encoding: exactly one byte in Velocity per data event.
                 // Pan is deliberately fixed to zero, so only 256 data event types
                 // can be produced regardless of payload size.
                 if (dataEvents.Any(ev => ev.Pan != 0) || dataEvents.Count != compressedLength)
@@ -281,9 +284,9 @@ internal static class NoteGroupMetadataCodec
             }
             else
             {
-                // Pair-packed encoding used by legacy v1-v3 and this diagnostic
-                // layout: two bytes (Velocity/Pan) per data event. Sorting by
-                // track then EventIndex rebuilds the original contiguous stream.
+                // Pair-packed encoding used by legacy payloads and current v5:
+                // two bytes (Velocity/Pan) per data event. Sorting by track then
+                // EventIndex rebuilds the original contiguous stream.
                 foreach (var chunk in dataEvents)
                 {
                     compressed.Add((byte)chunk.Velocity);
@@ -305,11 +308,18 @@ internal static class NoteGroupMetadataCodec
             deflate.CopyTo(output);
             var payload = JsonSerializer.Deserialize<Payload>(output.ToArray());
             if (payload is null ||
-                (isCurrentEncoding && payload.Version != MetadataVersion) ||
-                (!isCurrentEncoding && payload.Version is not (LegacyMetadataVersion or 2 or 3 or MetadataVersion)) ||
+                (isCurrentEncoding && payload.Version != PreviousMetadataVersion) ||
+                (!isCurrentEncoding && payload.Version is not (LegacyMetadataVersion or 2 or 3 or PreviousMetadataVersion or MetadataVersion)) ||
                 payload.Groups is null || payload.Instances is null || payload.Bindings is null ||
                 payload.Groups.Any(group => group is null || group.Id <= 0 || group.Members is null) ||
                 payload.Instances.Any(instance => instance is null))
+                return;
+
+            var hasPreviewStart = payload.PreviewStartMilliseconds.HasValue;
+            var hasPreviewEnd = payload.PreviewEndMilliseconds.HasValue;
+            if (hasPreviewStart != hasPreviewEnd ||
+                (hasPreviewStart && (payload.PreviewStartMilliseconds!.Value < 0 ||
+                                     payload.PreviewEndMilliseconds!.Value <= payload.PreviewStartMilliseconds.Value)))
                 return;
 
             var groups = payload.Groups;
@@ -363,6 +373,8 @@ internal static class NoteGroupMetadataCodec
 
             chart.NoteGroups.Clear();
             chart.NoteGroups.AddRange(groups.Select(CloneGroup));
+            chart.PreviewStartMilliseconds = payload.PreviewStartMilliseconds;
+            chart.PreviewEndMilliseconds = payload.PreviewEndMilliseconds;
             chart.NoteGroupInstances.Clear();
             chart.NoteGroupInstances.AddRange(instances);
             foreach (var (binding, target) in resolvedBindings)
@@ -378,6 +390,8 @@ internal static class NoteGroupMetadataCodec
             // Invalid editor metadata must never prevent the actual chart from loading.
             chart.NoteGroups.Clear();
             chart.NoteGroupInstances.Clear();
+            chart.PreviewStartMilliseconds = null;
+            chart.PreviewEndMilliseconds = null;
         }
         finally
         {

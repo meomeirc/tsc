@@ -89,7 +89,7 @@ public sealed class Game1 : Game
         double Height = 0);
     private string? _settingsEditingKey;
     private string _settingsEditingText = string.Empty;
-    private readonly TextFieldEditor _settingsTextEditor = new();
+    private readonly TextInputController _settingsTextEditor = new();
     private bool _settingsMouseSelecting;
     private int _settingsMouseAnchor;
     private bool _settingsKeybindsOpen;
@@ -2543,7 +2543,7 @@ public sealed class Game1 : Game
         return (character == '.' || character == ',') && !text.Contains('.') && !text.Contains(',');
     }
 
-    private static string SettingsValueButtonId(string settingKey) => settingKey switch
+    private static string SettingsValueInputId(string settingKey) => settingKey switch
     {
         "scroll_speed" => "setting_scroll_speed_value",
         "music_volume" => "setting_music_volume_value",
@@ -2584,9 +2584,11 @@ public sealed class Game1 : Game
     private int SettingsCaretFromMouse(string settingKey, int mouseX)
     {
         var text = _settingsTextEditor.Text;
-        var id = SettingsValueButtonId(settingKey);
-        if (_settingsMenuRuntime is null || string.IsNullOrEmpty(id) ||
-            !_settingsMenuRuntime.TryGetUiButtonBounds(id, out var bounds))
+        var id = SettingsValueInputId(settingKey);
+        if (_settingsMenuRuntime is null || string.IsNullOrEmpty(id))
+            return text.Length;
+        if (!_settingsMenuRuntime.TryGetUiInputBounds(id, out var bounds) &&
+            !_settingsMenuRuntime.TryGetUiButtonBounds(id, out bounds))
             return text.Length;
 
         var textWidth = MeasureSettingsEditorText(text);
@@ -2607,8 +2609,10 @@ public sealed class Game1 : Game
     {
         if (_settingsEditingKey is null || _settingsMenuRuntime is null)
             return;
-        var id = SettingsValueButtonId(_settingsEditingKey);
-        if (string.IsNullOrEmpty(id) || !_settingsMenuRuntime.TryGetUiButtonBounds(id, out var bounds))
+        var id = SettingsValueInputId(_settingsEditingKey);
+        if (string.IsNullOrEmpty(id) ||
+            (!_settingsMenuRuntime.TryGetUiInputBounds(id, out var bounds) &&
+             !_settingsMenuRuntime.TryGetUiButtonBounds(id, out bounds)))
             return;
         var caret = SettingsCaretFromMouse(_settingsEditingKey, mouseX);
         _settingsTextEditor.SetCaret(caret, extendSelection);

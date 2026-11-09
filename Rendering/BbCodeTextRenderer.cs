@@ -21,6 +21,21 @@ public static class BbCodeTextRenderer
     private readonly record struct StyledLine(List<Run> Runs, float Width);
 
     private static readonly Style Plain = new(false, false, false, false, false, false);
+    private const int LayoutCacheCapacity = 384;
+    private readonly record struct LayoutCacheKey(SpriteFont Font, string Text, float MaxWidth, float Scale, bool Wrap);
+    private sealed class LayoutCacheEntry
+    {
+        public LayoutCacheKey Key { get; }
+        public List<StyledLine> Lines { get; }
+
+        public LayoutCacheEntry(LayoutCacheKey key, List<StyledLine> lines)
+        {
+            Key = key;
+            Lines = lines;
+        }
+    }
+    private static readonly Dictionary<LayoutCacheKey, LinkedListNode<LayoutCacheEntry>> LayoutCache = new();
+    private static readonly LinkedList<LayoutCacheEntry> LayoutCacheLru = new();
 
     public static bool IsSupportedMetadataField(string? field)
         => field is "name" or "artist" or "mapper" or "description" or "version" or "series";
@@ -88,20 +103,65 @@ public static class BbCodeTextRenderer
     public static string StripMarkup(string? text)
         => string.Concat(Parse(text).Select(run => run.Text));
 
+    /// <summary>
+    /// Rich metadata is drawn every frame, but its parsed BBCode runs and wrapped
+    /// line structure usually remain unchanged. Keep a bounded cache so rendering
+    /// does not parse tags, tokenize words, and measure every glyph again per frame.
+    /// </summary>
+    private static List<StyledLine> GetCachedLines(SpriteFont font, string? text,
+        float maxWidth, float scale, bool wrap)
+    {
+        text ??= string.Empty;
+        if (text.Length > 2048)
+            return BuildLines(font, Parse(text), maxWidth, scale, wrap);
+
+        var key = new LayoutCacheKey(font, text, maxWidth, scale, wrap);
+        if (LayoutCache.TryGetValue(key, out var cached))
+        {
+            if (cached != LayoutCacheLru.First)
+            {
+                LayoutCacheLru.Remove(cached);
+                LayoutCacheLru.AddFirst(cached);
+            }
+            return cached.Value.Lines;
+        }
+
+        var lines = BuildLines(font, Parse(text), maxWidth, scale, wrap);
+        var node = LayoutCacheLru.AddFirst(new LayoutCacheEntry(key, lines));
+        LayoutCache[key] = node;
+        if (LayoutCache.Count > LayoutCacheCapacity)
+        {
+            var last = LayoutCacheLru.Last;
+            if (last is not null)
+            {
+                LayoutCache.Remove(last.Value.Key);
+                LayoutCacheLru.RemoveLast();
+            }
+        }
+        return lines;
+    }
+
+    /// <summary>Clears cached layouts when a skin/font set is replaced.</summary>
+    public static void ClearCache()
+    {
+        LayoutCache.Clear();
+        LayoutCacheLru.Clear();
+    }
+
     public static Vector2 Measure(SpriteFont font, string? text, float scale = 1f)
     {
-        var lines = BuildLines(font, Parse(text), float.MaxValue, scale, wrap: false);
+        var lines = GetCachedLines(font, text, float.MaxValue, scale, wrap: false);
         var lineHeight = UnicodeTextRenderer.GetLogicalLineSpacing(font) * Math.Max(0.01f, scale);
         return new Vector2(lines.Count == 0 ? 0f : lines.Max(line => line.Width),
             Math.Max(1, lines.Count) * lineHeight);
     }
 
     public static int MeasureLineCount(SpriteFont font, string? text, float maxWidth, float scale = 1f)
-        => Math.Max(1, BuildLines(font, Parse(text), Math.Max(1f, maxWidth), scale, wrap: true).Count);
+        => Math.Max(1, GetCachedLines(font, text, Math.Max(1f, maxWidth), scale, wrap: true).Count);
 
     public static Vector2 MeasureWrapped(SpriteFont font, string? text, float maxWidth, float scale = 1f)
     {
-        var lines = BuildLines(font, Parse(text), Math.Max(1f, maxWidth), scale, wrap: true);
+        var lines = GetCachedLines(font, text, Math.Max(1f, maxWidth), scale, wrap: true);
         var lineHeight = UnicodeTextRenderer.GetLogicalLineSpacing(font) * Math.Max(0.01f, scale);
         return new Vector2(lines.Count == 0 ? 0f : lines.Max(line => line.Width),
             Math.Max(1, lines.Count) * lineHeight);
@@ -110,7 +170,7 @@ public static class BbCodeTextRenderer
     public static float DrawSingleLine(SpriteBatch batch, Texture2D pixel, SpriteFont font, string? text,
         Vector2 position, Color color, float scale = 1f)
     {
-        var lines = BuildLines(font, Parse(text), float.MaxValue, scale, wrap: false);
+        var lines = GetCachedLines(font, text, float.MaxValue, scale, wrap: false);
         if (lines.Count == 0)
             return 0f;
         DrawLine(batch, pixel, font, lines[0], position, color, scale);
@@ -136,7 +196,8 @@ public static class BbCodeTextRenderer
         var wrapWidth = wrap && maxWidth > 0f
             ? maxWidth / Math.Max(0.01f, Math.Abs(scale.X))
             : float.MaxValue;
-        var lines = BuildLines(font, Parse(text), wrapWidth, 1f, wrap: wrap && maxWidth > 0f);
+        var shouldWrap = wrap && maxWidth > 0f;
+        var lines = GetCachedLines(font, text, wrapWidth, 1f, shouldWrap);
         if (lines.Count == 0)
             return Vector2.Zero;
 
@@ -187,7 +248,7 @@ public static class BbCodeTextRenderer
     public static void DrawWrapped(SpriteBatch batch, Texture2D pixel, SpriteFont font, string? text,
         Rectangle bounds, float insetX, float maxWidth, float scale, Color color)
     {
-        var lines = BuildLines(font, Parse(text), Math.Max(1f, maxWidth), scale, wrap: true);
+        var lines = GetCachedLines(font, text, Math.Max(1f, maxWidth), scale, wrap: true);
         var lineHeight = UnicodeTextRenderer.GetLogicalLineSpacing(font) * Math.Max(0.01f, scale) * 1.2f;
         var blockHeight = lines.Count * lineHeight;
         var y = bounds.Y + (bounds.Height - blockHeight) * 0.5f;

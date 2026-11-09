@@ -1325,7 +1325,7 @@ function render()
             color = { r = 0, g = 0, b = 0, a = 210 }, layer = 90,
         })
 -- Keep search input above the gallery hitboxes.
-        ui.button({
+        ui.input({
             id = "song_search_input",
             parent = "song_search_frame",
             x = 0, y = 0,

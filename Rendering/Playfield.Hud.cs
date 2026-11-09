@@ -2277,7 +2277,8 @@ public sealed partial class Playfield
                 ? GetEditorMetaStatsData()
                 : null);
 
-    private List<(string Label, string Value)> GetEditorMetaRows(double currentTick, EditorMetaStatsData? statsData)
+    private List<(string Label, string Value)> GetEditorMetaRows(double currentTick,
+        EditorMetaStatsData? statsData, bool? activeDifficultyHasChart = null)
     {
         if (_chart is null)
             return new List<(string Label, string Value)> { ("CHART", "No chart loaded") };
@@ -2342,7 +2343,8 @@ public sealed partial class Playfield
         {
             if (string.Equals(difficultyCode, "xt", StringComparison.OrdinalIgnoreCase))
                 rows.Insert(2, ("SC PASSCODE", Show(_chart.ScPasscode)));
-            rows.Add(("DELETE DIFFICULTY", HasEditorDifficultyChart(difficultyCode) ? "Delete this difficulty chart" : "No chart file supplied"));
+            rows.Add(("DELETE DIFFICULTY", (activeDifficultyHasChart ?? HasEditorDifficultyChart(difficultyCode))
+                ? "Delete this difficulty chart" : "No chart file supplied"));
         }
         return rows.Where(row => !row.Value.StartsWith("Unsupported by ", StringComparison.OrdinalIgnoreCase)).ToList();
     }
@@ -2374,27 +2376,26 @@ public sealed partial class Playfield
         if (field == "album_big" && _editorSharedAlbumBigBytes is { Length: > 0 }) return true;
         if (field is "album" or "album_big")
             return GetEditorArtworkAssetPath(field) is not null;
-
-        var sourceDirectory = _tstsWorkingDirectory;
-        if (string.IsNullOrWhiteSpace(sourceDirectory) && !string.IsNullOrWhiteSpace(_loadedSourcePath))
-            sourceDirectory = GetSongAssetDirectoryForChartPath(_loadedSourcePath);
-        if (string.IsNullOrWhiteSpace(sourceDirectory) || !Directory.Exists(sourceDirectory))
+        if (field != "music")
             return false;
 
-        var names = field switch
-        {
-            "music" => new[] { _editorBundleTemplate == ChartBundleTemplate.Tsts ? "song.opus" : "music.opus" },
-            "album" => _editorBundleTemplate == ChartBundleTemplate.Tsts
-                ? new[] { "cover.webp", "album.webp", "album.png", "album.jpg", "album.jpeg" }
-                : _editorBundleTemplate == ChartBundleTemplate.Tsc
-                    ? new[] { "album.png", "album.webp", "album.jpg", "album.jpeg" }
-                    : new[] { "album", "album.png", "album.webp", "album.jpg", "album.jpeg" },
-            "album_big" => _editorBundleTemplate == ChartBundleTemplate.Tsc
-                ? new[] { "album_big.png", "album_big.webp", "album_big.jpg", "album_big.jpeg" }
-                : new[] { "album_big", "album_big.png", "album_big.webp", "album_big.jpg", "album_big.jpeg" },
-            _ => Array.Empty<string>()
-        };
-        return names.Any(name => File.Exists(Path.Combine(sourceDirectory, name)));
+        var sourceDirectory = GetEditorMediaResourceDirectory();
+        if (string.IsNullOrWhiteSpace(sourceDirectory))
+            return false;
+
+        var normalizedField = field.ToLowerInvariant();
+        var cacheKey = new EditorMediaResourceCacheKey(normalizedField, sourceDirectory, _editorBundleTemplate);
+        if (_editorMediaResourceCache.TryGetValue(cacheKey, out var cachedResult))
+            return cachedResult;
+
+        var names = _editorBundleTemplate == ChartBundleTemplate.Tsts
+            ? new[] { "song.opus" }
+            : new[] { "music.opus" };
+        var exists = names.Any(name => File.Exists(Path.Combine(sourceDirectory, name)));
+        if (_editorMediaResourceCache.Count >= 12)
+            _editorMediaResourceCache.Clear();
+        _editorMediaResourceCache[cacheKey] = exists;
+        return exists;
     }
 
     private string GetEditorMediaButtonText(string field)
@@ -2735,7 +2736,7 @@ public sealed partial class Playfield
             var exportToggle = GetEditorMetaExportToggleBounds(virtualWidth, virtualHeight);
             DrawEditorMetaButton(exportToggle, "EXPORT", new Color(28, 28, 30, 250), Active);
             if (_editorMetaDeleteConfirmOpen) DrawEditorMetaDeleteConfirmation(virtualWidth, virtualHeight);
-            if (_editorPreviewEditorOpen)
+            if (_editorPreviewEditorOpen && _editorPreviewPendingChartTickTarget < 0)
                 DrawEditorPreviewEditorOverlay(virtualWidth, virtualHeight);
             if (_editorMetaExportExpanded)
                 DrawEditorMetaExportPopup(virtualWidth, virtualHeight);
@@ -3612,6 +3613,25 @@ public sealed partial class Playfield
                         continue;
                     commandScissor = clipped;
                 }
+
+                // Native waveform commands cannot be drawn by SpriteBatch. Flush
+                // the current 2D batch and route them through SkinRuntime's
+                // retained-geometry renderer, just like the general skin path.
+                // This is the chart editor's primary draw loop, so omitting this
+                // dispatch silently dropped the waveform while leaving its other
+                // controls visible.
+                if (command.Kind == SkinDrawCommandKind.WaveformBatch)
+                {
+                    EndBatch();
+                    _graphics.ScissorRectangle = commandScissor ?? originalScissor;
+                    runtime.RenderWaveformBatch(
+                        command,
+                        _graphics.Viewport.Width,
+                        _graphics.Viewport.Height);
+                    _graphics.ScissorRectangle = originalScissor;
+                    continue;
+                }
+
                 BeginBatch(command, commandScissor);
 
                 switch (command.Kind)

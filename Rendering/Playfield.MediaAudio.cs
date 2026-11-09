@@ -42,6 +42,8 @@ public sealed partial class Playfield
         _audio.Volume = volume;
         if (_editorPreviewPlayer is not null)
             _editorPreviewPlayer.Volume = volume;
+        if (_editorPreviewSelectionPlayer is not null)
+            _editorPreviewSelectionPlayer.Volume = volume;
     }
 
     private void ApplyEditorMusicVolumePendingPercent()

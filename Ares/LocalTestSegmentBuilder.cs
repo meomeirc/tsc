@@ -187,6 +187,8 @@ public static class LocalTestSegmentBuilder
             Level = source.Level,
             MusicPath = source.MusicPath,
             PreviewPath = source.PreviewPath,
+            PreviewStartMilliseconds = source.PreviewStartMilliseconds,
+            PreviewEndMilliseconds = source.PreviewEndMilliseconds,
             AlbumPath = source.AlbumPath,
             AlbumBigPath = source.AlbumBigPath,
             RawMagic = source.RawMagic,
