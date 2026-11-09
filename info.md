@@ -1,5 +1,9 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.52
+
+- actually whitelisted the songs/README.txt file for updates, oops. you can read it from the folder now
+
 # 0.0.51
 
 - reworked music preview editor
