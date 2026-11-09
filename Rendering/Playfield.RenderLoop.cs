@@ -259,6 +259,8 @@ public sealed partial class Playfield
             var feedbackVerticesStart = _debugTexturedVertices;
             allocStart = GC.GetAllocatedBytesForCurrentThread();
             DrawHitAnimations();
+            if (_chartEditorMode && !_editorPreviewMode && !_editorPanelsViewEnabled)
+                DrawEditorNotePlacementPreview(currentTick, currentState);
             if (!_editorPreviewMode)
                 DrawSelectionOverlay(currentTick, currentState);
             if (_chartEditorMode && !_editorPreviewMode && _editorPanelsViewEnabled)
@@ -675,12 +677,16 @@ public sealed partial class Playfield
 
     private void EnsureGameplayRenderTarget(int width, int height)
     {
-        // Connector and note-group previews render to transparent overlays before
-        // blending them back. Preserve the in-progress scene while either overlay
-        // target is bound; otherwise keep the faster discard-contents path.
+        // Connector, note-group, and single-note placement previews render to
+        // transparent overlays before blending them back. Preserve the in-progress
+        // scene while any of those overlay targets is bound; otherwise keep the
+        // faster discard-contents path. The single-note preview must be included
+        // here because it temporarily switches away from this target every time
+        // its hovered grid cell changes.
         var preserveContents = _chartEditorMode && !_editorPreviewMode &&
                                _chart is not null &&
-                               (_editorConnectorMode || _editorNoteGroupPlacementArmed);
+                               (_editorConnectorMode || _editorNoteGroupPlacementArmed ||
+                                (_editorPlacementEnabled && !_editorPanelsViewEnabled));
         if (_gameplayRenderTarget is not null &&
             _gameplayRenderTarget.Width == width &&
             _gameplayRenderTarget.Height == height &&

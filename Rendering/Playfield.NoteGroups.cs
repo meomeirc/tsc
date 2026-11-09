@@ -170,6 +170,8 @@ public sealed partial class Playfield
     private readonly Dictionary<int, int> _editorNoteGroupPlacementPreviewEventIndices = new();
     private AresChart? _editorNoteGroupPlacementPreviewChart;
     private readonly EditorNoteGroupPlacementPreviewRenderCacheState _editorNoteGroupPlacementPreviewRenderCaches = new();
+    private readonly ChartEvent _editorNotePlacementPreviewEvent = new();
+    private readonly List<ChartEvent> _editorNotePlacementPreviewEvents = new(1);
 
     private void InvalidateEditorNoteGroupPlacementPreviewCache()
     {
@@ -947,6 +949,7 @@ public sealed partial class Playfield
             return;
 
         var cache = new HashCode();
+        cache.Add("note-group-placement");
         cache.Add(_editorSelectedNoteGroupId);
         cache.Add(startTick);
         cache.Add(startTrack);
@@ -978,6 +981,109 @@ public sealed partial class Playfield
 
         if (_editorNoteGroupPlacementPreviewRenderTarget is null)
             return;
+        _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
+        _spriteBatch.Draw(_editorNoteGroupPlacementPreviewRenderTarget,
+            new Rectangle(0, 0, _graphics.Viewport.Width, _graphics.Viewport.Height),
+            canPlace ? new XnaColor(174, 255, 0, 160) : new XnaColor(255, 78, 88, 160));
+        _spriteBatch.End();
+    }
+
+    private void DrawEditorNotePlacementPreview(double currentTick, GearState currentState)
+    {
+        if (!_chartEditorMode || _editorPreviewMode || _gameplayMode || _editorPanelsViewEnabled ||
+            !_editorPlacementEnabled || _editorConnectorMode || _editorNoteGroupPlacementArmed ||
+            _editorNoteGroupEditMode || _editorSuperFlickTool == EditorSuperFlickTool.Place ||
+            !_editorMouseHoverActive || _chart is null || _tempo is null)
+            return;
+
+        // Use the same snapped grid cell and lane mapping as the ordinary hover
+        // marker and placement click. The fallback handles the frame in which a
+        // placement tool was just armed and the hover cache has not refreshed yet.
+        int? pointerTick = _hoverBeatTick;
+        var hoverTrack = _hoverTrack ?? -1;
+        if (pointerTick is null || hoverTrack is < 0 or > 15)
+            pointerTick = FindClickedQuarterBeat(_editorPointerPosition, currentTick, currentState,
+                out hoverTrack);
+        if (pointerTick is not int startTick || hoverTrack is < 0 or > 15)
+            return;
+
+        var startTrack = GetEditorHoverMarkerTrack(hoverTrack);
+        if (startTrack is < 0 or > 15 || !IsEditorTrackAllowedForNoteType(startTrack, _editorNoteType))
+            return;
+
+        var previewEvent = _editorNotePlacementPreviewEvent;
+        previewEvent.Tick = Math.Max(0, startTick);
+        previewEvent.Track = startTrack;
+        previewEvent.Attr = _editorAttr;
+        previewEvent.RawType = 1;
+        previewEvent.TypeIndex = -1;
+        previewEvent.Duration = _editorDuration;
+        previewEvent.NoteType = _editorNoteType;
+        previewEvent.EventIndex = 0;
+        previewEvent.LinePair = -1;
+        previewEvent.TwinPairId = null;
+        previewEvent.NoteGroupId = null;
+        previewEvent.NoteGroupInstanceId = null;
+        previewEvent.NoteGroupMemberId = null;
+        previewEvent.Kind = "Note";
+        previewEvent.Value = 0f;
+        previewEvent.Instrument = 0;
+        previewEvent.Velocity = 127;
+        previewEvent.Pan = 64;
+
+        var previewEvents = _editorNotePlacementPreviewEvents;
+        if (previewEvents.Count == 0)
+            previewEvents.Add(previewEvent);
+        else
+            previewEvents[0] = previewEvent;
+
+        // A hovered note/marker blocks the same click that would otherwise place
+        // this note. Keep the ghost visible in red to communicate that state.
+        var canPlace = _editorHoverHit is null;
+        var contentHashBuilder = new HashCode();
+        contentHashBuilder.Add("single-note-placement");
+        contentHashBuilder.Add(previewEvent.Tick);
+        contentHashBuilder.Add(previewEvent.Track);
+        contentHashBuilder.Add(previewEvent.Attr);
+        contentHashBuilder.Add(previewEvent.Duration);
+        contentHashBuilder.Add(previewEvent.NoteType);
+        var contentHash = contentHashBuilder.ToHashCode();
+
+        var cache = new HashCode();
+        cache.Add("single-note-placement");
+        cache.Add(previewEvent.Tick);
+        cache.Add(previewEvent.Track);
+        cache.Add(contentHash);
+        cache.Add(canPlace);
+        cache.Add(Math.Round(currentTick, 3));
+        cache.Add(_graphics.Viewport.Width);
+        cache.Add(_graphics.Viewport.Height);
+        cache.Add(ComputeLaneMeshCacheSignature(currentState));
+        cache.Add(currentState.Left);
+        cache.Add(currentState.Right);
+        cache.Add(currentState.CenterLeft);
+        cache.Add(currentState.CenterRight);
+        cache.Add(_projection.ScrollSpeedScale);
+        cache.Add(_projection.BaseScrollSpeed);
+        cache.Add(_topDownViewEnabled);
+        cache.Add(_compact);
+        cache.Add(_constantScroll);
+        cache.Add(_editorShowAttributes);
+        var cacheKey = cache.ToHashCode();
+
+        if (!_editorNoteGroupPlacementPreviewCacheValid ||
+            _editorNoteGroupPlacementPreviewCacheKey != cacheKey)
+        {
+            RenderEditorNoteGroupPlacementPreview(previewEvents, contentHash, currentTick, currentState);
+            _editorNoteGroupPlacementPreviewCacheKey = cacheKey;
+            _editorNoteGroupPlacementPreviewCacheValid = true;
+        }
+
+        if (_editorNoteGroupPlacementPreviewRenderTarget is null)
+            return;
+
+        // This runs before DrawSelectionOverlay, intentionally leaving the
+        // normal circular hover highlight visible above the textured note ghost.
         _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
         _spriteBatch.Draw(_editorNoteGroupPlacementPreviewRenderTarget,
             new Rectangle(0, 0, _graphics.Viewport.Width, _graphics.Viewport.Height),
