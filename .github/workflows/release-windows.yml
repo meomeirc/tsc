@@ -53,7 +53,12 @@ jobs:
 
       - name: Publish Windows x64 game and native launcher
         shell: pwsh
-        run: dotnet publish TSC.csproj --configuration Publish --property:PublishProfile=TSC-Publish
+        run: |
+          $publishRoot = Join-Path $env:GITHUB_WORKSPACE 'bin/Publish/win-x64'
+          if (Test-Path -LiteralPath $publishRoot) {
+            Remove-Item -LiteralPath $publishRoot -Recurse -Force
+          }
+          dotnet publish TSC.csproj --configuration Publish --property:PublishProfile=TSC-Publish
 
       - name: Verify publish layout and remove test fixtures
         shell: pwsh
@@ -62,6 +67,7 @@ jobs:
           $dataDir = Join-Path $publishRoot 'data'
           $requiredFiles = @(
             (Join-Path $publishRoot 'TSC.exe'),
+            (Join-Path $publishRoot 'songs/README.txt'),
             (Join-Path $publishRoot 'Skins/Default/scripts/skin.lua'),
             (Join-Path $dataDir 'TSC.exe'),
             (Join-Path $dataDir 'TSC.dll'),

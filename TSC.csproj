@@ -39,6 +39,7 @@
     <Content Remove="State\**\*" />
     <EmbeddedResource Remove="State\**\*" />
     <None Update="Updater\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
+    <None Update="build\PackageFiles\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
     <MonoGameContentReference Include="Content\Content.mgcb" />
     <EmbeddedResource Include="info.md" LogicalName="TSC.info.md" />
     <EmbeddedResource Include="version.txt" LogicalName="TSC.version.txt" />
@@ -63,12 +64,19 @@
          generated State/Logs folders from older publishes; root user data is preserved. -->
     <RemoveDir Directories="$(PublishDir)State;$(PublishDir)Logs" />
 
-    <!-- The songs folder is user-owned except for this application help file.
-         Stage only README.txt beside the launcher so release packages can update it. -->
-    <MakeDir Directories="$(TSCInstallRoot)songs" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\songs\README.txt"
-          DestinationFiles="$(TSCInstallRoot)songs\README.txt"
-          SkipUnchangedFiles="true" />
+    <!-- App-owned package files are kept outside user-data folders in source control.
+         Stage the build/PackageFiles tree at the install root; this lets application
+         files target songs/, save/, or other user-data folders without Git ignore
+         exceptions or updater path whitelists. -->
+    <ItemGroup>
+      <_TscPackageFiles Include="$(MSBuildProjectDirectory)\build\PackageFiles\**\*" />
+    </ItemGroup>
+    <MakeDir Directories="@(_TscPackageFiles->'$(TSCInstallRoot)%(RecursiveDir)')"
+             Condition="'@(_TscPackageFiles)' != ''" />
+    <Copy SourceFiles="@(_TscPackageFiles)"
+          DestinationFiles="@(_TscPackageFiles->'$(TSCInstallRoot)%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="'@(_TscPackageFiles)' != ''" />
     <!-- LAN testing is implemented in TSC now; remove helper scripts left by older publishes. -->
     <RemoveDir Directories="$(TSCInstallRoot)data\LanEditorServer;$(PublishDir)LanEditorServer" />
     <!-- Never ship a second copy of the skin under data/. -->

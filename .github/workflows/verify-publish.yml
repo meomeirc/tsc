@@ -26,9 +26,17 @@ jobs:
           New-Item -ItemType Directory -Path "tools" -Force | Out-Null
           Set-Content -LiteralPath "tools/publish-tool-check.txt" -Value "tools-folder-publish-check" -NoNewline
           Set-Content -LiteralPath "tools/ffmpeg.exe" -Value "must-not-be-published" -NoNewline
+          New-Item -ItemType Directory -Path "build/PackageFiles/songs" -Force | Out-Null
+          Set-Content -LiteralPath "build/PackageFiles/songs/ownership-policy-check.txt" -Value "owned by the application" -NoNewline
 
       - name: Publish Windows x64 game with integrated updater
-        run: dotnet publish TSC.csproj --configuration Publish --property:PublishProfile=TSC-Publish
+        shell: pwsh
+        run: |
+          $publishRoot = Join-Path $env:GITHUB_WORKSPACE 'bin/Publish/win-x64'
+          if (Test-Path -LiteralPath $publishRoot) {
+            Remove-Item -LiteralPath $publishRoot -Recurse -Force
+          }
+          dotnet publish TSC.csproj --configuration Publish --property:PublishProfile=TSC-Publish
 
       - name: Verify launcher and game publish layout
         shell: pwsh
@@ -37,6 +45,8 @@ jobs:
           $dataDir = Join-Path $publishRoot "data"
           $requiredFiles = @(
             (Join-Path $publishRoot "TSC.exe"),
+            (Join-Path $publishRoot "songs/README.txt"),
+            (Join-Path $publishRoot "songs/ownership-policy-check.txt"),
             (Join-Path $publishRoot "Skins/Default/scripts/skin.lua"),
             (Join-Path $dataDir "TSC.exe"),
             (Join-Path $dataDir "TSC.dll"),
@@ -89,3 +99,80 @@ jobs:
           }
 
           Write-Host "Verified tiny Native AOT launcher ($launcherSize bytes), game runtime under data/, user skin root, and tools/ payload without ffmpeg.exe."
+
+      - name: Verify bridge compatibility and ownership-based packaging
+        shell: pwsh
+        run: |
+          $publishRoot = Join-Path $env:GITHUB_WORKSPACE 'bin/Publish/win-x64'
+          $outputRoot = Join-Path $env:RUNNER_TEMP 'tsc-ownership-policy-check'
+          $version = (Get-Content -LiteralPath 'version.txt' -Raw).Trim()
+          $packager = Join-Path $env:GITHUB_WORKSPACE 'Updater/BuildReleaseAssets.ps1'
+          $sourceFixture = Join-Path $env:GITHUB_WORKSPACE 'build/PackageFiles/songs/ownership-policy-check.txt'
+          $fixtureRelative = 'songs/ownership-policy-check.txt'
+          $fixturePath = Join-Path $publishRoot ($fixtureRelative.Replace('/', [IO.Path]::DirectorySeparatorChar))
+
+          function Test-LegacyUpdaterCanInstall([string]$Path) {
+            $normalized = $Path.Replace('\', '/')
+            if ($normalized -ieq 'songs/README.txt') { return $true }
+            $parts = $normalized.Split('/')
+            if ($parts[0] -in @('songs', 'save', 'logs', 'state')) { return $false }
+            if ($parts[0] -ieq 'skins' -and ($parts.Count -lt 3 -or $parts[1] -ine 'Default')) { return $false }
+            if ($parts.Count -eq 1 -and $parts[0] -in @('gameconfig.json', 'keybinds.json', 'tsc_crash.log', 'info.md', 'version.txt', '.tsc-update-state.json', '.tsc-skin-state.json')) { return $false }
+            if ($parts[0] -ieq 'tools' -and $parts[-1] -ieq 'ffmpeg.exe') { return $false }
+            return $true
+          }
+
+          try {
+            if (-not (Test-Path -LiteralPath $sourceFixture -PathType Leaf) -or -not (Test-Path -LiteralPath $fixturePath -PathType Leaf)) {
+              throw 'The PackageFiles fixture was not staged into songs/ by the publish target.'
+            }
+
+            # Keep the future-only fixture out of the bridge package: an older updater
+            # must be able to install the bridge before it learns ownership metadata.
+            Remove-Item -LiteralPath $fixturePath -Force
+            $bridgeOutput = Join-Path $outputRoot 'bridge'
+            & $packager -Version $version -PublishDirectory $publishRoot -OutputDirectory $bridgeOutput
+            $bridgeManifestPath = Join-Path $bridgeOutput "TSC-win-x64-$version-manifest.json"
+            $bridgeManifest = Get-Content -LiteralPath $bridgeManifestPath -Raw | ConvertFrom-Json
+            foreach ($entry in $bridgeManifest.full.files) {
+              if (-not (Test-LegacyUpdaterCanInstall ([string]$entry.path))) {
+                throw "Bridge package contains a path that an older updater cannot install: $($entry.path)"
+              }
+              if ([string]::IsNullOrWhiteSpace([string]$entry.ownership)) {
+                throw "Bridge manifest is missing ownership metadata for '$($entry.path)'."
+              }
+            }
+
+            Copy-Item -LiteralPath $sourceFixture -Destination $fixturePath -Force
+            try {
+              $ownershipOutput = Join-Path $outputRoot 'ownership'
+              & $packager -Version $version -PublishDirectory $publishRoot -OutputDirectory $ownershipOutput
+              $manifestPath = Join-Path $ownershipOutput "TSC-win-x64-$version-manifest.json"
+              $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+              $entry = @($manifest.full.files | Where-Object { $_.path -ieq $fixtureRelative })
+              if ($entry.Count -ne 1) { throw "Package manifest did not include '$fixtureRelative'." }
+              if ($entry[0].ownership -ne 'application' -or $entry[0].updateMode -ne 'replace') {
+                throw "Package manifest assigned the wrong ownership policy to '$fixtureRelative'."
+              }
+
+              $zipPath = Join-Path $ownershipOutput "TSC-win-x64-$version.zip"
+              Add-Type -AssemblyName System.IO.Compression.FileSystem
+              $archive = [IO.Compression.ZipFile]::OpenRead($zipPath)
+              try {
+                if ($null -eq $archive.GetEntry($fixtureRelative)) {
+                  throw "Full package ZIP did not include '$fixtureRelative'."
+                }
+              }
+              finally { $archive.Dispose() }
+            }
+            finally {
+              if (Test-Path -LiteralPath $fixturePath) { Remove-Item -LiteralPath $fixturePath -Force }
+            }
+
+            Write-Host 'Verified the bridge manifest remains readable by the legacy updater and future owned files can be packaged inside songs/.'
+          }
+          finally {
+            if (Test-Path -LiteralPath $sourceFixture) { Remove-Item -LiteralPath $sourceFixture -Force }
+            if (Test-Path -LiteralPath $fixturePath) { Remove-Item -LiteralPath $fixturePath -Force }
+            if (Test-Path -LiteralPath $outputRoot) { Remove-Item -LiteralPath $outputRoot -Recurse -Force }
+          }

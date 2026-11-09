@@ -317,27 +317,18 @@ internal sealed class UpdateEngine
 
             Report("Installing game files…", 80);
             var oldState = await ReadStateAsync(GetUpdaterStatePath(StateFileName)).ConfigureAwait(true);
-            var deletePaths = FindObsoleteManagedPaths(oldState, package.Manifest);
-            if (package.Manifest.Kind == "full")
-            {
-                var oldSkinState = await ReadSkinStateAsync().ConfigureAwait(true);
-                var newSkinPaths = package.Manifest.Files.Where(f => IsDefaultSkinPath(f.Path))
-                    .Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
-                foreach (var oldSkinPath in oldSkinState?.Files ?? [])
-                    if (IsDefaultSkinPath(oldSkinPath) && !newSkinPaths.Contains(oldSkinPath))
-                        deletePaths.Add(oldSkinPath);
-            }
-            var writes = package.Files.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
-            await ApplyTransactionAsync(writes, deletePaths, 82, 95).ConfigureAwait(true);
+            var deletePaths = await FindObsoleteManagedPathsAsync(oldState, package.Manifest).ConfigureAwait(true);
+            var installPlan = await BuildPackageInstallPlanAsync(package, oldState).ConfigureAwait(true);
+            await ApplyTransactionAsync(installPlan.Writes, deletePaths, 82, 95).ConfigureAwait(true);
 
             var newState = new ManagedState
             {
                 Version = versionText,
                 Kind = package.Manifest.Kind,
-                Files = package.Manifest.Files.Where(f => !IsProtectedPath(f.Path)).ToList()
+                Files = installPlan.ManagedFiles
             };
 
-            await SaveSkinStateFromPackageAsync(package.Manifest.Files, versionText).ConfigureAwait(true);
+            await SaveSkinStateFromPackageAsync(installPlan.ManagedFiles, versionText).ConfigureAwait(true);
 
             await WriteUpdaterStateAsync(StateFileName, JsonSerializer.Serialize(newState, JsonOptions)).ConfigureAwait(true);
             await ScheduleRestartAsync(latest).ConfigureAwait(true);
@@ -525,62 +516,72 @@ internal sealed class UpdateEngine
 
     private async Task<PreparedPackage> ExtractPackageAsync(string archivePath, string destination, string expectedVersion, string expectedKind, PackageManifest? externalManifest)
     {
-        var files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
-        PackageManifest? manifest = externalManifest;
         using var archive = ZipFile.OpenRead(archivePath);
         if (archive.Entries.Count > 50000) throw new InvalidDataException("Package has too many entries.");
+
+        // Read embedded metadata before processing payloads so ownership is known even
+        // when the manifest entry appears after files in the ZIP. Older packages may
+        // still embed a schema-1 manifest; newer releases provide it as a separate asset.
+        var manifest = externalManifest;
+        if (manifest is null)
+        {
+            var embeddedManifest = archive.GetEntry(PackageManifestName)
+                ?? throw new InvalidDataException("The package has no external or embedded manifest.");
+            if (embeddedManifest.Length > 16 * 1024 * 1024)
+                throw new InvalidDataException("Package manifest is unexpectedly large.");
+            await using var manifestStream = embeddedManifest.Open();
+            manifest = await JsonSerializer.DeserializeAsync<PackageManifest>(manifestStream, JsonOptions).ConfigureAwait(true);
+        }
+
+        ValidatePackageManifest(manifest, expectedVersion, expectedKind);
+
+        var manifestFiles = new Dictionary<string, ManagedFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (var spec in manifest!.Files)
+            manifestFiles.Add(spec.Path, spec);
+
+        var files = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         long totalExpanded = 0;
         foreach (var entry in archive.Entries)
         {
             if (string.IsNullOrEmpty(entry.Name)) continue;
             var path = NormalizeArchivePath(entry.FullName);
-            if (path.Equals(PackageManifestName, StringComparison.OrdinalIgnoreCase))
-            {
-                // Older releases embedded the package manifest in the ZIP. New releases
-                // publish it as a separate GitHub Release asset; prefer that external copy.
-                if (manifest is null)
-                {
-                    if (entry.Length > 16 * 1024 * 1024) throw new InvalidDataException("Package manifest is unexpectedly large.");
-                    await using var manifestStream = entry.Open();
-                    manifest = await JsonSerializer.DeserializeAsync<PackageManifest>(manifestStream, JsonOptions).ConfigureAwait(true);
-                }
+            if (path.Equals(PackageManifestName, StringComparison.OrdinalIgnoreCase) ||
+                path.Equals("version.txt", StringComparison.OrdinalIgnoreCase) ||
+                path.Equals("info.md", StringComparison.OrdinalIgnoreCase))
                 continue;
+
+            if (!manifestFiles.ContainsKey(path))
+            {
+                // Legacy archives sometimes carried user-owned files that were not in
+                // their manifest. Continue ignoring those paths, but reject unexpected
+                // application payloads so the archive and manifest cannot drift apart.
+                if (IsLegacyProtectedPath(path) || IsAlwaysProtectedPath(path)) continue;
+                throw new InvalidDataException($"Package contains a file that is not listed in its manifest: {path}");
             }
-            if (IsProtectedPath(path) || path.Equals("version.txt", StringComparison.OrdinalIgnoreCase) || path.Equals("info.md", StringComparison.OrdinalIgnoreCase)) continue;
+
             totalExpanded += entry.Length;
-            if (totalExpanded > 8L * 1024 * 1024 * 1024) throw new InvalidDataException("Package expands beyond the allowed 8 GiB limit.");
+            if (totalExpanded > 8L * 1024 * 1024 * 1024)
+                throw new InvalidDataException("Package expands beyond the allowed 8 GiB limit.");
             if (entry.Length > int.MaxValue) throw new InvalidDataException($"Package entry is too large: {path}");
+
             await using var input = entry.Open();
             using var memory = new MemoryStream((int)Math.Min(entry.Length, 16 * 1024 * 1024));
             await input.CopyToAsync(memory).ConfigureAwait(true);
             var bytes = memory.ToArray();
-            files[path] = bytes;
+            if (!files.TryAdd(path, bytes))
+                throw new InvalidDataException($"Package contains duplicate file path: {path}");
+
             var staged = ResolveSafePath(destination, path);
             Directory.CreateDirectory(Path.GetDirectoryName(staged)!);
             await File.WriteAllBytesAsync(staged, bytes).ConfigureAwait(true);
         }
 
-        if (manifest is not null)
+        foreach (var pair in manifestFiles)
         {
-            if (manifest.SchemaVersion != 1 || !string.Equals(manifest.Version, expectedVersion, StringComparison.Ordinal) ||
-                !string.Equals(manifest.Kind, expectedKind, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("The package manifest version or type does not match the selected GitHub release asset.");
-            foreach (var spec in manifest.Files)
-            {
-                var path = NormalizeArchivePath(spec.Path);
-                if (IsProtectedPath(path)) throw new InvalidDataException($"Package manifest includes a protected path: {path}");
-                if (!files.TryGetValue(path, out var bytes))
-                    throw new InvalidDataException($"Package manifest entry is missing: {path}");
-                if (bytes.LongLength != spec.Size || !HashMatches(bytes, spec.Sha256))
-                    throw new InvalidDataException($"Package file failed verification: {path}");
-            }
-            var listed = manifest.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            if (files.Keys.Any(path => !listed.Contains(path)))
-                throw new InvalidDataException("Package contains files not listed in its manifest.");
-        }
-        else
-        {
-            throw new InvalidDataException("The selected release has no separate package manifest asset and the ZIP does not contain a legacy embedded manifest.");
+            if (!files.TryGetValue(pair.Key, out var bytes))
+                throw new InvalidDataException($"Package manifest entry is missing: {pair.Key}");
+            if (bytes.LongLength != pair.Value.Size || !HashMatches(bytes, pair.Value.Sha256))
+                throw new InvalidDataException($"Package file failed verification: {pair.Key}");
         }
 
         if (files.Count == 0) throw new InvalidDataException("Downloaded package contained no installable files.");
@@ -592,6 +593,7 @@ internal sealed class UpdateEngine
         var stateHashes = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         var finalWrites = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         var finalDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var unmanagedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         PackageManifest? targetManifest = null;
         var previousVersion = current;
 
@@ -618,8 +620,9 @@ internal sealed class UpdateEngine
             if (manifest.SchemaVersion != 1 || !string.Equals(manifest.FromVersion, previousVersion.ToString(), StringComparison.Ordinal) ||
                 !string.Equals(manifest.ToVersion, patchRelease.Version.ToString(), StringComparison.Ordinal))
                 throw new InvalidDataException($"Patch version chain mismatch in {patchRelease.Asset.Name}.");
-            if (manifest.TargetManifest is null || manifest.TargetManifest.Version != manifest.ToVersion)
-                throw new InvalidDataException("Patch lacks a valid target package manifest.");
+            if (manifest.Files is null || manifest.DeletedFiles is null)
+                throw new InvalidDataException("Patch manifest has an invalid file list.");
+            ValidatePackageManifest(manifest.TargetManifest, manifest.ToVersion, "full");
 
             // New combined release manifests include the size and SHA-256 of the exact
             // patch ZIP they describe. This detects accidentally mixed release assets
@@ -651,11 +654,22 @@ internal sealed class UpdateEngine
                     throw new InvalidDataException($"Patch ZIP {patchRelease.Asset.Name} contains duplicate payload path 'files/{payloadPath}'.");
             }
 
+            var patchPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var file in manifest.Files)
             {
+                if (file is null || file.Size < 0 || !IsSha256Hex(file.Sha256) ||
+                    (!string.IsNullOrWhiteSpace(file.FromSha256) && !IsSha256Hex(file.FromSha256)))
+                    throw new InvalidDataException("Patch manifest contains an invalid file entry.");
                 var path = NormalizeArchivePath(file.Path);
-                if (IsProtectedPath(path) || path.Equals("version.txt", StringComparison.OrdinalIgnoreCase) || path.Equals("info.md", StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException($"Patch attempts to change protected path: {path}");
+                if (!patchPaths.Add(path))
+                    throw new InvalidDataException($"Patch manifest contains duplicate path: {path}");
+                var targetSpec = manifest.TargetManifest!.Files.FirstOrDefault(f =>
+                    string.Equals(f.Path, path, StringComparison.OrdinalIgnoreCase));
+                if (targetSpec is null || !IsManagedFile(targetSpec))
+                    throw new InvalidDataException($"Patch attempts to change a path that is not application-managed by its target manifest: {path}");
+                ValidateUpdatePolicy(targetSpec);
+                if (targetSpec.Size != file.Size || !targetSpec.Sha256.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException($"Patch metadata does not match the target manifest for: {path}");
                 if (!payloads.TryGetValue(path, out var payload))
                 {
                     var matchingArchiveEntries = archive.Entries
@@ -681,19 +695,38 @@ internal sealed class UpdateEngine
                     throw new InvalidDataException($"Patch file failed verification: {path}");
 
                 var currentHash = await GetCurrentHashAsync(path, stateHashes).ConfigureAwait(true);
-                if (!string.IsNullOrWhiteSpace(file.FromSha256) && currentHash is not null && currentHash.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
+                var updateMode = GetUpdateMode(targetSpec);
+                if (currentHash is not null && currentHash.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
                 {
                     // Already at this step's target state; tolerate interrupted/manual reuse.
+                    stateHashes[path] = file.Sha256;
+                    finalWrites.Remove(path);
+                    finalDeletes.Remove(path);
+                    continue;
                 }
-                else if (string.IsNullOrWhiteSpace(file.FromSha256))
+
+                if (updateMode == "install-if-missing" && currentHash is not null)
                 {
-                    if (currentHash is not null && !currentHash.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
-                        throw new InvalidDataException($"Patch expected new file {path}, but it already exists with different content.");
+                    unmanagedPaths.Add(path);
+                    stateHashes[path] = currentHash;
+                    continue;
                 }
-                else if (!string.Equals(currentHash, file.FromSha256, StringComparison.OrdinalIgnoreCase))
+
+                if (updateMode == "replace-if-unmodified" && currentHash is not null &&
+                    !string.Equals(currentHash, file.FromSha256, StringComparison.OrdinalIgnoreCase))
                 {
+                    // A user changed this file after it was installed. Keep it and stop
+                    // claiming ownership so a later obsolete-file cleanup cannot remove it.
+                    unmanagedPaths.Add(path);
+                    stateHashes[path] = currentHash;
+                    continue;
+                }
+
+                if (updateMode == "replace" && !string.IsNullOrWhiteSpace(file.FromSha256) &&
+                    !string.Equals(currentHash, file.FromSha256, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"Installed file does not match the expected patch base: {path}");
-                }
+                if (updateMode == "replace" && string.IsNullOrWhiteSpace(file.FromSha256) && currentHash is not null)
+                    throw new InvalidDataException($"Patch expected new file {path}, but it already exists with different content.");
 
                 stateHashes[path] = file.Sha256;
                 finalWrites[path] = bytes;
@@ -702,12 +735,25 @@ internal sealed class UpdateEngine
 
             foreach (var deletion in manifest.DeletedFiles)
             {
+                if (deletion is null || (!string.IsNullOrWhiteSpace(deletion.FromSha256) && !IsSha256Hex(deletion.FromSha256)))
+                    throw new InvalidDataException("Patch manifest contains an invalid deletion entry.");
                 var path = NormalizeArchivePath(deletion.Path);
-                if (IsProtectedPath(path)) throw new InvalidDataException($"Patch attempts to delete protected path: {path}");
+                if (!patchPaths.Add(path))
+                    throw new InvalidDataException($"Patch manifest changes or deletes the same path more than once: {path}");
+                if (!IsManagedPatchPath(path, deletion.Ownership, deletion.UpdateMode))
+                    throw new InvalidDataException($"Patch attempts to delete a path that is not application-managed: {path}");
                 var currentHash = await GetCurrentHashAsync(path, stateHashes).ConfigureAwait(true);
-                if (currentHash is not null && !string.IsNullOrWhiteSpace(deletion.FromSha256) &&
-                    !currentHash.Equals(deletion.FromSha256, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException($"Installed file does not match the expected deletion base: {path}");
+                if (currentHash is not null &&
+                    (string.IsNullOrWhiteSpace(deletion.FromSha256) ||
+                     !currentHash.Equals(deletion.FromSha256, StringComparison.OrdinalIgnoreCase)))
+                {
+                    // Never remove a file without a known base hash or one that no
+                    // longer matches the updater's last installed copy; it may contain
+                    // user edits or may not have been owned by the updater at all.
+                    unmanagedPaths.Add(path);
+                    stateHashes[path] = currentHash;
+                    continue;
+                }
                 stateHashes[path] = null;
                 finalWrites.Remove(path);
                 finalDeletes.Add(path);
@@ -720,6 +766,27 @@ internal sealed class UpdateEngine
         if (targetManifest is null || latest.Version is null || previousVersion.CompareTo(latest.Version) != 0)
             throw new InvalidDataException("The patch chain does not reach the latest release.");
 
+        var managedFiles = new List<ManagedFile>();
+        foreach (var spec in targetManifest!.Files)
+        {
+            if (unmanagedPaths.Contains(spec.Path)) continue;
+            var currentHash = await GetCurrentHashAsync(spec.Path, stateHashes).ConfigureAwait(true);
+            if (currentHash is null)
+                throw new InvalidDataException($"Patch cannot restore a missing unchanged file without a full package: {spec.Path}");
+            if (currentHash.Equals(spec.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                managedFiles.Add(spec);
+                continue;
+            }
+
+            if (GetUpdateMode(spec) == "replace")
+                throw new InvalidDataException($"Patch does not contain the payload needed to restore a modified application file: {spec.Path}");
+
+            // User-modifiable files that were not part of this patch may have local
+            // edits. Preserve them, and do not claim ownership until they match again.
+            unmanagedPaths.Add(spec.Path);
+        }
+
         var workOutput = Path.Combine(_work, "patch-output");
         Directory.CreateDirectory(workOutput);
         foreach (var pair in finalWrites)
@@ -728,7 +795,7 @@ internal sealed class UpdateEngine
             Directory.CreateDirectory(Path.GetDirectoryName(output)!);
             await File.WriteAllBytesAsync(output, pair.Value).ConfigureAwait(true);
         }
-        return new PatchResult(targetManifest, finalDeletes, finalWrites);
+        return new PatchResult(targetManifest, finalDeletes, finalWrites, managedFiles);
     }
 
     private async Task<string?> GetCurrentHashAsync(string path, Dictionary<string, string?> stateHashes)
@@ -756,10 +823,10 @@ internal sealed class UpdateEngine
         {
             Version = result.Manifest.Version,
             Kind = "patch",
-            Files = result.Manifest.Files.Where(f => !IsProtectedPath(f.Path)).ToList()
+            Files = result.ManagedFiles
         };
         await WriteUpdaterStateAsync(StateFileName, JsonSerializer.Serialize(newState, JsonOptions)).ConfigureAwait(true);
-        var skinFiles = result.Manifest.Files.Where(f => IsDefaultSkinPath(f.Path)).ToList();
+        var skinFiles = newState.Files.Where(f => IsDefaultSkinPath(f.Path)).ToList();
         await WriteUpdaterStateAsync(SkinStateFileName, JsonSerializer.Serialize(new SkinState
         {
             Version = result.Manifest.Version,
@@ -772,10 +839,10 @@ internal sealed class UpdateEngine
 
     private async Task ApplyTransactionAsync(Dictionary<string, byte[]> writes, HashSet<string> deletions, int startPercent, int endPercent)
     {
-        var actualWrites = writes.Where(p => !IsProtectedPath(p.Key) &&
+        var actualWrites = writes.Where(p => !IsAlwaysProtectedPath(p.Key) &&
             !p.Key.Equals(StateFileName, StringComparison.OrdinalIgnoreCase) && !p.Key.Equals(SkinStateFileName, StringComparison.OrdinalIgnoreCase))
             .ToDictionary(p => NormalizeArchivePath(p.Key), p => p.Value, StringComparer.OrdinalIgnoreCase);
-        var actualDeletes = deletions.Where(p => !IsProtectedPath(p) &&
+        var actualDeletes = deletions.Where(p => !IsAlwaysProtectedPath(p) &&
             !p.Equals(StateFileName, StringComparison.OrdinalIgnoreCase) && !p.Equals(SkinStateFileName, StringComparison.OrdinalIgnoreCase))
             .Select(NormalizeArchivePath).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
@@ -841,14 +908,101 @@ internal sealed class UpdateEngine
         }
     }
 
-    private HashSet<string> FindObsoleteManagedPaths(ManagedState? oldState, PackageManifest newManifest)
+    private async Task<PackageInstallPlan> BuildPackageInstallPlanAsync(PreparedPackage package, ManagedState? oldState)
     {
-        var newPaths = newManifest.Files.Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var previousFiles = new Dictionary<string, ManagedFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (var previousFile in oldState?.Files ?? [])
+        {
+            if (previousFile is null) continue;
+            try { previousFiles[NormalizeArchivePath(previousFile.Path)] = previousFile; }
+            catch (InvalidDataException) { /* Ignore corrupt legacy state entries; never use them to authorize a write. */ }
+        }
+        var writes = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+        var managedFiles = new List<ManagedFile>();
+
+        foreach (var spec in package.Manifest.Files)
+        {
+            if (!IsManagedFile(spec)) continue;
+            ValidateUpdatePolicy(spec);
+            if (!package.Files.TryGetValue(spec.Path, out var bytes))
+                throw new InvalidDataException($"Verified package payload is missing: {spec.Path}");
+
+            var mode = GetUpdateMode(spec);
+            var destination = ResolveSafePath(_root, spec.Path);
+            var exists = File.Exists(destination);
+            var shouldWrite = mode == "replace" || !exists;
+            var shouldManage = true;
+            string? currentHash = null;
+            if (exists && (mode != "replace" || IsLegacyProtectedPath(spec.Path)))
+            {
+                await using var stream = File.OpenRead(destination);
+                currentHash = Convert.ToHexString(await SHA256.HashDataAsync(stream).ConfigureAwait(true));
+            }
+
+            if (mode == "replace" && exists && IsLegacyProtectedPath(spec.Path))
+            {
+                // A newly owned path inside a legacy user-data folder may collide
+                // with a user's existing file. Only take it over when it already
+                // matches the package or the old updater state proves TSC managed it.
+                var wasManaged = previousFiles.TryGetValue(spec.Path, out var previous) && IsManagedFile(previous);
+                var alreadyAtTarget = currentHash!.Equals(spec.Sha256, StringComparison.OrdinalIgnoreCase);
+                shouldWrite = wasManaged && !alreadyAtTarget;
+                shouldManage = wasManaged || alreadyAtTarget;
+            }
+
+            if (mode == "replace-if-unmodified" && exists)
+            {
+                shouldWrite = false;
+                if (currentHash is not null && currentHash.Equals(spec.Sha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    shouldManage = true;
+                }
+                else if (previousFiles.TryGetValue(spec.Path, out var previousPolicyFile) && IsManagedFile(previousPolicyFile) &&
+                         !string.IsNullOrWhiteSpace(previousPolicyFile.Sha256) && currentHash is not null)
+                {
+                    shouldWrite = currentHash.Equals(previousPolicyFile.Sha256, StringComparison.OrdinalIgnoreCase);
+                    shouldManage = shouldWrite;
+                }
+                else
+                {
+                    shouldManage = false;
+                }
+            }
+            else if (mode == "install-if-missing" && exists)
+            {
+                shouldWrite = false;
+                shouldManage = currentHash is not null && currentHash.Equals(spec.Sha256, StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (shouldWrite)
+                writes[spec.Path] = bytes;
+            if (shouldManage)
+                managedFiles.Add(spec);
+            // A pre-existing user-modified file is intentionally not added to the
+            // managed state. Future updates will leave it alone, including cleanup.
+        }
+
+        return new PackageInstallPlan(writes, managedFiles);
+    }
+
+    private async Task<HashSet<string>> FindObsoleteManagedPathsAsync(ManagedState? oldState, PackageManifest newManifest)
+    {
+        var newPaths = newManifest.Files.Where(IsManagedFile)
+            .Select(f => f.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var file in oldState?.Files ?? [])
         {
-            if (newPaths.Contains(file.Path) || IsProtectedPath(file.Path)) continue;
-            result.Add(file.Path);
+            if (file is null || !IsManagedFile(file) || string.IsNullOrWhiteSpace(file.Sha256)) continue;
+            string path;
+            try { path = NormalizeArchivePath(file.Path); }
+            catch (InvalidDataException) { continue; }
+            if (newPaths.Contains(path)) continue;
+            var localPath = ResolveSafePath(_root, path);
+            if (!File.Exists(localPath)) continue;
+            await using var stream = File.OpenRead(localPath);
+            var currentHash = Convert.ToHexString(await SHA256.HashDataAsync(stream).ConfigureAwait(true));
+            if (currentHash.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
+                result.Add(path);
         }
         return result;
     }
@@ -861,7 +1015,7 @@ internal sealed class UpdateEngine
 
     private async Task SaveSkinStateFromPackageAsync(IEnumerable<ManagedFile> files, string version)
     {
-        await SaveSkinStateAsync(files.Where(f => IsDefaultSkinPath(f.Path)).Select(f => f.Path), null, version).ConfigureAwait(true);
+        await SaveSkinStateAsync(files.Where(f => IsManagedFile(f) && IsDefaultSkinPath(f.Path)).Select(f => f.Path), null, version).ConfigureAwait(true);
     }
 
     private static string GetUpdaterStatePath(string fileName) =>
@@ -872,14 +1026,6 @@ internal sealed class UpdateEngine
         var path = GetUpdaterStatePath(fileName);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllTextAsync(path, contents).ConfigureAwait(true);
-    }
-
-    private async Task<SkinState?> ReadSkinStateAsync()
-    {
-        var path = GetUpdaterStatePath(SkinStateFileName);
-        if (!File.Exists(path)) return null;
-        try { return JsonSerializer.Deserialize<SkinState>(await File.ReadAllTextAsync(path).ConfigureAwait(true), JsonOptions); }
-        catch { return null; }
     }
 
     private static async Task<ManagedState?> ReadStateAsync(string path)
@@ -996,11 +1142,96 @@ internal sealed class UpdateEngine
 
     private void Report(string status, int percent, string? detail = null) => _progress(status, Math.Clamp(percent, 0, 100), detail);
 
-    private static bool IsProtectedPath(string path)
+    private static void ValidatePackageManifest(PackageManifest? manifest, string expectedVersion, string expectedKind)
+    {
+        if (manifest is null || manifest.SchemaVersion != 1 ||
+            !string.Equals(manifest.Version, expectedVersion, StringComparison.Ordinal) ||
+            !string.Equals(manifest.Kind, expectedKind, StringComparison.OrdinalIgnoreCase) ||
+            manifest.Files is null)
+            throw new InvalidDataException("The package manifest version, type, or structure is invalid.");
+
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in manifest.Files)
+        {
+            if (file is null) throw new InvalidDataException("Package manifest contains an empty file entry.");
+            var path = NormalizeArchivePath(file.Path);
+            file.Path = path;
+            if (file.Size < 0 || !IsSha256Hex(file.Sha256))
+                throw new InvalidDataException($"Package manifest contains invalid size or SHA-256 metadata for: {path}");
+            if (!IsManagedFile(file))
+                throw new InvalidDataException($"Package manifest includes a protected, user-data, or unsupported path: {path}");
+            ValidateUpdatePolicy(file);
+            if (!paths.Add(path))
+                throw new InvalidDataException($"Package manifest contains duplicate path: {path}");
+        }
+    }
+
+    private static bool IsManagedFile(ManagedFile file)
+    {
+        if (IsAlwaysProtectedPath(file.Path)) return false;
+        if (string.IsNullOrWhiteSpace(file.Ownership))
+            return !IsLegacyProtectedPath(file.Path);
+
+        return file.Ownership.Equals("application", StringComparison.OrdinalIgnoreCase) ||
+               file.Ownership.Equals("user-modifiable", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsManagedPatchPath(string path, string? ownership, string? updateMode)
+    {
+        if (IsAlwaysProtectedPath(path)) return false;
+        if (string.IsNullOrWhiteSpace(ownership)) return !IsLegacyProtectedPath(path);
+        if (ownership.Equals("application", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(updateMode) || updateMode.Equals("replace", StringComparison.OrdinalIgnoreCase);
+        if (ownership.Equals("user-modifiable", StringComparison.OrdinalIgnoreCase))
+            return string.IsNullOrWhiteSpace(updateMode) ||
+                   updateMode.Equals("replace-if-unmodified", StringComparison.OrdinalIgnoreCase) ||
+                   updateMode.Equals("install-if-missing", StringComparison.OrdinalIgnoreCase);
+        return false;
+    }
+
+    private static void ValidateUpdatePolicy(ManagedFile file)
+    {
+        if (string.IsNullOrWhiteSpace(file.Ownership)) return; // Legacy manifest.
+        var ownership = file.Ownership.ToLowerInvariant();
+        var updateMode = GetUpdateMode(file);
+        if (ownership == "application" && updateMode != "replace")
+            throw new InvalidDataException($"Application-owned file '{file.Path}' must use updateMode 'replace'.");
+        if (ownership == "user-modifiable" && updateMode is not ("replace-if-unmodified" or "install-if-missing"))
+            throw new InvalidDataException($"User-modifiable file '{file.Path}' has an unsupported update mode '{updateMode}'.");
+        if (ownership is not ("application" or "user-modifiable"))
+            throw new InvalidDataException($"File '{file.Path}' has unsupported ownership '{file.Ownership}'. User data and generated files must not be shipped as managed package files.");
+    }
+
+    private static string GetUpdateMode(ManagedFile file)
+    {
+        if (string.IsNullOrWhiteSpace(file.Ownership)) return "replace";
+        if (!string.IsNullOrWhiteSpace(file.UpdateMode)) return file.UpdateMode.ToLowerInvariant();
+        return file.Ownership.Equals("user-modifiable", StringComparison.OrdinalIgnoreCase)
+            ? "replace-if-unmodified"
+            : "replace";
+    }
+
+    private static bool IsAlwaysProtectedPath(string path)
     {
         var normalized = path.Replace('\\', '/');
-        // The songs directory is user data, except for this application-owned help file.
-        // Keep this exact-path exception before the directory-level protection check.
+        var parts = normalized.Split('/');
+        if (parts.Length == 1)
+        {
+            string[] protectedFiles = ["gameconfig.json", "keybinds.json", "tsc_crash.log", "info.md", "version.txt", StateFileName, SkinStateFileName];
+            if (protectedFiles.Contains(parts[0], StringComparer.OrdinalIgnoreCase)) return true;
+        }
+        return parts.Length >= 2 &&
+               parts[0].Equals("tools", StringComparison.OrdinalIgnoreCase) &&
+               parts[^1].Equals("ffmpeg.exe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // This is intentionally only a compatibility fallback for manifests created
+    // before per-file ownership metadata existed. New manifests can manage files
+    // anywhere except the reserved settings/state paths above.
+    private static bool IsLegacyProtectedPath(string path)
+    {
+        var normalized = path.Replace('\\', '/');
+        if (IsAlwaysProtectedPath(normalized)) return true;
         if (normalized.Equals("songs/README.txt", StringComparison.OrdinalIgnoreCase)) return false;
         var parts = normalized.Split('/');
         if (parts.Length == 0) return true;
@@ -1010,14 +1241,7 @@ internal sealed class UpdateEngine
             parts[0].Equals("state", StringComparison.OrdinalIgnoreCase)) return true;
         if (parts[0].Equals("skins", StringComparison.OrdinalIgnoreCase) &&
             (parts.Length < 3 || !parts[1].Equals("Default", StringComparison.OrdinalIgnoreCase))) return true;
-        if (parts.Length == 1)
-        {
-            string[] protectedFiles = ["gameconfig.json", "keybinds.json", "tsc_crash.log", "info.md", "version.txt", StateFileName, SkinStateFileName];
-            if (protectedFiles.Contains(parts[0], StringComparer.OrdinalIgnoreCase)) return true;
-        }
-        return parts.Length >= 2 &&
-               parts[0].Equals("tools", StringComparison.OrdinalIgnoreCase) &&
-               parts[^1].Equals("ffmpeg.exe", StringComparison.OrdinalIgnoreCase);
+        return false;
     }
 
     private static bool IsDefaultSkinPath(string path) => path.Replace('\\', '/').StartsWith("Skins/Default/", StringComparison.OrdinalIgnoreCase);
@@ -1040,6 +1264,9 @@ internal sealed class UpdateEngine
         if (!full.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException($"Path escapes target directory: {relative}");
         return full;
     }
+
+    private static bool IsSha256Hex(string? value) =>
+        value is { Length: 64 } && value.All(Uri.IsHexDigit);
 
     private static bool HashMatches(byte[] bytes, string expected) => Sha256(bytes).Equals(expected, StringComparison.OrdinalIgnoreCase);
     private static string Sha256(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes));
@@ -1067,14 +1294,15 @@ internal sealed class UpdateEngine
     private sealed record ReleaseAsset(string Name, string DownloadUrl, long Size, string? Digest);
     private sealed record PatchRelease(Version FromVersion, Version Version, ReleaseInfo Release, ReleaseAsset Asset, ReleaseAsset? ManifestAsset, string? ManifestPath = null);
     private sealed record PreparedPackage(PackageManifest Manifest, Dictionary<string, byte[]> Files);
-    private sealed record PatchResult(PackageManifest Manifest, HashSet<string> Deletions, Dictionary<string, byte[]> FinalWrites);
+    private sealed record PatchResult(PackageManifest Manifest, HashSet<string> Deletions, Dictionary<string, byte[]> FinalWrites, List<ManagedFile> ManagedFiles);
+    private sealed record PackageInstallPlan(Dictionary<string, byte[]> Writes, List<ManagedFile> ManagedFiles);
 
     private sealed class PackageManifest { public int SchemaVersion { get; set; } = 1; public string Version { get; set; } = ""; public string Kind { get; set; } = "full"; public List<ManagedFile> Files { get; set; } = []; }
     private sealed class ReleaseManifest { public int SchemaVersion { get; set; } = 2; public string Version { get; set; } = ""; public PackageManifest? Full { get; set; } public PatchManifest? Patch { get; set; } }
-    private sealed class ManagedFile { public string Path { get; set; } = ""; public long Size { get; set; } public string Sha256 { get; set; } = ""; }
+    private sealed class ManagedFile { public string Path { get; set; } = ""; public long Size { get; set; } public string Sha256 { get; set; } = ""; public string? Ownership { get; set; } public string? UpdateMode { get; set; } }
     private sealed class PatchManifest { public int SchemaVersion { get; set; } = 1; public string FromVersion { get; set; } = ""; public string ToVersion { get; set; } = ""; public List<PatchFile> Files { get; set; } = []; public List<PatchDeletion> DeletedFiles { get; set; } = []; public PackageManifest? TargetManifest { get; set; } public long AssetSize { get; set; } public string AssetSha256 { get; set; } = ""; }
-    private sealed class PatchFile { public string Path { get; set; } = ""; public string? FromSha256 { get; set; } public long Size { get; set; } public string Sha256 { get; set; } = ""; }
-    private sealed class PatchDeletion { public string Path { get; set; } = ""; public string? FromSha256 { get; set; } }
+    private sealed class PatchFile { public string Path { get; set; } = ""; public string? FromSha256 { get; set; } public long Size { get; set; } public string Sha256 { get; set; } = ""; public string? Ownership { get; set; } public string? UpdateMode { get; set; } }
+    private sealed class PatchDeletion { public string Path { get; set; } = ""; public string? FromSha256 { get; set; } public string? Ownership { get; set; } public string? UpdateMode { get; set; } }
     private sealed class ManagedState { public string Version { get; set; } = ""; public string Kind { get; set; } = "full"; public List<ManagedFile> Files { get; set; } = []; }
     private sealed class SkinState { public string Version { get; set; } = ""; public string? Commit { get; set; } public List<string> Files { get; set; } = []; }
 }

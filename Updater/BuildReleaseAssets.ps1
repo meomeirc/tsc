@@ -52,16 +52,41 @@ New-Item -ItemType Directory -Path $output -Force | Out-Null
 $work = Join-Path ([IO.Path]::GetTempPath()) ("TSC-release-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 
-function Test-ProtectedPath([string]$RelativePath) {
+function Test-ReservedPath([string]$RelativePath) {
     $p = $RelativePath.Replace('\', '/')
-    # songs is user data, except for this application-owned instruction file.
-    if ($p -ieq 'songs/README.txt') { return $false }
     $parts = $p.Split('/')
-    if ($parts[0] -in @('songs', 'save', 'logs', 'state')) { return $true }
-    if ($parts[0] -ieq 'Skins' -and ($parts.Count -lt 3 -or $parts[1] -ine 'Default')) { return $true }
     if ($parts.Count -eq 1 -and $parts[0] -in @('gameConfig.json', 'keybinds.json', 'tsc_crash.log', 'info.md', 'version.txt', '.tsc-update-state.json', '.tsc-skin-state.json')) { return $true }
     if ($parts[0] -ieq 'tools' -and $parts[-1] -ieq 'ffmpeg.exe') { return $true }
     return $false
+}
+
+function Get-FilePolicy([string]$RelativePath, $Rules) {
+    $policy = [pscustomobject]@{ ownership = 'application'; updateMode = 'replace' }
+    foreach ($rule in @($Rules.rules)) {
+        $pattern = [string]$rule.path
+        if ([string]::IsNullOrWhiteSpace($pattern)) { throw 'Package file policy contains a rule without a path pattern.' }
+        if ($RelativePath -like $pattern) {
+            $ownership = ([string]$rule.ownership).ToLowerInvariant()
+            $updateMode = ([string]$rule.updateMode).ToLowerInvariant()
+            if ($ownership -notin @('application', 'user-modifiable', 'user-data', 'generated')) {
+                throw "Package file policy has unsupported ownership '$ownership' for '$pattern'."
+            }
+            if ([string]::IsNullOrWhiteSpace($updateMode)) {
+                $updateMode = if ($ownership -eq 'user-modifiable') { 'replace-if-unmodified' } else { 'replace' }
+            }
+            if ($updateMode -notin @('replace', 'replace-if-unmodified', 'install-if-missing')) {
+                throw "Package file policy has unsupported update mode '$updateMode' for '$pattern'."
+            }
+            if ($ownership -eq 'application' -and $updateMode -ne 'replace') {
+                throw "Application-owned files must use updateMode 'replace': '$pattern'."
+            }
+            if ($ownership -eq 'user-modifiable' -and $updateMode -eq 'replace') {
+                throw "User-modifiable files must use 'replace-if-unmodified' or 'install-if-missing': '$pattern'."
+            }
+            $policy = [pscustomobject]@{ ownership = $ownership; updateMode = $updateMode }
+        }
+    }
+    return $policy
 }
 
 function Get-RelativePath([string]$Root, [string]$Path) {
@@ -84,18 +109,26 @@ function Copy-DirectoryContents([string]$SourceRoot, [string]$DestinationRoot) {
     }
 }
 
-function Get-ManagedManifest([string]$Root, [string]$PackVersion, [string]$Kind) {
+function Get-ManagedManifest([string]$Root, [string]$PackVersion, [string]$Kind, $Rules) {
     $files = @()
     foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
         $relative = (Get-RelativePath $Root $file.FullName).Replace('\', '/')
-        if ($relative -ieq '.tsc-package-manifest.json' -or (Test-ProtectedPath $relative)) { continue }
+        if ($relative -ieq '.tsc-package-manifest.json' -or (Test-ReservedPath $relative)) { continue }
+        $policy = Get-FilePolicy $relative $Rules
+        if ($policy.ownership -in @('user-data', 'generated')) { continue }
         $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
-        $files += [pscustomobject]@{ path = $relative; size = [long]$file.Length; sha256 = $hash }
+        $files += [pscustomobject]@{
+            path = $relative
+            size = [long]$file.Length
+            sha256 = $hash
+            ownership = $policy.ownership
+            updateMode = $policy.updateMode
+        }
     }
     return [pscustomobject]@{ schemaVersion = 1; version = $PackVersion; kind = $Kind; files = @($files | Sort-Object path) }
 }
 
-function Remove-ExcludedFiles([string]$Root) {
+function Remove-ExcludedFiles([string]$Root, $Rules) {
     # The update mode lives in data/TSC.exe; only the small Native AOT launcher is at root.
     # Remove leftovers if this publish directory was previously built by an older version.
     foreach ($legacyName in @('updater', 'updater.next', 'updater.old', 'data/updater', 'data/updater.next', 'data/updater.old')) {
@@ -107,9 +140,13 @@ function Remove-ExcludedFiles([string]$Root) {
 
     foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
         $relative = (Get-RelativePath $Root $file.FullName).Replace('\', '/')
-        if ($relative -ieq 'info.md' -or $relative -ieq 'version.txt' -or $relative -ieq '.tsc-package-manifest.json' -or $relative -ieq 'patch-manifest.json' -or (Test-ProtectedPath $relative)) {
-            # Never ship manifests inside a ZIP, user settings, scores, logs, user song files,
-            # custom skins, or any user's FFmpeg executable.
+        if ($relative -ieq 'info.md' -or $relative -ieq 'version.txt' -or $relative -ieq '.tsc-package-manifest.json' -or $relative -ieq 'patch-manifest.json' -or (Test-ReservedPath $relative)) {
+            # Reserved settings and locally installed tools are never package artifacts.
+            Remove-Item -LiteralPath $file.FullName -Force
+            continue
+        }
+        $policy = Get-FilePolicy $relative $Rules
+        if ($policy.ownership -in @('user-data', 'generated')) {
             Remove-Item -LiteralPath $file.FullName -Force
             continue
         }
@@ -227,7 +264,15 @@ function Assert-PatchZipMatchesManifest([string]$ZipPath, $Manifest) {
 }
 
 try {
-    foreach ($required in @('TSC.exe', 'data/TSC.exe', 'data/TSC.dll', 'data/TSC.deps.json', 'data/TSC.runtimeconfig.json', 'data/coreclr.dll', 'Skins/Default/scripts/skin.lua')) {
+    $policyPath = Join-Path $projectRoot 'Updater/PackageFileRules.json'
+    $policyRules = [pscustomobject]@{ rules = @() }
+    if (Test-Path -LiteralPath $policyPath -PathType Leaf) {
+        $policyRules = Get-Content -LiteralPath $policyPath -Raw | ConvertFrom-Json
+        if ($policyRules.schemaVersion -ne 1) { throw "Unsupported package file policy schema in '$policyPath'." }
+        if ($null -eq $policyRules.rules) { throw "Package file policy is missing its rules array: $policyPath" }
+    }
+
+    foreach ($required in @('TSC.exe', 'songs/README.txt', 'data/TSC.exe', 'data/TSC.dll', 'data/TSC.deps.json', 'data/TSC.runtimeconfig.json', 'data/coreclr.dll', 'Skins/Default/scripts/skin.lua')) {
         $requiredPath = Join-Path $publish ($required.Replace('/', [IO.Path]::DirectorySeparatorChar))
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
             throw "Publish output is incomplete; missing '$requiredPath'. Run the TSC-Publish profile successfully before packaging."
@@ -239,9 +284,9 @@ try {
     $fullRoot = Join-Path $work 'full'
     New-Item -ItemType Directory -Path $fullRoot -Force | Out-Null
     Copy-DirectoryContents $publish $fullRoot
-    Remove-ExcludedFiles $fullRoot
+    Remove-ExcludedFiles $fullRoot $policyRules
 
-    $fullManifest = Get-ManagedManifest $fullRoot $Version 'full'
+    $fullManifest = Get-ManagedManifest $fullRoot $Version 'full' $policyRules
     $releaseManifestPath = Join-Path $output "TSC-win-x64-$Version-manifest.json"
     $legacyMinimalManifestPath = Join-Path $output "TSC-win-x64-$Version-minimal-manifest.json"
     $legacyPatchManifestPath = Join-Path $output "TSC-win-x64-$Version-patch-manifest.json"
@@ -327,6 +372,8 @@ try {
                 fromSha256 = if ($null -ne $old) { [string]$old.sha256 } else { $null }
                 size = [long]$entry.size
                 sha256 = [string]$entry.sha256
+                ownership = [string]$entry.ownership
+                updateMode = [string]$entry.updateMode
             }
         }
 
@@ -334,7 +381,12 @@ try {
         foreach ($entry in $previousManifest.files) {
             $rel = [string]$entry.path
             if (-not $targetByPath.ContainsKey($rel)) {
-                $deleted += [pscustomobject]@{ path = $rel; fromSha256 = [string]$entry.sha256 }
+                $deleted += [pscustomobject]@{
+                    path = $rel
+                    fromSha256 = [string]$entry.sha256
+                    ownership = [string]$entry.ownership
+                    updateMode = [string]$entry.updateMode
+                }
             }
         }
         $patchManifest = [pscustomobject]@{

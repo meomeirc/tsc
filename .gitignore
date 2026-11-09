@@ -18,7 +18,8 @@ save/
 tools/
 
 /songs/*
-!/songs/README.txt
+
+/State
 
 release-assets/
 
