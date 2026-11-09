@@ -1112,7 +1112,10 @@ public sealed partial class Playfield
             indicatorTitle = "GROUP LOCK";
         }
 
-        if (visible.Count == 0 && (!indicatorGroupId.HasValue || !indicatorInstanceId.HasValue))
+        var showConnectorIndicator = _editorConnectorMode && _editorPlacementEnabled &&
+            _editorMouseHoverActive && _editorDraggedEvent is null && !_editorRectSelecting;
+        if (visible.Count == 0 && (!indicatorGroupId.HasValue || !indicatorInstanceId.HasValue) &&
+            !showConnectorIndicator)
             return;
 
         // Instance order and display labels are prepared only when the chart changes.
@@ -1171,11 +1174,64 @@ public sealed partial class Playfield
                 labelColor, 0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
         }
 
-        // Keep the status badge beside the current pointer, as with the original
-        // SuperFlick hover indicator. Its group/instance identity comes from the
-        // stored edit or lock context, so deselecting notes does not hide or change it.
-        if (indicatorGroupId is int statusGroupId && indicatorInstanceId is int statusInstanceId)
+        // Connector mode gets the same pointer-following status badge as note
+        // group edit/lock mode. Keep the connector prompt as the single active
+        // status so the two labels never overlap when connecting grouped notes.
+        if (showConnectorIndicator)
         {
+            ChartEvent? source = null;
+            if (_selectedEventKey.HasValue &&
+                _eventsByKey.TryGetValue(_selectedEventKey.Value, out var selectedSource) &&
+                selectedSource.Kind == "Note" && selectedSource.RawType == 1)
+                source = selectedSource;
+            if (source is not null)
+            {
+                // When a point on a link chain is selected, connector operations
+                // continue from its actual endpoint. Show that same point in the
+                // cursor hint so the displayed source matches the click behavior.
+                var sourceRoot = GetEditorLinkRoot(source);
+                if (sourceRoot is not null)
+                    source = GetEditorLinkChainEnd(source);
+            }
+
+            var connectModifierHeld = KeybindSettings.IsModifierBindingDown("editor_connect_modifier");
+            string connectorText;
+            if (source is null)
+            {
+                connectorText = "CONNECTOR TOOL ACTIVE · CLICK A SOURCE NOTE";
+            }
+            else if (!connectModifierHeld)
+            {
+                connectorText = $"SOURCE {source.Tick}/{source.Track} · HOLD CONNECT + CLICK TARGET";
+            }
+            else if (_hoverBeatTick is int targetTick && _hoverTrack is int targetTrack)
+            {
+                var hoveredTarget = _editorHoverHit?.Event;
+                var targetRoot = hoveredTarget is null ? null : GetEditorLinkRoot(hoveredTarget);
+                var displayTarget = targetRoot ?? hoveredTarget;
+                var sourceRoot = GetEditorLinkRoot(source);
+                var sameSource = hoveredTarget is not null &&
+                    (ReferenceEquals(hoveredTarget, source) ||
+                     (sourceRoot is not null && ReferenceEquals(targetRoot, sourceRoot)));
+                connectorText = sameSource
+                    ? "CHOOSE A DIFFERENT TARGET NOTE"
+                    : displayTarget is not null
+                        ? $"TARGET {displayTarget.Tick}/{displayTarget.Track} · CLICK TO CONNECT"
+                        : $"TARGET {targetTick}/{targetTrack} · CLICK TO CONNECT";
+            }
+            else
+            {
+                connectorText = "CONNECT HELD · MOVE TO A TARGET";
+            }
+
+            DrawEditorHoverIndicator(connectorText, _editorPointerPosition, 4f,
+                new Color(52, 211, 153), Color.White);
+        }
+        else if (indicatorGroupId is int statusGroupId && indicatorInstanceId is int statusInstanceId)
+        {
+            // Keep the group status badge beside the current pointer. Its identity
+            // comes from the stored edit or lock context, so deselecting notes does
+            // not hide or change it.
             var instanceCount = instanceCounts.TryGetValue(statusGroupId, out var count) ? count : 0;
             var displayInstance = displayInstanceNumbers.TryGetValue((statusGroupId, statusInstanceId), out var number)
                 ? number
