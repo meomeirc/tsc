@@ -1,5 +1,9 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.53
+
+- reworked updater flow. nothing new other than that, this only serves as a bridge + test update i guess
+
 # 0.0.52
 
 - actually whitelisted the songs/README.txt file for updates, oops. you can read it from the folder now
