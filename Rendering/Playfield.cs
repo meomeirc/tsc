@@ -542,6 +542,7 @@ public sealed partial class Playfield
     private bool _editorHoverCacheValid;
     private bool _chartEditorMode;
     private bool _editorPreviewMode;
+    private bool _editorGameplayPreviewSkinWarmupAttempted;
     private bool _editorPreviewPreviousBeatLines;
     private bool _editorPreviewPreviousTempoLines;
     private bool _editorPreviewPreviousTopDownViewEnabled;
@@ -1393,6 +1394,17 @@ public sealed partial class Playfield
             var editorStatus = _statusMessage;
             ReloadSkinForCurrentViewport();
             _statusMessage = editorStatus;
+        }
+
+        // ConfigureChartEditor is called once before the chart is loaded and once
+        // after chart preparation. The latter call is the first point where the
+        // gameplay skin can be prewarmed against the editor's final viewport/state.
+        if (enabled && _chart is not null && _tempo is not null)
+        {
+            // The chart may have been prepared while this Playfield was hidden,
+            // before its regular Update loop refreshed the skin's game-state view.
+            RefreshSkinGameState();
+            PrewarmEditorGameplayPreviewSkin();
         }
     }
 
@@ -11673,13 +11685,18 @@ public sealed partial class Playfield
                 _statusMessage = renderConfigStatus;
             _lastSkinScriptVirtualWidth = virtualWidth;
             _lastSkinScriptVirtualHeight = virtualHeight;
+            _editorGameplayPreviewSkinWarmupAttempted = false;
             RefreshSkinGameState();
             var scriptsOk = _skinRuntime.LastError is null &&
                             _pauseSkinRuntime.LastError is null &&
                             _resultSkinRuntime.LastError is null &&
                             _chartEditorInterfaceRuntime.LastError is null;
             if (scriptsOk)
+            {
                 PrewarmGameplayAnimationFontsIfActive();
+                if (_chartEditorMode && _chart is not null && _tempo is not null)
+                    PrewarmEditorGameplayPreviewSkin();
+            }
             var ok = renderConfigOk && scriptsOk;
             Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_DONE ok={ok} scripts={scriptsOk} renderConfig={renderConfigOk}");
             return ok;
@@ -11714,9 +11731,14 @@ public sealed partial class Playfield
             if (scriptOk)
                 _skin.UIConfig = _skinRuntime.UIConfig;
 
+            _editorGameplayPreviewSkinWarmupAttempted = false;
             RefreshSkinGameState();
             if (scriptOk)
+            {
                 PrewarmGameplayAnimationFontsIfActive();
+                if (_chartEditorMode && _chart is not null && _tempo is not null)
+                    PrewarmEditorGameplayPreviewSkin();
+            }
             var ok = scriptOk && pauseOk && resultOk && editorInterfaceOk;
             Program.LogRuntime($"PLAYFIELD_SKIN_SCRIPTS_RELOAD_DONE ok={ok} main={scriptOk} pause={pauseOk} result={resultOk} chartEditor={editorInterfaceOk}");
             return ok;
@@ -11822,6 +11844,7 @@ public sealed partial class Playfield
         _pauseSkinRuntime = nextPauseRuntime!;
         _resultSkinRuntime = nextResultRuntime!;
         _chartEditorInterfaceRuntime = nextEditorInterfaceRuntime!;
+        _editorGameplayPreviewSkinWarmupAttempted = false;
         _hitSounds = nextHitSounds!;
         _textures = nextTextures!;
 
@@ -11888,6 +11911,8 @@ public sealed partial class Playfield
         }
         RefreshSkinGameState();
         PrewarmGameplayAnimationFontsIfActive();
+        if (_chartEditorMode && _chart is not null && _tempo is not null)
+            PrewarmEditorGameplayPreviewSkin();
 
         var (currentVirtualWidth, currentVirtualHeight) = GetVirtualResolution(
             _graphics.Viewport.Width,

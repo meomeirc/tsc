@@ -556,6 +556,118 @@ public sealed partial class Playfield
         _spriteBatch.End();
     }
 
+    /// <summary>
+    /// Warms the gameplay skin with the same display flags used by editor
+    /// gameplay-preview mode. This runs during editor loading, not on the first
+    /// preview toggle, and renders into the normal gameplay target which the next
+    /// frame clears before drawing the editor scene.
+    /// </summary>
+    private void PrewarmEditorGameplayPreviewSkin()
+    {
+        if (!_chartEditorMode || _editorGameplayPreviewSkinWarmupAttempted)
+            return;
+
+        // An absent/failed Lua skin uses the built-in C# fallback and has no
+        // deferred skin render resources to prepare. Mark the attempt so toggling
+        // preview cannot retry a known-unavailable runtime on the interactive path.
+        _editorGameplayPreviewSkinWarmupAttempted = true;
+        if (!_skinRuntime.IsLoaded)
+            return;
+
+        var (width, height) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
+        var previousTargets = _graphics.GetRenderTargets();
+        var previousViewport = _graphics.Viewport;
+        var previousScissor = _graphics.ScissorRectangle;
+        var previousBlend = _graphics.BlendState;
+        var previousDepth = _graphics.DepthStencilState;
+        var previousRasterizer = _graphics.RasterizerState;
+        var previousSampler0 = _graphics.SamplerStates[0];
+        var previousSampler1 = _graphics.SamplerStates[1];
+
+        var warmed = false;
+        try
+        {
+            using var timing = new LoadTimingScope("editor_gameplay_skin_prewarm");
+            EnsureGameplayRenderTarget(width, height);
+            if (_gameplayRenderTarget is null)
+                return;
+
+            _graphics.SetRenderTarget(_gameplayRenderTarget);
+            _graphics.Viewport = new Viewport(0, 0, width, height);
+            _graphics.ScissorRectangle = new Rectangle(0, 0, width, height);
+            _graphics.Clear(Color.Transparent);
+
+            // Generate commands with the same flags as gameplay preview, then
+            // send both layers through the exact renderer used by the normal
+            // gameplay frame. This prepares first-use font/shadow atlases, 3D
+            // texture composites, sparkles, and SpriteBatch/effect state without
+            // running gameplay lifecycle callbacks or starting audio.
+            var previousEditorMode = _chartEditorMode && !_editorPreviewMode;
+            var previousEditorPreviewMode = _editorPreviewMode;
+            var previousPlaying = _playing;
+            try
+            {
+                // Some skins only submit their gameplay HUD while the chart is
+                // playing. Expose a temporary active-playback state so those
+                // commands also get their first GPU/font preparation here.
+                if (!_playing)
+                {
+                    _playing = true;
+                    RefreshSkinGameState();
+                }
+
+                _skinRuntime.SetEditorMode(false);
+                _skinRuntime.SetEditorPreviewMode(true);
+                _skinRuntime.PrepareGameplayAnimationFonts();
+                var commands = _skinRuntime.BuildDrawCommands(width, height, _font);
+                warmed = commands.Count > 0;
+                DrawSkinScriptUiLayers(commands, true, _skinRuntime);
+                DrawSkinScriptUiLayers(commands, false, _skinRuntime);
+            }
+            finally
+            {
+                _skinRuntime.SetEditorMode(previousEditorMode);
+                _skinRuntime.SetEditorPreviewMode(previousEditorPreviewMode);
+                if (_playing != previousPlaying)
+                {
+                    _playing = previousPlaying;
+                    RefreshSkinGameState();
+                }
+            }
+            Program.LogRuntime(
+                $"EDITOR_GAMEPLAY_SKIN_PREWARM_DONE warmed={warmed} " +
+                $"loaded={_skinRuntime.IsLoaded} error={_skinRuntime.LastError ?? "none"}");
+        }
+        catch (Exception ex)
+        {
+            // Preview skin preparation is an optimization, never a reason to make
+            // an otherwise valid chart impossible to open. The normal skin path
+            // remains available and will surface its own error if it cannot draw.
+            Program.LogFatal("EDITOR_GAMEPLAY_SKIN_PREWARM", ex);
+        }
+        finally
+        {
+            try
+            {
+                if (previousTargets.Length == 0)
+                    _graphics.SetRenderTarget(null);
+                else
+                    _graphics.SetRenderTargets(previousTargets);
+                _graphics.Viewport = previousViewport;
+                _graphics.ScissorRectangle = previousScissor;
+                _graphics.BlendState = previousBlend;
+                _graphics.DepthStencilState = previousDepth;
+                _graphics.RasterizerState = previousRasterizer;
+                _graphics.SamplerStates[0] = previousSampler0;
+                _graphics.SamplerStates[1] = previousSampler1;
+            }
+            catch (Exception ex)
+            {
+                Program.LogFatal("EDITOR_GAMEPLAY_SKIN_PREWARM_RESTORE", ex);
+            }
+        }
+    }
+
     private void EnsureGameplayRenderTarget(int width, int height)
     {
         // Connector and note-group previews render to transparent overlays before
