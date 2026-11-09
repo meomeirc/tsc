@@ -201,10 +201,15 @@ internal sealed class UpdateEngine
             {
                 try
                 {
-                    Report("Downloading update patches…", 6, $"{patchChain.Count} patch file(s)");
+                    // Validate every available external patch manifest before downloading
+                    // any patch ZIP. A schema or ownership-policy change can therefore
+                    // trigger the full-package fallback without first downloading a chain
+                    // of payload archives that will never be applied.
+                    var patchManifests = await DownloadAndPreflightPatchManifestsAsync(patchChain, current, latest).ConfigureAwait(true);
+
+                    Report("Downloading update patches…", 16, $"{patchChain.Count} patch file(s)");
                     var patchArchives = new List<string>();
-                    var patchManifestPaths = new List<string?>();
-                    var totalPatchBytes = patchChain.Sum(p => (double)Math.Max(0L, p.Asset.Size) + Math.Max(0L, p.ManifestAsset?.Size ?? 0L));
+                    var totalPatchBytes = patchChain.Sum(p => (double)Math.Max(0L, p.Asset.Size));
                     double completedBytes = 0;
                     for (var i = 0; i < patchChain.Count; i++)
                     {
@@ -214,34 +219,16 @@ internal sealed class UpdateEngine
                         await DownloadAssetAsync(patch.Asset, archivePath, (received, _) =>
                         {
                             var overall = totalPatchBytes <= 0 ? 1 : (baseCompleted + received) / totalPatchBytes;
-                            Report($"Downloading patch {i + 1} of {patchChain.Count}…", 6 + (int)(overall * 50), patch.Asset.Name);
+                            Report($"Downloading patch {i + 1} of {patchChain.Count}…", 16 + (int)(overall * 40), patch.Asset.Name);
                         }).ConfigureAwait(true);
                         completedBytes += Math.Max(0L, patch.Asset.Size);
                         patchArchives.Add(archivePath);
-
-                        var patchManifestPath = patch.ManifestPath;
-                        var patchManifestAsset = patch.ManifestAsset;
-                        if (patchManifestAsset is not null && string.IsNullOrWhiteSpace(patchManifestPath))
-                        {
-                            patchManifestPath = Path.Combine(_work, $"patch-{i + 1}-manifest.json");
-                            var manifestBaseCompleted = completedBytes;
-                            await DownloadAssetAsync(patchManifestAsset, patchManifestPath, (received, _) =>
-                            {
-                                var overall = totalPatchBytes <= 0 ? 1 : (manifestBaseCompleted + received) / totalPatchBytes;
-                                Report($"Downloading patch metadata {i + 1} of {patchChain.Count}…", 6 + (int)(overall * 50), patchManifestAsset.Name);
-                            }).ConfigureAwait(true);
-                            completedBytes += Math.Max(0L, patchManifestAsset.Size);
-                        }
-                        else if (patchManifestAsset is not null)
-                        {
-                            // Direct target patches may be pre-inspected so unrelated
-                            // releases between the installed and target versions are skipped.
-                            completedBytes += Math.Max(0L, patchManifestAsset.Size);
-                        }
-                        patchManifestPaths.Add(patchManifestPath);
                     }
 
-                    preparedPatch = await PreparePatchChainAsync(patchChain, patchArchives, patchManifestPaths, current, latest, 60).ConfigureAwait(true);
+                    // Embedded manifests from older releases can only be inspected after
+                    // their ZIP is downloaded. All external manifests have already passed
+                    // preflight at this point.
+                    preparedPatch = await PreparePatchChainAsync(patchChain, patchArchives, patchManifests, current, latest, 60).ConfigureAwait(true);
                 }
                 catch (Exception ex)
                 {
@@ -413,7 +400,7 @@ internal sealed class UpdateEngine
                     try
                     {
                         await DownloadAssetAsync(directManifest, manifestPath, null).ConfigureAwait(true);
-                        var metadata = await ReadPatchManifestAssetAsync(manifestPath, directManifest.Name).ConfigureAwait(true);
+                        var metadata = await ReadPatchManifestAssetAsync(manifestPath, directManifest.Name, target.ToString()).ConfigureAwait(true);
                         if (metadata is not null &&
                             string.Equals(metadata.FromVersion, current.ToString(), StringComparison.Ordinal) &&
                             string.Equals(metadata.ToVersion, target.ToString(), StringComparison.Ordinal) &&
@@ -588,7 +575,154 @@ internal sealed class UpdateEngine
         return new PreparedPackage(manifest, files);
     }
 
-    private async Task<PatchResult> PreparePatchChainAsync(List<PatchRelease> chain, List<string> archives, List<string?> externalManifestPaths, Version current, ReleaseInfo latest, int initialPercent)
+    private async Task<List<PatchManifest?>> DownloadAndPreflightPatchManifestsAsync(List<PatchRelease> chain, Version current, ReleaseInfo latest)
+    {
+        var manifests = new List<PatchManifest?>(chain.Count);
+
+        // Stage one: fetch all separate metadata assets. Do not start downloading patch
+        // payload ZIPs until every available external manifest has been parsed.
+        for (var i = 0; i < chain.Count; i++)
+        {
+            var patch = chain[i];
+            var manifestAsset = patch.ManifestAsset;
+            if (manifestAsset is null)
+            {
+                manifests.Add(null);
+                continue;
+            }
+
+            var manifestPath = patch.ManifestPath;
+            if (string.IsNullOrWhiteSpace(manifestPath))
+            {
+                manifestPath = Path.Combine(_work, $"patch-{i + 1}-manifest.json");
+                Report($"Downloading patch metadata {i + 1} of {chain.Count}…", 6 + (int)(8.0 * (i + 1) / Math.Max(1, chain.Count)), manifestAsset.Name);
+                await DownloadAssetAsync(manifestAsset, manifestPath, null).ConfigureAwait(true);
+            }
+
+            manifests.Add(await ReadPatchManifestAssetAsync(manifestPath, manifestAsset.Name, patch.Version.ToString()).ConfigureAwait(true));
+        }
+
+        // Stage two: validate the whole version chain and every external manifest's
+        // structure, paths, target ownership, and patch-to-package metadata.
+        var expectedFromVersion = current;
+        for (var i = 0; i < chain.Count; i++)
+        {
+            var patch = chain[i];
+            if (patch.FromVersion != expectedFromVersion)
+            {
+                throw new InvalidDataException(
+                    $"Patch chain is incomplete before {patch.Release.TagName}: expected a patch from {expectedFromVersion}, " +
+                    $"but the selected chain starts from {patch.FromVersion}.");
+            }
+
+            var manifest = manifests[i];
+            if (manifest is not null)
+                ValidatePatchManifestMetadata(manifest, patch, patch.FromVersion, patch.Version);
+
+            expectedFromVersion = patch.Version;
+        }
+
+        if (latest.Version is null || expectedFromVersion != latest.Version)
+            throw new InvalidDataException("The selected patch chain does not reach the latest release.");
+
+        Report("Patch metadata verified…", 15, "Patch archives are safe to download.");
+        return manifests;
+    }
+
+    private static void ValidatePatchManifestMetadata(PatchManifest manifest, PatchRelease patchRelease, Version expectedFromVersion, Version expectedToVersion)
+    {
+        if (manifest.SchemaVersion != 1 ||
+            !string.Equals(manifest.FromVersion, expectedFromVersion.ToString(), StringComparison.Ordinal) ||
+            !string.Equals(manifest.ToVersion, expectedToVersion.ToString(), StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"Patch manifest {patchRelease.ManifestAsset?.Name ?? patchRelease.Asset.Name} has an unsupported structure " +
+                "or does not match the selected incremental version chain.");
+        }
+
+        if (manifest.Files is null || manifest.DeletedFiles is null)
+            throw new InvalidDataException($"Patch manifest for {patchRelease.Version} has an invalid file list.");
+
+        ValidatePackageManifest(manifest.TargetManifest, manifest.ToVersion, "full");
+
+        // The release API's asset size is available without downloading the ZIP, so
+        // reject mismatched patch/manifest pairs during preflight where possible.
+        if (manifest.AssetSize > 0 && patchRelease.Asset.Size >= 0 && manifest.AssetSize != patchRelease.Asset.Size)
+        {
+            throw new InvalidDataException(
+                $"Patch ZIP {patchRelease.Asset.Name} does not match its combined manifest: " +
+                $"expected {manifest.AssetSize} bytes, release metadata reports {patchRelease.Asset.Size}. " +
+                "Rebuild the patch ZIP and manifest together, then replace both release assets.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(manifest.AssetSha256) && !IsSha256Hex(manifest.AssetSha256))
+            throw new InvalidDataException($"Patch manifest for {patchRelease.Version} contains an invalid patch SHA-256 value.");
+
+        var releaseAssetDigest = patchRelease.Asset.Digest;
+        if (!string.IsNullOrWhiteSpace(releaseAssetDigest) &&
+            releaseAssetDigest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(manifest.AssetSha256) &&
+            !releaseAssetDigest[7..].Equals(manifest.AssetSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                $"Patch ZIP {patchRelease.Asset.Name} has a SHA-256 digest that disagrees with its combined manifest.");
+        }
+
+        var changedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var file in manifest.Files)
+        {
+            if (file is null || file.Size < 0 || !IsSha256Hex(file.Sha256) ||
+                (!string.IsNullOrWhiteSpace(file.FromSha256) && !IsSha256Hex(file.FromSha256)))
+            {
+                throw new InvalidDataException($"Patch manifest for {patchRelease.Version} contains an invalid file entry.");
+            }
+
+            var path = NormalizeArchivePath(file.Path);
+            file.Path = path;
+            if (!changedPaths.Add(path))
+                throw new InvalidDataException($"Patch manifest for {patchRelease.Version} contains duplicate path: {path}");
+
+            var targetSpec = manifest.TargetManifest!.Files.FirstOrDefault(f =>
+                string.Equals(f.Path, path, StringComparison.OrdinalIgnoreCase));
+            if (targetSpec is null || !IsManagedFile(targetSpec))
+                throw new InvalidDataException($"Patch attempts to change a path that is not application-managed by its target manifest: {path}");
+
+            ValidateUpdatePolicy(targetSpec);
+            if (targetSpec.Size != file.Size || !targetSpec.Sha256.Equals(file.Sha256, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException($"Patch metadata does not match the target manifest for: {path}");
+
+            if (!string.IsNullOrWhiteSpace(file.Ownership) &&
+                !file.Ownership.Equals(targetSpec.Ownership, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"Patch ownership metadata does not match the target manifest for: {path}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(file.UpdateMode) &&
+                !file.UpdateMode.Equals(GetUpdateMode(targetSpec), StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"Patch update policy does not match the target manifest for: {path}");
+            }
+        }
+
+        foreach (var deletion in manifest.DeletedFiles)
+        {
+            if (deletion is null ||
+                (!string.IsNullOrWhiteSpace(deletion.FromSha256) && !IsSha256Hex(deletion.FromSha256)))
+            {
+                throw new InvalidDataException($"Patch manifest for {patchRelease.Version} contains an invalid deletion entry.");
+            }
+
+            var path = NormalizeArchivePath(deletion.Path);
+            if (!changedPaths.Add(path))
+                throw new InvalidDataException($"Patch manifest changes or deletes the same path more than once: {path}");
+            if (!IsManagedPatchPath(path, deletion.Ownership, deletion.UpdateMode))
+                throw new InvalidDataException($"Patch attempts to delete a path that is not application-managed: {path}");
+            if (manifest.TargetManifest!.Files.Any(f => string.Equals(f.Path, path, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidDataException($"Patch deletes a path that remains in its target manifest: {path}");
+        }
+    }
+
+    private async Task<PatchResult> PreparePatchChainAsync(List<PatchRelease> chain, List<string> archives, List<PatchManifest?> preflightManifests, Version current, ReleaseInfo latest, int initialPercent)
     {
         var stateHashes = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
         var finalWrites = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
@@ -602,12 +736,7 @@ internal sealed class UpdateEngine
             var patchRelease = chain[i];
             Report($"Verifying patch {i + 1} of {chain.Count}…", initialPercent + (i * 5));
             using var archive = ZipFile.OpenRead(archives[i]);
-            PatchManifest? manifest = null;
-            var externalManifestPath = i < externalManifestPaths.Count ? externalManifestPaths[i] : null;
-            if (!string.IsNullOrWhiteSpace(externalManifestPath))
-            {
-                manifest = await ReadPatchManifestAssetAsync(externalManifestPath, patchRelease.ManifestAsset?.Name ?? "patch manifest").ConfigureAwait(true);
-            }
+            PatchManifest? manifest = i < preflightManifests.Count ? preflightManifests[i] : null;
             if (manifest is null)
             {
                 // Backward compatibility for old releases that stored patch-manifest.json
@@ -1105,7 +1234,7 @@ internal sealed class UpdateEngine
             : null;
     }
 
-    private static async Task<PatchManifest?> ReadPatchManifestAssetAsync(string path, string assetName)
+    private static async Task<PatchManifest?> ReadPatchManifestAssetAsync(string path, string assetName, string expectedVersion)
     {
         var info = new FileInfo(path);
         if (info.Length > 16 * 1024 * 1024) throw new InvalidDataException($"Manifest asset {assetName} is unexpectedly large.");
@@ -1113,23 +1242,99 @@ internal sealed class UpdateEngine
         using var document = await JsonDocument.ParseAsync(stream).ConfigureAwait(true);
         var root = document.RootElement;
         if (root.ValueKind != JsonValueKind.Object) throw new InvalidDataException($"Manifest asset {assetName} is not a JSON object.");
-        if (root.TryGetProperty("patch", out _))
+        if (root.TryGetProperty("patch", out var patchElement))
         {
+            if (!HasManifestSchemaVersion(root, 2) ||
+                !root.TryGetProperty("version", out var combinedVersionElement) ||
+                combinedVersionElement.ValueKind != JsonValueKind.String ||
+                !string.Equals(combinedVersionElement.GetString(), expectedVersion, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException($"Release manifest {assetName} has an unsupported schema or version.");
+            }
+            if (patchElement.ValueKind != JsonValueKind.Object || !HasManifestSchemaVersion(patchElement, 1))
+                throw new InvalidDataException($"Release manifest {assetName} contains an unsupported patch manifest schema.");
+
+            var hasCombinedTarget = root.TryGetProperty("full", out var fullElement) && fullElement.ValueKind == JsonValueKind.Object;
+            if (hasCombinedTarget)
+                ValidatePackageManifestJsonStructure(fullElement, $"full package section in {assetName}");
+            ValidatePatchManifestJsonStructure(patchElement, assetName, hasCombinedTarget);
+
             var combined = root.Deserialize<ReleaseManifest>(JsonOptions)
                 ?? throw new InvalidDataException($"Release manifest {assetName} is empty.");
-            var patch = combined.Patch;
-            if (patch is null) return null;
+            var patch = combined.Patch
+                ?? throw new InvalidDataException($"Release manifest {assetName} does not contain patch instructions for the published patch ZIP.");
             patch.TargetManifest ??= combined.Full;
             return patch;
         }
         if (root.TryGetProperty("fromVersion", out _) && root.TryGetProperty("toVersion", out _))
+        {
+            if (!HasManifestSchemaVersion(root, 1))
+                throw new InvalidDataException($"Patch manifest {assetName} has an unsupported or missing schema version.");
+            ValidatePatchManifestJsonStructure(root, assetName, false);
             return root.Deserialize<PatchManifest>(JsonOptions)
                 ?? throw new InvalidDataException($"Patch manifest {assetName} is empty.");
+        }
 
-        // Some legacy releases have a package-only manifest asset alongside a patch
-        // ZIP whose patch manifest is embedded. Let the caller try that archive entry.
-        return null;
+        // Some legacy releases exposed only a package manifest as a separate asset,
+        // while keeping the actual patch instructions inside the patch ZIP. Recognize
+        // that exact legacy shape; do not silently treat an unknown/new manifest schema
+        // as an embedded-manifest release, since that would postpone detecting a format
+        // mismatch until after downloading the large patch payload.
+        if (root.TryGetProperty("version", out _) &&
+            root.TryGetProperty("kind", out _) &&
+            root.TryGetProperty("files", out _))
+        {
+            ValidatePackageManifestJsonStructure(root, assetName);
+            var legacyPackageManifest = root.Deserialize<PackageManifest>(JsonOptions)
+                ?? throw new InvalidDataException($"Legacy package manifest {assetName} is empty.");
+            var version = expectedVersion;
+            if (!string.Equals(legacyPackageManifest.Kind, "full", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(legacyPackageManifest.Kind, "minimal", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"Legacy package manifest {assetName} has an unsupported package kind.");
+            }
+            ValidatePackageManifest(legacyPackageManifest, version, legacyPackageManifest.Kind);
+            return null;
+        }
+
+        throw new InvalidDataException($"Patch manifest {assetName} uses an unsupported or unrecognized structure.");
     }
+
+    private static bool HasManifestSchemaVersion(JsonElement element, int expected) =>
+        element.TryGetProperty("schemaVersion", out var version) &&
+        version.ValueKind == JsonValueKind.Number &&
+        version.TryGetInt32(out var actual) && actual == expected;
+
+    private static void ValidatePackageManifestJsonStructure(JsonElement element, string description)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !HasManifestSchemaVersion(element, 1) ||
+            !HasStringProperty(element, "version") || !HasStringProperty(element, "kind") ||
+            !HasArrayProperty(element, "files"))
+        {
+            throw new InvalidDataException($"Package manifest {description} is missing required fields or uses an unsupported schema.");
+        }
+    }
+
+    private static void ValidatePatchManifestJsonStructure(JsonElement element, string description, bool hasSiblingTargetManifest)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !HasManifestSchemaVersion(element, 1) ||
+            !HasStringProperty(element, "fromVersion") || !HasStringProperty(element, "toVersion") ||
+            !HasArrayProperty(element, "files") || !HasArrayProperty(element, "deletedFiles"))
+        {
+            throw new InvalidDataException($"Patch manifest {description} is missing required fields or uses an unsupported schema.");
+        }
+
+        if (element.TryGetProperty("targetManifest", out var targetManifest))
+            ValidatePackageManifestJsonStructure(targetManifest, $"target package section in {description}");
+        else if (!hasSiblingTargetManifest)
+            throw new InvalidDataException($"Patch manifest {description} does not include its target package manifest.");
+    }
+
+    private static bool HasStringProperty(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String;
+
+    private static bool HasArrayProperty(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Array;
 
     private static async Task<T> ReadJsonAssetAsync<T>(string path, string assetName) where T : class
     {
