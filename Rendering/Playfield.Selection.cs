@@ -8700,7 +8700,7 @@ public sealed partial class Playfield
             if (OutsideNoteView(projected, projected))
                 continue;
             var center = projected.Position;
-            var radius = GetEditorHoverMarkerRadius(projected, ev);
+            var radius = GetEditorHoverHitTestRadius(projected, ev);
             var distance = Vector2.Distance(point, center);
             var visibleOutline = Math.Clamp(radius * 0.16f, 1f, 2.25f);
             if (distance <= radius + visibleOutline + 1f && distance < bestDistance)
@@ -8759,7 +8759,7 @@ public sealed partial class Playfield
             var endpointProjected = _projection.ProjectAtTicks(
                 endpointTrack, endpointTick, currentTick, currentState);
             var endpointCenter = endpointProjected.Position;
-            var radius = GetEditorHoverMarkerRadius(endpointProjected, ev);
+            var radius = GetEditorHoverHitTestRadius(endpointProjected, ev);
             var distance = Vector2.Distance(point, endpointCenter);
             // Match the visible endpoint highlighter. Its outline can extend slightly
             // beyond the radius, but the hit area must not reach far into the link body
@@ -10429,24 +10429,15 @@ public sealed partial class Playfield
         => GetEditorMarkerRadius(
             track, tick, currentTick, currentState, out markerCenter, note, projected, travel);
 
-    // Lightweight radius for transient previews. Selection overlays still use
-    // exact projected card geometry; hover rings do not need to reconstruct it.
-    private float GetEditorPlacementPreviewMarkerRadius(float noteWidth, ProjectedPoint projected)
-    {
-        var projectedRadius = noteWidth * projected.Scale * projected.LaneRotationDepthScale * 0.5f;
-        return float.IsFinite(projectedRadius) ? Math.Max(1.25f, projectedRadius) : 1.25f;
-    }
-
-    // Hover rings need only the projected note width. Building all six 3D card
-    // vertices just to recover their average width made every pointer frame much
-    // more expensive than the highlight itself. Keep exact card geometry for the
-    // actual note hit-test and selection overlays; use this lightweight estimate
-    // for the transient hover marker.
-    private float GetEditorHoverMarkerRadius(ProjectedPoint projected, ChartEvent? note = null)
+    // Hit-testing can examine many notes in one pointer update, so it uses a
+    // lightweight projected-width estimate. The visible hover marker itself uses
+    // GetEditorMarkerRadius and the same card projection as selection highlights.
+    private float GetEditorHoverHitTestRadius(ProjectedPoint projected, ChartEvent? note = null)
     {
         var isFlick = note?.IsFlick ?? (_editorAttr is 10 or 50);
         var noteWidth = isFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
-        return GetEditorPlacementPreviewMarkerRadius(noteWidth, projected);
+        var projectedRadius = noteWidth * projected.Scale * projected.LaneRotationDepthScale * 0.5f;
+        return float.IsFinite(projectedRadius) ? Math.Max(1.25f, projectedRadius) : 1.25f;
     }
 
     private static readonly Color EditorGroupLockIndicatorColor = new(255, 180, 64);
@@ -11208,8 +11199,10 @@ public sealed partial class Playfield
                     hoverHit.Track, hoverHit.Tick, currentTick, currentState);
                 if (!OutsideNoteView(hitPoint, hitPoint))
                 {
-                    var hitCenter = hitPoint.Position;
-                    var hitRadius = GetEditorHoverMarkerRadius(hitPoint, hoverHit.Event);
+                    var hitTravel = (float)_projection.ScrollPixelsAtTicks(hoverHit.Tick, currentTick);
+                    var hitRadius = GetEditorMarkerRadius(
+                        hoverHit.Track, hoverHit.Tick, currentTick, currentState,
+                        out var hitCenter, hoverHit.Event, hitPoint, hitTravel);
                     if (hoverHit.Kind == EditorHoverHitKind.HoldEndMarker ||
                         hoverHit.Event.NoteType == NoteType.LinkTail)
                         hitRadius *= 0.5f;
@@ -11225,8 +11218,10 @@ public sealed partial class Playfield
                 var point = _projection.ProjectAtTicks(markerTrack, _hoverBeatTick.Value, currentTick, currentState);
                 if (!OutsideNoteView(point, point))
                 {
-                    var markerCenter = point.Position;
-                    var radius = GetEditorHoverMarkerRadius(point);
+                    var markerTravel = (float)_projection.ScrollPixelsAtTicks(_hoverBeatTick.Value, currentTick);
+                    var radius = GetEditorMarkerRadius(
+                        markerTrack, _hoverBeatTick.Value, currentTick, currentState,
+                        out var markerCenter, null, point, markerTravel);
                     if (_editorPreviewPendingChartTickTarget >= 0)
                     {
                         var pickColor = _editorPreviewPendingChartTickTarget == 0
