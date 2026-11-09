@@ -17,7 +17,8 @@ save/
 # Optional local FFmpeg archive
 tools/
 
-songs/
+/songs/*
+!/songs/README.txt
 
 release-assets/
 

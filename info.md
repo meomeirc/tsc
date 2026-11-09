@@ -1,5 +1,11 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.51
+
+- reworked music preview editor
+- some significant performance fixes. song select and chart editor should have much less stuttering now
+- added readme on how to properly insert songs into song select in case anyone doesnt know how. go read it i guess (songs/README.txt)
+
 # 0.0.49
 
 - added combo distribution to the chart stats tab and adjusted the note counters to count each bank separately
