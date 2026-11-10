@@ -748,10 +748,17 @@ public sealed partial class Playfield
         if (!_scoredEntryIds.Add(entry.Id))
             return;
 
-        if (tier == JudgementTier.Miss)
+        var baseMultiplier = tier switch
+        {
+            JudgementTier.PerfectPlus => 1.0,
+            JudgementTier.Perfect => PerfectScoreMultiplier,
+            JudgementTier.Good => GoodScoreMultiplier,
+            JudgementTier.Miss => 0.0,
+            _ => 0.0
+        };
+        if (baseMultiplier <= 0.0)
             return;
 
-        var baseMultiplier = tier == JudgementTier.Good ? GoodScoreMultiplier : 1.0;
         _scoreBasePoints = Math.Min(BaseScoreTarget, _scoreBasePoints + entry.BasePoints * baseMultiplier);
         if (tier == JudgementTier.PerfectPlus)
         {

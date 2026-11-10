@@ -990,7 +990,11 @@ public sealed partial class Playfield
     // reduction).
     private const double HoldTickScoreWeight = 0.25;
     private const double HoldTickAccuracyWeight = 0.25;
-    private const double GoodScoreMultiplier = 0.50;
+    // Score rewards are intentionally independent from timing accuracy:
+    // Perfect+ earns the full base value, Perfect earns 80%, Good earns 40%,
+    // and Miss earns nothing. Perfect+ also receives the separate 10% bonus.
+    private const double PerfectScoreMultiplier = 0.80;
+    private const double GoodScoreMultiplier = 0.40;
 
     private const double EasyGaugeClear = 70.0;
     private const double GaugeMax = 100.0;
