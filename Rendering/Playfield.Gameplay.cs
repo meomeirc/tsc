@@ -1751,7 +1751,7 @@ public sealed partial class Playfield
         var tier = tierOverride ?? (value >= 0.5 ? JudgementTier.Perfect : JudgementTier.Miss);
         var offsetMs = offsetOverride ?? runtime.StartOffsetMs;
         IncrementJudgementCount(tier);
-        _accuracySum += AccuracyFromJudgement(tier, offsetMs, PerfectPlusWindowMs, GoodWindowMs) * Math.Clamp(value, 0.0, 1.0) * weight;
+        _accuracySum += AccuracyFromJudgement(tier, offsetMs, PerfectPlusWindowMs, PerfectWindowMs, GoodWindowMs) * Math.Clamp(value, 0.0, 1.0) * weight;
         _accuracyResolvedWeight += weight;
     }
 

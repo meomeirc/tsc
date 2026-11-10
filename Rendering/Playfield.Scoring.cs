@@ -838,21 +838,37 @@ public sealed partial class Playfield
         return Math.Clamp((effectiveSum / _accuracyBudget) * 100.0, 0.0, 100.0);
     }
 
-    private static double AccuracyFromJudgement(JudgementTier tier, double offsetMs, double perfectPlusWindowMs, double goodWindowMs)
+    private static double AccuracyFromJudgement(
+        JudgementTier tier,
+        double offsetMs,
+        double perfectPlusWindowMs,
+        double perfectWindowMs,
+        double goodWindowMs)
     {
+        // Accuracy is a timing reward, but each judgement band has its own
+        // reward range to better reflect the distinction between tiers:
+        // Perfect+ is always 100%, Perfect falls from 80% to 60%, and Good
+        // falls from 40% to 0%. The drops at the tier boundaries are intentional.
+        if (tier == JudgementTier.PerfectPlus)
+            return 1.0;
         if (tier == JudgementTier.Miss)
             return 0.0;
 
-        // Accuracy is independent from the judgement label. The curve is tied
-        // to the active chart's configured timing windows: Perfect+ is full
-        // accuracy at or inside its boundary, and the quadratic falloff reaches
-        // zero at the configured Good/Miss boundary.
         var absOffset = Math.Abs(offsetMs);
-        var configuredRange = goodWindowMs - perfectPlusWindowMs;
-        var progress = configuredRange > 1e-9
-            ? Math.Clamp((absOffset - perfectPlusWindowMs) / configuredRange, 0.0, 1.0)
-            : (absOffset <= goodWindowMs ? 0.0 : 1.0);
-        return 1.0 - progress * progress;
+        static double GetProgress(double value, double start, double end)
+        {
+            var range = end - start;
+            return range > 1e-9
+                ? Math.Clamp((value - start) / range, 0.0, 1.0)
+                : (value <= end ? 0.0 : 1.0);
+        }
+
+        return tier switch
+        {
+            JudgementTier.Perfect => 0.8 - (0.2 * GetProgress(absOffset, perfectPlusWindowMs, perfectWindowMs)),
+            JudgementTier.Good => 0.4 * (1.0 - GetProgress(absOffset, perfectWindowMs, goodWindowMs)),
+            _ => 0.0
+        };
     }
 
     private bool TryGetAccuracyWeight(ChartEvent ev, out double weight)
@@ -896,7 +912,7 @@ public sealed partial class Playfield
             return;
 
         IncrementJudgementCount(tier);
-        _accuracySum += AccuracyFromJudgement(tier, offsetMs, PerfectPlusWindowMs, GoodWindowMs) * weight;
+        _accuracySum += AccuracyFromJudgement(tier, offsetMs, PerfectPlusWindowMs, PerfectWindowMs, GoodWindowMs) * weight;
         _accuracyResolvedWeight += weight;
     }
 
@@ -906,7 +922,7 @@ public sealed partial class Playfield
             return;
 
         IncrementJudgementCount(tier);
-        _accuracySum += AccuracyFromJudgement(tier, offsetMs, PerfectPlusWindowMs, GoodWindowMs) * entry.AccuracyWeight;
+        _accuracySum += AccuracyFromJudgement(tier, offsetMs, PerfectPlusWindowMs, PerfectWindowMs, GoodWindowMs) * entry.AccuracyWeight;
         _accuracyResolvedWeight += entry.AccuracyWeight;
     }
 
