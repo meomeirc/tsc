@@ -1751,11 +1751,10 @@ public sealed partial class Playfield
 
     private sealed record EditorLinkPathIssue(int Tick, int Track, string Message, ChartEvent? Event);
 
-    // Route combinations start with the active banks in the initial gear.
-    // Each valid SuperFlick then registers its source/destination bank pair,
-    // plus any pair of banks active in the resulting gear state. Those route
-    // combinations persist for the rest of the chart instead of being limited
-    // to the exact tick range in which a particular gear state is active.
+    // Route combinations contain only banks that can be active together on
+    // opposite sides. Banks on the same side are mutually exclusive and may
+    // safely reuse a Link ID pair. Reachable cross-side combinations persist
+    // for the rest of the chart.
     private static bool EditorLinkFamiliesCanSharePair(
         GearTimeline timeline, string? familyA, string? familyB,
         int startTick, int endTickExclusive)
@@ -1766,14 +1765,14 @@ public sealed partial class Playfield
         return timeline.FamiliesCanSharePair(familyA, familyB, sampleEnd);
     }
 
-    // Link IDs can be handed off at an exact duration boundary when the new
-    // chain starts with a LinkHead and its next LinkTail is later. A LinkTail
-    // at that same boundary is different: it can be mistaken for the ending
-    // point of the previous chain, so the two chains must not share an ID.
+    // A LinkTail at an exact duration boundary is ambiguous only when both
+    // chains use the same bank/family. Different banks are separate physical
+    // lanes, and the ending chain's half-open duration has already expired.
     private static ChartEvent? GetEditorLinkBoundaryTailConflict(
         EditorLinkChainInfo endingChain, EditorLinkChainInfo startingChain)
     {
-        if (endingChain.EndTick != startingChain.StartTick)
+        if (endingChain.EndTick != startingChain.StartTick ||
+            !string.Equals(endingChain.Family, startingChain.Family, StringComparison.Ordinal))
             return null;
 
         return startingChain.Nodes
@@ -1786,8 +1785,18 @@ public sealed partial class Playfield
     private static bool EditorLinkIntervalsConflict(
         GearTimeline timeline,
         string? familyA, int startA, long endA, bool hasTailAtStartA,
-        string? familyB, int startB, long endB, bool hasTailAtStartB)
+        string? familyB, int startB, long endB, bool hasTailAtStartB,
+        int? terminalTailTickA = null, int? terminalTailTickB = null)
     {
+        // A terminal LinkTail is the actual end point of its chain. A new
+        // LinkHead on a different bank at that exact tick is a hand-off, even
+        // when the terminal LinkTail also carries duration metadata (for example
+        // a horizontal link-end). That terminal duration must not make the two
+        // banks appear to overlap at the hand-off point.
+        if (!string.Equals(familyA, familyB, StringComparison.Ordinal) &&
+            (terminalTailTickA == startB || terminalTailTickB == startA))
+            return false;
+
         var overlapStart = Math.Max(startA, startB);
         var overlapEnd = Math.Min(endA, endB);
         if (overlapStart < overlapEnd &&
@@ -1797,14 +1806,17 @@ public sealed partial class Playfield
             return true;
         }
 
+        // At a duration boundary the old interval is already over. Only a
+        // same-bank tail can be confused with the previous chain by LinkBuilder;
+        // a tail on any other bank is physically distinct and may reuse the ID.
         if (endA == startB && hasTailAtStartB && startB < int.MaxValue &&
-            EditorLinkFamiliesCanSharePair(timeline, familyA, familyB, startB, startB + 1))
+            string.Equals(familyA, familyB, StringComparison.Ordinal))
         {
             return true;
         }
 
         return endB == startA && hasTailAtStartA && startA < int.MaxValue &&
-               EditorLinkFamiliesCanSharePair(timeline, familyA, familyB, startA, startA + 1);
+               string.Equals(familyA, familyB, StringComparison.Ordinal);
     }
 
     private static bool EditorLinkChainsConflictInTime(
@@ -1812,10 +1824,17 @@ public sealed partial class Playfield
     {
         var aHasTailAtStart = a.Nodes.Any(node => node.NoteType == NoteType.LinkTail && node.Tick == a.StartTick);
         var bHasTailAtStart = b.Nodes.Any(node => node.NoteType == NoteType.LinkTail && node.Tick == b.StartTick);
+        var terminalTailTickA = a.Nodes.LastOrDefault() is { NoteType: NoteType.LinkTail } terminalA
+            ? terminalA.Tick
+            : (int?)null;
+        var terminalTailTickB = b.Nodes.LastOrDefault() is { NoteType: NoteType.LinkTail } terminalB
+            ? terminalB.Tick
+            : (int?)null;
         return EditorLinkIntervalsConflict(
             timeline,
             a.Family, a.StartTick, a.EndTick, aHasTailAtStart,
-            b.Family, b.StartTick, b.EndTick, bHasTailAtStart);
+            b.Family, b.StartTick, b.EndTick, bHasTailAtStart,
+            terminalTailTickA, terminalTailTickB);
     }
 
     private bool HasSelectedEditorNotes()
@@ -6229,9 +6248,8 @@ public sealed partial class Playfield
                 if (a.Pair != b.Pair)
                     continue;
 
-                // Reuse is allowed only until the two families have become a
-                // possible route combination by the end of their overlap. A valid
-                // SuperFlick registers its source/destination banks persistently.
+                // Reuse is blocked only when the two banks can be visible
+                // simultaneously during the overlapping part of the chains.
                 if (EditorLinkChainsConflictInTime(routeTimeline, a, b) &&
                     a.StartTick < b.EndTick && b.StartTick < a.EndTick)
                 {
@@ -6250,7 +6268,7 @@ public sealed partial class Playfield
                 if (boundaryTail is not null)
                 {
                     Add(boundaryTail,
-                        $"pair {a.Pair}/{a.Pair + 1} cannot be reused at tick {boundaryTail.Tick}: a LinkTail at the hand-off tick is ambiguous; use a different ID");
+                        $"pair {a.Pair}/{a.Pair + 1} cannot be reused at tick {boundaryTail.Tick}: a same-bank LinkTail at the hand-off tick is ambiguous; use a different ID");
                 }
             }
         }
@@ -6833,13 +6851,15 @@ public sealed partial class Playfield
             var endTickForPath = Math.Max(terminalEnd, points[^1].Tick);
             var hasLinkTailAtStart = points.Count > 1 && points[1].Tick == startTick;
             var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, endTickForPath, selectedSet, hasLinkTailAtStart) &&
+                IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, points[^1].Tick, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
                     EditorLinkIntervalsConflict(
                         routeTimeline,
                         plan.Family, plan.StartTick, plan.EndTick,
                         plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick,
-                        grouping.Key, startTick, endTickForPath, hasLinkTailAtStart)));
+                        grouping.Key, startTick, endTickForPath, hasLinkTailAtStart,
+                        plan.Points.Count > 1 ? plan.Points[^1].Tick : null,
+                        points.Count > 1 ? points[^1].Tick : null)));
             if (pair == 0)
             {
                 _statusMessage = "No safe link pair is available for the route combinations reached by this chart.";
@@ -7114,7 +7134,7 @@ public sealed partial class Playfield
                 TryGetEditorSameTickTapHoldPair(notes, out var sameTickTap, out var sameTickHold))
             {
                 var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                    IsEditorLinkPairAvailable(grouping.Key, candidate, sameTickTap.Tick, sameTickHold.EndTick, selectedSet,
+                    IsEditorLinkPairAvailable(grouping.Key, candidate, sameTickTap.Tick, sameTickHold.Tick, selectedSet,
                         hasLinkTailAtStart: true) &&
                     !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
                         EditorLinkIntervalsConflict(
@@ -7122,7 +7142,9 @@ public sealed partial class Playfield
                             plan.Family, plan.StartTick, plan.EndTick,
                             plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
                             (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick),
-                            grouping.Key, sameTickTap.Tick, sameTickHold.EndTick, true)));
+                            grouping.Key, sameTickTap.Tick, sameTickHold.EndTick, true,
+                            plan.Points.Count > 1 ? plan.Points[^1].Tick : null,
+                            sameTickHold.Tick)));
                 if (pair == 0)
                 {
                     _statusMessage = "No safe link pair is available for the route combinations reached by this chart.";
@@ -7251,14 +7273,16 @@ public sealed partial class Playfield
             var hasLinkTailAtStart = generated.Any(ev => ev.Tick == startTick) ||
                                      (points.Count > 1 && points[1].Tick == startTick);
             var pairId = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
-                IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, terminalEnd, selectedSet, hasLinkTailAtStart) &&
+                IsEditorLinkPairAvailable(grouping.Key, candidate, startTick, points[^1].Tick, selectedSet, hasLinkTailAtStart) &&
                 !plans.Any(plan => !plan.VerticalOnly && plan.Pair == candidate &&
                     EditorLinkIntervalsConflict(
                         routeTimeline,
                         plan.Family, plan.StartTick, plan.EndTick,
                         plan.Generated.Any(ev => ev.Tick == plan.StartTick) ||
                         (plan.Points.Count > 1 && plan.Points[1].Tick == plan.StartTick),
-                        grouping.Key, startTick, terminalEnd, hasLinkTailAtStart)));
+                        grouping.Key, startTick, terminalEnd, hasLinkTailAtStart,
+                        plan.Points.Count > 1 ? plan.Points[^1].Tick : null,
+                        points.Count > 1 ? points[^1].Tick : null)));
             if (pairId == 0)
             {
                 _statusMessage = "No safe link pair is available for the route combinations reached by this chart.";

@@ -4,9 +4,10 @@ public sealed class GearTimeline
 {
     private readonly GearState _initial;
     private readonly List<(int Tick, GearState State)> _changes = new();
-    // A route combination becomes possible when it is present in the starting
-    // gear, appears in a later reachable gear state, or is crossed by a valid
-    // SuperFlick transition. Once registered, it remains possible for the rest
+    // A route combination becomes possible only when two banks on opposite
+    // sides are simultaneously active in a reachable gear state. Banks on the
+    // same side are mutually exclusive and must never share a Link ID pair.
+    // Once registered, a cross-side combination remains possible for the rest
     // of the chart. The earliest tick is enough because combinations persist.
     private readonly Dictionary<(string First, string Second), int> _possibleFamilyPairTicks = new();
 
@@ -55,14 +56,10 @@ public sealed class GearTimeline
                 for (var mask = 0; mask < independentMaskCount; mask++)
                 {
                     var routeAfter = routeBefore.Copy();
-                    var appliedEvents = new List<ChartEvent>(possibleChanges.Count);
                     if (atomicVariant == 1)
                     {
                         foreach (var ev in atomicInnerEvents)
-                        {
-                            if (routeAfter.ApplySuperFlick(ev.Attr / 10, ev.Track))
-                                appliedEvents.Add(ev);
-                        }
+                            routeAfter.ApplySuperFlick(ev.Attr / 10, ev.Track);
                     }
 
                     for (var i = 0; i < independentEvents.Count; i++)
@@ -70,16 +67,12 @@ public sealed class GearTimeline
                         if ((mask & (1 << i)) == 0)
                             continue;
                         var ev = independentEvents[i];
-                        if (routeAfter.ApplySuperFlick(ev.Attr / 10, ev.Track))
-                            appliedEvents.Add(ev);
+                        routeAfter.ApplySuperFlick(ev.Attr / 10, ev.Track);
                     }
 
-                    foreach (var ev in appliedEvents)
-                    {
-                        var side = ev.GetSuperFlickSide();
-                        if (side is not null)
-                            RegisterTransitionFamilyCombination(routeBefore, routeAfter, side, tickGroup.Key);
-                    }
+                    // Only register families that can be active together after
+                    // this tick. A source and destination bank on the same side
+                    // are mutually exclusive, even across a hand-off tick.
                     RegisterActiveFamilyCombinations(routeAfter, tickGroup.Key);
                     nextPossibleRouteStates[StateKey(routeAfter)] = routeAfter;
                 }
@@ -202,16 +195,22 @@ public sealed class GearTimeline
         return applied;
     }
 
-    // Returns whether these two Link families have ever become a possible
-    // route combination by the end of the supplied exclusive tick. A direct
-    // SuperFlick transition registers its source/destination banks even though
-    // those two banks are not active at the same instant; that pairing then
-    // remains valid for the rest of the chart.
+    // Returns whether these two Link families can be active together in a
+    // reachable route state by the end of the supplied exclusive tick. Banks
+    // on the same side are mutually exclusive and can always reuse an ID pair.
     public bool FamiliesCanSharePair(string? familyA, string? familyB, int endTickExclusive)
     {
         if (familyA is null || familyB is null ||
             string.Equals(familyA, familyB, StringComparison.Ordinal))
             return true;
+
+        // Each side can display exactly one bank at a time. For example,
+        // Left 1K, Left 2K, and Left 3K can never be part of one simultaneous
+        // route combination, even if SuperFlicks can transition between them.
+        var sideA = GetFamilySide(familyA);
+        var sideB = GetFamilySide(familyB);
+        if (sideA is not null && string.Equals(sideA, sideB, StringComparison.Ordinal))
+            return false;
 
         var key = MakeFamilyPairKey(familyA, familyB);
         return _possibleFamilyPairTicks.TryGetValue(key, out var registeredTick) &&
@@ -263,14 +262,6 @@ public sealed class GearTimeline
     private static (int Left, int Right, int CenterLeft, int CenterRight) StateKey(GearState state)
         => (state.Left, state.Right, state.CenterLeft, state.CenterRight);
 
-    private void RegisterTransitionFamilyCombination(
-        GearState before, GearState after, string side, int tick)
-    {
-        var sourceFamily = GetActiveFamilyForSide(before, side);
-        var destinationFamily = GetActiveFamilyForSide(after, side);
-        RegisterFamilyPair(sourceFamily, destinationFamily, tick);
-    }
-
     private void RegisterActiveFamilyCombinations(GearState state, int tick)
     {
         var activeFamilies = new List<string>(2);
@@ -284,6 +275,15 @@ public sealed class GearTimeline
         for (var i = 0; i < activeFamilies.Count; i++)
         for (var j = i + 1; j < activeFamilies.Count; j++)
             RegisterFamilyPair(activeFamilies[i], activeFamilies[j], tick);
+    }
+
+    private static string? GetFamilySide(string family)
+    {
+        if (family.EndsWith("Left", StringComparison.OrdinalIgnoreCase))
+            return "left";
+        if (family.EndsWith("Right", StringComparison.OrdinalIgnoreCase))
+            return "right";
+        return null;
     }
 
     private static string? GetActiveFamilyForSide(GearState state, string side)

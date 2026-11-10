@@ -1691,7 +1691,8 @@ public sealed partial class Playfield
         }
 
         var groupPairs = new Dictionary<int, int>();
-        var groupRanges = new Dictionary<int, (string Family, int StartTick, int EndTick, bool HasLinkTailAtStart)>();
+        var groupRanges = new Dictionary<int, (string Family, int StartTick, int EndTick,
+            bool HasLinkTailAtStart, int? TerminalTailTick)>();
         void AllocateLinkPairs()
         {
             groupPairs.Clear();
@@ -1718,6 +1719,13 @@ public sealed partial class Playfield
                 var hasLinkTailAtStart = group.Any(index =>
                     clipboardEntries[index].NoteType == NoteType.LinkTail &&
                     (long)baseTick + clipboardEntries[index].TickOffset == startTickLong);
+                var terminalEntry = group
+                    .OrderBy(index => clipboardEntries[index].TickOffset)
+                    .ThenBy(index => clipboardEntries[index].NoteType == NoteType.LinkTail ? 1 : 0)
+                    .Last();
+                int? terminalTailTick = clipboardEntries[terminalEntry].NoteType == NoteType.LinkTail
+                    ? (int)(baseTick + clipboardEntries[terminalEntry].TickOffset)
+                    : null;
                 var pair = new[] { 1, 3, 5, 7 }.FirstOrDefault(candidate =>
                     !IsLinkPairOccupied(_chart, family, candidate, startTick, endTick,
                         hasLinkTailAtStart: hasLinkTailAtStart) &&
@@ -1726,11 +1734,12 @@ public sealed partial class Playfield
                         EditorLinkIntervalsConflict(
                             routeTimeline,
                             range.Family, range.StartTick, range.EndTick, range.HasLinkTailAtStart,
-                            family, startTick, endTick, hasLinkTailAtStart)));
+                            family, startTick, endTick, hasLinkTailAtStart,
+                            range.TerminalTailTick, terminalTailTick)));
                 if (pair != 0)
                 {
                     groupPairs[group.Key] = pair;
-                    groupRanges[group.Key] = (family, startTick, endTick, hasLinkTailAtStart);
+                    groupRanges[group.Key] = (family, startTick, endTick, hasLinkTailAtStart, terminalTailTick);
                 }
             }
         }

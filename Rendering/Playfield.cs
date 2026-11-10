@@ -9500,10 +9500,10 @@ public sealed partial class Playfield
         if (targetTick < startTick)
             return false;
 
-        // A pair can be shared only while the candidate and existing families
-        // have not yet become a possible route combination. The starting gear,
-        // valid SuperFlick transitions, and reached route states register those
-        // combinations, which remain possible for the rest of the chart.
+        // A pair can be shared unless the candidate and existing families can
+        // be active together on opposite sides. Reached cross-side route states
+        // register those combinations, which remain possible for the rest of
+        // the chart. Different banks on the same side are mutually exclusive.
         var families = linkFamiliesOverride ?? chart.Events
             .Where(ev => ignoredEvents is null || !ignoredEvents.Contains(ev))
             .Select(ev => LinkBuilder.Family(ev.Track))
@@ -9524,14 +9524,14 @@ public sealed partial class Playfield
                 cachedNodes = linkPairNodesOverride.TryGetValue((existingFamily, pair), out var indexedNodes)
                     ? indexedNodes
                     : Array.Empty<ChartEvent>();
-            if (IsLinkPairOccupiedInFamily(chart, existingFamily, pair, startTick, targetTick,
+            if (IsLinkPairOccupiedInFamily(chart, candidateFamily, existingFamily, pair, startTick, targetTick,
                     ignoredEvents, hasLinkTailAtStart, cachedNodes))
                 return true;
         }
         return false;
     }
 
-    private static bool IsLinkPairOccupiedInFamily(AresChart chart, string family, int pair,
+    private static bool IsLinkPairOccupiedInFamily(AresChart chart, string candidateFamily, string family, int pair,
         int startTick, int targetTick, HashSet<ChartEvent>? ignoredEvents = null,
         bool hasLinkTailAtStart = false, IReadOnlyList<ChartEvent>? preorderedNodes = null)
     {
@@ -9560,10 +9560,37 @@ public sealed partial class Playfield
         // Be conservative if malformed data contains overlapping chains that
         // reuse one pair: a later head must not erase the earlier chain's longer
         // occupied interval while the allocator is deciding whether to reuse it.
-        // The interval is normally half-open, so a LinkHead may hand off the ID
-        // exactly at startTick. A candidate LinkTail at that same tick is the
-        // exception because it would be ambiguous with the previous chain's end.
+        // The interval is half-open, so an ID may be handed off exactly at
+        // startTick. A same-bank LinkTail is still ambiguous with the previous
+        // chain's end; cross-bank terminal-tail hand-offs at the exact tick are
+        // handled separately below.
         long occupiedUntil = long.MinValue;
+        var sameBank = string.Equals(candidateFamily, family, StringComparison.Ordinal);
+
+        // A terminal LinkTail can be the endpoint of a horizontal link path.
+        // A new LinkHead on another bank at that exact tick is a hand-off, not
+        // an overlap: the LinkTail's own duration metadata must not keep the old
+        // chain's pair occupied at the hand-off point. A LinkTail that continues
+        // into another segment is not terminal and does not qualify.
+        var linkHeads = chart.Links.Select(link => link.Head).ToHashSet();
+        var incomingLinksAtStart = !sameBank
+            ? chart.Links.Where(link => nodes.Contains(link.Tail) && link.Tail.Tick == startTick).ToList()
+            : new List<LinkSegment>();
+        var terminalTailsAtStart = incomingLinksAtStart
+            .Select(link => link.Tail)
+            .Where(tail => !linkHeads.Contains(tail))
+            .ToHashSet();
+        var sameTickHeadsForTerminalTails = terminalTailsAtStart.Count > 0
+            ? incomingLinksAtStart
+                .Where(link => terminalTailsAtStart.Contains(link.Tail) && link.Head.Tick == startTick)
+                .Select(link => link.Head).ToHashSet()
+            : new HashSet<ChartEvent>();
+        var allowedHandoffEventsAtStart = terminalTailsAtStart
+            .Concat(sameTickHeadsForTerminalTails)
+            .ToHashSet();
+        var hasUnrelatedEventAtStart = terminalTailsAtStart.Count > 0 && nodes.Any(ev =>
+            ev.Tick == startTick && !allowedHandoffEventsAtStart.Contains(ev));
+        var hasCrossBankTerminalTailHandoff = terminalTailsAtStart.Count > 0 && !hasUnrelatedEventAtStart;
 
         for (var i = 0; i < nodes.Count; i++)
         {
@@ -9574,18 +9601,32 @@ public sealed partial class Playfield
             // Treat the requested range as start-inclusive and end-exclusive. A
             // point at targetTick is on the boundary, not inside the requested
             // span, so two chains may hand off the same ID there. Same-tick
-            // connector operations still need to check their single tick. If the
-            // candidate has a LinkTail at startTick, a previous chain ending
-            // exactly there also occupies the pair.
+            // connector operations still check that tick. At an exact duration
+            // end, only a same-bank hand-off remains ambiguous.
             if (ev.Tick >= startTick)
             {
+                if (ev.Tick == startTick && hasCrossBankTerminalTailHandoff)
+                {
+                    // The terminal LinkTail is the actual endpoint of this
+                    // chain. Its duration metadata (and the duration inherited
+                    // from the preceding horizontal segment) must not keep the
+                    // ID occupied beyond the endpoint when another bank starts
+                    // a new chain at this exact tick. Clear only the chain that
+                    // ends here, then keep scanning for later chains that may
+                    // still block the requested range.
+                    active = false;
+                    expiry = startTick;
+                    occupiedUntil = startTick;
+                    continue;
+                }
+
                 var pointIsInsideRange = targetTick > startTick
                     ? ev.Tick < targetTick
                     : ev.Tick == startTick;
                 var anExistingChainExtendsIntoRange = targetTick > startTick
                     ? occupiedUntil > startTick
-                    : occupiedUntil >= startTick;
-                var sameTickTailConflictsWithBoundary = hasLinkTailAtStart && occupiedUntil == startTick;
+                    : occupiedUntil > startTick || (sameBank && occupiedUntil >= startTick);
+                var sameTickTailConflictsWithBoundary = sameBank && hasLinkTailAtStart && occupiedUntil == startTick;
                 return pointIsInsideRange || anExistingChainExtendsIntoRange ||
                        sameTickTailConflictsWithBoundary;
             }
@@ -9650,8 +9691,8 @@ public sealed partial class Playfield
 
         var requestedRangeOccupied = targetTick > startTick
             ? occupiedUntil > startTick
-            : occupiedUntil >= startTick;
-        return requestedRangeOccupied || (hasLinkTailAtStart && occupiedUntil == startTick);
+            : occupiedUntil > startTick || (sameBank && occupiedUntil >= startTick);
+        return requestedRangeOccupied || (sameBank && hasLinkTailAtStart && occupiedUntil == startTick);
     }
 
     private bool TryCreateEditorConnectorSplitPath(

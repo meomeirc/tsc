@@ -23,7 +23,8 @@ public sealed partial class Playfield
         NoteGroupDefinition Representative, List<EditorNoteGroupSourceRemap> Sources);
 
     private sealed record EditorNoteGroupLinkPairReservation(
-        int Pair, string? Family, int StartTick, long EndTick, bool HasTailAtStart);
+        int Pair, string? Family, int StartTick, long EndTick, bool HasTailAtStart,
+        int? TerminalTailTick);
 
     // The placement ghost has its own small chart and render caches. Reuse these
     // collections across cursor updates instead of copying the full source chart
@@ -3174,7 +3175,8 @@ public sealed partial class Playfield
             .ToHashSet();
         var plans = new List<(NoteGroupInstance Instance, EditorLinkChainInfo Chain,
             List<(ChartEvent Source, ChartEvent Target)> Nodes, string Family,
-            int StartTick, int EndTick, bool HasTailAtStart, List<int> PreferredPairs)>();
+            int StartTick, int EndTick, bool HasTailAtStart, int? TerminalTailTick,
+            List<int> PreferredPairs)>();
 
         foreach (var chain in sourceChains)
         {
@@ -3250,6 +3252,9 @@ public sealed partial class Playfield
                 var endTick = (int)Math.Max(endTickLong, startTickLong < int.MaxValue ? startTickLong + 1 : startTickLong);
                 var hasTailAtStart = chain.Nodes.Any(node => node.NoteType == NoteType.LinkTail &&
                     (long)node.Tick + tickOffset == startTickLong);
+                int? terminalTailTick = chain.Nodes.LastOrDefault() is { NoteType: NoteType.LinkTail } terminalTail
+                    ? (int)(terminalTail.Tick + tickOffset)
+                    : null;
                 var preferredPairs = mappedNodes.Select(node => node.Target.LinePair)
                     .Where(pair => pair is 1 or 3 or 5 or 7)
                     .GroupBy(pair => pair)
@@ -3258,12 +3263,13 @@ public sealed partial class Playfield
                     .Select(group => group.Key)
                     .ToList();
                 plans.Add((instance, chain, mappedNodes, mappedFamilies[0]!,
-                    startTick, endTick, hasTailAtStart, preferredPairs));
+                    startTick, endTick, hasTailAtStart, terminalTailTick, preferredPairs));
             }
         }
 
         var routeTimeline = new GearTimeline(_chart);
-        var assigned = new List<(int Pair, string Family, int StartTick, long EndTick, bool HasTailAtStart)>();
+        var assigned = new List<(int Pair, string Family, int StartTick, long EndTick,
+            bool HasTailAtStart, int? TerminalTailTick)>();
         var resolvedPlans = new List<(NoteGroupInstance Instance, EditorLinkChainInfo Chain,
             List<(ChartEvent Source, ChartEvent Target)> Nodes, int Pair)>();
 
@@ -3281,7 +3287,8 @@ public sealed partial class Playfield
                 if (assigned.Any(existing => existing.Pair == candidate &&
                     EditorLinkIntervalsConflict(routeTimeline,
                         existing.Family, existing.StartTick, existing.EndTick, existing.HasTailAtStart,
-                        plan.Family, plan.StartTick, plan.EndTick, plan.HasTailAtStart)))
+                        plan.Family, plan.StartTick, plan.EndTick, plan.HasTailAtStart,
+                        existing.TerminalTailTick, plan.TerminalTailTick)))
                     continue;
 
                 selectedPair = candidate;
@@ -3294,7 +3301,8 @@ public sealed partial class Playfield
                 return false;
             }
 
-            assigned.Add((selectedPair, plan.Family, plan.StartTick, plan.EndTick, plan.HasTailAtStart));
+            assigned.Add((selectedPair, plan.Family, plan.StartTick, plan.EndTick,
+                plan.HasTailAtStart, plan.TerminalTailTick));
             resolvedPlans.Add((plan.Instance, plan.Chain, plan.Nodes, selectedPair));
         }
 
@@ -3450,6 +3458,9 @@ public sealed partial class Playfield
         var endTick = Math.Max(startTick < int.MaxValue ? startTick + 1 : startTick, (int)endTickLong);
         var hasTailAtStart = sourceChain.Any(ev => ev.NoteType == NoteType.LinkTail &&
             (long)ev.Tick + tickOffset == startTickLong);
+        int? terminalTailTick = sourceChain.LastOrDefault() is { NoteType: NoteType.LinkTail } sourceTerminalTail
+            ? (int)(sourceTerminalTail.Tick + tickOffset)
+            : null;
 
         var candidatePairs = targetChainEvents
             .Where(ev => (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail) &&
@@ -3477,13 +3488,14 @@ public sealed partial class Playfield
                 EditorLinkIntervalsConflict(routeTimeline,
                     targetFamily, startTick, endTick, hasTailAtStart,
                     reservation.Family, reservation.StartTick, reservation.EndTick,
-                    reservation.HasTailAtStart));
+                    reservation.HasTailAtStart,
+                    terminalTailTick, reservation.TerminalTailTick));
             if (conflictsWithPendingChain)
                 continue;
 
             pair = candidate;
             map[chainRootMemberId] = new EditorNoteGroupLinkPairReservation(
-                pair, targetFamily, startTick, endTick, hasTailAtStart);
+                pair, targetFamily, startTick, endTick, hasTailAtStart, terminalTailTick);
             return true;
         }
 
