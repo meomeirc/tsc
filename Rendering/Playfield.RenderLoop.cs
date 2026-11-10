@@ -26,9 +26,9 @@ public sealed partial class Playfield
             return 0;
         if (_chart.PlayTime > 0)
         {
-            // PlayTime is the music duration. If audio starts after chart tick
-            // zero, keep the chart clock alive until that duration has elapsed
-            // from AudioOriginTick rather than stopping early at PlayTime.
+            // PlayTime is the source music duration. The editor uses this to keep
+            // the complete waveform/audio timeline available even when the
+            // authored Play End marker intentionally stops gameplay earlier.
             var audioOriginSeconds = _tempo.TickToSeconds(Math.Max(0, _chart.AudioOriginTick));
             return audioOriginSeconds + _chart.PlayTime;
         }
@@ -38,6 +38,30 @@ public sealed partial class Playfield
             lastTick = _chart.Events.Max(e => e.Tick);
         return _tempo.TickToSeconds(lastTick) + 1.0;
     }
+
+    private double GameplayDuration()
+    {
+        if (_chart is null || _tempo is null)
+            return 0;
+
+        // PlayTick is the authored Play End marker. It is independent of the
+        // source music duration: a marker before the end of the music must end
+        // gameplay early, while a marker after the music may let the chart clock
+        // continue after audio playback has naturally stopped.
+        if (_chart.PlayTick > 0)
+        {
+            var playEndSeconds = _tempo.TickToSeconds(_chart.PlayTick);
+            if (double.IsFinite(playEndSeconds) && playEndSeconds >= 0.0)
+                return playEndSeconds;
+        }
+
+        // Older charts without an explicit Play End marker retain their previous
+        // music-duration fallback.
+        return ChartDuration();
+    }
+
+    private double ActivePlaybackDuration()
+        => (_gameplayMode || _lockMenuPlayMode) ? GameplayDuration() : ChartDuration();
 
     public void Draw()
     {
@@ -686,7 +710,7 @@ public sealed partial class Playfield
         var preserveContents = _chartEditorMode && !_editorPreviewMode &&
                                _chart is not null &&
                                (_editorConnectorMode || _editorNoteGroupPlacementArmed ||
-                                (_editorPlacementEnabled && !_editorPanelsViewEnabled));
+                                _editorPlacementEnabled);
         if (_gameplayRenderTarget is not null &&
             _gameplayRenderTarget.Width == width &&
             _gameplayRenderTarget.Height == height &&

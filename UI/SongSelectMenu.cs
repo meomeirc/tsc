@@ -53,6 +53,12 @@ public sealed class SongSelectMenu : IDisposable
         public string? AlbumPath { get; init; }
         public string? AlbumBigPath { get; init; }
 
+        // Artwork paths are resolved lazily once per chart, not probed from disk
+        // every frame while the gallery scrolls. Missing artwork is cached too.
+        public bool ArtworkPathsResolved { get; set; }
+        public string? ResolvedAlbumPath { get; set; }
+        public string? ResolvedAlbumBigPath { get; set; }
+
         // Reserved for the future record/save system.
         public int Score { get; set; }
         public double Accuracy { get; set; }
@@ -80,21 +86,37 @@ public sealed class SongSelectMenu : IDisposable
         public string Artist { get; set; } = string.Empty;
         public List<ChartEntry> Charts { get; } = new();
 
-        public ChartEntry RepresentativeChart =>
-            Charts
-                .OrderByDescending(c => c.Level ?? int.MinValue)
-                .ThenByDescending(c => c.DifficultyRank)
-                .First();
+        private ChartEntry? _representativeChart;
+
+        public ChartEntry RepresentativeChart
+        {
+            get
+            {
+                if (_representativeChart is not null)
+                    return _representativeChart;
+
+                ChartEntry? best = null;
+                foreach (var chart in Charts)
+                {
+                    if (best is null ||
+                        (chart.Level ?? int.MinValue) > (best.Level ?? int.MinValue) ||
+                        ((chart.Level ?? int.MinValue) == (best.Level ?? int.MinValue) &&
+                         chart.DifficultyRank > best.DifficultyRank))
+                    {
+                        best = chart;
+                    }
+                }
+
+                return _representativeChart = best
+                    ?? throw new InvalidOperationException("A song entry has no charts.");
+            }
+        }
 
         public ChartEntry? GetChart(string difficulty)
             => Charts.FirstOrDefault(c => c.Difficulty == difficulty);
 
         public ChartEntry? GetBestDefaultChart()
-            => GetChart("ex")
-                ?? Charts
-                    .OrderByDescending(c => c.Level ?? int.MinValue)
-                    .ThenByDescending(c => c.DifficultyRank)
-                    .FirstOrDefault();
+            => GetChart("ex") ?? (Charts.Count > 0 ? RepresentativeChart : null);
     }
 
     private sealed class LastSongSelection
@@ -149,6 +171,10 @@ public sealed class SongSelectMenu : IDisposable
 
     private readonly Dictionary<string, Texture2D> _artCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, SkinAssetHandle> _artHandleCache = new(StringComparer.OrdinalIgnoreCase);
+    // Charts in one song often share the same artwork paths. Cache resolved and
+    // missing results by chart directory + metadata paths so difficulty-sorted
+    // entries do not repeat the same filesystem probes.
+    private readonly Dictionary<string, (string? Regular, string? Big)> _resolvedArtworkPathsByLookup = new(StringComparer.OrdinalIgnoreCase);
     private readonly LinkedList<string> _artLru = new();
     private readonly Dictionary<string, LinkedListNode<string>> _artLruNodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<string> _artworkLoadQueue = new();
@@ -4100,10 +4126,11 @@ public sealed class SongSelectMenu : IDisposable
 
     private SkinAssetHandle? TryGetArtworkHandle(string? path)
     {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        if (string.IsNullOrWhiteSpace(path))
             return null;
 
-        path = Path.GetFullPath(path);
+        // GetArtworkPath only returns paths verified during the one-time resolution.
+        // Avoid repeating File.Exists for every visible card on every draw.
 
         if (_artHandleCache.TryGetValue(path, out var existing))
         {
@@ -4127,10 +4154,10 @@ public sealed class SongSelectMenu : IDisposable
 
     private Texture2D? GetArtworkOrQueue(string? path)
     {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        if (string.IsNullOrWhiteSpace(path))
             return null;
 
-        path = Path.GetFullPath(path);
+        // GetArtworkPath already resolved and validated this path for the chart.
         if (_artCache.TryGetValue(path, out var texture))
         {
             TouchArtwork(path);
@@ -4150,10 +4177,10 @@ public sealed class SongSelectMenu : IDisposable
 
     private void QueueArtwork(string? path)
     {
-        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        if (string.IsNullOrWhiteSpace(path))
             return;
 
-        path = Path.GetFullPath(path);
+        // The path is already validated and normalized by GetArtworkPath.
         if (_artCache.ContainsKey(path) || _artworkFailed.Contains(path))
             return;
 
@@ -4199,8 +4226,16 @@ public sealed class SongSelectMenu : IDisposable
             var path = _artworkLoadQueue.Dequeue();
             _artworkQueued.Remove(path);
             if (!_artworkWanted.Contains(path) || _artCache.ContainsKey(path) ||
-                _artworkFailed.Contains(path) || !File.Exists(path))
+                _artworkFailed.Contains(path))
                 continue;
+
+            // A cached path can disappear if the user changes files while Song Select
+            // is open. Remember that failure rather than rechecking it every frame.
+            if (!File.Exists(path))
+            {
+                _artworkFailed.Add(path);
+                continue;
+            }
 
             _artworkDecodePath = path;
             _artworkDecodeTask = Task.Run(() => DecodeArtwork(path));
@@ -4632,51 +4667,135 @@ public sealed class SongSelectMenu : IDisposable
         DrawText("SEARCHING", offsetX + 645f * scale, offsetY + 14f * scale, 16f * scale, new XnaColor(175, 183, 195));
     }
 
+    private static readonly string[] RegularArtworkFallbackNames =
+    {
+        "album.png", "album.jpg", "album.jpeg", "cover.songselect.png", "cover.webp",
+        "album_big.png", "album_big.jpg", "album_big.jpeg"
+    };
+
+    private static readonly string[] BigArtworkFallbackNames =
+    {
+        "album_big.png", "album_big.jpg", "album_big.jpeg", "album.png", "album.jpg",
+        "album.jpeg", "cover.songselect.png", "cover.webp"
+    };
+
     private string? GetArtworkPath(ChartEntry chart, bool preferBig)
     {
-        var preferred = preferBig ? chart.AlbumBigPath : chart.AlbumPath;
-        var alternate = preferBig ? chart.AlbumPath : chart.AlbumBigPath;
-
-        static string? Existing(string? path)
+        if (!chart.ArtworkPathsResolved)
         {
-            if (string.IsNullOrWhiteSpace(path))
-                return null;
+            var lookupKey = string.Concat(
+                Path.GetDirectoryName(chart.Path) ?? string.Empty,
+                "\n",
+                chart.AlbumPath ?? string.Empty,
+                "\n",
+                chart.AlbumBigPath ?? string.Empty);
+
+            if (_resolvedArtworkPathsByLookup.TryGetValue(lookupKey, out var cached))
+            {
+                chart.ResolvedAlbumPath = cached.Regular;
+                chart.ResolvedAlbumBigPath = cached.Big;
+                chart.ArtworkPathsResolved = true;
+            }
+            else
+            {
+                ResolveArtworkPaths(chart);
+                _resolvedArtworkPathsByLookup[lookupKey] =
+                    (chart.ResolvedAlbumPath, chart.ResolvedAlbumBigPath);
+            }
+        }
+
+        return preferBig ? chart.ResolvedAlbumBigPath : chart.ResolvedAlbumPath;
+    }
+
+    private static string? GetExistingArtworkPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return null;
+
+        try
+        {
+            var full = Path.GetFullPath(path);
+            return File.Exists(full) ? full : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void ResolveArtworkPaths(ChartEntry chart)
+    {
+        // Resolve explicit metadata paths first. If one of the two variants exists,
+        // preserve the existing fallback behavior by using it for both card and
+        // selected-panel artwork when the other variant is absent.
+        var regular = GetExistingArtworkPath(chart.AlbumPath);
+        var big = GetExistingArtworkPath(chart.AlbumBigPath);
+        if (regular is not null || big is not null)
+        {
+            chart.ResolvedAlbumPath = regular ?? big;
+            chart.ResolvedAlbumBigPath = big ?? regular;
+            chart.ArtworkPathsResolved = true;
+            return;
+        }
+
+        var folder = Path.GetDirectoryName(chart.Path);
+        if (!string.IsNullOrWhiteSpace(folder))
+        {
             try
             {
-                var full = Path.GetFullPath(path);
-                return File.Exists(full) ? full : null;
+                var current = Path.GetFullPath(folder);
+                if (Directory.Exists(current))
+                {
+                    // The regular and large-art searches use the same candidate set
+                    // in a different priority order. Check each candidate at most
+                    // once per directory, then select the first match for each order.
+                    for (var depth = 0; depth < 4 && current is not null; depth++)
+                    {
+                        var existingNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var name in RegularArtworkFallbackNames)
+                        {
+                            if (File.Exists(Path.Combine(current, name)))
+                                existingNames.Add(name);
+                        }
+
+                        string? regularInDirectory = null;
+                        foreach (var name in RegularArtworkFallbackNames)
+                        {
+                            if (existingNames.Contains(name))
+                            {
+                                regularInDirectory = Path.Combine(current, name);
+                                break;
+                            }
+                        }
+
+                        string? bigInDirectory = null;
+                        foreach (var name in BigArtworkFallbackNames)
+                        {
+                            if (existingNames.Contains(name))
+                            {
+                                bigInDirectory = Path.Combine(current, name);
+                                break;
+                            }
+                        }
+
+                        regular ??= regularInDirectory;
+                        big ??= bigInDirectory;
+                        if (regular is not null && big is not null)
+                            break;
+
+                        current = Directory.GetParent(current)?.FullName;
+                    }
+                }
             }
             catch
             {
-                return null;
+                // Artwork is optional. An invalid path should behave like missing art.
             }
         }
 
-        var path = Existing(preferred) ?? Existing(alternate);
-        if (path is not null)
-            return path;
-
-        var folder = Path.GetDirectoryName(chart.Path);
-        if (string.IsNullOrWhiteSpace(folder) || !Directory.Exists(folder))
-            return null;
-
-        var names = preferBig
-            ? new[] { "album_big.png", "album_big.jpg", "album_big.jpeg", "album.png", "album.jpg", "album.jpeg", "cover.songselect.png", "cover.webp" }
-            : new[] { "album.png", "album.jpg", "album.jpeg", "cover.songselect.png", "cover.webp", "album_big.png", "album_big.jpg", "album_big.jpeg" };
-
-        var current = Path.GetFullPath(folder);
-        for (var depth = 0; depth < 4 && current is not null; depth++)
-        {
-            foreach (var name in names)
-            {
-                var candidate = Path.Combine(current, name);
-                if (File.Exists(candidate))
-                    return candidate;
-            }
-            current = Directory.GetParent(current)?.FullName;
-        }
-
-        return null;
+        chart.ResolvedAlbumPath = regular ?? big;
+        chart.ResolvedAlbumBigPath = big ?? regular;
+        chart.ArtworkPathsResolved = true;
     }
 
     private void TouchArtwork(string path)

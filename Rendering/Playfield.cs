@@ -2387,15 +2387,17 @@ public sealed partial class Playfield
         => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
     /// <summary>
-    /// Keep the Play End tick consistent with the authored music duration. Prefer
-    /// preserving Play Time when every playable note fits inside its endpoint;
-    /// only extend Play Time when notes really need a later endpoint.
+    /// Infer a missing Play End marker from the source music duration and playable
+    /// content. An existing positive PlayTick is authored state and must remain
+    /// authoritative, even when it intentionally ends before the music or before
+    /// other chart events.
     /// </summary>
     private bool ReconcilePlayTickAndPlayTime()
     {
         var chart = _chart;
         var tempo = _tempo;
-        if (chart is null || tempo is null || !double.IsFinite(chart.PlayTime) || chart.PlayTime <= 0.0)
+        if (chart is null || tempo is null || chart.PlayTick > 0 ||
+            !double.IsFinite(chart.PlayTime) || chart.PlayTime <= 0.0)
             return false;
 
         var originTick = Math.Max(0, chart.AudioOriginTick);
@@ -4641,10 +4643,17 @@ public sealed partial class Playfield
             RebuildLinkAdjacencyCache();
         using (new LoadTimingScope("chart_tempo_map"))
             _tempo = new TempoMap(_chart);
-        var playRangeAdjustedOnLoad = _chartEditorMode && ReconcilePlayTickAndPlayTime();
+        // Reconcile the runtime endpoint for gameplay as well as the editor.
+        // Older/external charts can carry a Play Time header that was calculated
+        // without accounting for a later tempo change. The editor previously
+        // extended that stale duration to include the last playable note, while
+        // gameplay trusted the shorter header and could end around the tempo
+        // change. Keep both modes on the same effective chart endpoint; only the
+        // editor needs its native Play End marker and dirty-state updates.
+        var playRangeAdjustedOnLoad = ReconcilePlayTickAndPlayTime();
         if (_chartEditorMode)
             AresLoader.SynchronizePlayTickMarker(_chart);
-        if (playRangeAdjustedOnLoad)
+        if (_chartEditorMode && playRangeAdjustedOnLoad)
         {
             MarkEditorDirty();
             _statusMessage = "Play End adjusted to match Play Time and the chart notes.";
@@ -12164,7 +12173,7 @@ public sealed partial class Playfield
         if (_playing && _chart is not null)
         {
             _playSeconds += playbackElapsedSeconds;
-            var duration = ChartDuration();
+            var duration = ActivePlaybackDuration();
             if (_playSeconds >= duration)
             {
                 _playSeconds = duration;
@@ -12483,11 +12492,12 @@ public sealed partial class Playfield
             : currentTick / _chart.TicksPerBeat;
         var viewport = _graphics.Viewport;
         var aspect = viewport.Height <= 0 ? 1.0 : viewport.Width / (double)viewport.Height;
+        var activeDuration = ActivePlaybackDuration();
 
         _skinRuntime.UpdateGameState(
             _playSeconds,
             currentTick,
-            ChartDuration(),
+            activeDuration,
             _lastPlayableTick,
             _lastPlayableTickReached,
             beat,
@@ -12510,7 +12520,7 @@ public sealed partial class Playfield
         _pauseSkinRuntime.UpdateGameState(
             _playSeconds,
             currentTick,
-            ChartDuration(),
+            activeDuration,
             _lastPlayableTick,
             _lastPlayableTickReached,
             beat,
@@ -12534,7 +12544,7 @@ public sealed partial class Playfield
         _resultSkinRuntime.UpdateGameState(
             _playSeconds,
             currentTick,
-            ChartDuration(),
+            activeDuration,
             _lastPlayableTick,
             _lastPlayableTickReached,
             beat,
