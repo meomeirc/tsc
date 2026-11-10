@@ -1730,20 +1730,8 @@ public sealed partial class Playfield
                     break;
                 transitionSeconds = Math.Max(0.0, transitionSeconds);
 
-                var before = intendedRouteState.Copy();
-                var appliedSides = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var changed = false;
-                foreach (var ev in tickGroup)
-                {
-                    var side = ev.GetSuperFlickSide();
-                    if (side is null || appliedSides.Contains(side) ||
-                        !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
-                        continue;
-                    appliedSides.Add(side);
-                    changed |= intendedRouteState.ApplySuperFlick(ev.Attr / 10, ev.Track);
-                }
-
-                if (changed)
+                var applied = GearTimeline.ApplySuperFlickChangesForTick(intendedRouteState, tickGroup, tickGroup);
+                if (applied.Count > 0)
                     intendedRoute.Add((transitionSeconds, intendedRouteState.Copy()));
             }
         }
@@ -1925,51 +1913,23 @@ public sealed partial class Playfield
                 if (transitionSeconds > duration)
                     break;
 
-                var before = forecastState.Copy();
-                var appliedLeft = false;
-                var appliedRight = false;
-                var changed = false;
-                for (var i = groupStart; i < nextEventIndex; i++)
+                var tickEvents = _editorTimelineTraceSuperFlicks
+                    .GetRange(groupStart, nextEventIndex - groupStart);
+                var candidates = tickEvents.Where(ev =>
                 {
-                    var ev = _editorTimelineTraceSuperFlicks[i];
                     var key = SuperFlickKeyOf(ev);
                     var wasManuallyHit = _hitEvents.Contains(KeyOf(ev));
                     var wasMissed = _missedEvents.Contains(KeyOf(ev));
                     var wasResolved = _resolvedSuperFlicks.Contains(key);
 
-                    // Autoplay records successful score entries separately from manual
-                    // hit events, so exclude those events here too without scanning the
-                    // entire score-entry list on every frame.
+                    // Successful events remain satisfied candidates for an atomic
+                    // same-tick 60/70 pair until its other side is also resolved.
                     var alreadyScored = _scoreSuperFlickEntries.TryGetValue(key, out var scoreEntry) &&
                                         _scoredEntryIds.Contains(scoreEntry.Id);
-
-                    var side = ev.GetSuperFlickSide();
-                    if (side is null)
-                        continue;
-                    var sideAlreadyApplied = side.Equals("left", StringComparison.OrdinalIgnoreCase)
-                        ? appliedLeft
-                        : appliedRight;
-                    if (wasManuallyHit || alreadyScored)
-                    {
-                        // The live state already includes this success, sometimes a
-                        // little before its chart tick because hits have a timing window.
-                        // Do not predict a second same-side transition at that same tick.
-                        if (side.Equals("left", StringComparison.OrdinalIgnoreCase)) appliedLeft = true;
-                        else appliedRight = true;
-                        continue;
-                    }
-                    if (wasMissed || wasResolved || sideAlreadyApplied ||
-                        !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
-                        continue;
-                    if (forecastState.ApplySuperFlick(ev.Attr / 10, ev.Track))
-                    {
-                        if (side.Equals("left", StringComparison.OrdinalIgnoreCase)) appliedLeft = true;
-                        else appliedRight = true;
-                        changed = true;
-                    }
-                }
-
-                if (changed)
+                    return wasManuallyHit || alreadyScored || (!wasMissed && !wasResolved);
+                }).ToList();
+                var applied = GearTimeline.ApplySuperFlickChangesForTick(forecastState, tickEvents, candidates);
+                if (applied.Count > 0)
                     futureRoute.Add((transitionSeconds, forecastState.Copy()));
             }
 

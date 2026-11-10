@@ -15,6 +15,11 @@ public sealed class GearTimeline
         _initial = GearState.FromStartAttribute(chart.InitialGearAttr);
         RegisterActiveFamilyCombinations(_initial, int.MinValue);
         var state = _initial.Copy();
+        var possibleRouteStates = new Dictionary<(int Left, int Right, int CenterLeft, int CenterRight), GearState>
+        {
+            [StateKey(_initial)] = _initial.Copy()
+        };
+
         foreach (var tickGroup in chart.Events
                      .Where(e => e.IsSuperFlick)
                      .OrderBy(e => e.Tick)
@@ -22,39 +27,180 @@ public sealed class GearTimeline
                      .ThenBy(e => e.EventIndex)
                      .GroupBy(e => e.Tick))
         {
-            // Every event at a tick is evaluated against the route at the start
-            // of that tick. Apply at most one transition per side so duplicate
-            // records cannot cascade through multiple modes in one tick.
-            var before = state.Copy();
-            var appliedSides = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var changed = false;
-            foreach (var ev in tickGroup)
+            var tickEvents = tickGroup.ToList();
+
+            // Link validation must account for every route the player can reach,
+            // not just the route where every SuperFlick succeeds. Independent
+            // transitions can be hit one side at a time, even on the same tick.
+            // A same-tick 60/70 pair is the exception: it is either unchanged or
+            // both sides change together, never through a one-sided intermediate.
+            var nextPossibleRouteStates = new Dictionary<(int Left, int Right, int CenterLeft, int CenterRight), GearState>();
+            foreach (var routeBefore in possibleRouteStates.Values)
             {
-                var side = ev.GetSuperFlickSide();
-                if (side is null || appliedSides.Contains(side) ||
-                    !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
-                    continue;
+                var possibleChanges = SelectSuperFlickChangesForTick(routeBefore, tickEvents, tickEvents);
+                var hasAtomicInnerPair = possibleChanges.Any(ev => (ev.Attr is 60 or 70) &&
+                    string.Equals(ev.GetSuperFlickSide(), "left", StringComparison.OrdinalIgnoreCase)) &&
+                    possibleChanges.Any(ev => (ev.Attr is 60 or 70) &&
+                    string.Equals(ev.GetSuperFlickSide(), "right", StringComparison.OrdinalIgnoreCase));
+                var atomicInnerEvents = hasAtomicInnerPair
+                    ? possibleChanges.Where(ev => ev.Attr is 60 or 70).ToList()
+                    : new List<ChartEvent>();
+                var independentEvents = hasAtomicInnerPair
+                    ? possibleChanges.Where(ev => ev.Attr is not (60 or 70)).ToList()
+                    : possibleChanges;
 
-                appliedSides.Add(side);
-                var transitionBefore = state.Copy();
-                if (!state.ApplySuperFlick(ev.Attr / 10, ev.Track))
-                    continue;
+                var independentMaskCount = 1 << independentEvents.Count;
+                var atomicVariantCount = hasAtomicInnerPair ? 2 : 1;
+                for (var atomicVariant = 0; atomicVariant < atomicVariantCount; atomicVariant++)
+                for (var mask = 0; mask < independentMaskCount; mask++)
+                {
+                    var routeAfter = routeBefore.Copy();
+                    var appliedEvents = new List<ChartEvent>(possibleChanges.Count);
+                    if (atomicVariant == 1)
+                    {
+                        foreach (var ev in atomicInnerEvents)
+                        {
+                            if (routeAfter.ApplySuperFlick(ev.Attr / 10, ev.Track))
+                                appliedEvents.Add(ev);
+                        }
+                    }
 
-                changed = true;
-                RegisterTransitionFamilyCombination(transitionBefore, state, side, tickGroup.Key);
+                    for (var i = 0; i < independentEvents.Count; i++)
+                    {
+                        if ((mask & (1 << i)) == 0)
+                            continue;
+                        var ev = independentEvents[i];
+                        if (routeAfter.ApplySuperFlick(ev.Attr / 10, ev.Track))
+                            appliedEvents.Add(ev);
+                    }
+
+                    foreach (var ev in appliedEvents)
+                    {
+                        var side = ev.GetSuperFlickSide();
+                        if (side is not null)
+                            RegisterTransitionFamilyCombination(routeBefore, routeAfter, side, tickGroup.Key);
+                    }
+                    RegisterActiveFamilyCombinations(routeAfter, tickGroup.Key);
+                    nextPossibleRouteStates[StateKey(routeAfter)] = routeAfter;
+                }
             }
-            if (changed)
-            {
-                // Both sides can transition on the same tick. Register only the
-                // final state as a simultaneous combination; intermediate states
-                // within that tick are not separate reachable chart states.
-                RegisterActiveFamilyCombinations(state, tickGroup.Key);
+            possibleRouteStates = nextPossibleRouteStates;
+
+            // Keep the deterministic authored route for AtTick/IsActiveAt. All
+            // valid authored transitions are applied, using the same atomic rule.
+            var applied = ApplySuperFlickChangesForTick(state, tickEvents, tickEvents);
+            if (applied.Count > 0)
                 _changes.Add((tickGroup.Key, state.Copy()));
-            }
         }
     }
 
     public GearState Initial => _initial.Copy();
+
+    /// <summary>
+    /// Selects the SuperFlick events that may change the route at one chart tick.
+    /// <paramref name="authoredTickEvents"/> describes every SuperFlick authored
+    /// at the tick; <paramref name="candidateEvents"/> is the subset that is
+    /// actually eligible to apply (for example, successfully hit events).
+    ///
+    /// Attr 60/70 events authored on both sides at the same tick form one atomic
+    /// transition. Both sides must have an eligible event, otherwise neither
+    /// side changes. When only one side has an Attr 60/70 event at that tick, it
+    /// remains independent, which permits offset left/right transitions. Attr
+    /// 20/40 and 80/90 are always independent of opposite-side timing.
+    /// </summary>
+    public static List<ChartEvent> SelectSuperFlickChangesForTick(
+        GearState state,
+        IEnumerable<ChartEvent> authoredTickEvents,
+        IEnumerable<ChartEvent> candidateEvents)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        ArgumentNullException.ThrowIfNull(authoredTickEvents);
+        ArgumentNullException.ThrowIfNull(candidateEvents);
+
+        static bool IsInner(ChartEvent ev) => ev.Attr is 60 or 70;
+        static string? SideOf(ChartEvent ev) => ev.GetSuperFlickSide();
+        static IOrderedEnumerable<ChartEvent> Order(IEnumerable<ChartEvent> events) => events
+            .Where(ev => ev.IsSuperFlick)
+            .OrderBy(ev => ev.Track)
+            .ThenBy(ev => ev.EventIndex);
+
+        var authored = Order(authoredTickEvents).ToArray();
+        var candidates = Order(candidateEvents).Distinct().ToArray();
+        var before = state.Copy();
+        var selected = new List<ChartEvent>(2);
+        var usedSides = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var hasLeftInner = authored.Any(ev => IsInner(ev) &&
+            string.Equals(SideOf(ev), "left", StringComparison.OrdinalIgnoreCase));
+        var hasRightInner = authored.Any(ev => IsInner(ev) &&
+            string.Equals(SideOf(ev), "right", StringComparison.OrdinalIgnoreCase));
+
+        if (hasLeftInner && hasRightInner)
+        {
+            var left = candidates.FirstOrDefault(ev => IsInner(ev) &&
+                string.Equals(SideOf(ev), "left", StringComparison.OrdinalIgnoreCase) &&
+                before.CanApplySuperFlick(ev.Attr / 10, ev.Track));
+            var right = candidates.FirstOrDefault(ev => IsInner(ev) &&
+                string.Equals(SideOf(ev), "right", StringComparison.OrdinalIgnoreCase) &&
+                before.CanApplySuperFlick(ev.Attr / 10, ev.Track));
+
+            // Do not apply just one half of a same-tick inner transition.
+            if (left is not null && right is not null)
+            {
+                selected.Add(left);
+                selected.Add(right);
+                usedSides.Add("left");
+                usedSides.Add("right");
+            }
+        }
+        else
+        {
+            // No same-tick opposite-side partner: process offset/lone 60/70
+            // transitions independently, one transition per side.
+            foreach (var ev in candidates.Where(IsInner))
+            {
+                var side = SideOf(ev);
+                if (side is null || usedSides.Contains(side) ||
+                    !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
+                    continue;
+                selected.Add(ev);
+                usedSides.Add(side);
+            }
+        }
+
+        // Outer SuperFlick families (including 20/40) do not participate in the
+        // 60/70 pairing rule. They continue to resolve independently per side.
+        foreach (var ev in candidates.Where(ev => !IsInner(ev)))
+        {
+            var side = SideOf(ev);
+            if (side is null || usedSides.Contains(side) ||
+                !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
+                continue;
+            selected.Add(ev);
+            usedSides.Add(side);
+        }
+
+        return selected
+            .OrderBy(ev => ev.Track)
+            .ThenBy(ev => ev.EventIndex)
+            .ToList();
+    }
+
+    /// <summary>Applies the selected events for one tick as a single route update.</summary>
+    public static List<ChartEvent> ApplySuperFlickChangesForTick(
+        GearState state,
+        IEnumerable<ChartEvent> authoredTickEvents,
+        IEnumerable<ChartEvent> candidateEvents)
+    {
+        var selected = SelectSuperFlickChangesForTick(state, authoredTickEvents, candidateEvents);
+        var applied = new List<ChartEvent>(selected.Count);
+        foreach (var ev in selected)
+        {
+            if (state.ApplySuperFlick(ev.Attr / 10, ev.Track))
+                applied.Add(ev);
+        }
+        return applied;
+    }
 
     // Returns whether these two Link families have ever become a possible
     // route combination by the end of the supplied exclusive tick. A direct
@@ -113,6 +259,9 @@ public sealed class GearTimeline
             ? state.CanApplySuperFlick(ev.Attr / 10, ev.Track)
             : state.IsActive(ev.Track);
     }
+
+    private static (int Left, int Right, int CenterLeft, int CenterRight) StateKey(GearState state)
+        => (state.Left, state.Right, state.CenterLeft, state.CenterRight);
 
     private void RegisterTransitionFamilyCombination(
         GearState before, GearState after, string side, int tick)

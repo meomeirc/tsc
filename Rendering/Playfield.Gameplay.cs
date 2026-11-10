@@ -180,35 +180,10 @@ public sealed partial class Playfield
                 if (transitionSeconds > targetSeconds + timeEpsilon)
                     break;
 
-                // Same-tick events are checked against the same pre-transition
-                // snapshot, with at most one successful SuperFlick per side.
-                var before = state.Copy();
-                var appliedLeft = false;
-                var appliedRight = false;
-                var changed = false;
-                for (var i = groupStart; i < nextEventIndex; i++)
-                {
-                    var ev = _editorTimelineTraceSuperFlicks[i];
-                    var side = ev.GetSuperFlickSide();
-                    if (side is null)
-                        continue;
-
-                    var sideAlreadyApplied = side.Equals("left", StringComparison.OrdinalIgnoreCase)
-                        ? appliedLeft
-                        : appliedRight;
-                    if (sideAlreadyApplied || !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
-                        continue;
-                    if (!state.ApplySuperFlick(ev.Attr / 10, ev.Track))
-                        continue;
-
-                    if (side.Equals("left", StringComparison.OrdinalIgnoreCase))
-                        appliedLeft = true;
-                    else
-                        appliedRight = true;
-                    changed = true;
-                }
-
-                if (changed)
+                var tickEvents = _editorTimelineTraceSuperFlicks
+                    .GetRange(groupStart, nextEventIndex - groupStart);
+                var applied = GearTimeline.ApplySuperFlickChangesForTick(state, tickEvents, tickEvents);
+                if (applied.Count > 0)
                     RecordEditorTimelineRouteState(transitionSeconds, state);
             }
         }
@@ -235,25 +210,53 @@ public sealed partial class Playfield
                     break;
 
                 var before = state.Copy();
-                var appliedLeft = false;
-                var appliedRight = false;
-                for (var i = groupEndExclusive - 1; i >= groupStart; i--)
+                var tickEvents = _editorTimelineTraceSuperFlicks
+                    .GetRange(groupStart, groupEndExclusive - groupStart);
+                var hasLeftInner = tickEvents.Any(ev => (ev.Attr is 60 or 70) &&
+                    string.Equals(ev.GetSuperFlickSide(), "left", StringComparison.OrdinalIgnoreCase));
+                var hasRightInner = tickEvents.Any(ev => (ev.Attr is 60 or 70) &&
+                    string.Equals(ev.GetSuperFlickSide(), "right", StringComparison.OrdinalIgnoreCase));
+                var reversedSides = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                bool CanReverse(ChartEvent candidate)
                 {
-                    var ev = _editorTimelineTraceSuperFlicks[i];
+                    var probe = before.Copy();
+                    return TryReverseEditorPreviewSuperFlick(candidate, before, probe);
+                }
+
+                if (hasLeftInner && hasRightInner)
+                {
+                    var left = tickEvents.FirstOrDefault(ev => (ev.Attr is 60 or 70) &&
+                        string.Equals(ev.GetSuperFlickSide(), "left", StringComparison.OrdinalIgnoreCase) && CanReverse(ev));
+                    var right = tickEvents.FirstOrDefault(ev => (ev.Attr is 60 or 70) &&
+                        string.Equals(ev.GetSuperFlickSide(), "right", StringComparison.OrdinalIgnoreCase) && CanReverse(ev));
+                    if (left is not null && right is not null)
+                    {
+                        TryReverseEditorPreviewSuperFlick(left, before, state);
+                        TryReverseEditorPreviewSuperFlick(right, before, state);
+                        reversedSides.Add("left");
+                        reversedSides.Add("right");
+                    }
+                }
+                else
+                {
+                    foreach (var ev in tickEvents.Where(ev => ev.Attr is 60 or 70).Reverse())
+                    {
+                        var side = ev.GetSuperFlickSide();
+                        if (side is null || reversedSides.Contains(side) ||
+                            !TryReverseEditorPreviewSuperFlick(ev, before, state))
+                            continue;
+                        reversedSides.Add(side);
+                    }
+                }
+
+                foreach (var ev in tickEvents.Where(ev => ev.Attr is not (60 or 70)).Reverse())
+                {
                     var side = ev.GetSuperFlickSide();
-                    if (side is null)
+                    if (side is null || reversedSides.Contains(side) ||
+                        !TryReverseEditorPreviewSuperFlick(ev, before, state))
                         continue;
-
-                    var sideAlreadyApplied = side.Equals("left", StringComparison.OrdinalIgnoreCase)
-                        ? appliedLeft
-                        : appliedRight;
-                    if (sideAlreadyApplied || !TryReverseEditorPreviewSuperFlick(ev, before, state))
-                        continue;
-
-                    if (side.Equals("left", StringComparison.OrdinalIgnoreCase))
-                        appliedLeft = true;
-                    else
-                        appliedRight = true;
+                    reversedSides.Add(side);
                 }
             }
 
@@ -402,27 +405,52 @@ public sealed partial class Playfield
     }
 
     private void ApplyEditorPreviewSuperFlickHit(ChartEvent ev)
+        => ApplyEditorPreviewSuperFlickHits(new[] { ev });
+
+    private void ApplyEditorPreviewSuperFlickHits(IEnumerable<ChartEvent> successfulEvents)
     {
-        if (!_chartEditorMode)
+        if (!_chartEditorMode || _chart is null)
             return;
 
-        var state = EnsureEditorPreviewGearState();
-        var before = state.Copy();
-        if (!state.ApplySuperFlick(ev.Attr / 10, ev.Track))
-            return;
-        var after = state.Copy();
-        _gameplayState = after.Copy();
-        SyncEditorPreviewBankIndicators(after);
-        RecordEditorTimelineRouteState(_playSeconds, after);
-
-        var position = GearState.Position(ev.Track);
-        if (position is not null)
+        foreach (var tickGroup in successfulEvents
+                     .Where(ev => ev.IsSuperFlick)
+                     .GroupBy(ev => ev.Tick)
+                     .OrderBy(group => group.Key))
         {
-            var side = ev.GetSuperFlickSide() ?? position.Value.Side;
-            var beforeBank = GearTimeline.ActiveBankForSide(before, side);
-            var afterBank = GearTimeline.ActiveBankForSide(after, side);
-            if (!string.Equals(beforeBank, afterBank, StringComparison.OrdinalIgnoreCase))
-                StartBankSwitchTransition(side, afterBank, ev.Attr / 10, ev.GetSuperFlickFamily(before));
+            var state = EnsureEditorPreviewGearState();
+            var before = state.Copy();
+            var authoredTickEvents = _orderedRenderableEvents
+                .Where(ev => ev.Tick == tickGroup.Key && ev.IsSuperFlick)
+                .ToList();
+            var successfulKeys = tickGroup.Select(KeyOf).ToHashSet();
+            var candidates = authoredTickEvents.Where(ev =>
+            {
+                if (successfulKeys.Contains(KeyOf(ev)) || _hitEvents.Contains(KeyOf(ev)))
+                    return true;
+                var key = SuperFlickKeyOf(ev);
+                return _scoreSuperFlickEntries.TryGetValue(key, out var scoreEntry) &&
+                       _scoredEntryIds.Contains(scoreEntry.Id);
+            }).ToList();
+            var applied = GearTimeline.ApplySuperFlickChangesForTick(state, authoredTickEvents, candidates);
+            if (applied.Count == 0)
+                continue;
+
+            var after = state.Copy();
+            _gameplayState = after.Copy();
+            SyncEditorPreviewBankIndicators(after);
+            RecordEditorTimelineRouteState(_playSeconds, after);
+
+            foreach (var ev in applied)
+            {
+                var position = GearState.Position(ev.Track);
+                if (position is null)
+                    continue;
+                var side = ev.GetSuperFlickSide() ?? position.Value.Side;
+                var beforeBank = GearTimeline.ActiveBankForSide(before, side);
+                var afterBank = GearTimeline.ActiveBankForSide(after, side);
+                if (!string.Equals(beforeBank, afterBank, StringComparison.OrdinalIgnoreCase))
+                    StartBankSwitchTransition(side, afterBank, ev.Attr / 10, ev.GetSuperFlickFamily(before));
+            }
         }
     }
 
@@ -485,10 +513,13 @@ public sealed partial class Playfield
 
                 PlayAutomaticHitSounds(noteVolume, changeVolume);
 
-                // As with manual play, all notes at one tick use the state that
-                // was active at the start of that tick.
-                foreach (var change in stateChanges)
-                    state.ApplySuperFlick(change.Attr / 10, change.Track);
+                // Use the complete authored tick group when selecting changes so
+                // one successful half of a same-tick 60/70 pair cannot switch only
+                // one side. Offset 60/70 events and Attr 20/40 remain independent.
+                var authoredTickEvents = _orderedRenderableEvents
+                    .Skip(i).Take(next - i)
+                    .Where(ev => ev.IsSuperFlick);
+                GearTimeline.ApplySuperFlickChangesForTick(state, authoredTickEvents, stateChanges);
                 i = next;
             }
             return;
@@ -719,21 +750,15 @@ public sealed partial class Playfield
                      .GroupBy(e => e.Tick))
         {
             var before = state.Copy();
-            var appliedSides = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var ev in tickGroup)
+            var applied = GearTimeline.ApplySuperFlickChangesForTick(state, tickGroup, tickGroup);
+            foreach (var ev in applied)
             {
                 var side = ev.GetSuperFlickSide();
-                if (side is null || appliedSides.Contains(side) ||
-                    !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
+                if (side is null)
                     continue;
-
                 var beforeMode = side.Equals("left", StringComparison.OrdinalIgnoreCase)
                     ? before.LeftMode
                     : before.RightMode;
-                if (!state.ApplySuperFlick(ev.Attr / 10, ev.Track))
-                    continue;
-
-                appliedSides.Add(side);
                 var afterMode = side.Equals("left", StringComparison.OrdinalIgnoreCase)
                     ? state.LeftMode
                     : state.RightMode;
@@ -1184,7 +1209,7 @@ public sealed partial class Playfield
                     _superFlickResolvedThisFrame.Add(superFlickKey);
                     _resolvedSuperFlicks.Add(superFlickKey);
                     RegisterHit(deltaSeconds * 1000.0, ev);
-                    _pendingSuperFlickStateChanges.Add((ev.Tick, ev.Attr / 10, ev.Track, ev.GetSuperFlickFamily(frameGameplayState)));
+                    _pendingSuperFlickStateChanges.Add(ev);
                     if (_superFlickDebugEnabled)
                         SuperFlickDebugLog($"STATE QUEUED tick={ev.Tick} track={ev.Track} pending={_pendingSuperFlickStateChanges.Count} gearSnapshot={SuperFlickDebugGearState()}");
                     PlayHitSound(ev);
@@ -1261,40 +1286,57 @@ public sealed partial class Playfield
         // early-miss detector considers the next note.
         ProcessEarlyPressMisses(ordered, currentSeconds, consumedPressedKeys, frameGameplayState);
 
-        // Apply superFlick-induced bank changes only after the entire frame has been
-        // resolved against the same active-bank snapshot. This prevents a superFlick
-        // from making unrelated events become active halfway through the pass.
-        foreach (var change in _pendingSuperFlickStateChanges)
+        // Apply SuperFlick-induced bank changes only after the entire frame has
+        // been resolved against the same active-bank snapshot. A same-tick 60/70
+        // pair changes both sides only after both notes have actually been hit;
+        // an offset pair is handled as two independent tick changes.
+        foreach (var pendingTick in _pendingSuperFlickStateChanges
+                     .Select(ev => ev.Tick)
+                     .Distinct()
+                     .OrderBy(tick => tick))
         {
+            var authoredTickEvents = ordered
+                .Where(ev => ev.Tick == pendingTick && ev.IsSuperFlick)
+                .ToList();
+            // Include successful hits from earlier frames at this same chart tick.
+            // This lets the second half of a same-tick 60/70 pair complete the
+            // atomic transition without applying the first half prematurely.
+            var successfulTickEvents = authoredTickEvents.Where(IsHit).ToList();
             var before = _gameplayState.Copy();
-            if (!_gameplayState.ApplySuperFlick(change.Direction, change.Track))
+            var applied = GearTimeline.ApplySuperFlickChangesForTick(
+                _gameplayState, authoredTickEvents, successfulTickEvents);
+            if (applied.Count == 0)
                 continue;
+
             var after = _gameplayState.Copy();
-            var superFlickPosition = GearState.Position(change.Track);
-            if (superFlickPosition is not null)
+            foreach (var change in applied)
             {
-                var side = superFlickPosition.Value.Side;
-                var bank = GearTimeline.ActiveBankForSide(after, side);
-                StartBankSwitchTransition(side, bank, change.Direction, change.Family);
+                var position = GearState.Position(change.Track);
+                if (position is not null)
+                {
+                    var side = change.GetSuperFlickSide() ?? position.Value.Side;
+                    var bank = GearTimeline.ActiveBankForSide(after, side);
+                    StartBankSwitchTransition(side, bank, change.Attr / 10,
+                        change.GetSuperFlickFamily(before));
+                }
+
+                if (_superFlickDebugEnabled)
+                    SuperFlickDebugLog($"STATE APPLY track={change.Track} dir={change.Attr / 10} before={before.LeftMode}/{before.RightMode} after={after.LeftMode}/{after.RightMode}");
             }
+
             if (_chartEditorMode)
             {
-                // Keep the bank buttons in sync with the state reached by an
-                // actually judged manual SuperFlick. The start-bank choice is
-                // separate, so Retry can restore the route the user selected.
+                // Keep the bank buttons in sync with the route reached by actually
+                // judged manual SuperFlicks. Retry still restores the selected start banks.
                 _editorPreviewGearState = after.Copy();
                 SyncEditorPreviewBankIndicators(after);
                 RecordEditorTimelineRouteState(_playSeconds, after);
             }
 
-            if (_superFlickDebugEnabled)
-                SuperFlickDebugLog($"STATE APPLY track={change.Track} dir={change.Direction} before={before.LeftMode}/{before.RightMode} after={SuperFlickDebugGearState()}");
-
-            // A superFlick can reveal notes that were completely unavailable during
-            // their own judgement window. Those notes must never become a MISS
-            // just because the bank was switched back to them later. Decide this
-            // at the exact activation boundary instead of trying to infer it from
-            // whether the note happened to be active in an earlier bank.
+            // A bank switch can reveal notes which were already past their timing
+            // window. Check the whole atomic tick transition against its single
+            // before/after snapshot so a paired 60/70 switch is never treated as
+            // two independently reachable intermediate states.
             if (_tempo is not null)
             {
                 var activationFirst = Math.Max(0, LowerBound(_eventSeconds, currentSeconds - 0.001));
@@ -1316,11 +1358,9 @@ public sealed partial class Playfield
                     var eventSeconds = _eventSeconds[activationIndex];
 
                     // A bank switch takes effect strictly after the flick tick.
-                    // A normal note that becomes active exactly on the switch tick
-                    // is therefore not playable on the newly activated route.
-                    // It remains in the score model so an alternate route that
-                    // does not perform the switch can still score it normally.
-                    if (!ev.IsSuperFlick && ev.Tick == change.Tick)
+                    // A normal note on the same tick is not playable on the newly
+                    // activated route, even when both sides switched atomically.
+                    if (!ev.IsSuperFlick && ev.Tick == pendingTick)
                     {
                         _gameplayIgnoredEvents.Add(key);
                         if (_superFlickDebugEnabled)

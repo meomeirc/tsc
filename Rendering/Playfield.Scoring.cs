@@ -399,18 +399,16 @@ public sealed partial class Playfield
                      .GroupBy(e => e.Tick))
         {
             var before = state.Copy();
-            var appliedSides = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var ev in tickGroup)
+            var applied = GearTimeline.ApplySuperFlickChangesForTick(state, tickGroup, tickGroup);
+            if (applied.Count == 0)
+                continue;
+
+            foreach (var ev in applied)
             {
                 var side = ev.GetSuperFlickSide();
-                if (side is null || appliedSides.Contains(side) ||
-                    !before.CanApplySuperFlick(ev.Attr / 10, ev.Track))
+                if (side is null)
                     continue;
-
                 var beforeBank = GearTimeline.ActiveBankForSide(before, side);
-                if (!state.ApplySuperFlick(ev.Attr / 10, ev.Track))
-                    continue;
-                appliedSides.Add(side);
                 var afterBank = GearTimeline.ActiveBankForSide(state, side);
                 if (!string.Equals(beforeBank, afterBank, StringComparison.OrdinalIgnoreCase))
                     result[side].Add(tickGroup.Key);
@@ -518,8 +516,8 @@ public sealed partial class Playfield
                 }
             }
 
-            foreach (var hit in successfulSuperFlicks)
-                ApplyEditorPreviewSuperFlickHit(hit);
+            if (successfulSuperFlicks.Count > 0)
+                ApplyEditorPreviewSuperFlickHits(successfulSuperFlicks);
             if (!scoreOnly && successfulSuperFlicks.Count > 0)
                 RefreshSkinGameState();
             index = next;

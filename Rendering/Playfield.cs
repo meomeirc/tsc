@@ -905,7 +905,7 @@ public sealed partial class Playfield
     private readonly HashSet<ChartEventKey> _gameplayIgnoredEvents = new();
     private readonly HashSet<SuperFlickVisualKey> _superFlickResolvedThisFrame = new();
     private readonly HashSet<SuperFlickVisualKey> _resolvedSuperFlicks = new();
-    private readonly List<(int Tick, int Direction, int Track, SuperFlickFamily Family)> _pendingSuperFlickStateChanges = new();
+    private readonly List<ChartEvent> _pendingSuperFlickStateChanges = new();
     private bool _superFlickDebugEnabled;
     private readonly Queue<string> _superFlickDebugRecent = new();
     private readonly LaneHighlightState[] _laneHighlights =
