@@ -12,7 +12,11 @@ namespace TSC;
 /// </summary>
 public sealed class ScoreSaveStore
 {
-    private const int CurrentVersion = 2;
+    // File format changes are handled separately from score-system changes.
+    // Increment CurrentScoreVersion whenever score or judgement rules change
+    // enough that records from an older system should no longer be retained.
+    private const int CurrentFileFormatVersion = 2;
+    private const int CurrentScoreVersion = 2;
     private const int MaxRecordsPerChart = 5;
     private const int MaxSaveFileBytes = 8 * 1024 * 1024;
     private static readonly object Sync = new();
@@ -24,7 +28,11 @@ public sealed class ScoreSaveStore
 
     private sealed class SaveFile
     {
-        public int Version { get; set; } = CurrentVersion;
+        public int Version { get; set; } = CurrentFileFormatVersion;
+        // Nullable by design: files created before score-system versioning do
+        // not have this field and must be treated as stale, even if their file
+        // format version happens to match.
+        public int? ScoreVersion { get; set; }
         public Dictionary<string, List<ScoreRecord>> Records { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
@@ -33,6 +41,10 @@ public sealed class ScoreSaveStore
         public int Score { get; set; }
         public double Accuracy { get; set; }
         public int MaxCombo { get; set; }
+        public int PerfectPlusCount { get; set; }
+        public int PerfectCount { get; set; }
+        public int GoodCount { get; set; }
+        public int MissCount { get; set; }
         public string Grade { get; set; } = string.Empty;
         public string ClearType { get; set; } = string.Empty;
         public string LastPlayedUtc { get; set; } = string.Empty;
@@ -130,7 +142,11 @@ public sealed class ScoreSaveStore
         double accuracy,
         int maxCombo,
         string grade,
-        string clearType)
+        string clearType,
+        int perfectPlusCount,
+        int perfectCount,
+        int goodCount,
+        int missCount)
     {
         lock (Sync)
         {
@@ -141,6 +157,10 @@ public sealed class ScoreSaveStore
                 Score = Math.Max(0, score),
                 Accuracy = Math.Clamp(accuracy, 0.0, 100.0),
                 MaxCombo = Math.Max(0, maxCombo),
+                PerfectPlusCount = Math.Max(0, perfectPlusCount),
+                PerfectCount = Math.Max(0, perfectCount),
+                GoodCount = Math.Max(0, goodCount),
+                MissCount = Math.Max(0, missCount),
                 Grade = grade ?? string.Empty,
                 ClearType = clearType ?? string.Empty,
                 LastPlayedUtc = DateTime.UtcNow.ToString("O")
@@ -264,12 +284,22 @@ public sealed class ScoreSaveStore
             if (data is null || data.Records is null)
                 return;
 
-            // Version 2 is the current format. Keep the reader permissive because
-            // some installations may still contain equivalent score records that
-            // are keyed by path or by a bare SHA-256 string. The write side remains
-            // strictly v2 hash-keyed.
-            if (data.Version != CurrentVersion)
-                Program.LogRuntime($"SCORE_SAVE_VERSION_READ version={data.Version} expected={CurrentVersion} — attempting compatible read");
+            if (data.ScoreVersion != CurrentScoreVersion)
+            {
+                var previousVersion = data.ScoreVersion?.ToString() ?? "missing";
+                Program.LogRuntime($"SCORE_SYSTEM_VERSION_RESET previous={previousVersion} current={CurrentScoreVersion} — clearing saved scores");
+                _records.Clear();
+                // Persist the reset immediately so older records are not loaded
+                // again on the next launch. A future score-system change only
+                // needs to increment CurrentScoreVersion.
+                Save();
+                return;
+            }
+
+            // File format versioning is independent. Keep this reader permissive
+            // for equivalent path-keyed or bare-hash records where possible.
+            if (data.Version != CurrentFileFormatVersion)
+                Program.LogRuntime($"SCORE_SAVE_FORMAT_READ version={data.Version} expected={CurrentFileFormatVersion} — attempting compatible read");
 
             foreach (var pair in data.Records)
             {
@@ -305,7 +335,8 @@ public sealed class ScoreSaveStore
 
             var data = new SaveFile
             {
-                Version = CurrentVersion,
+                Version = CurrentFileFormatVersion,
+                ScoreVersion = CurrentScoreVersion,
                 Records = _records.ToDictionary(
                     pair => pair.Key,
                     pair => pair.Value.Select(Clone).ToList(),
@@ -335,6 +366,10 @@ public sealed class ScoreSaveStore
             Score = value.Score,
             Accuracy = value.Accuracy,
             MaxCombo = value.MaxCombo,
+            PerfectPlusCount = value.PerfectPlusCount,
+            PerfectCount = value.PerfectCount,
+            GoodCount = value.GoodCount,
+            MissCount = value.MissCount,
             Grade = value.Grade,
             ClearType = value.ClearType,
             LastPlayedUtc = value.LastPlayedUtc

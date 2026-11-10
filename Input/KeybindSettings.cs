@@ -46,6 +46,7 @@ internal static class KeybindSettings
         // Gameplay
         ("gameplay_result_continue", "RESULT: CONTINUE", "gameplay", new[] { 40 }, new[] { 44 }),
         ("gameplay_result_retry", "RESULT: RETRY", "gameplay", new[] { 21 }, Array.Empty<int>()),
+        ("gameplay_toggle_chart_radar", "CYCLE CHART PANEL", "gameplay", new[] { 53 }, Array.Empty<int>()),
         ("game_left_1", "LEFT 1", "gameplay", new[] { 22 }, new[] { 20 }),
         ("game_left_2", "LEFT 2", "gameplay", new[] { 7 }, new[] { 26 }),
         ("game_left_3", "LEFT 3", "gameplay", new[] { 9 }, new[] { 8 }),

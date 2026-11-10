@@ -25,19 +25,20 @@ local DIFF = {
 -- SONG SELECT LAYOUT ---------------------------------------------------------
 local LAYOUT = {
     selected_panel = {
-        x = 0, y = 0, anchor = "top-left", width = 655,
+        x = 0, y = 0, anchor = "top-left", width = 655, scale = 0.86,
         empty_title = { x = 32, y = 48, anchor = "left", size = 41 },
-        art_inset = 0, art_max_size = 655, artwork_info_height = 168,
-        series = { x = 29, y = 513, anchor = "left", max_chars = 34 },
-        title = { x = 29, y = 557, anchor = "left", size = 50, max_chars = 24 },
-        artist = { x = 29, y = 601, anchor = "left", size = 32, max_chars = 34 },
-        bpm_label = { right = 142, y = 605, anchor = "left", size = 24 },
-        bpm_value = { right = 94, y = 605, anchor = "left", size = 42 },
+        art_inset = 0, art_max_size = 655, metadata_height = 150,
+        series = { x = 29, y = 18, anchor = "left", max_chars = 34 },
+        title = { x = 29, y = 51, anchor = "left", size = 50, max_chars = 24 },
+        artist = { x = 29, y = 103, anchor = "left", size = 32, max_chars = 34 },
+        bpm_label = { right = 142, y = 104, anchor = "left", size = 24 },
+        bpm_value = { right = 94, y = 104, anchor = "left", size = 42 },
         tabs = { anchor = "top-left", top_gap = 5, width = 131, height = 61, gap = 2, label_y = 31, label_size = 28 },
         score = {
-            anchor = "left", height = 171,
-            label_x = 27, label_y = 27, label_size = 24,
-            value_x = 28, value_y = 85, value_size = 90,
+            anchor = "center", height = 205,
+            label_size = 42,
+            horizontal_padding = 20, vertical_padding = 20,
+            label_value_gap = 2, value_size = 90,
         },
 -- Minimum breathing room reserved for the ACC/GRADE/CLEAR block.
         min_stats_height = 115,
@@ -54,8 +55,8 @@ local LAYOUT = {
         },
     },
     card = {
-        size = 300, gap = 27, columns = 3, min_rows = 3,
-        top = 38,
+        size = 315, gap = 22, columns = 3, min_rows = 3,
+        top = 26,
         bottom_reserved = 142, background_x = 94, background_right_margin = 769,
         shadow_y = 5, shadow_blur = 14,
         info_height = 66,
@@ -67,7 +68,7 @@ local LAYOUT = {
         selected_border = 3,
     },
     gallery = {
-        y = 24, anchor = "top-left",
+        y = 16, anchor = "top-left",
         -- Relative adjustment after automatic centering, in reference units.
         horizontal_offset = 0,
     },
@@ -80,20 +81,20 @@ local LAYOUT = {
         continue_button = { height = 80, text_size = UI.sizes.button },
     },
     footer = {
-        height = 147, anchor = "bottom-left",
+        height = 100, anchor = "bottom-left",
 -- Footer edges exactly match the three-card gallery group.
-        padding = 20, control_gap = 12,
+        padding = 14, control_gap = 8,
         controls = {
             pack = { weight = 0.38 },
             sort = { weight = 0.38 },
             order = { weight = 0.24 },
         },
-        label_y = 31, label_size = 24,
-        value_y = 63, value_size = 32,
-        underline_y = 100, underline_height = 4,
+        label_y = 21, label_size = 16,
+        value_y = 43, value_size = 22,
+        underline_y = 69, underline_height = 3,
     },
     popups = {
-        footer_gap = 10, row_height = 42,
+        footer_gap = 8, row_height = 38,
 -- Popup frames anchor to their controls and share a consistent width.
         pack = { max_width = 382, max_rows = 10, header_rows = 1, top_padding = 42, bottom_padding = 18, title_x = 18, title_y = 18, title_size = UI.sizes.small },
         sort = { max_width = 382, top_padding = 7, bottom_padding = 7 },
@@ -175,12 +176,14 @@ function song_select_layout_metrics(width, height)
     local R = LAYOUT.right_controls
 
 -- The details column is one responsive stack.
-    local panel_stack_height = P.art_inset * 2 + P.art_max_size
+    local panel_stack_height = P.art_inset * 2 + P.art_max_size + P.metadata_height
         + P.tabs.top_gap + P.tabs.height + P.score.height
     local stats_min_height = P.min_stats_height or 115
     local panel_scale = math.min(scale, viewport_height / math.max(1,
         P.y + panel_stack_height + stats_min_height))
-    panel_scale = math.max(0.01, panel_scale)
+    -- Keep the full selected-song strip more compact to reclaim horizontal
+    -- room for the gallery without changing its internal proportions.
+    panel_scale = math.max(0.01, panel_scale * (P.scale or 1.0))
 
     local panel_x = P.x * panel_scale
     local panel_y = P.y * panel_scale
@@ -260,6 +263,11 @@ function song_select_layout_metrics(width, height)
         panel_y = panel_y,
         panel_width = panel_width,
         panel_height = panel_height,
+        artwork_x = viewport_x + panel_x + P.art_inset * panel_scale,
+        artwork_y = viewport_y + panel_y + P.art_inset * panel_scale,
+        artwork_size = math.min(
+            panel_width - P.art_inset * 2 * panel_scale,
+            P.art_max_size * panel_scale),
         right_controls_x = right_controls_x,
         right_controls_y = right_controls_y,
         right_controls_width = right_controls_width,
@@ -659,13 +667,14 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
         })
     end
 
+    local metadata_y = frame_y + art_size
     draw.rect({
         parent = "song_selected_panel",
         x = frame_x,
-        y = frame_y + art_size - px(P.artwork_info_height, panelScale),
+        y = metadata_y,
         width = art_size,
-        height = px(P.artwork_info_height, panelScale),
-        color = { r = 0, g = 0, b = 0, a = 150 },
+        height = px(P.metadata_height, panelScale),
+        color = DARK,
         layer = 24,
     })
 
@@ -678,7 +687,7 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     draw.user_text(selected_title, {
         parent = "song_selected_panel",
         x = selected_title_x,
-        y = frame_y + art_size - px(P.art_max_size - P.title.y, panelScale),
+        y = metadata_y + px(P.title.y, panelScale),
         size = selected_title_size,
         color = WHITE, font = FONT_BOLD, anchor = P.title.anchor or "left", layer = 28,
         shadow = soft_shadow(FONT_BOLD, 2 * panelScale, 2 * panelScale, 0.85),
@@ -691,7 +700,7 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
         draw.user_text(series, {
             parent = "song_selected_panel",
             x = seriesX,
-            y = frame_y + art_size - px(P.art_max_size - P.series.y, panelScale),
+            y = metadata_y + px(P.series.y, panelScale),
             size = seriesSize,
             color = SOFT, font = FONT_REGULAR, anchor = P.series.anchor or "left", layer = 28,
             shadow = soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8),
@@ -699,12 +708,14 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     end
     local selected_artist = tostring(selected.artist or "")
     local selected_artist_x = px(P.artist.x, panelScale)
+    local artist_max_width = math.max(1,
+        art_size - selected_artist_x - px(P.bpm_label.right + 22, panelScale))
     local selected_artist_size = fit_user_text_size(selected_artist, px(P.artist.size, panelScale),
-        math.max(1, art_size - selected_artist_x - px(16, panelScale)), FONT_REGULAR)
+        artist_max_width, FONT_REGULAR)
     draw.user_text(selected_artist, {
         parent = "song_selected_panel",
         x = selected_artist_x,
-        y = frame_y + art_size - px(P.art_max_size - P.artist.y, panelScale),
+        y = metadata_y + px(P.artist.y, panelScale),
         size = selected_artist_size,
         color = WHITE, font = FONT_REGULAR, anchor = P.artist.anchor or "left", layer = 28,
         shadow = soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8),
@@ -712,19 +723,19 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     draw.text("BPM", {
         parent = "song_selected_panel",
         x = panel_w - px(P.bpm_label.right, panelScale),
-        y = frame_y + art_size - px(P.art_max_size - P.bpm_label.y, panelScale),
+        y = metadata_y + px(P.bpm_label.y, panelScale),
         size = px(P.bpm_label.size, panelScale),
         color = WHITE, font = FONT_REGULAR, anchor = P.bpm_label.anchor or "left", layer = 28,
     })
     draw.text(string.format("%.0f", selected.bpm or 0), {
         parent = "song_selected_panel",
         x = panel_w - px(P.bpm_value.right, panelScale),
-        y = frame_y + art_size - px(P.art_max_size - P.bpm_value.y, panelScale),
+        y = metadata_y + px(P.bpm_value.y, panelScale),
         size = px(P.bpm_value.size, panelScale),
         color = WHITE, font = FONT_BOLD_ITALIC, anchor = P.bpm_value.anchor or "left", layer = 28,
     })
 
-    local tabs_y = frame_y + art_size + px(P.tabs.top_gap, panelScale)
+    local tabs_y = metadata_y + px(P.metadata_height + P.tabs.top_gap, panelScale)
     local tab_w = px(P.tabs.width, panelScale)
     local tab_h = px(P.tabs.height, panelScale)
     local tab_gap = px(P.tabs.gap, panelScale)
@@ -771,27 +782,69 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     local best_score_color = DIFF[selected_diff_index].color
 
     local score_y = tabs_y + tab_h
+    -- Size the score against the maximum reference value, not the current value.
+    -- This makes a 10,000,000 score leave exactly the configured side padding,
+    -- while shorter scores keep the same font size and naturally leave more room.
+    local score_base_size = px(P.score.value_size, panelScale)
+    local score_reference_width = draw.measure_user_text_width("10,000,000", {
+        font = FONT_BOLD, size = score_base_size,
+    })
+    local score_max_width = math.max(1,
+        panel_w - px(P.score.horizontal_padding * 2, panelScale))
+    local score_size = score_base_size
+    if score_reference_width > 0 then
+        score_size = score_base_size * score_max_width / score_reference_width
+    end
+
+    local score_text_height = draw.measure_user_text_height("10,000,000", {
+        font = FONT_BOLD, size = score_size, max_width = score_max_width + 2,
+    })
+    if score_text_height <= 0 then
+        score_text_height = score_size
+    end
+
+    local score_label_size = px(P.score.label_size, panelScale)
+    -- This is a single-line label. Reserve its actual font size instead of the
+    -- larger line-box measurement, which was leaving a visible blank band.
+    local score_label_height = score_label_size
+    local score_label_value_gap = px(P.score.label_value_gap, panelScale)
+    local score_content_height = score_label_height + score_label_value_gap + score_text_height
+    local score_vertical_padding = px(P.score.vertical_padding, panelScale)
+    local score_box_height = math.max(
+        px(P.score.height, panelScale),
+        score_content_height + score_vertical_padding * 2)
+    local score_content_top = (score_box_height - score_content_height) * 0.5
+    local score_label_y = score_content_top + score_label_size * 0.5
+    local score_text_top = score_content_top + score_label_height + score_label_value_gap
+    local score_value_y = score_text_top + score_text_height * 0.5
+
+    draw.text("BEST SCORE", {
+        parent = "song_selected_panel",
+        x = px(P.score.label_x or 27, panelScale),
+        y = score_y + score_label_y,
+        size = score_label_size, color = WHITE,
+        font = FONT_BOLD, anchor = "left", layer = 32,
+    })
+
+    -- Keep the colored score panel exactly as tall as the measured content box.
+    -- The score height can exceed the design minimum when the reference value
+    -- needs more room, so the background must follow that calculated height.
     draw.rect({
         parent = "song_selected_panel",
         x = panel_x, y = score_y,
-        width = panel_w, height = px(P.score.height, panelScale),
+        width = panel_w, height = score_box_height,
         color = best_score_color, layer = 30,
     })
-    draw.text("BEST SCORE", {
-        parent = "song_selected_panel",
-        x = px(P.score.label_x, panelScale), y = score_y + px(P.score.label_y, panelScale),
-        size = px(P.score.label_size, panelScale), color = WHITE,
-        font = FONT_BOLD, anchor = "left", layer = 32,
-    })
+
     draw.text(score_text(selected.score), {
         parent = "song_selected_panel",
-        x = px(P.score.value_x, panelScale), y = score_y + px(P.score.value_y, panelScale),
-        size = px(P.score.value_size, panelScale), color = WHITE,
-        font = FONT_BOLD, anchor = "left", layer = 32,
+        x = panel_w * 0.5, y = score_y + score_value_y,
+        size = score_size, color = WHITE,
+        font = FONT_BOLD, anchor = "center", layer = 32,
         shadow = soft_shadow(FONT_BOLD, 2 * panelScale, 3 * panelScale, 0.32),
     })
 
-    local stats_y = score_y + px(P.score.height, panelScale)
+    local stats_y = score_y + score_box_height
     draw.rect({
         parent = "song_selected_panel",
         x = panel_x, y = stats_y,

@@ -11120,9 +11120,13 @@ public sealed partial class Playfield
             GetAccuracyPercent(),
             _maxCombo,
             GetGrade(),
-            clearType);
+            clearType,
+            _perfectPlusCount,
+            _perfectCount,
+            _goodCount,
+            _missCount);
 
-        Program.LogRuntime($"SCORE_SAVED chart={ScoreSaveStore.MakeKey(_scoreRecordPath)} score={GetDisplayedScore()} accuracy={GetAccuracyPercent():0.000} maxCombo={_maxCombo} grade={GetGrade()} clear={clearType}");
+        Program.LogRuntime($"SCORE_SAVED chart={ScoreSaveStore.MakeKey(_scoreRecordPath)} score={GetDisplayedScore()} accuracy={GetAccuracyPercent():0.000} maxCombo={_maxCombo} perfectPlus={_perfectPlusCount} perfect={_perfectCount} good={_goodCount} miss={_missCount} grade={GetGrade()} clear={clearType}");
     }
 
     private string GetClearType()
