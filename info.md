@@ -1,4 +1,14 @@
 hi hello for bugs and feedbacks ping me (@phigos)
+# 0.0.54
+
+- added hover preview of the note when arming a note placement tool
+- added hover text overlay when connector tool is active
+- fixed perspective scale on hover highlights
+- fixed gameplay from ending too early
+- changed default panel duration for placement to 6 ticks and make duration 6 animations open-ended
+- changed superflick 60/70 to be atomic switches if they are put at the same tick on both sides
+- some adjustments to the link id pair assignment and validation
+- other fixes
 
 # 0.0.53
 
