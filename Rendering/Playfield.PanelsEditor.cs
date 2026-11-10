@@ -65,11 +65,10 @@ public sealed partial class Playfield
         => ev.Kind == "Note" && ev.RawType == 1 &&
            ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108;
 
-    // Panel attrs 107–108 use a short 6-tick duration by default.
-    // All other panel attrs use a 48-tick duration by default.
+    // All panel animation attributes use the same short 6-tick placement default.
     private int GetDefaultEditorPanelAnimationDuration(int attr)
     {
-        return attr is 107 or 108 ? 6 : 48;
+        return 6;
     }
 
     private Rectangle GetEditorPanelsTrackAreaBounds(int virtualWidth, int virtualHeight)

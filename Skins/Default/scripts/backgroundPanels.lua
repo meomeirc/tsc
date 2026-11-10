@@ -524,15 +524,20 @@ local function get_active_event(track, current_tick, current_time)
             local light_cfg = ANIMATION_CONFIG.light[event.attr]
             local movement = (cfg and cfg.movementDuration) or (light_cfg and light_cfg.movementDuration) or 0
             state.active_until = (event.start_time or 0) + movement + ((cfg and cfg.holdDuration) or 1.0)
-        elseif event ~= nil and (event.attr == 105 or event.attr == 106) then
-            local cfg = ANIMATION_CONFIG.character[event.attr]
-            local movement = math.max(0.001,
-                tonumber(cfg.movementDuration) or tonumber(cfg.duration) or 5.0)
-            local fade = math.max(0, tonumber(cfg.fadeOutDuration) or 0)
-            -- Keep the event alive through its post-movement fade. Otherwise it
-            -- is discarded at the five-second mark, just as it reaches the edge.
-            local animation_end = (event.start_time or 0) + movement + fade
-            state.active_until = math.max(state.active_until, animation_end)
+        elseif event ~= nil and event.attr >= 101 and event.attr <= 106 then
+            -- Six ticks is the panel editor's default placement length, not an
+            -- instruction to stop the animation. Treat it (and a missing
+            -- duration) as open-ended: keep the current animation until another
+            -- event on this panel track replaces it. A longer duration is an
+            -- explicit end time and is honored as authored in the chart.
+            local duration_ticks = tonumber(event.duration_ticks or event.duration)
+            if duration_ticks == nil or duration_ticks <= 6 then
+                state.active_until = math.huge
+            end
+            -- Character animation progress is intentionally not wrapped here.
+            -- Looping types (103/104) loop in get_character_view; one-shot types
+            -- (101/102/105/106) advance once and stay at their final configured
+            -- state instead of restarting from their first frame.
         else
             local cfg = event ~= nil and ANIMATION_CONFIG.character[event.attr] or nil
             if cfg ~= nil and cfg.duration ~= nil then
