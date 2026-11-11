@@ -1,4 +1,10 @@
 hi hello for bugs and feedbacks ping me (@phigos)
+
+# 0.0.55
+
+- added difficulty radar and combo distribution overlay to song select
+- adjusted score distribution and changed accuracy calculation, along with score versioning so incompatible scores dont get mixed with the new system
+
 # 0.0.54
 
 - added hover preview of the note when arming a note placement tool
