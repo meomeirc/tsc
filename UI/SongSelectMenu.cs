@@ -40,6 +40,11 @@ public sealed class SongSelectMenu : IDisposable
     private const string ImportedBundleMarkerFileName = ".tsc-bundle-import.sha256";
     private const string BundleImportStagingDirectoryName = "bundle-import-staging";
     private static readonly TimeSpan BundleImportStagingRetention = TimeSpan.FromDays(1);
+    private static readonly RasterizerState ChartPanelScissorRasterizer = new()
+    {
+        CullMode = CullMode.None,
+        ScissorTestEnable = true,
+    };
     private sealed class ChartEntry
     {
         public required string Path { get; init; }
@@ -521,21 +526,7 @@ public sealed class SongSelectMenu : IDisposable
 
         UpdateNavigationKeyRepeats(keyboard, previousKeyboard, Math.Max(0.0, deltaSeconds));
         if (KeybindSettings.IsPressed("gameplay_toggle_chart_radar"))
-        {
-            _chartPanelMode = _chartPanelMode switch
-            {
-                ChartPanelMode.DifficultyRadar => ChartPanelMode.ComboDistribution,
-                ChartPanelMode.ComboDistribution => ChartPanelMode.Hidden,
-                _ => ChartPanelMode.DifficultyRadar,
-            };
-            if (_chartPanelMode != ChartPanelMode.Hidden)
-            {
-                _chartRadarDesiredKey = null;
-                _chartRadarDesiredPath = null;
-                _chartRadarResult = null;
-                _chartRadarError = null;
-            }
-        }
+            CycleChartPanelMode();
         UpdateChartRadarState();
 
         if (Pressed(keyboard, previousKeyboard, XnaKeys.F10))
@@ -1130,10 +1121,32 @@ public sealed class SongSelectMenu : IDisposable
         return _skinRuntime.ConsumeSongSelectAction();
     }
 
+    private void CycleChartPanelMode()
+    {
+        _chartPanelMode = _chartPanelMode switch
+        {
+            ChartPanelMode.DifficultyRadar => ChartPanelMode.ComboDistribution,
+            ChartPanelMode.ComboDistribution => ChartPanelMode.Hidden,
+            _ => ChartPanelMode.DifficultyRadar,
+        };
+
+        if (_chartPanelMode != ChartPanelMode.Hidden)
+        {
+            _chartRadarDesiredKey = null;
+            _chartRadarDesiredPath = null;
+            _chartRadarResult = null;
+            _chartRadarError = null;
+        }
+    }
+
     private void HandleSkinAction(SkinUiAction action)
     {
         switch (action.Name.Trim().ToLowerInvariant())
         {
+            case "cycle_chart_panel":
+                CycleChartPanelMode();
+                break;
+
             case "continue":
                 TryPlaySelected();
                 break;
@@ -1374,7 +1387,6 @@ public sealed class SongSelectMenu : IDisposable
                     if (_skinRuntime.IsLoaded)
                     {
                         DrawSongSelectErrorOverlay(width, height);
-                        DrawChartRadarArtworkOverlay(width, height);
                         return;
                     }
 
@@ -1444,12 +1456,11 @@ public sealed class SongSelectMenu : IDisposable
         _spriteBatch.End();
         if (!string.IsNullOrWhiteSpace(_errorMessage))
             DrawSongSelectErrorOverlay(width, height);
-        DrawChartRadarArtworkOverlay(width, height);
     }
 
-    private void UpdateChartRadarState()
+    private void UpdateChartRadarState(bool force = false)
     {
-        if (_chartPanelMode == ChartPanelMode.Hidden)
+        if (_chartPanelMode == ChartPanelMode.Hidden && !force)
             return;
 
         // Finish one worker at a time. If selection changed while it was parsing,
@@ -1535,218 +1546,290 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
-    private void DrawChartRadarArtworkOverlay(int width, int height)
+    /// <summary>
+    /// Native renderer for draw.chart_panel. The skin controls placement, layer,
+    /// mode and palette through the command; chart parsing and graph geometry stay
+    /// here so skins do not need to reproduce the radar implementation.
+    /// </summary>
+    private void DrawChartPanelFromSkin(SkinDrawCommand command, int viewportWidth, int viewportHeight)
     {
-        if (_chartPanelMode == ChartPanelMode.Hidden || width <= 0 || height <= 0 || SelectedSong is null)
+        if (command is null || viewportWidth <= 0 || viewportHeight <= 0 || SelectedSong is null)
             return;
 
-        // Input may have changed the selection after the normal Update pass
-        // (for example, a mouse click on a difficulty button). Refresh before
-        // drawing so old values are never shown on the newly selected card.
-        UpdateChartRadarState();
-
-        if (_skinDrawDisabled || _galleryLayoutMetrics is not { } layout ||
-            layout.ArtworkSize <= 0)
+        var panelMode = command.ChartPanelMode switch
+        {
+            "radar" => ChartPanelMode.DifficultyRadar,
+            "combo" or "combo_distribution" => ChartPanelMode.ComboDistribution,
+            "hidden" => ChartPanelMode.Hidden,
+            _ => _chartPanelMode,
+        };
+        if (panelMode == ChartPanelMode.Hidden)
             return;
 
-        var x = (float)layout.ArtworkX;
-        var y = (float)layout.ArtworkY;
-        var size = (float)layout.ArtworkSize;
-        if (size < 80f || x >= width || y >= height || x + size <= 0 || y + size <= 0)
+        UpdateChartRadarState(force: true);
+
+        var panelWidth = command.Size.X;
+        var panelHeight = command.Size.Y;
+        var x = command.Position.X - panelWidth * command.Anchor.X;
+        var y = command.Position.Y - panelHeight * command.Anchor.Y;
+        var minSize = Math.Min(panelWidth, panelHeight);
+        if (minSize < 80f || x >= viewportWidth || y >= viewportHeight ||
+            x + panelWidth <= 0f || y + panelHeight <= 0f)
             return;
 
-        var unit = Math.Clamp(size / 300f, 0.55f, 1.5f);
-        var left = Math.Max(0, x);
-        var top = Math.Max(0, y);
-        var right = Math.Min(width, x + size);
-        var bottom = Math.Min(height, y + size);
-        if (right <= left || bottom <= top)
-            return;
+        var unit = Math.Clamp(minSize / 300f, 0.55f, 1.5f);
+        static XnaColor ApplyAlpha(XnaColor color, float alpha)
+            => new(color.R, color.G, color.B,
+                (byte)Math.Clamp((int)MathF.Round(color.A * alpha), 0, 255));
+
+        var background = ApplyAlpha(command.ChartPanelBackgroundColor, command.Alpha);
+        var border = ApplyAlpha(command.ChartPanelBorderColor, command.Alpha);
+        var headerColor = ApplyAlpha(command.ChartPanelHeaderColor, command.Alpha);
+        var dividerColor = ApplyAlpha(command.ChartPanelDividerColor, command.Alpha);
+        var radarFill = ApplyAlpha(command.ChartPanelRadarFillColor, command.Alpha);
+        var radarLine = ApplyAlpha(command.ChartPanelRadarLineColor, command.Alpha);
+        var guideColor = ApplyAlpha(command.ChartPanelGuideColor, command.Alpha);
+        var categoryColors = new[]
+        {
+            ApplyAlpha(command.ChartPanelTapsColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelLongsColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelSlidesColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelFlicksColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelStreamColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelTravelColor, command.Alpha),
+        };
 
         _spriteBatch.Begin(
             SpriteSortMode.Deferred,
             BlendState.NonPremultiplied,
             SamplerState.LinearClamp,
             DepthStencilState.None,
-            RasterizerState.CullNone);
-
-        // Use one translucent dark backing panel (80% opacity). Expand its fill
-        // slightly beyond the artwork and round outward to whole pixels so the
-        // album image cannot peek through fractional-coordinate edge gaps.
-        var panelBleed = Math.Max(2f, 2f * unit);
-        var panelLeft = Math.Max(0, (int)MathF.Floor(x - panelBleed));
-        var panelTop = Math.Max(0, (int)MathF.Floor(y - panelBleed));
-        var panelRight = Math.Min(width, (int)MathF.Ceiling(x + size + panelBleed));
-        var panelBottom = Math.Min(height, (int)MathF.Ceiling(y + size + panelBleed));
-        if (panelRight > panelLeft && panelBottom > panelTop)
+            command.ScissorClip.HasValue ? ChartPanelScissorRasterizer : RasterizerState.CullNone);
+        try
         {
-            _spriteBatch.Draw(_pixel,
-                new XnaRectangle(panelLeft, panelTop, panelRight - panelLeft, panelBottom - panelTop),
-                new XnaColor(12, 20, 29, 204));
-        }
-        DrawBorder(x, y, size, size, new XnaColor(96, 137, 160, 238), Math.Max(1f, 1.6f * unit));
-
-        var panelHeader = _chartPanelMode == ChartPanelMode.DifficultyRadar
-            ? "DIFFICULTY RADAR"
-            : "COMBO DISTRIBUTION";
-        DrawText(panelHeader, x + 13f * unit, y + 9f * unit,
-            15f * unit, new XnaColor(239, 245, 250));
-        DrawRect(x + 10f * unit, y + 31f * unit,
-            size - 20f * unit, Math.Max(1f, unit), new XnaColor(125, 157, 178, 155));
-
-        if (_chartPanelMode == ChartPanelMode.ComboDistribution)
-        {
-            if (_chartRadarResult is { } comboResult)
+            // One translucent backing panel. A tiny outward bleed keeps fractional
+            // artwork edges from peeking through, while the skin owns the panel box.
+            var panelBleed = Math.Max(0f, command.ChartPanelBackgroundBleed * unit);
+            var panelLeft = Math.Max(0, (int)MathF.Floor(x - panelBleed));
+            var panelTop = Math.Max(0, (int)MathF.Floor(y - panelBleed));
+            var panelRight = Math.Min(viewportWidth, (int)MathF.Ceiling(x + panelWidth + panelBleed));
+            var panelBottom = Math.Min(viewportHeight, (int)MathF.Ceiling(y + panelHeight + panelBleed));
+            if (panelRight > panelLeft && panelBottom > panelTop)
             {
-                DrawComboDistributionPanel(comboResult.ComboDistribution, x, y, size, unit);
+                _spriteBatch.Draw(_pixel,
+                    new XnaRectangle(panelLeft, panelTop, panelRight - panelLeft, panelBottom - panelTop),
+                    background);
+            }
+
+            if (command.ChartPanelBorderWidth > 0f)
+            {
+                DrawBorder(x, y, panelWidth, panelHeight, border,
+                    command.ChartPanelBorderWidth * unit);
+            }
+
+            if (command.ChartPanelShowHeader)
+            {
+                var defaultHeader = panelMode == ChartPanelMode.DifficultyRadar
+                    ? "DIFFICULTY RADAR"
+                    : "COMBO DISTRIBUTION";
+                var header = string.IsNullOrWhiteSpace(command.ChartPanelHeaderText)
+                    ? defaultHeader
+                    : command.ChartPanelHeaderText!;
+                DrawText(header, x + 13f * unit, y + 9f * unit,
+                    command.ChartPanelHeaderSize * unit, headerColor);
+                DrawRect(x + 10f * unit, y + 31f * unit,
+                    panelWidth - 20f * unit, Math.Max(1f, unit), dividerColor);
+            }
+
+            if (panelMode == ChartPanelMode.ComboDistribution)
+            {
+                if (_chartRadarResult is { } comboResult)
+                {
+                    DrawComboDistributionPanel(
+                        comboResult.ComboDistribution,
+                        x, y, panelWidth, panelHeight, unit,
+                        categoryColors,
+                        ApplyAlpha(command.ChartPanelBarBackgroundColor, command.Alpha),
+                        command.ChartPanelShowHeader);
+                }
+                else if (!string.IsNullOrWhiteSpace(_chartRadarError))
+                {
+                    DrawText("COMBO DATA UNAVAILABLE", x + panelWidth * 0.5f, y + panelHeight * 0.45f,
+                        12f * unit, ApplyAlpha(new XnaColor(255, 135, 125), command.Alpha), centered: true);
+                    DrawFittedText(_chartRadarError, x + 14f * unit, y + panelHeight * 0.51f,
+                        panelWidth - 28f * unit, 10f * unit,
+                        ApplyAlpha(new XnaColor(195, 160, 155), command.Alpha));
+                }
+                else
+                {
+                    DrawText("ANALYZING CHART...", x + panelWidth * 0.5f, y + panelHeight * 0.48f,
+                        12f * unit, ApplyAlpha(new XnaColor(150, 185, 205), command.Alpha), centered: true);
+                }
+            }
+            else if (_chartRadarResult is { } result)
+            {
+                var metrics = new (string Name, ChartRadarMetric Metric, XnaColor Color)[]
+                {
+                    ("TAPS", result.Taps, categoryColors[0]),
+                    ("LONGS", result.Longs, categoryColors[1]),
+                    ("SLIDES", result.Slides, categoryColors[2]),
+                    ("FLICKS", result.Flicks, categoryColors[3]),
+                    ("STREAM", result.Stream, categoryColors[4]),
+                    ("TRAVEL", result.Travel, categoryColors[5])
+                };
+
+                // The 100% guide is the hexagon edge. The 200% overflow radius is
+                // fitted to this skin-provided panel size; axis labels are anchored
+                // independently and are drawn after all radar geometry.
+                var centerX = x + panelWidth * 0.5f;
+                var centerY = y + panelHeight * 0.54f;
+                const float maximumVisualFactor = 2f;
+                var availableToEdge = Math.Min(
+                    Math.Min(centerX - x, x + panelWidth - centerX),
+                    Math.Min(centerY - y, y + panelHeight - centerY));
+                var radius = Math.Max(0f, availableToEdge / maximumVisualFactor - 1.5f * unit);
+                var labelRadius = minSize * 0.34f;
+                var angles = new[]
+                {
+                    -MathF.PI * 0.5f,
+                    -MathF.PI / 6f,
+                    MathF.PI / 6f,
+                    MathF.PI * 0.5f,
+                    MathF.PI * 5f / 6f,
+                    MathF.PI * 7f / 6f
+                };
+
+                var outer = new Vector2[6];
+                var values = new Vector2[6];
+                for (var i = 0; i < metrics.Length; i++)
+                {
+                    var dx = MathF.Cos(angles[i]);
+                    var dy = MathF.Sin(angles[i]);
+                    outer[i] = new Vector2(centerX + dx * radius, centerY + dy * radius);
+                    var radiusFactor = GetRadarRadiusFactor(metrics[i].Metric.NormalizedValue);
+                    values[i] = new Vector2(centerX + dx * radius * radiusFactor,
+                        centerY + dy * radius * radiusFactor);
+                }
+
+                DrawRadarFill(values, radarFill, unit);
+
+                // Four guide levels establish the 0–100 scale; overflow is drawn
+                // outside the 100% outline and clipped visually at 200%.
+                foreach (var levelValue in new[] { 0.25f, 0.50f, 0.75f, 1.0f })
+                {
+                    var guide = new Vector2[6];
+                    for (var i = 0; i < guide.Length; i++)
+                    {
+                        guide[i] = new Vector2(
+                            centerX + MathF.Cos(angles[i]) * radius * levelValue,
+                            centerY + MathF.Sin(angles[i]) * radius * levelValue);
+                    }
+                    var color = levelValue >= 0.99f
+                        ? new XnaColor(guideColor.R, guideColor.G, guideColor.B,
+                            (byte)Math.Clamp(guideColor.A + 40, 0, 255))
+                        : guideColor;
+                    for (var i = 0; i < guide.Length; i++)
+                    {
+                        var next = (i + 1) % guide.Length;
+                        DrawRadarLine(guide[i], guide[next], color,
+                            Math.Max(1.2f, (levelValue >= 0.99f ? 1.7f : 1.25f) * unit));
+                    }
+                }
+                for (var i = 0; i < outer.Length; i++)
+                {
+                    DrawRadarLine(new Vector2(centerX, centerY), outer[i],
+                        new XnaColor(guideColor.R, guideColor.G, guideColor.B,
+                            (byte)Math.Clamp((int)MathF.Round(guideColor.A * 0.98f), 0, 255)),
+                        Math.Max(1f, 1.05f * unit));
+                }
+
+                var radarPointSize = 4.8f * unit;
+                for (var i = 0; i < values.Length; i++)
+                {
+                    var next = (i + 1) % values.Length;
+                    DrawRadarLine(values[i], values[next], radarLine, Math.Max(2f, 2.2f * unit));
+                    DrawRect(values[i].X - radarPointSize * 0.5f, values[i].Y - radarPointSize * 0.5f,
+                        radarPointSize, radarPointSize, metrics[i].Color);
+                }
+
+                // Keep labels as the final sub-layer of the native command so
+                // overflow can never paint over them. Their positions are based
+                // on the skin panel's size and can be redesigned by changing API
+                // geometry options without implementing radar drawing in Lua.
+                for (var i = 0; i < metrics.Length; i++)
+                {
+                    var labelX = centerX + MathF.Cos(angles[i]) * labelRadius;
+                    var labelY = centerY + MathF.Sin(angles[i]) * labelRadius;
+                    var value = metrics[i].Metric.NormalizedValue;
+                    var labelYTop = labelY - 16f * unit;
+                    DrawText(metrics[i].Name, labelX, labelYTop,
+                        13f * unit, metrics[i].Color, centered: true);
+                    DrawText($"{value:0}", labelX, labelYTop + 15f * unit,
+                        18f * unit, ApplyAlpha(new XnaColor(235, 243, 248), command.Alpha), centered: true);
+                    var rawUnit = metrics[i].Metric.Unit switch
+                    {
+                        "onsets/sec" => "/s",
+                        _ => "/m"
+                    };
+                    var rawLabel = metrics[i].Metric.RawValue.ToString("0.0", CultureInfo.InvariantCulture) + rawUnit;
+                    DrawText(rawLabel, labelX, labelYTop + 34f * unit,
+                        11.5f * unit, ApplyAlpha(new XnaColor(155, 178, 192), command.Alpha), centered: true);
+                }
             }
             else if (!string.IsNullOrWhiteSpace(_chartRadarError))
             {
-                DrawText("COMBO DATA UNAVAILABLE", x + size * 0.5f, y + size * 0.45f,
-                    12f * unit, new XnaColor(255, 135, 125), centered: true);
-                DrawFittedText(_chartRadarError, x + 14f * unit, y + size * 0.51f,
-                    size - 28f * unit, 10f * unit, new XnaColor(195, 160, 155));
+                DrawText("RADAR UNAVAILABLE", x + panelWidth * 0.5f, y + panelHeight * 0.43f,
+                    13f * unit, ApplyAlpha(new XnaColor(255, 135, 125), command.Alpha), centered: true);
+                DrawFittedText(_chartRadarError, x + 14f * unit, y + panelHeight * 0.50f,
+                    panelWidth - 28f * unit, 10f * unit,
+                    ApplyAlpha(new XnaColor(195, 160, 155), command.Alpha));
             }
             else
             {
-                DrawText("ANALYZING CHART...", x + size * 0.5f, y + size * 0.48f,
-                    12f * unit, new XnaColor(150, 185, 205), centered: true);
+                DrawText("ANALYZING CHART...", x + panelWidth * 0.5f, y + panelHeight * 0.48f,
+                    12f * unit, ApplyAlpha(new XnaColor(150, 185, 205), command.Alpha), centered: true);
             }
         }
-        else if (_chartRadarResult is { } result)
+        finally
         {
-            var metrics = new (string Name, ChartRadarMetric Metric, XnaColor Color)[]
-            {
-                ("TAPS", result.Taps, new XnaColor(82, 181, 255)),
-                ("LONGS", result.Longs, new XnaColor(65, 205, 168)),
-                ("SLIDES", result.Slides, new XnaColor(177, 130, 255)),
-                ("FLICKS", result.Flicks, new XnaColor(255, 173, 82)),
-                ("STREAM", result.Stream, new XnaColor(255, 105, 145)),
-                ("TRAVEL", result.Travel, new XnaColor(230, 205, 85))
-            };
-
-            // Use nearly the full cover area; the metadata now lives below it.
-            var centerX = x + size * 0.5f;
-            var centerY = y + size * 0.54f;
-            // Reserve a clear strip for the panel title and keep all axis labels
-            // inside the square backing instead of crowding its edges.
-            var radius = size * 0.225f;
-            var labelRadius = size * 0.34f;
-            var angles = new[]
-            {
-                -MathF.PI * 0.5f,
-                -MathF.PI / 6f,
-                MathF.PI / 6f,
-                MathF.PI * 0.5f,
-                MathF.PI * 5f / 6f,
-                MathF.PI * 7f / 6f
-            };
-
-            var outer = new Vector2[6];
-            var values = new Vector2[6];
-            for (var i = 0; i < metrics.Length; i++)
-            {
-                var dx = MathF.Cos(angles[i]);
-                var dy = MathF.Sin(angles[i]);
-                outer[i] = new Vector2(centerX + dx * radius, centerY + dy * radius);
-                var normalized = (float)(Math.Clamp(metrics[i].Metric.NormalizedValue, 0.0, 100.0) / 100.0);
-                values[i] = new Vector2(centerX + dx * radius * normalized, centerY + dy * radius * normalized);
-            }
-
-            // A subtle filled area makes the radar profile readable at a glance.
-            DrawRadarFill(values, new XnaColor(42, 179, 174, 70), unit);
-
-            // Four clearly visible hexagonal guides, plus spokes, establish a readable 0–100 scale.
-            foreach (var levelValue in new[] { 0.25f, 0.50f, 0.75f, 1.0f })
-            {
-                var guide = new Vector2[6];
-                for (var i = 0; i < guide.Length; i++)
-                {
-                    guide[i] = new Vector2(
-                        centerX + MathF.Cos(angles[i]) * radius * levelValue,
-                        centerY + MathF.Sin(angles[i]) * radius * levelValue);
-                }
-                for (var i = 0; i < guide.Length; i++)
-                {
-                    var next = (i + 1) % guide.Length;
-                    DrawRadarLine(guide[i], guide[next],
-                        new XnaColor((byte)115, (byte)153, (byte)174, levelValue >= 0.99f ? (byte)235 : (byte)195),
-                        Math.Max(1.2f, (levelValue >= 0.99f ? 1.7f : 1.25f) * unit));
-                }
-            }
-            for (var i = 0; i < outer.Length; i++)
-            {
-                DrawRadarLine(new Vector2(centerX, centerY), outer[i],
-                    new XnaColor(93, 128, 149, 190), Math.Max(1f, 1.05f * unit));
-            }
-
-            // The data polygon has a bright continuous outline and vertex markers.
-            var radarColor = new XnaColor(76, 218, 205, 245);
-            for (var i = 0; i < values.Length; i++)
-            {
-                var next = (i + 1) % values.Length;
-                DrawRadarLine(values[i], values[next], radarColor, Math.Max(2f, 2.2f * unit));
-                DrawRect(values[i].X - 2.4f * unit, values[i].Y - 2.4f * unit,
-                    4.8f * unit, 4.8f * unit, metrics[i].Color);
-            }
-
-            // Axis names, normalized values, and the original raw measurement
-            // remain visible so this panel stays useful for reading the radar.
-            for (var i = 0; i < metrics.Length; i++)
-            {
-                var labelX = centerX + MathF.Cos(angles[i]) * labelRadius;
-                var labelY = centerY + MathF.Sin(angles[i]) * labelRadius;
-                var value = metrics[i].Metric.NormalizedValue;
-                var labelYTop = labelY - 16f * unit;
-                DrawText(metrics[i].Name, labelX, labelYTop,
-                    13f * unit, metrics[i].Color, centered: true);
-                DrawText($"{value:0}", labelX, labelYTop + 15f * unit,
-                    18f * unit, new XnaColor(235, 243, 248), centered: true);
-                var rawUnit = metrics[i].Metric.Unit switch
-                {
-                    "onsets/sec" => "/s",
-                    _ => "/m"
-                };
-                var rawLabel = metrics[i].Metric.RawValue.ToString("0.0", CultureInfo.InvariantCulture) + rawUnit;
-                DrawText(rawLabel, labelX, labelYTop + 34f * unit,
-                    11.5f * unit, new XnaColor(155, 178, 192), centered: true);
-            }
+            _spriteBatch.End();
         }
-        else if (!string.IsNullOrWhiteSpace(_chartRadarError))
-        {
-            DrawText("RADAR UNAVAILABLE", x + size * 0.5f, y + size * 0.43f,
-                13f * unit, new XnaColor(255, 135, 125), centered: true);
-            DrawFittedText(_chartRadarError, x + 14f * unit, y + size * 0.50f,
-                size - 28f * unit, 10f * unit, new XnaColor(195, 160, 155));
-        }
-        else
-        {
-            DrawText("ANALYZING CHART...", x + size * 0.5f, y + size * 0.48f,
-                12f * unit, new XnaColor(150, 185, 205), centered: true);
-        }
-
-        _spriteBatch.End();
     }
 
-    private void DrawComboDistributionPanel(ChartComboDistribution distribution,
-        float x, float y, float size, float unit)
+    private static float GetRadarRadiusFactor(double percentage)
+    {
+        if (!double.IsFinite(percentage) || percentage <= 0.0)
+            return 0f;
+
+        // Keep the 100% hexagon edge fixed. Overflow is linear and unccompressed
+        // up to 200%, where the graphic is capped at twice the hexagon radius.
+        // The displayed value is deliberately not capped by this visual limit.
+        return (float)(Math.Min(percentage, 200.0) / 100.0);
+    }
+
+    private void DrawComboDistributionPanel(
+        ChartComboDistribution distribution,
+        float x,
+        float y,
+        float width,
+        float height,
+        float unit,
+        XnaColor[] categoryColors,
+        XnaColor barBackgroundColor,
+        bool showHeader)
     {
         var items = new (string Label, int Count, XnaColor Color)[]
         {
-            ("TAPS", distribution.Taps, new XnaColor(96, 165, 250)),
-            ("LONGS", distribution.Longs, new XnaColor(34, 185, 129)),
-            ("SLIDES", distribution.Slides, new XnaColor(250, 204, 21)),
-            ("FLICKS", distribution.Flicks, new XnaColor(255, 77, 184)),
+            ("TAPS", distribution.Taps, categoryColors[0]),
+            ("LONGS", distribution.Longs, categoryColors[1]),
+            ("SLIDES", distribution.Slides, categoryColors[2]),
+            ("FLICKS", distribution.Flicks, categoryColors[3]),
         };
         var total = Math.Max(0, distribution.Total);
-
-        // Four full-width horizontal bars are easier to compare than a radar
-        // polygon when categories are evenly distributed. The colored fill
-        // represents each category's share of the intended-route combo total.
         var rowLeft = x + 14f * unit;
-        var rowWidth = size - 28f * unit;
-        var contentTop = y + 43f * unit;
-        var contentBottom = y + size - 13f * unit;
+        var rowWidth = width - 28f * unit;
+        var contentTop = y + (showHeader ? 43f : 13f) * unit;
+        var contentBottom = y + height - 13f * unit;
         var rowGap = 7f * unit;
         var slotHeight = (contentBottom - contentTop - rowGap * (items.Length - 1)) / items.Length;
         var barHeight = Math.Min(39f * unit, slotHeight);
@@ -1757,37 +1840,29 @@ public sealed class SongSelectMenu : IDisposable
         {
             var rowY = contentTop + i * (slotHeight + rowGap) + (slotHeight - barHeight) * 0.5f;
             var percentage = total > 0 ? Math.Clamp(items[i].Count * 100.0 / total, 0.0, 100.0) : 0.0;
-
-            // Draw a quiet track first, then a translucent category-colored
-            // fill proportional to the category's share of all combos.
-            DrawRect(rowLeft, rowY, rowWidth, barHeight,
-                new XnaColor(27, 40, 53, 225));
+            DrawRect(rowLeft, rowY, rowWidth, barHeight, barBackgroundColor);
             var fillWidth = rowWidth * (float)(percentage / 100.0);
             if (fillWidth > 0.5f)
             {
                 var fillColor = items[i].Color;
                 DrawRect(rowLeft, rowY, fillWidth, barHeight,
-                    new XnaColor(fillColor.R, fillColor.G, fillColor.B, (byte)105));
+                    new XnaColor(fillColor.R, fillColor.G, fillColor.B,
+                        (byte)Math.Clamp((int)MathF.Round(fillColor.A * 0.42f), 0, 255)));
             }
-
-            // A narrow solid color marker keeps the category recognizable even
-            // when its value is zero and therefore has no proportional fill.
             DrawRect(rowLeft, rowY, Math.Max(2f, 3f * unit), barHeight, items[i].Color);
             DrawBorder(rowLeft, rowY, rowWidth, barHeight,
                 new XnaColor(104, 137, 158, 150), Math.Max(1f, unit));
 
             var textY = rowY + (barHeight - labelSize) * 0.5f;
-            DrawText(items[i].Label, rowLeft + 11f * unit, textY,
-                labelSize, new XnaColor(245, 248, 251));
-
+            DrawText(items[i].Label, rowLeft + 11f * unit, textY, labelSize,
+                new XnaColor((byte)245, (byte)248, (byte)251, barBackgroundColor.A));
             var valueText = $"{items[i].Count.ToString("N0", CultureInfo.InvariantCulture)}  ({percentage:0.#}%)";
             var valueNativeSize = UnicodeTextRenderer.MeasureString(_font, valueText);
             var valueScale = valueNativeSize.Y <= 0f ? 1f : valueSize / valueNativeSize.Y;
             var valueWidth = valueNativeSize.X * valueScale;
             var valueX = rowLeft + rowWidth - 10f * unit - valueWidth;
             var valueY = rowY + (barHeight - valueSize) * 0.5f;
-            DrawText(valueText, valueX, valueY, valueSize,
-                new XnaColor(245, 248, 251));
+            DrawText(valueText, valueX, valueY, valueSize, new XnaColor((byte)245, (byte)248, (byte)251, (byte)Math.Clamp(barBackgroundColor.A + 30, 0, 255)));
         }
     }
 
@@ -3973,28 +4048,26 @@ public sealed class SongSelectMenu : IDisposable
 
         var current = Math.Clamp(_selectedSongIndex, 0, _visibleSongs.Count - 1);
         var columns = GalleryColumnCount();
-        var col = current % columns;
-        var row = current / columns;
+        var target = current;
 
         if (columnDelta != 0)
         {
-            col += columnDelta;
-            while (col < 0)
-                col += columns;
-            while (col >= columns)
-                col -= columns;
+            // Left/right follow the song list's linear order. Crossing a row edge
+            // continues into the adjacent row instead of wrapping within this row.
+            target = Math.Clamp(current + columnDelta, 0, _visibleSongs.Count - 1);
         }
-
-        if (rowDelta != 0)
-            row = Math.Max(0, row + rowDelta);
-
-        var target = row * columns + col;
-        if (target >= _visibleSongs.Count)
+        else if (rowDelta != 0)
         {
-            if (rowDelta > 0)
-                target = _visibleSongs.Count - 1;
-            else
-                return;
+            var col = current % columns;
+            var row = Math.Max(0, current / columns + rowDelta);
+            target = row * columns + col;
+            if (target >= _visibleSongs.Count)
+            {
+                if (rowDelta > 0)
+                    target = _visibleSongs.Count - 1;
+                else
+                    return;
+            }
         }
 
         _selectedSongIndex = Math.Clamp(target, 0, _visibleSongs.Count - 1);
@@ -4571,7 +4644,13 @@ public sealed class SongSelectMenu : IDisposable
             searchSelectionWidth,
             autoplay: _gameConfig.Autoplay,
             gauge: GameConfig.NormalizeGaugeType(_gameConfig.Gauge),
-            scrollMode: GameConfig.NormalizeScrollMode(_gameConfig.ScrollMode));
+            scrollMode: GameConfig.NormalizeScrollMode(_gameConfig.ScrollMode),
+            chartPanelMode: _chartPanelMode switch
+            {
+                ChartPanelMode.DifficultyRadar => "radar",
+                ChartPanelMode.ComboDistribution => "combo",
+                _ => "hidden",
+            });
     }
 
     private SkinAssetHandle? TryGetArtworkHandle(string? path)
@@ -5471,6 +5550,7 @@ public sealed class SongSelectMenu : IDisposable
                 _graphics.Viewport.Height,
                 skinSparklesEffect: _skinSparklesEffect,
                 skinQuad3DEffect: _skinQuad3DEffect);
+            replacement.SongSelectChartPanelRenderer = DrawChartPanelFromSkin;
 
             var previous = _skinRuntime;
             _skinDirectory = normalizedDirectory;
@@ -5508,6 +5588,7 @@ public sealed class SongSelectMenu : IDisposable
         {
             var gameConfigPath = UserDataPaths.GameConfigPath;
             _skinRuntime = new SkinRuntime(_skinDirectory, _graphics, "songSelect.lua", _gameConfig, gameConfigPath, _graphics.Viewport.Width, _graphics.Viewport.Height, skinSparklesEffect: _skinSparklesEffect, skinQuad3DEffect: _skinQuad3DEffect);
+            _skinRuntime.SongSelectChartPanelRenderer = DrawChartPanelFromSkin;
             return true;
         }
         catch (Exception ex)

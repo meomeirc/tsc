@@ -32,20 +32,22 @@ internal sealed record ChartRadarResult(
 /// </summary>
 internal static class ChartRadarAnalyzer
 {
-    private const double TapReferencePerMinute = 350.0;
-    private const double LongReferencePerMinute = 42.0;
-    private const double SlideReferencePerMinute = 50.0;
-    private const double FlickReferencePerMinute = 35.0;
-    private const double StreamReferencePerSecond = 10.0;
-    private const double TravelReferencePerMinute = 770.0;
+    // TAPS, LONGS, SLIDES and FLICKS use the same combo-per-minute unit and the
+    // exact same intended-route counts as Song Select's Combo Distribution. Each
+    // axis has its own stock-calibrated reference (TAPS 390, LONGS 300, SLIDES
+    // 250, FLICKS 50 combos/min) so one category does not inherit another's
+    // typical density. The skin never needs to implement this.
+    // SC charts are excluded, including SC patterns labelled level 10.
+    // STREAM and TRAVEL remain independent timing measurements with their own
+    // stock references. Values are unbounded; the renderer alone caps overflow
+    // graphics at 200%. Keep calibration values centralized here.
+    private const double TapsReferencePerMinute = 390.0;
+    private const double LongsReferencePerMinute = 300.0;
+    private const double SlidesReferencePerMinute = 250.0;
+    private const double FlicksReferencePerMinute = 50.0;
+    private const double StreamReferencePerSecond = 11.0;
+    private const double TravelReferencePerMinute = 990.0;
     private const double StreamWindowSeconds = 2.0;
-
-    private sealed class SlideComponent
-    {
-        public int EdgeCount;
-        public int FirstTick = int.MaxValue;
-        public int LastTick = int.MinValue;
-    }
 
     private readonly record struct TravelCandidate(
         ChartEvent Event,
@@ -109,25 +111,15 @@ internal static class ChartRadarAnalyzer
             .ThenBy(ev => ev.Track)
             .ThenBy(ev => ev.EventIndex)
             .ToArray();
-        var activeSet = new HashSet<ChartEvent>(activeEvents, ReferenceEqualityComparer.Instance);
-
-        var tapCount = activeEvents.Count(ev => ev.NoteType == NoteType.Single && !ev.IsFlick && !ev.IsSuperFlick);
-        var tapRate = tapCount / minutes;
-
-        var longUnits = 0.0;
-        foreach (var ev in activeEvents.Where(ev => ev.IsHoldNote))
-        {
-            var endTick = Math.Min((long)lastPlayableTick, ev.EndTick);
-            var noteDuration = Math.Max(0.0, tempo.TickToSeconds(endTick) - tempo.TickToSeconds(ev.Tick));
-            longUnits += 1.0 + Math.Min(noteDuration, 2.0) / 2.0;
-        }
-        var longRate = longUnits / minutes;
-
-        var slideUnits = CalculateSlideUnits(chart, activeSet, lastPlayableTick, tempo);
-        var slideRate = slideUnits / minutes;
-
-        var flickCount = activeEvents.Count(ev => ev.IsFlick || ev.IsSuperFlick);
-        var flickRate = flickCount / minutes;
+        // Use the exact same intended-route combo counts as the Combo
+        // Distribution panel, then divide each category by playable duration.
+        // Per-category stock references normalize the timing density without
+        // changing the underlying category counts or their Combo Distribution.
+        var comboDistribution = CalculateComboDistribution(chart, activeEvents, timeline, tempo);
+        var tapRate = comboDistribution.Taps / minutes;
+        var longRate = comboDistribution.Longs / minutes;
+        var slideRate = comboDistribution.Slides / minutes;
+        var flickRate = comboDistribution.Flicks / minutes;
 
         // Stream density is based on actual tap onsets. A LinkHead is tapped,
         // but each LinkTail is only a chain destination and must not add an onset.
@@ -141,15 +133,14 @@ internal static class ChartRadarAnalyzer
 
         var travelUnits = CalculateTravelUnits(activeEvents, tempo);
         var travelRate = travelUnits / minutes;
-        var comboDistribution = CalculateComboDistribution(chart, activeEvents, timeline, tempo);
 
         return new ChartRadarResult(
             durationSeconds,
             activeEvents.Length,
-            Metric(tapRate, TapReferencePerMinute, "taps/min"),
-            Metric(longRate, LongReferencePerMinute, "hold units/min"),
-            Metric(slideRate, SlideReferencePerMinute, "slide units/min"),
-            Metric(flickRate, FlickReferencePerMinute, "flicks/min"),
+            Metric(tapRate, TapsReferencePerMinute, "combos/min"),
+            Metric(longRate, LongsReferencePerMinute, "combos/min"),
+            Metric(slideRate, SlidesReferencePerMinute, "combos/min"),
+            Metric(flickRate, FlicksReferencePerMinute, "combos/min"),
             Metric(streamRate, StreamReferencePerSecond, "onsets/sec"),
             Metric(travelRate, TravelReferencePerMinute, "travel units/min"),
             comboDistribution);
@@ -314,68 +305,6 @@ internal static class ChartRadarAnalyzer
         return active;
     }
 
-    private static double CalculateSlideUnits(
-        AresChart chart,
-        HashSet<ChartEvent> activeEvents,
-        int endTick,
-        TempoMap tempo)
-    {
-        var edges = chart.Links
-            .Where(link => link.Head.Tick <= endTick && link.Tail.Tick <= endTick &&
-                activeEvents.Contains(link.Head) && activeEvents.Contains(link.Tail))
-            .ToArray();
-        if (edges.Length == 0)
-            return 0.0;
-
-        var parents = new Dictionary<ChartEvent, ChartEvent>(ReferenceEqualityComparer.Instance);
-        ChartEvent Find(ChartEvent node)
-        {
-            if (!parents.TryGetValue(node, out var parent))
-            {
-                parents[node] = node;
-                return node;
-            }
-            if (ReferenceEquals(parent, node))
-                return node;
-            var root = Find(parent);
-            parents[node] = root;
-            return root;
-        }
-        void Union(ChartEvent a, ChartEvent b)
-        {
-            var rootA = Find(a);
-            var rootB = Find(b);
-            if (!ReferenceEquals(rootA, rootB))
-                parents[rootB] = rootA;
-        }
-
-        foreach (var edge in edges)
-            Union(edge.Head, edge.Tail);
-
-        var components = new Dictionary<ChartEvent, SlideComponent>(ReferenceEqualityComparer.Instance);
-        foreach (var edge in edges)
-        {
-            var root = Find(edge.Head);
-            if (!components.TryGetValue(root, out var component))
-            {
-                component = new SlideComponent();
-                components.Add(root, component);
-            }
-            component.EdgeCount++;
-            component.FirstTick = Math.Min(component.FirstTick, Math.Min(edge.Head.Tick, edge.Tail.Tick));
-            component.LastTick = Math.Max(component.LastTick, Math.Max(edge.Head.Tick, edge.Tail.Tick));
-        }
-
-        var total = 0.0;
-        foreach (var component in components.Values)
-        {
-            var duration = Math.Max(0.0,
-                tempo.TickToSeconds(component.LastTick) - tempo.TickToSeconds(component.FirstTick));
-            total += 1.0 + 0.5 * Math.Max(0, component.EdgeCount - 1) + 0.25 * Math.Min(duration, 4.0);
-        }
-        return total;
-    }
-
     private static double CalculateStreamP90(int[] onsetTicks, TempoMap tempo)
     {
         if (onsetTicks.Length == 0)
@@ -481,7 +410,9 @@ internal static class ChartRadarAnalyzer
     {
         if (!double.IsFinite(raw) || raw < 0.0)
             raw = 0.0;
-        var normalized = reference > 0.0 ? Math.Clamp(raw / reference * 100.0, 0.0, 100.0) : 0.0;
+        // Keep the true percentage, including values above 100. The renderer
+        // maps overflow beyond the 100% guide into its visible outer band.
+        var normalized = reference > 0.0 ? raw / reference * 100.0 : 0.0;
         return new ChartRadarMetric(raw, normalized, unit);
     }
 }

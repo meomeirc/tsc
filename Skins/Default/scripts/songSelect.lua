@@ -22,6 +22,28 @@ local DIFF = {
     { name = "XT", key = "xt_level", color = "#9560C7" },
 }
 
+-- Native chart panel renderer: the skin owns the placement, draw layer and palette;
+-- C# keeps the chart analysis, combo counting and radar geometry.
+local CHART_PANEL_STYLE = {
+    background_color = { r = 12, g = 20, b = 29, a = 204 },
+    border_color = { r = 96, g = 137, b = 160, a = 238 },
+    header_color = { r = 239, g = 245, b = 250, a = 255 },
+    divider_color = { r = 125, g = 157, b = 178, a = 155 },
+    radar_fill_color = { r = 42, g = 179, b = 174, a = 70 },
+    radar_line_color = { r = 76, g = 218, b = 205, a = 245 },
+    guide_color = { r = 115, g = 153, b = 174, a = 195 },
+    bar_background_color = { r = 27, g = 40, b = 53, a = 225 },
+    taps_color = "#52B5FF",
+    longs_color = "#41CDA8",
+    slides_color = "#B182FF",
+    flicks_color = "#FFAD52",
+    stream_color = "#FF6991",
+    travel_color = "#E6CD55",
+    border_width = 1.6,
+    header_size = 15,
+    background_bleed = 2,
+}
+
 -- SONG SELECT LAYOUT ---------------------------------------------------------
 local LAYOUT = {
     selected_panel = {
@@ -33,7 +55,7 @@ local LAYOUT = {
         artist = { x = 29, y = 103, anchor = "left", size = 32, max_chars = 34 },
         bpm_label = { right = 142, y = 104, anchor = "left", size = 24 },
         bpm_value = { right = 94, y = 104, anchor = "left", size = 42 },
-        tabs = { anchor = "top-left", top_gap = 5, width = 131, height = 61, gap = 2, label_y = 31, label_size = 28 },
+        tabs = { anchor = "top-left", top_gap = 5, width = 131, height = 72, gap = 2, label_y = 36, label_size = 34 },
         score = {
             anchor = "center", height = 205,
             label_size = 42,
@@ -41,17 +63,17 @@ local LAYOUT = {
             label_value_gap = 2, value_size = 90,
         },
 -- Minimum breathing room reserved for the ACC/GRADE/CLEAR block.
-        min_stats_height = 115,
+        min_stats_height = 155,
         stats = {
             anchor = "top-left",
             acc_x = 27,
-            grade_x = 218,
-            clear_x = 348,
-            label_y = 33,
-            value_y = 80,
-            grade_value_y = 80,
-            clear_value_y = 80,
-            label_size = 24, accuracy_size = 50, grade_size = 50, clear_size = 50,
+            grade_x = 210,
+            clear_x = 370,
+            label_y = 42,
+            value_y = 104,
+            grade_value_y = 104,
+            clear_value_y = 104,
+            label_size = 31, accuracy_size = 64, grade_size = 64, clear_size = 62,
         },
     },
     card = {
@@ -89,9 +111,9 @@ local LAYOUT = {
             sort = { weight = 0.38 },
             order = { weight = 0.24 },
         },
-        label_y = 21, label_size = 16,
-        value_y = 43, value_size = 22,
-        underline_y = 69, underline_height = 3,
+        label_y = 20, label_size = 20,
+        value_y = 48, value_size = 28,
+        underline_y = 82, underline_height = 3,
     },
     popups = {
         footer_gap = 8, row_height = 38,
@@ -178,7 +200,7 @@ function song_select_layout_metrics(width, height)
 -- The details column is one responsive stack.
     local panel_stack_height = P.art_inset * 2 + P.art_max_size + P.metadata_height
         + P.tabs.top_gap + P.tabs.height + P.score.height
-    local stats_min_height = P.min_stats_height or 115
+    local stats_min_height = P.min_stats_height or 155
     local panel_scale = math.min(scale, viewport_height / math.max(1,
         P.y + panel_stack_height + stats_min_height))
     -- Keep the full selected-song strip more compact to reclaim horizontal
@@ -1323,6 +1345,45 @@ function render()
     })
 
     draw_selected_panel(selected, metrics, scale, viewport_w, viewport_h)
+
+    -- The selected chart panel is a single native draw command. Skins can move it,
+    -- resize it, restyle it and choose its layer without implementing radar maths.
+    if selected ~= nil and type(draw.chart_panel) == "function" then
+        draw.chart_panel({
+            id = "selected_chart_panel",
+            x = metrics.artwork_x,
+            y = metrics.artwork_y,
+            width = metrics.artwork_size,
+            height = metrics.artwork_size,
+            mode = "current",
+            layer = 25,
+            clickable = true,
+            hitbox = {
+                id = "selected_chart_panel_toggle",
+                action = "cycle_chart_panel",
+                hit_test_priority = 50,
+            },
+            header = true,
+            background_color = CHART_PANEL_STYLE.background_color,
+            border_color = CHART_PANEL_STYLE.border_color,
+            header_color = CHART_PANEL_STYLE.header_color,
+            divider_color = CHART_PANEL_STYLE.divider_color,
+            radar_fill_color = CHART_PANEL_STYLE.radar_fill_color,
+            radar_line_color = CHART_PANEL_STYLE.radar_line_color,
+            guide_color = CHART_PANEL_STYLE.guide_color,
+            bar_background_color = CHART_PANEL_STYLE.bar_background_color,
+            taps_color = CHART_PANEL_STYLE.taps_color,
+            longs_color = CHART_PANEL_STYLE.longs_color,
+            slides_color = CHART_PANEL_STYLE.slides_color,
+            flicks_color = CHART_PANEL_STYLE.flicks_color,
+            stream_color = CHART_PANEL_STYLE.stream_color,
+            travel_color = CHART_PANEL_STYLE.travel_color,
+            border_width = CHART_PANEL_STYLE.border_width,
+            header_size = CHART_PANEL_STYLE.header_size,
+            background_bleed = CHART_PANEL_STYLE.background_bleed,
+        })
+    end
+
     draw_gallery(selected, metrics, scale, viewport_w, viewport_h)
     if not song_select.loading and (tonumber(song_select.song_count or 0) or 0) == 0 then
         local search = tostring(song_select.search or "")

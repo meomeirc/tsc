@@ -1649,6 +1649,7 @@ public enum SkinDrawCommandKind
     Line,
     LineBatch,
     WaveformBatch,
+    ChartPanel,
     Shadow,
     Quad3D,
     Sparkles
@@ -1785,6 +1786,29 @@ public sealed class SkinDrawCommand
     public SkinSparkleSettings? Sparkles { get; internal set; }
     public SkinSparkleAnimation? SparkleAnimation { get; internal set; }
     public SkinQuad3DWidth? Quad3DWidth { get; internal set; }
+    // Song Select chart panel is a specialized native renderer command. The skin
+    // chooses its placement, layer, mode and palette while C# retains chart analysis
+    // and all radar/combo geometry.
+    public string ChartPanelMode { get; internal set; } = "current";
+    public string? ChartPanelHeaderText { get; internal set; }
+    public bool ChartPanelShowHeader { get; internal set; } = true;
+    public XnaColor ChartPanelBackgroundColor { get; internal set; } = new(12, 20, 29, 204);
+    public XnaColor ChartPanelBorderColor { get; internal set; } = new(96, 137, 160, 238);
+    public XnaColor ChartPanelHeaderColor { get; internal set; } = new(239, 245, 250);
+    public XnaColor ChartPanelDividerColor { get; internal set; } = new(125, 157, 178, 155);
+    public XnaColor ChartPanelRadarFillColor { get; internal set; } = new(42, 179, 174, 70);
+    public XnaColor ChartPanelRadarLineColor { get; internal set; } = new(76, 218, 205, 245);
+    public XnaColor ChartPanelGuideColor { get; internal set; } = new(115, 153, 174, 195);
+    public XnaColor ChartPanelBarBackgroundColor { get; internal set; } = new(27, 40, 53, 225);
+    public XnaColor ChartPanelTapsColor { get; internal set; } = new(82, 181, 255);
+    public XnaColor ChartPanelLongsColor { get; internal set; } = new(65, 205, 168);
+    public XnaColor ChartPanelSlidesColor { get; internal set; } = new(177, 130, 255);
+    public XnaColor ChartPanelFlicksColor { get; internal set; } = new(255, 173, 82);
+    public XnaColor ChartPanelStreamColor { get; internal set; } = new(255, 105, 145);
+    public XnaColor ChartPanelTravelColor { get; internal set; } = new(230, 205, 85);
+    public float ChartPanelBorderWidth { get; internal set; } = 1.6f;
+    public float ChartPanelHeaderSize { get; internal set; } = 15f;
+    public float ChartPanelBackgroundBleed { get; internal set; } = 2f;
     // Used only by sampled F8 profiling to attribute actual 3D render cost.
     internal int DebugProfileGroup { get; set; }
     internal void Reset()
@@ -1845,6 +1869,26 @@ public sealed class SkinDrawCommand
         Sparkles = null;
         SparkleAnimation = null;
         Quad3DWidth = null;
+        ChartPanelMode = "current";
+        ChartPanelHeaderText = null;
+        ChartPanelShowHeader = true;
+        ChartPanelBackgroundColor = new XnaColor(12, 20, 29, 204);
+        ChartPanelBorderColor = new XnaColor(96, 137, 160, 238);
+        ChartPanelHeaderColor = new XnaColor(239, 245, 250);
+        ChartPanelDividerColor = new XnaColor(125, 157, 178, 155);
+        ChartPanelRadarFillColor = new XnaColor(42, 179, 174, 70);
+        ChartPanelRadarLineColor = new XnaColor(76, 218, 205, 245);
+        ChartPanelGuideColor = new XnaColor(115, 153, 174, 195);
+        ChartPanelBarBackgroundColor = new XnaColor(27, 40, 53, 225);
+        ChartPanelTapsColor = new XnaColor(82, 181, 255);
+        ChartPanelLongsColor = new XnaColor(65, 205, 168);
+        ChartPanelSlidesColor = new XnaColor(177, 130, 255);
+        ChartPanelFlicksColor = new XnaColor(255, 173, 82);
+        ChartPanelStreamColor = new XnaColor(255, 105, 145);
+        ChartPanelTravelColor = new XnaColor(230, 205, 85);
+        ChartPanelBorderWidth = 1.6f;
+        ChartPanelHeaderSize = 15f;
+        ChartPanelBackgroundBleed = 2f;
         DebugProfileGroup = 0;
     }
 }
@@ -2056,6 +2100,11 @@ public sealed class SkinRuntime : IDisposable
     public int DebugLastQuad3DBatchedRuns { get; private set; }
     public int DebugLastQuad3DBatchedQuads { get; private set; }
     public int DebugLastQuad3DDrawCallsSaved { get; private set; }
+    /// <summary>
+    /// Optional native renderer for the draw.chart_panel command. Song Select sets
+    /// this callback so skin ordering controls when the specialized panel is drawn.
+    /// </summary>
+    public Action<SkinDrawCommand, int, int>? SongSelectChartPanelRenderer { get; set; }
     private int _skinQuad3DCameraWidth = -1;
     private int _skinQuad3DCameraHeight = -1;
     private float _skinQuad3DCameraDistance;
@@ -3774,7 +3823,8 @@ public sealed class SkinRuntime : IDisposable
         float searchSelectionWidth = 0f,
         bool autoplay = false,
         string gauge = "hard",
-        string scrollMode = "xmod")
+        string scrollMode = "xmod",
+        string chartPanelMode = "hidden")
     {
         if (_songSelect is null || _script is null)
             return;
@@ -3843,6 +3893,7 @@ public sealed class SkinRuntime : IDisposable
         _songSelect.Set("autoplay", DynValue.NewBoolean(autoplay));
         _songSelect.Set("gauge", DynValue.NewString(GameConfig.NormalizeGaugeType(gauge)));
         _songSelect.Set("scroll_mode", DynValue.NewString(GameConfig.NormalizeScrollMode(scrollMode)));
+        _songSelect.Set("chart_panel_mode", DynValue.NewString(chartPanelMode ?? "hidden"));
         _songSelect.Set("edit_confirm_open", DynValue.NewBoolean(editConfirmOpen));
         _songSelect.Set("error", DynValue.NewString(error ?? string.Empty));
         _songSelect.Set("loading", DynValue.NewBoolean(loading));
@@ -4049,6 +4100,29 @@ public sealed class SkinRuntime : IDisposable
                     if (clipped.Width <= 0 || clipped.Height <= 0)
                         continue;
                     commandScissor = clipped;
+                }
+
+                if (command.Kind == SkinDrawCommandKind.ChartPanel)
+                {
+                    if (batchOpen)
+                    {
+                        spriteBatch.End();
+                        batchOpen = false;
+                        currentBlend = null;
+                        currentSampler = null;
+                        currentScissor = null;
+                    }
+
+                    _graphics.ScissorRectangle = commandScissor ?? originalScissor;
+                    try
+                    {
+                        SongSelectChartPanelRenderer?.Invoke(command, width, height);
+                    }
+                    finally
+                    {
+                        _graphics.ScissorRectangle = originalScissor;
+                    }
+                    continue;
                 }
 
                 if (command.Kind == SkinDrawCommandKind.WaveformBatch)
@@ -4312,6 +4386,7 @@ public sealed class SkinRuntime : IDisposable
             SkinDrawCommandKind.LineBatch => command.LineSegments is not null && command.LineSegmentCount > 0,
             SkinDrawCommandKind.WaveformBatch => command.WaveformLevels is { Length: > 0 } &&
                 command.WaveformPrefix is { Length: > 1 } && command.Size.X > 0f && command.Size.Y > 0f,
+            SkinDrawCommandKind.ChartPanel => command.Size.X > 0f && command.Size.Y > 0f,
             SkinDrawCommandKind.Shadow => command.BoxShadow is not null && command.Size.X > 0f && command.Size.Y > 0f,
             SkinDrawCommandKind.Quad3D => command.Size.X > 0f && command.Size.Y > 0f,
             SkinDrawCommandKind.Sparkles => command.Sparkles is not null || command.SparkleAnimation is not null,
@@ -6962,6 +7037,7 @@ public sealed class SkinRuntime : IDisposable
         // Specialized chart-editor waveform path: resolves the cached native audio
         // envelope and renders every visible column in one triangle-list submission.
         table.Set("waveform_batch_fast", DynValue.NewCallback(DrawWaveformBatchFast));
+        table.Set("chart_panel", DynValue.NewCallback(DrawChartPanel));
         table.Set("shadow", DynValue.NewCallback(DrawShadow));
         return table;
     }
@@ -8165,6 +8241,193 @@ public sealed class SkinRuntime : IDisposable
         return DynValue.Nil;
     }
 
+    /// <summary>
+    /// Queues the native Song Select radar/combo panel at the skin's chosen layer.
+    /// Lua controls placement and presentation; chart loading, analysis and graph
+    /// rendering remain in the native renderer.
+    /// </summary>
+    private DynValue DrawChartPanel(ScriptExecutionContext _, CallbackArguments args)
+    {
+        var options = GetOptions(args, 0);
+        var size = GetNumber(options, "size", 0f);
+        var width = GetNumber(options, "width", size);
+        var height = GetNumber(options, "height", size);
+        if (!float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f)
+            throw new ScriptRuntimeException("draw.chart_panel(options) expects positive width/height or size");
+
+        var mode = GetString(options, "mode", "current").Trim().ToLowerInvariant();
+        if (mode is not ("current" or "radar" or "combo" or "combo_distribution" or "hidden"))
+            throw new ScriptRuntimeException("draw.chart_panel mode must be current, radar, combo, or hidden");
+
+        var headerValue = options.Get("header");
+        var showHeader = headerValue.Type == DataType.Boolean
+            ? headerValue.Boolean
+            : GetBool(options, "show_header", true);
+        var headerText = headerValue.Type == DataType.String
+            ? headerValue.String
+            : GetOptionalString(options, "header_text");
+
+        var command = AcquireDrawCommand();
+        command.Kind = SkinDrawCommandKind.ChartPanel;
+        command.Id = GetOptionalString(options, "id")?.Trim();
+        command.ParentId = GetOptionalString(options, "parent")?.Trim();
+        if (string.IsNullOrWhiteSpace(command.ParentId))
+            command.ParentId = null;
+        command.Position = GetPosition(options);
+        command.Anchor = GetAnchor(options);
+        command.Size = new Vector2(width, height);
+        command.Alpha = Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f);
+        command.Layer = (int)Math.Clamp(Math.Round(GetNumber(options, "layer", 0f)), int.MinValue, int.MaxValue);
+        command.ScissorClip = GetScissorClip(options);
+        command.ChartPanelMode = mode;
+        command.ChartPanelHeaderText = headerText;
+        command.ChartPanelShowHeader = showHeader;
+        command.ChartPanelBackgroundColor = GetColor(options, "background_color", command.ChartPanelBackgroundColor);
+        command.ChartPanelBorderColor = GetColor(options, "border_color", command.ChartPanelBorderColor);
+        command.ChartPanelHeaderColor = GetColor(options, "header_color", command.ChartPanelHeaderColor);
+        command.ChartPanelDividerColor = GetColor(options, "divider_color", command.ChartPanelDividerColor);
+        command.ChartPanelRadarFillColor = GetColor(options, "radar_fill_color", command.ChartPanelRadarFillColor);
+        command.ChartPanelRadarLineColor = GetColor(options, "radar_line_color", command.ChartPanelRadarLineColor);
+        command.ChartPanelGuideColor = GetColor(options, "guide_color", command.ChartPanelGuideColor);
+        command.ChartPanelBarBackgroundColor = GetColor(options, "bar_background_color", command.ChartPanelBarBackgroundColor);
+        command.ChartPanelTapsColor = GetColor(options, "taps_color", command.ChartPanelTapsColor);
+        command.ChartPanelLongsColor = GetColor(options, "longs_color", command.ChartPanelLongsColor);
+        command.ChartPanelSlidesColor = GetColor(options, "slides_color", command.ChartPanelSlidesColor);
+        command.ChartPanelFlicksColor = GetColor(options, "flicks_color", command.ChartPanelFlicksColor);
+        command.ChartPanelStreamColor = GetColor(options, "stream_color", command.ChartPanelStreamColor);
+        command.ChartPanelTravelColor = GetColor(options, "travel_color", command.ChartPanelTravelColor);
+        command.ChartPanelBorderWidth = Math.Max(0f, GetNumber(options, "border_width", command.ChartPanelBorderWidth));
+        command.ChartPanelHeaderSize = Math.Max(0f, GetNumber(options, "header_size", command.ChartPanelHeaderSize));
+        command.ChartPanelBackgroundBleed = Math.Max(0f, GetNumber(options, "background_bleed", command.ChartPanelBackgroundBleed));
+        command.Order = _drawOrder++;
+        _drawCommands.Add(command);
+        RegisterLayoutNode(command, false);
+        RegisterChartPanelHitbox(command, options);
+        return DynValue.Nil;
+    }
+
+    /// <summary>
+    /// Registers the chart-panel click region through the same layout and pointer
+    /// dispatch system as ui.button. By default it inherits the panel's skin-defined
+    /// parent, position, anchor and size; a hitbox table may override any of them.
+    /// </summary>
+    private void RegisterChartPanelHitbox(SkinDrawCommand command, Table options)
+    {
+        var hitboxValue = options.Get("hitbox");
+        var hasHitboxTable = hitboxValue.Type == DataType.Table && hitboxValue.Table is not null;
+        var clickableValue = options.Get("clickable");
+        var clickable = clickableValue.Type == DataType.Boolean
+            ? clickableValue.Boolean
+            : hasHitboxTable;
+        if (!clickable)
+            return;
+
+        var hitboxOptions = hasHitboxTable ? hitboxValue.Table! : options;
+        var hitboxId = hasHitboxTable
+            ? GetOptionalString(hitboxOptions, "id")?.Trim()
+            : null;
+        if (string.IsNullOrWhiteSpace(hitboxId))
+            hitboxId = GetOptionalString(options, "hitbox_id")?.Trim();
+        if (string.IsNullOrWhiteSpace(hitboxId))
+        {
+            var baseId = string.IsNullOrWhiteSpace(command.Id) ? "chart_panel" : command.Id.Trim();
+            hitboxId = $"{baseId}_hitbox";
+        }
+
+        if (_layoutNodes.ContainsKey(hitboxId) || _uiButtons.ContainsKey(hitboxId) || _uiSliders.ContainsKey(hitboxId))
+            throw new ScriptRuntimeException($"chart panel hitbox '{hitboxId}' is already registered this frame");
+
+        var parentValue = hitboxOptions.Get("parent");
+        var parentId = parentValue.Type == DataType.String
+            ? parentValue.String?.Trim()
+            : command.ParentId;
+        if (string.IsNullOrWhiteSpace(parentId))
+            parentId = null;
+
+        var positionValue = hitboxOptions.Get("position");
+        var position = positionValue.IsNil()
+            ? new Vector2(
+                (float)GetOptionalNumber(hitboxOptions, "x", command.Position.X),
+                (float)GetOptionalNumber(hitboxOptions, "y", command.Position.Y))
+            : GetVector(positionValue, command.Position);
+        var width = (float)GetOptionalNumber(hitboxOptions, "width", command.Size.X);
+        var height = (float)GetOptionalNumber(hitboxOptions, "height", command.Size.Y);
+        if (!float.IsFinite(position.X) || !float.IsFinite(position.Y) ||
+            !float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f)
+            throw new ScriptRuntimeException($"chart panel hitbox '{hitboxId}' requires finite position and positive width/height");
+
+        var anchor = hitboxOptions.Get("anchor").IsNil()
+            ? command.Anchor
+            : GetAnchor(hitboxOptions);
+        var clipValue = hitboxOptions.Get("clip");
+        var scissorClip = clipValue.Type == DataType.Table
+            ? GetScissorClip(hitboxOptions)
+            : command.ScissorClip;
+
+        var callback = hitboxOptions.Get("on_click");
+        if (callback.IsNil() && hasHitboxTable)
+            callback = options.Get("on_click");
+        DynValue? onClick = null;
+        if (!callback.IsNil())
+        {
+            if (callback.Type != DataType.Function)
+                throw new ScriptRuntimeException($"chart panel hitbox '{hitboxId}' on_click must be a function");
+            onClick = callback;
+        }
+
+        var action = GetOptionalString(hitboxOptions, "action")?.Trim();
+        if (string.IsNullOrWhiteSpace(action) && hasHitboxTable)
+            action = GetOptionalString(options, "action")?.Trim();
+        if (string.IsNullOrWhiteSpace(action))
+            action = onClick is null ? "cycle_chart_panel" : null;
+        if (onClick is not null && action is not null)
+            throw new ScriptRuntimeException($"chart panel hitbox '{hitboxId}' cannot use both on_click and action");
+
+        var actionValue = hitboxOptions.Get("value");
+        if (actionValue.IsNil() && hasHitboxTable)
+            actionValue = options.Get("value");
+        if (actionValue.Type != DataType.Nil && action is null)
+            throw new ScriptRuntimeException($"chart panel hitbox '{hitboxId}' value requires action");
+
+        object? parsedActionValue = actionValue.Type switch
+        {
+            DataType.Nil => null,
+            DataType.Number => actionValue.Number,
+            DataType.String => actionValue.String,
+            DataType.Boolean => actionValue.Boolean,
+            _ => throw new ScriptRuntimeException(
+                $"chart panel hitbox '{hitboxId}' value must be a number, string, boolean, or nil"),
+        };
+
+        var priorityValue = GetOptionalNumber(hitboxOptions, "hit_test_priority", 50.0);
+        var hitTestPriority = double.IsFinite(priorityValue)
+            ? (int)Math.Clamp(Math.Round(priorityValue), -1000.0, 1000.0)
+            : 50;
+        var button = new SkinUiButton(
+            hitboxId,
+            parentId,
+            position.X,
+            position.Y,
+            width,
+            height,
+            onClick,
+            action,
+            parsedActionValue,
+            hitTestPriority,
+            scissorClip);
+        _uiButtons[hitboxId] = button;
+        RegisterInteractiveLayoutNode(
+            hitboxId,
+            parentId,
+            position.X,
+            position.Y,
+            width,
+            height,
+            button,
+            null,
+            anchor);
+    }
+
     private DynValue DrawRect(ScriptExecutionContext _, CallbackArguments args)
     {
         var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
@@ -8646,7 +8909,8 @@ public sealed class SkinRuntime : IDisposable
         float width,
         float height,
         SkinUiButton? button,
-        SkinUiSlider? slider)
+        SkinUiSlider? slider,
+        Vector2? anchor = null)
     {
         if (_layoutNodes.ContainsKey(id))
             throw new ScriptRuntimeException($"ui control '{id}' is already used in this render");
@@ -8658,7 +8922,7 @@ public sealed class SkinRuntime : IDisposable
             new Vector2(x, y),
             Vector2.Zero,
             new Vector2(width, height),
-            Vector2.Zero,
+            anchor ?? Vector2.Zero,
             false,
             button,
             slider);
