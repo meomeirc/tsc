@@ -1796,17 +1796,21 @@ public sealed partial class Playfield
             if (!animation.IsHold || animation.HoldRootKey != rootKey)
                 continue;
 
-            // Link hit effects belong to the live chain body. When the chain is
-            // dropped, the body effect must vanish immediately instead of finishing
-            // its authored/loop duration. Regular hold effects retain their existing
-            // release behavior and play out their non-looping ending frames.
+            // A dropped sustain stops looping immediately but still plays the
+            // authored outro. Start that outro from the current UI-time position
+            // so it does not wait for the chart's original hold-end tick.
+            if (!completedNormally)
+            {
+                if (!animation.PostLoopStartElapsedSeconds.HasValue)
+                    animation.PostLoopStartElapsedSeconds = animation.ElapsedSeconds;
+                continue;
+            }
+
+            // A completed link chain lets only its terminal tail play the authored
+            // non-looping ending. Intermediate segments no longer own the effect.
             if (animation.IsLinkAnimation)
             {
-                // A normally completed link chain should let the terminal tail
-                // finish the non-looping ending of the hold animation. Only the
-                // live looping portion is owned by the chain while it is moving.
-                // Dropping the chain still cancels link animations immediately.
-                if (completedNormally && animation.IsTerminalLinkTail)
+                if (animation.IsTerminalLinkTail)
                 {
                     if (!animation.PostLoopStartElapsedSeconds.HasValue)
                         animation.PostLoopStartElapsedSeconds = animation.ElapsedSeconds;
@@ -1817,6 +1821,7 @@ public sealed partial class Playfield
                 continue;
             }
 
+            // Successfully completed hold/vibrato notes play their normal outro.
             if (!animation.PostLoopStartElapsedSeconds.HasValue)
                 animation.PostLoopStartElapsedSeconds = animation.ElapsedSeconds;
         }
@@ -1828,6 +1833,10 @@ public sealed partial class Playfield
             return;
         runtime.Dropped = true;
         ReleaseHoldHitAnimations(KeyOf(runtime.Root), completedNormally: false);
+        // Lua hit-effect renderers own their looping frames. Notify every chain
+        // node so its loop ends at the drop and its authored outro plays immediately.
+        foreach (var node in runtime.ChainNodes)
+            _skinRuntime.OnHoldDropped(BuildSkinNoteView(node, hit: true, missed: false), _uiTimeSeconds);
         runtime.DropSeconds = _playSeconds;
         runtime.DropTick = _tempo?.SecondsToTick(_playSeconds) ?? 0.0;
         _missedEvents.Add(KeyOf(runtime.Root));

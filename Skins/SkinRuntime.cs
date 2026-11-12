@@ -52,6 +52,7 @@ public sealed class SkinGameView
     private bool _playing;
     private bool _autoplay;
     private bool _editorPreviewMode;
+    private bool _compact;
     private double _aspectRatio;
     private double _accuracy;
     private double _scrollSpeed = Rendering.ChartProjection.DefaultScrollSpeedScale;
@@ -92,6 +93,8 @@ public sealed class SkinGameView
     public bool autoplay => _autoplay;
     /// <summary>True while editor-owned preview playback is using the gameplay skin.</summary>
     public bool editor_preview_mode => _editorPreviewMode;
+    /// <summary>True when inactive playfield banks are hidden (collapsed mode).</summary>
+    public bool compact => _compact;
     public double aspect_ratio => _aspectRatio;
     public double accuracy => _accuracy;
     public double scroll_speed => _scrollSpeed;
@@ -162,6 +165,9 @@ public sealed class SkinGameView
 
     internal void SetEditorPreviewMode(bool enabled)
         => _editorPreviewMode = enabled;
+
+    internal void SetCompactMode(bool enabled)
+        => _compact = enabled;
 
     internal void UpdatePauseState(double scrollSpeed, bool paused, int selection)
     {
@@ -335,6 +341,8 @@ public sealed class SkinScreenView
 
     public double width => _width;
     public double height => _height;
+    public double aspect => _height <= 0.0 ? 1.0 : _width / _height;
+    public double aspect_ratio => aspect;
     public double ref_scale => _refScale;
 
     internal void Update(int width, int height)
@@ -413,17 +421,212 @@ internal readonly record struct SkinPanelEventData(
 /// <summary>
 /// Snapshot of a chart note for skin callbacks.
 /// </summary>
+internal readonly record struct SkinPlayfieldGeometrySnapshot(
+    VertexPositionColorTexture[] Vertices,
+    float Depth,
+    int Layer,
+    int Track,
+    int Tick,
+    int EventIndex,
+    int Attr,
+    int DurationTicks,
+    string NoteType,
+    string Component,
+    string Side,
+    string Bank,
+    bool Hit,
+    bool Missed,
+    bool Simultaneous,
+    int GeometryTrack);
+
+public sealed class SkinPlayfieldGeometryHandle
+{
+    private SkinPlayfieldGeometrySnapshot _snapshot;
+    internal long FrameId { get; }
+    internal VertexPositionColorTexture[] Vertices => _snapshot.Vertices;
+    public float depth => _snapshot.Depth;
+    public int layer => _snapshot.Layer;
+    public int track => _snapshot.Track;
+    public int geometry_track => _snapshot.GeometryTrack;
+    public int tick => _snapshot.Tick;
+    public int event_index => _snapshot.EventIndex;
+    public int attr => _snapshot.Attr;
+    public int duration_ticks => _snapshot.DurationTicks;
+    public int vertex_count => _snapshot.Vertices.Length;
+    public string note_type => _snapshot.NoteType;
+    public string role => _snapshot.Component;
+    public string side => _snapshot.Side;
+    public string bank => _snapshot.Bank;
+    public bool hit => _snapshot.Hit;
+    public bool missed => _snapshot.Missed;
+    public bool simultaneous => _snapshot.Simultaneous;
+
+    internal SkinPlayfieldGeometryHandle(SkinPlayfieldGeometrySnapshot snapshot, long frameId)
+    {
+        _snapshot = snapshot;
+        FrameId = frameId;
+    }
+}
+
+internal readonly record struct SkinPlayfieldGeometryDrawRequest(
+    SkinAssetHandle? Asset,
+    SkinPlayfieldGeometryHandle Geometry,
+    XnaColor Tint,
+    float Alpha,
+    int Layer,
+    float ScaleX,
+    float ScaleY);
+
+internal readonly record struct SkinPlayfieldSpriteGeometrySnapshot(
+    int Track,
+    int Tick,
+    int EventIndex,
+    int Attr,
+    int DurationTicks,
+    string NoteType,
+    string Component,
+    string Side,
+    string Bank,
+    string Family,
+    bool Hit,
+    bool Missed,
+    bool Simultaneous,
+    float Depth,
+    Vector2 TopLeft = default,
+    Vector2 TopRight = default,
+    Vector2 BottomRight = default,
+    Vector2 BottomLeft = default,
+    bool HasScreenQuad = false,
+    bool FlipU = false,
+    bool FlipV = false,
+    int Layer = 0,
+    float Opacity = 1f);
+
+public sealed class SkinPlayfieldSpriteGeometryHandle
+{
+    private readonly SkinPlayfieldSpriteGeometrySnapshot _snapshot;
+    internal SkinPlayfieldSpriteGeometrySnapshot Snapshot => _snapshot;
+    internal long FrameId { get; }
+    public float depth => _snapshot.Depth;
+    public int layer => _snapshot.Layer;
+    public int track => _snapshot.Track;
+    public int tick => _snapshot.Tick;
+    public int event_index => _snapshot.EventIndex;
+    public int attr => _snapshot.Attr;
+    public int duration_ticks => _snapshot.DurationTicks;
+    public string note_type => _snapshot.NoteType;
+    public string role => _snapshot.Component;
+    public string side => _snapshot.Side;
+    public string bank => _snapshot.Bank;
+    public string family => _snapshot.Family;
+    public bool hit => _snapshot.Hit;
+    public bool missed => _snapshot.Missed;
+    public bool simultaneous => _snapshot.Simultaneous;
+    public bool has_screen_quad => _snapshot.HasScreenQuad;
+    public float opacity => _snapshot.Opacity;
+
+    internal SkinPlayfieldSpriteGeometryHandle(SkinPlayfieldSpriteGeometrySnapshot snapshot, long frameId)
+    {
+        _snapshot = snapshot;
+        FrameId = frameId;
+    }
+}
+
+internal readonly record struct SkinPlayfieldSpriteDrawRequest(
+    SkinAssetHandle Asset,
+    SkinPlayfieldSpriteGeometryHandle Geometry,
+    XnaColor Tint,
+    float Alpha,
+    int Layer,
+    bool FlipX,
+    bool FlipY,
+    float ScaleX,
+    float ScaleY);
+
+internal readonly record struct SkinPlayfieldSurfaceGeometrySnapshot(
+    VertexPositionColorTexture[] Vertices,
+    float Depth,
+    string Side,
+    string Bank,
+    float CenterNormalized,
+    float HalfNormalizedWidth,
+    bool IsTransition,
+    bool IsLine,
+    float NearDepth,
+    float Opacity,
+    string Role = "lane",
+    int Track = -1,
+    bool Held = false,
+    bool Autoplay = false,
+    double PressedAtSeconds = -1.0,
+    double ReleasedAtSeconds = -1.0,
+    double ElapsedSeconds = 0.0,
+    float Direction = 1f);
+
+public sealed class SkinPlayfieldSurfaceGeometryHandle
+{
+    private readonly SkinPlayfieldSurfaceGeometrySnapshot _snapshot;
+    internal SkinPlayfieldSurfaceGeometrySnapshot Snapshot => _snapshot;
+    internal long FrameId { get; }
+    internal VertexPositionColorTexture[] Vertices => _snapshot.Vertices;
+    public float depth => _snapshot.Depth;
+    public int layer => _snapshot.IsLine ? 1 : 0;
+    public string role => _snapshot.Role;
+    public string side => _snapshot.Side;
+    public string bank => _snapshot.Bank;
+    public float center => _snapshot.CenterNormalized;
+    public float half_width => _snapshot.HalfNormalizedWidth;
+    public bool transition => _snapshot.IsTransition;
+    public float near_depth => _snapshot.NearDepth;
+    public float opacity => _snapshot.Opacity;
+    public int track => _snapshot.Track;
+    public bool held => _snapshot.Held;
+    public bool autoplay => _snapshot.Autoplay;
+    public double pressed_at => _snapshot.PressedAtSeconds;
+    public double released_at => _snapshot.ReleasedAtSeconds;
+    public double elapsed => _snapshot.ElapsedSeconds;
+    public float direction => _snapshot.Direction;
+    public int vertex_count => _snapshot.Vertices.Length;
+
+    internal SkinPlayfieldSurfaceGeometryHandle(SkinPlayfieldSurfaceGeometrySnapshot snapshot, long frameId)
+    {
+        _snapshot = snapshot;
+        FrameId = frameId;
+    }
+}
+
+internal readonly record struct SkinPlayfieldSurfaceDrawRequest(
+    SkinAssetHandle? Asset,
+    SkinPlayfieldSurfaceGeometryHandle Geometry,
+    XnaColor Tint,
+    float Alpha,
+    int Layer,
+    float ScaleX,
+    float ScaleY,
+    float OffsetX,
+    float OffsetY,
+    float AnchorX,
+    float AnchorY,
+    string Blend);
+
 public sealed class SkinNoteView
 {
     public string type { get; }
     public double time { get; }
     public double duration { get; }
+    public int track { get; }
     public int lane { get; }
     public string side { get; }
     public string bank { get; }
     public SkinVector2View position { get; }
+    /// <summary>Exact judgement-line position for screen-space hit effects.</summary>
+    public SkinVector2View hit_position { get; }
     public float rotation { get; }
     public float scale { get; }
+    /// <summary>Default hit-effect billboard width already adjusted for the current projection.</summary>
+    public float hit_width { get; }
+    /// <summary>Lane-following billboard rotation when the active hit style requests it.</summary>
+    public float hit_rotation { get; }
     public double progress { get; }
     public bool hit { get; }
     public bool missed { get; }
@@ -432,17 +635,23 @@ public sealed class SkinNoteView
     public bool is_hold { get; }
     public bool is_link { get; }
     public bool is_superFlick { get; }
+    public bool is_multi { get; }
+    public string super_flick_family { get; }
 
     internal SkinNoteView(
         string type,
         double time,
         double duration,
+        int track,
         int lane,
         string side,
         string bank,
         SkinVector2View position,
+        SkinVector2View hitPosition,
         float rotation,
         float scale,
+        float hitWidth,
+        float hitRotation,
         double progress,
         bool hit,
         bool missed,
@@ -450,17 +659,23 @@ public sealed class SkinNoteView
         bool visible,
         bool isHold,
         bool isLink,
-        bool isSuperFlick)
+        bool isSuperFlick,
+        bool isMulti,
+        string superFlickFamily)
     {
         this.type = type;
         this.time = time;
         this.duration = duration;
+        this.track = track;
         this.lane = lane;
         this.side = side;
         this.bank = bank;
         this.position = position;
+        this.hit_position = hitPosition;
         this.rotation = rotation;
         this.scale = scale;
+        this.hit_width = hitWidth;
+        this.hit_rotation = hitRotation;
         this.progress = progress;
         this.hit = hit;
         this.missed = missed;
@@ -469,19 +684,26 @@ public sealed class SkinNoteView
         this.is_hold = isHold;
         this.is_link = isLink;
         this.is_superFlick = isSuperFlick;
+        this.is_multi = isMulti;
+        this.super_flick_family = superFlickFamily ?? string.Empty;
     }
 }
 
 /// <summary>
-/// Opaque handle returned by assets.load(). Lua can inspect path/width/height but
-/// cannot access Texture2D or the graphics device directly.
+/// Handle returned by assets.load(). Still images and looping video frames share
+/// the same drawing API; Lua can inspect path/size/video state but cannot access
+/// Texture2D or the graphics device directly.
 /// </summary>
 public sealed class SkinAssetHandle
 {
-    internal Texture2D Texture { get; }
+    private readonly Texture2D _texture;
+    private readonly SkinVideoPlayer? _videoPlayer;
+
+    internal Texture2D Texture => _videoPlayer?.Texture ?? _texture;
     internal string FullPath { get; }
 
     public string path { get; }
+    public bool is_video => _videoPlayer is not null;
 
     // Lowercase properties are exposed to Lua; uppercase aliases are used by C# rendering code.
     public int width => Texture.Width;
@@ -491,18 +713,48 @@ public sealed class SkinAssetHandle
 
     internal SkinAssetHandle(Texture2D texture, string fullPath, string relativePath)
     {
-        Texture = texture;
+        _texture = texture;
         FullPath = fullPath;
         path = relativePath.Replace(Path.DirectorySeparatorChar, '/');
+    }
+
+    internal SkinAssetHandle(SkinVideoPlayer videoPlayer, string fullPath, string relativePath)
+    {
+        _texture = videoPlayer.Texture;
+        _videoPlayer = videoPlayer;
+        FullPath = fullPath;
+        path = relativePath.Replace(Path.DirectorySeparatorChar, '/');
+    }
+
+    internal void UpdateVideo() => _videoPlayer?.Update();
+
+    internal string? TakeVideoPlaybackError() => _videoPlayer?.TakePlaybackError();
+
+    internal void Dispose()
+    {
+        if (_videoPlayer is not null)
+            _videoPlayer.Dispose();
+        else
+            _texture.Dispose();
     }
 }
 
 internal sealed class SkinAssetStore : IDisposable
 {
+    private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv", ".flv",
+        ".mpg", ".mpeg", ".m2v", ".3gp", ".ts", ".ogv"
+    };
+
     private readonly GraphicsDevice _graphics;
     private readonly string _skinDirectory;
     private readonly string? _fallbackSkinDirectory;
     private readonly Dictionary<string, SkinAssetHandle?> _assets = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<SkinAssetHandle> _videoAssets = new();
+
+    internal static bool IsVideoPath(string path)
+        => VideoExtensions.Contains(Path.GetExtension(path));
 
     public SkinAssetStore(GraphicsDevice graphics, string skinDirectory, string? fallbackSkinDirectory = null)
     {
@@ -545,7 +797,7 @@ internal sealed class SkinAssetStore : IDisposable
                 var handlePath = string.Equals(directory, _fallbackSkinDirectory, StringComparison.OrdinalIgnoreCase)
                     ? relativeKey
                     : Path.GetRelativePath(_skinDirectory, candidate);
-                if (TryLoadTexture(candidate, handlePath, out var handle))
+                if (TryLoadAsset(candidate, handlePath, out var handle))
                 {
                     _assets[key] = handle;
                     return handle;
@@ -565,7 +817,7 @@ internal sealed class SkinAssetStore : IDisposable
                     var candidate = ResolveWithinRoot(directory, relative);
                     if (candidate is null || !File.Exists(candidate))
                         continue;
-                    if (TryLoadTexture(candidate, relativeKey, out var handle))
+                    if (TryLoadAsset(candidate, relativeKey, out var handle))
                     {
                         _assets[key] = handle;
                         return handle;
@@ -576,6 +828,25 @@ internal sealed class SkinAssetStore : IDisposable
 
         _assets[key] = null;
         return null;
+    }
+
+    private bool TryLoadAsset(string fullPath, string relativePath, out SkinAssetHandle? handle)
+    {
+        if (IsVideoPath(fullPath))
+        {
+            var player = SkinVideoPlayer.TryCreate(_graphics, fullPath, out _);
+            if (player is not null)
+            {
+                handle = new SkinAssetHandle(player, fullPath, relativePath);
+                _videoAssets.Add(handle);
+                return true;
+            }
+
+            handle = null;
+            return false;
+        }
+
+        return TryLoadTexture(fullPath, relativePath, out handle);
     }
 
     private bool TryLoadTexture(string fullPath, string relativePath, out SkinAssetHandle? handle)
@@ -595,6 +866,18 @@ internal sealed class SkinAssetStore : IDisposable
             // A corrupt custom asset should not block the matching Default asset.
             handle = null;
             return false;
+        }
+    }
+
+    /// <summary>Uploads the newest decoded frame for every active video asset.</summary>
+    public void Update()
+    {
+        foreach (var handle in _videoAssets)
+        {
+            handle.UpdateVideo();
+            var playbackError = handle.TakeVideoPlaybackError();
+            if (!string.IsNullOrWhiteSpace(playbackError))
+                Program.LogRuntime($"SKIN_VIDEO_PLAYBACK_FAILED path={handle.path} error={playbackError}");
         }
     }
 
@@ -784,9 +1067,10 @@ internal sealed class SkinAssetStore : IDisposable
 
     public void Dispose()
     {
-        foreach (var handle in _assets.Values)
-            handle?.Texture.Dispose();
+        foreach (var handle in _assets.Values.Distinct())
+            handle?.Dispose();
         _assets.Clear();
+        _videoAssets.Clear();
     }
 }
 
@@ -1720,6 +2004,8 @@ public sealed class SkinDrawCommand
     public SkinDrawCommandKind Kind { get; internal set; }
     public SkinAssetHandle? Asset { get; internal set; }
     public SkinAssetHandle? MaskAsset { get; internal set; }
+    internal SkinShaderHandle? Shader { get; set; }
+    internal Table? ShaderUniforms { get; set; }
     /// <summary>Optional normalized mask UV rectangle: left, top, right, bottom.
     /// When present, mask texture coordinates are locked to an external frame
     /// instead of simply mapping 0..1 across the drawn quad.
@@ -1763,6 +2049,9 @@ public sealed class SkinDrawCommand
     public bool TextWrap { get; internal set; }
     public XnaColor Color { get; internal set; } = XnaColor.White;
     public int Layer { get; internal set; }
+    /// <summary>Marks commands emitted by render_hit_effects so they can be drawn
+    /// at the hit-feedback stage instead of with the regular below/above-HUD layers.</summary>
+    internal bool IsHitEffect { get; set; }
     internal long Order { get; set; }
     public SpriteEffects SpriteEffects { get; internal set; } = SpriteEffects.None;
     public bool AdditiveBlend { get; internal set; }
@@ -1816,6 +2105,8 @@ public sealed class SkinDrawCommand
         Kind = default;
         Asset = null;
         MaskAsset = null;
+        Shader = null;
+        ShaderUniforms = null;
         MaskUv = null;
         ClipRect = null;
         ScissorClip = null;
@@ -1852,6 +2143,7 @@ public sealed class SkinDrawCommand
         TextWrap = false;
         Color = XnaColor.White;
         Layer = 0;
+        IsHitEffect = false;
         Order = 0L;
         SpriteEffects = SpriteEffects.None;
         AdditiveBlend = false;
@@ -2014,6 +2306,9 @@ public sealed class SkinRuntime : IDisposable
     private bool UseLegacyUiTextSizing => _useLegacyUiTextSizing || _game.editor_mode;
     private string? _activeScriptPath;
     private readonly GraphicsDevice _graphics;
+    private readonly SkinShaderStore _shaderStore;
+    private readonly SkinGlShaderRenderer _shaderRenderer;
+    private readonly float[] _skinShaderQuadVertices = new float[6 * 9];
     private readonly BasicEffect _skin3DEffect;
     private readonly BasicEffect _skinWaveformEffect;
     private VertexPositionColor[] _skinWaveformVertices = new VertexPositionColor[6 * 2048];
@@ -2036,6 +2331,7 @@ public sealed class SkinRuntime : IDisposable
     private readonly Effect? _skinSparklesEffect;
     private readonly Effect? _skinQuad3DEffect;
     private double _skinEffectTime;
+    private double _skinEffectDeltaTime;
     private readonly Texture2D _skin3DWhiteTexture;
     private readonly VertexPositionColorTexture[] _skin3DQuadVertices = new VertexPositionColorTexture[6];
     // A reusable vertex buffer for consecutive ordinary 3D quads that share
@@ -2118,7 +2414,41 @@ public sealed class SkinRuntime : IDisposable
     private SamplerState? _skinQuad3DRunOldSamplerState1;
     private BlendState? _skinQuad3DRunCurrentBlendState;
     private readonly List<SkinDrawCommand> _drawCommands = new();
+    private bool _insideHitEffectRenderer;
     private readonly List<SkinDrawCommand> _drawCommandPool = new();
+    private readonly List<SkinPlayfieldGeometryDrawRequest> _playfieldGeometryDrawRequests = new();
+    private readonly List<SkinPlayfieldSpriteDrawRequest> _playfieldSpriteDrawRequests = new();
+    private readonly List<SkinPlayfieldSurfaceDrawRequest> _playfieldSurfaceDrawRequests = new();
+    private readonly List<SkinPlayfieldSpriteDrawRequest> _judgementLineSpriteDrawRequests = new();
+    private readonly Dictionary<(int Track, int Tick, int EventIndex), int> _playfieldNoteIndices = new();
+    private readonly List<Table> _playfieldNoteTables = new();
+    private readonly List<Table> _playfieldNoteGeometryTables = new();
+    private readonly List<int> _playfieldNoteGeometryCounts = new();
+    private readonly List<int> _playfieldNotePreviousGeometryCounts = new();
+    private Table? _playfieldNoteFrameTable;
+    private Table? _playfieldNotesTable;
+    private Script? _playfieldTableOwner;
+    private int _playfieldPreviousNoteCount;
+    private long _playfieldGeometryFrameId;
+    private bool _insidePlayfieldNoteRenderer;
+    private Table? _playfieldSurfaceFrameTable;
+    private Table? _hitEffectFrameTable;
+    private Script? _hitEffectFrameTableOwner;
+    private Table? _playfieldSurfaceGeometryTable;
+    private Script? _playfieldSurfaceTableOwner;
+    private long _playfieldSurfaceGeometryFrameId;
+    private int _playfieldSurfacePreviousGeometryCount;
+    private bool _insidePlayfieldSurfaceRenderer;
+    private Table? _playfieldLifecycleTable;
+    private string _playfieldLifecyclePhase = "idle";
+    private string _playfieldLifecycleReason = string.Empty;
+    private double _playfieldLifecycleElapsed;
+    private Table? _judgementLineFrameTable;
+    private Table? _judgementLineGeometryTable;
+    private Script? _judgementLineTableOwner;
+    private long _judgementLineGeometryFrameId;
+    private int _judgementLinePreviousGeometryCount;
+    private bool _insideJudgementLineRenderer;
     private int _drawCommandPoolIndex;
     private const int TextLayoutCacheCapacity = 1024;
     private readonly Dictionary<SkinTextLayoutCacheKey, LinkedListNode<SkinTextLayoutCacheEntry>> _textLayoutCache = new();
@@ -2176,6 +2506,10 @@ public sealed class SkinRuntime : IDisposable
     private sealed class SkinQuad3DCachedBatchEntry
     {
         public readonly SkinDrawCommand Command = new();
+        // Hit effects are collected into a separate render stage. Keep a separate
+        // cached command so one Lua options table can safely be reused by both
+        // render_hit_effects() and the normal render() callback in the same frame.
+        public readonly SkinDrawCommand HitEffectCommand = new() { IsHitEffect = true };
         public Vector2 Anchor;
         public Vector2 Pivot;
         public SkinAssetHandle? MaskAsset;
@@ -2478,6 +2812,80 @@ public sealed class SkinRuntime : IDisposable
     public int DebugLastShadowApiCalls { get; private set; }
 
     public bool IsLoaded => _script is not null && LastError is null;
+    public bool SupportsPlayfieldNoteRenderer
+    {
+        get
+        {
+            if (_script is null || LastError is not null)
+                return false;
+            return _script.Globals.Get("render_notes").Type == DataType.Function;
+        }
+    }
+    /// <summary>
+    /// New skins own hit visuals by receiving a hit event and drawing their own
+    /// active effects. Requiring both callbacks prevents a partially implemented
+    /// API from silently disabling the legacy native fallback.
+    /// </summary>
+    public bool SupportsHitEffectRenderer
+    {
+        get
+        {
+            if (_script is null || LastError is not null)
+                return false;
+            return _script.Globals.Get("on_hit_effect").Type == DataType.Function &&
+                   _script.Globals.Get("render_hit_effects").Type == DataType.Function;
+        }
+    }
+
+    public bool SupportsPlayfieldRenderer
+    {
+        get
+        {
+            if (_script is null || LastError is not null)
+                return false;
+            return _script.Globals.Get("render_playfield").Type == DataType.Function;
+        }
+    }
+    public bool SupportsLaneHighlightRenderer
+    {
+        get
+        {
+            if (_script is null || LastError is not null)
+                return false;
+            return _script.Globals.Get("render_lane_highlights").Type == DataType.Function;
+        }
+    }
+    public bool SupportsTransitionFlashRenderer
+    {
+        get
+        {
+            if (_script is null || LastError is not null)
+                return false;
+            return _script.Globals.Get("render_transition_flashes").Type == DataType.Function;
+        }
+    }
+    public bool SupportsJudgementLineRenderer
+    {
+        get
+        {
+            if (_script is null || LastError is not null)
+                return false;
+            return _script.Globals.Get("render_judgement_line").Type == DataType.Function;
+        }
+    }
+    internal IReadOnlyList<SkinPlayfieldGeometryDrawRequest> PlayfieldGeometryDrawRequests
+        => _playfieldGeometryDrawRequests;
+    internal IReadOnlyList<SkinPlayfieldSpriteDrawRequest> PlayfieldSpriteDrawRequests
+        => _playfieldSpriteDrawRequests;
+    internal IReadOnlyList<SkinPlayfieldSurfaceDrawRequest> PlayfieldSurfaceDrawRequests
+        => _playfieldSurfaceDrawRequests;
+    internal IReadOnlyList<SkinPlayfieldSpriteDrawRequest> JudgementLineSpriteDrawRequests
+        => _judgementLineSpriteDrawRequests;
+    internal Texture2D PlayfieldGeometryWhiteTexture => _skin3DWhiteTexture;
+    internal void ClearPlayfieldGeometryDrawRequests() => _playfieldGeometryDrawRequests.Clear();
+    internal void ClearPlayfieldSpriteDrawRequests() => _playfieldSpriteDrawRequests.Clear();
+    internal void ClearPlayfieldSurfaceDrawRequests() => _playfieldSurfaceDrawRequests.Clear();
+    internal void ClearJudgementLineSpriteDrawRequests() => _judgementLineSpriteDrawRequests.Clear();
     internal bool IsInitialLoadDeferred => _initialLoadDeferred;
     public string ScriptPath => _scriptPath;
     internal string? ActiveScriptPath => _script is not null ? _activeScriptPath : null;
@@ -2501,7 +2909,11 @@ public sealed class SkinRuntime : IDisposable
         UserData.RegisterType<SkinUiLayoutView>();
         UserData.RegisterType<SkinVector2View>();
         UserData.RegisterType<SkinNoteView>();
+        UserData.RegisterType<SkinPlayfieldGeometryHandle>();
+        UserData.RegisterType<SkinPlayfieldSpriteGeometryHandle>();
+        UserData.RegisterType<SkinPlayfieldSurfaceGeometryHandle>();
         UserData.RegisterType<SkinAssetHandle>();
+        UserData.RegisterType<SkinShaderHandle>();
     }
 
     public SkinRuntime(
@@ -2565,6 +2977,8 @@ public sealed class SkinRuntime : IDisposable
             string.Equals(screenScriptName, "gameplayPause.lua", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(screenScriptName, "transition.lua", StringComparison.OrdinalIgnoreCase);
         _graphics = graphics;
+        _shaderStore = new SkinShaderStore(_skinDirectory, _defaultSkinDirectory);
+        _shaderRenderer = new SkinGlShaderRenderer(graphics);
         _skinSparklesEffect = skinSparklesEffect;
         _skinQuad3DEffect = skinQuad3DEffect;
         _initialLoadDeferred = deferInitialLoad;
@@ -2725,7 +3139,12 @@ public sealed class SkinRuntime : IDisposable
             capturedSlider.ScrollHandler?.CancelPointer();
 
         _script = null;
+        // The lifecycle belongs to the active playfield session, not a particular
+        // Lua VM. Preserve it across F10 reloads and fallback script attempts.
+        _playfieldLifecycleTable = null;
         _skinEffectTime = 0.0;
+        _skinEffectDeltaTime = 0.0;
+        _shaderStore.Clear();
         _drawCommands.Clear();
         _drawCommandPoolIndex = 0;
         _layoutNodes.Clear();
@@ -2782,6 +3201,7 @@ public sealed class SkinRuntime : IDisposable
             script.Globals["transition"] = _transition;
             script.Globals["assets"] = CreateAssetsApi(script);
             script.Globals["fonts"] = CreateFontsApi(script);
+            script.Globals["shaders"] = CreateShadersApi(script);
             script.Globals["draw"] = CreateDrawApi(script);
             _skinPerfApi = CreateSkinPerfApi(script);
             script.Globals["skinperf"] = _skinPerfApi;
@@ -3391,6 +3811,9 @@ public sealed class SkinRuntime : IDisposable
     public void SetEditorPreviewMode(bool enabled)
         => _game.SetEditorPreviewMode(enabled);
 
+    public void SetCompactMode(bool enabled)
+        => _game.SetCompactMode(enabled);
+
     public void UpdatePauseState(double scrollSpeed, bool paused, int selection)
         => _game.UpdatePauseState(scrollSpeed, paused, selection);
 
@@ -3448,7 +3871,17 @@ public sealed class SkinRuntime : IDisposable
     {
         var safeDt = Math.Max(0.0, dt);
         _skinEffectTime += safeDt;
+        _skinEffectDeltaTime = safeDt;
+        if (!string.Equals(_playfieldLifecyclePhase, "idle", StringComparison.Ordinal))
+            _playfieldLifecycleElapsed += safeDt;
         InvokeOptional("update", false, DynValue.NewNumber(safeDt));
+    }
+
+    private void SetPlayfieldLifecycle(string phase, string reason)
+    {
+        _playfieldLifecyclePhase = phase;
+        _playfieldLifecycleReason = reason;
+        _playfieldLifecycleElapsed = 0.0;
     }
 
     private SkinDrawCommand AcquireDrawCommand()
@@ -3466,6 +3899,7 @@ public sealed class SkinRuntime : IDisposable
 
         _drawCommandPoolIndex++;
         command.Reset();
+        command.IsHitEffect = _insideHitEffectRenderer;
         return command;
     }
 
@@ -3474,8 +3908,18 @@ public sealed class SkinRuntime : IDisposable
     /// submitted through draw.*. Calling render() is the only place the example skin
     /// draws its HUD; callbacks are expected to update skin state instead.
     /// </summary>
-    public IReadOnlyList<SkinDrawCommand> BuildDrawCommands(int width, int height, SpriteFont? fallbackFont = null)
+    public IReadOnlyList<SkinDrawCommand> BuildDrawCommands(
+        int width,
+        int height,
+        SpriteFont? fallbackFont = null,
+        double realTime = 0.0,
+        double chartTime = 0.0,
+        string view = "gameplay")
     {
+        // Video assets expose a live Texture2D through the same assets.load()/draw.sprite()
+        // path as still images. Upload the newest decoded frame on the graphics thread.
+        _assets.Update();
+
         // Playfield rendering submits commands directly instead of going through
         // RenderDrawCommands(), so provide its shared fallback font before Lua
         // submits text. This also lets text layouts be cached at submission time.
@@ -3530,6 +3974,11 @@ public sealed class SkinRuntime : IDisposable
             DebugLastLineApiCalls = 0;
             DebugLastShadowApiCalls = 0;
         }
+
+        // Hit effects are collected with the skin's regular commands but tagged
+        // separately. The playfield draws them after notes and before editor/HUD
+        // overlays, matching the former native hit-feedback layer.
+        InvokeHitEffectRenderer(realTime, chartTime, width, height, view);
 
         var renderAllocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
         InvokeOptional("render", false);
@@ -4081,7 +4530,10 @@ public sealed class SkinRuntime : IDisposable
                         _graphics.ScissorRectangle = originalScissor;
                     }
 
-                    RenderSkinQuad3D(command, width, height);
+                    if (command.Shader is not null && command.Kind == SkinDrawCommandKind.Quad3D)
+                        RenderSkinShaderQuad3D(command, width, height);
+                    else
+                        RenderSkinQuad3D(command, width, height);
                     continue;
                 }
 
@@ -4100,6 +4552,33 @@ public sealed class SkinRuntime : IDisposable
                     if (clipped.Width <= 0 || clipped.Height <= 0)
                         continue;
                     commandScissor = clipped;
+                }
+
+                if (command.Kind == SkinDrawCommandKind.Sprite && command.Shader is not null)
+                {
+                    if (batchOpen)
+                    {
+                        spriteBatch.End();
+                        batchOpen = false;
+                        currentBlend = null;
+                        currentSampler = null;
+                        currentScissor = null;
+                    }
+
+                    _graphics.ScissorRectangle = commandScissor ?? originalScissor;
+                    try
+                    {
+                        RenderSkinShaderSprite(
+                            command,
+                            width,
+                            height,
+                            commandScissor.HasValue ? _uiScissorRasterizerState : RasterizerState.CullNone);
+                    }
+                    finally
+                    {
+                        _graphics.ScissorRectangle = originalScissor;
+                    }
+                    continue;
                 }
 
                 if (command.Kind == SkinDrawCommandKind.ChartPanel)
@@ -4793,7 +5272,11 @@ public sealed class SkinRuntime : IDisposable
 
     private static bool CanBatchSkinQuad3D(SkinDrawCommand command)
     {
+        // The compatible fast path uses BasicEffect and cannot execute a custom
+        // GLSL program. Shader commands must be submitted individually through
+        // RenderQuad3D(), which dispatches to RenderSkinShaderQuad3D().
         if (command.Kind != SkinDrawCommandKind.Quad3D ||
+            command.Shader is not null ||
             command.Size.X <= 0f || command.Size.Y <= 0f ||
             command.ForceWhiteColor ||
             command.MaskAsset is not null ||
@@ -4931,6 +5414,15 @@ public sealed class SkinRuntime : IDisposable
 
     internal void RenderQuad3D(SkinDrawCommand command, int width, int height)
     {
+        // Gameplay/editor draw through Playfield.DrawSkinScriptUiLayers(), not
+        // SkinRuntime.RenderDrawCommands(). Route shader-backed quads here as
+        // well so both rendering paths execute the same native GLSL renderer.
+        if (command.Shader is not null)
+        {
+            RenderSkinShaderQuad3D(command, width, height);
+            return;
+        }
+
         var profileGroup = DebugMeasureApiAllocations ? command.DebugProfileGroup : 0;
         if (profileGroup <= 0 || profileGroup >= _debugQuad3DGroupMilliseconds.Length)
         {
@@ -5474,6 +5966,238 @@ public sealed class SkinRuntime : IDisposable
             Math.Max(4096f, _skinQuad3DCameraDistance * 8f));
     }
 
+    private bool RenderSkinShaderSprite(
+        SkinDrawCommand command,
+        int width,
+        int height,
+        RasterizerState rasterizerState)
+    {
+        var asset = command.Asset;
+        var shader = command.Shader;
+        if (asset is null || shader is null || !shader.valid || width <= 0 || height <= 0 ||
+            command.Scale.X <= 0f || command.Scale.Y <= 0f)
+            return false;
+
+        var fill = Math.Clamp(command.Fill, 0f, 1f);
+        if (fill <= 0f)
+            return false;
+
+        XnaRectangle source;
+        if (fill < 0.9999f)
+        {
+            source = new XnaRectangle(0, 0, Math.Max(1, (int)MathF.Round(asset.Width * fill)), asset.Height);
+        }
+        else if (command.CropCover && command.Size.X > 0f && command.Size.Y > 0f)
+        {
+            source = CalculateCoverSourceRect(
+                asset.Width,
+                asset.Height,
+                Math.Max(1, (int)MathF.Round(command.Size.X)),
+                Math.Max(1, (int)MathF.Round(command.Size.Y)));
+        }
+        else
+        {
+            source = new XnaRectangle(0, 0, asset.Width, asset.Height);
+        }
+
+        var u0 = source.Left / (float)Math.Max(1, asset.Width);
+        var u1 = source.Right / (float)Math.Max(1, asset.Width);
+        var v0 = source.Top / (float)Math.Max(1, asset.Height);
+        var v1 = source.Bottom / (float)Math.Max(1, asset.Height);
+        if ((command.SpriteEffects & SpriteEffects.FlipHorizontally) != 0)
+            (u0, u1) = (u1, u0);
+        if ((command.SpriteEffects & SpriteEffects.FlipVertically) != 0)
+            (v0, v1) = (v1, v0);
+
+        // Match SpriteBatch's anchor/origin and clockwise screen-space rotation.
+        var left = -source.Width * command.Anchor.X * command.Scale.X;
+        var right = source.Width * (1f - command.Anchor.X) * command.Scale.X;
+        var top = -source.Height * command.Anchor.Y * command.Scale.Y;
+        var bottom = source.Height * (1f - command.Anchor.Y) * command.Scale.Y;
+        var cosine = MathF.Cos(command.Rotation);
+        var sine = MathF.Sin(command.Rotation);
+        Vector3 Position(float x, float y)
+        {
+            return new Vector3(
+                command.Position.X + x * cosine - y * sine,
+                command.Position.Y + x * sine + y * cosine,
+                0f);
+        }
+
+        var tint = command.Color;
+        var vertices = _skinShaderQuadVertices;
+        WriteSkinShaderVertex(vertices, 0, Position(left, top), u0, v0, tint);
+        WriteSkinShaderVertex(vertices, 9, Position(right, top), u1, v0, tint);
+        WriteSkinShaderVertex(vertices, 18, Position(right, bottom), u1, v1, tint);
+        WriteSkinShaderVertex(vertices, 27, Position(left, top), u0, v0, tint);
+        WriteSkinShaderVertex(vertices, 36, Position(right, bottom), u1, v1, tint);
+        WriteSkinShaderVertex(vertices, 45, Position(left, bottom), u0, v1, tint);
+
+        var projection = new XnaMatrix(
+            2f / width, 0f, 0f, 0f,
+            0f, -2f / height, 0f, 0f,
+            0f, 0f, 1f, 0f,
+            -1f, 1f, 0f, 1f);
+        return _shaderRenderer.DrawTriangles(
+            shader,
+            asset.Texture,
+            vertices,
+            6,
+            width,
+            height,
+            _skinEffectTime,
+            _skinEffectDeltaTime,
+            command.Alpha,
+            command.Color,
+            command.ShaderUniforms,
+            projection,
+            command.AdditiveBlend,
+            modelMatrix: XnaMatrix.Identity,
+            forceWhiteColor: command.ForceWhiteColor,
+            rasterizerState: rasterizerState);
+    }
+
+    internal bool RenderShaderSprite(
+        SkinDrawCommand command,
+        int width,
+        int height,
+        RasterizerState? rasterizerState = null)
+    {
+        if (command.Kind != SkinDrawCommandKind.Sprite || command.Shader is null)
+            return false;
+
+        return RenderSkinShaderSprite(
+            command,
+            width,
+            height,
+            rasterizerState ?? RasterizerState.CullNone);
+    }
+
+    private void RenderSkinShaderQuad3D(SkinDrawCommand command, int width, int height)
+    {
+        if (command.Shader is null || !command.Shader.valid || width <= 0 || height <= 0 ||
+            command.Size.X <= 0f || command.Size.Y <= 0f)
+            return;
+
+        if (command.ClipRect is { } requestedClip &&
+            (requestedClip.Z - requestedClip.X <= 0.01f || requestedClip.W - requestedClip.Y <= 0.01f))
+            return;
+
+        var texture = command.Asset?.Texture ?? _skin3DWhiteTexture;
+        if (command.Asset is not null && command.BackgroundColor.HasValue && !command.Asset.is_video)
+            texture = GetSkin3DBackgroundTexture(command.Asset, command.BackgroundColor.Value);
+
+        var textureWidth = Math.Max(1, texture.Width);
+        var textureHeight = Math.Max(1, texture.Height);
+        var source = command.CropUv.HasValue
+            ? CalculateUvSourceRect(textureWidth, textureHeight, command.CropUv.Value)
+            : command.CropCover
+                ? CalculateCoverSourceRect(
+                    textureWidth,
+                    textureHeight,
+                    Math.Max(1, (int)MathF.Round(command.Size.X)),
+                    Math.Max(1, (int)MathF.Round(command.Size.Y)))
+                : new XnaRectangle(0, 0, textureWidth, textureHeight);
+
+        var u0 = source.Left / (float)textureWidth;
+        var u1 = source.Right / (float)textureWidth;
+        var v0 = source.Top / (float)textureHeight;
+        var v1 = source.Bottom / (float)textureHeight;
+        if ((command.SpriteEffects & SpriteEffects.FlipHorizontally) != 0)
+            (u0, u1) = (u1, u0);
+        if ((command.SpriteEffects & SpriteEffects.FlipVertically) != 0)
+            (v0, v1) = (v1, v0);
+
+        var screenWidth = Math.Max(1f, width);
+        var screenHeight = Math.Max(1f, height);
+        EnsureSkinQuad3DCameraMatrices((int)screenWidth, (int)screenHeight);
+        var renderSize = command.ScreenSpaceSizing
+            ? ResolveSkin3DScreenSpaceSize(command, screenWidth, screenHeight)
+            : command.Size;
+        var w = renderSize.X;
+        var h = renderSize.Y;
+        var quadWidth = command.Quad3DWidth;
+        var pivotLocal = new Vector3(
+            w * (command.Pivot.X - command.Anchor.X),
+            h * (command.Anchor.Y - command.Pivot.Y),
+            0f);
+        var rotation = XnaMatrix.CreateFromYawPitchRoll(
+            command.RotationY,
+            command.RotationX,
+            command.RotationZ);
+        var model =
+            XnaMatrix.CreateTranslation(-pivotLocal) *
+            rotation *
+            XnaMatrix.CreateTranslation(pivotLocal) *
+            XnaMatrix.CreateTranslation(
+                command.Position.X - screenWidth * 0.5f,
+                screenHeight * 0.5f - command.Position.Y,
+                command.Depth);
+        var worldViewProjection = model * _skinQuad3DViewMatrix * _skinQuad3DProjectionMatrix;
+
+        var topWidth = quadWidth?.Top ?? w;
+        var bottomWidth = quadWidth?.Bottom ?? w;
+        var leftHeight = quadWidth?.Left ?? h;
+        var rightHeight = quadWidth?.Right ?? h;
+        var topLeftX = -topWidth * command.Anchor.X;
+        var topRightX = topWidth * (1f - command.Anchor.X);
+        var bottomLeftX = -bottomWidth * command.Anchor.X;
+        var bottomRightX = bottomWidth * (1f - command.Anchor.X);
+        var topLeftY = leftHeight * command.Anchor.Y;
+        var topRightY = rightHeight * command.Anchor.Y;
+        var bottomLeftY = -leftHeight * (1f - command.Anchor.Y);
+        var bottomRightY = -rightHeight * (1f - command.Anchor.Y);
+
+        var tint = command.Color;
+        var vertices = _skinShaderQuadVertices;
+        WriteSkinShaderVertex(vertices, 0, new Vector3(topLeftX, topLeftY, 0f), u0, v0, tint);
+        WriteSkinShaderVertex(vertices, 9, new Vector3(topRightX, topRightY, 0f), u1, v0, tint);
+        WriteSkinShaderVertex(vertices, 18, new Vector3(bottomRightX, bottomRightY, 0f), u1, v1, tint);
+        WriteSkinShaderVertex(vertices, 27, new Vector3(topLeftX, topLeftY, 0f), u0, v0, tint);
+        WriteSkinShaderVertex(vertices, 36, new Vector3(bottomRightX, bottomRightY, 0f), u1, v1, tint);
+        WriteSkinShaderVertex(vertices, 45, new Vector3(bottomLeftX, bottomLeftY, 0f), u0, v1, tint);
+
+        _shaderRenderer.DrawTriangles(
+            command.Shader,
+            texture,
+            vertices,
+            6,
+            width,
+            height,
+            _skinEffectTime,
+            _skinEffectDeltaTime,
+            command.Alpha,
+            command.Color,
+            command.ShaderUniforms,
+            worldViewProjection,
+            command.AdditiveBlend,
+            command.MaskAsset?.Texture,
+            command.MaskUv,
+            command.ClipRect,
+            model,
+            command.ForceWhiteColor,
+            RasterizerState.CullNone);
+    }
+
+    private static void WriteSkinShaderVertex(
+        float[] destination,
+        int offset,
+        Vector3 position,
+        float u,
+        float v,
+        XnaColor color)
+    {
+        destination[offset] = position.X;
+        destination[offset + 1] = position.Y;
+        destination[offset + 2] = position.Z;
+        destination[offset + 3] = u;
+        destination[offset + 4] = v;
+        destination[offset + 5] = color.R / 255f;
+        destination[offset + 6] = color.G / 255f;
+        destination[offset + 7] = color.B / 255f;
+        destination[offset + 8] = color.A / 255f;
+    }
+
     private void RenderSkinQuad3D(SkinDrawCommand command, int width, int height)
     {
         if (width <= 0 || height <= 0 || command.Size.X <= 0f || command.Size.Y <= 0f)
@@ -5492,7 +6216,7 @@ public sealed class SkinRuntime : IDisposable
         }
 
         var texture = command.Asset?.Texture ?? _skin3DWhiteTexture;
-        if (command.Asset is not null && command.BackgroundColor.HasValue)
+        if (command.Asset is not null && command.BackgroundColor.HasValue && !command.Asset.is_video)
             texture = GetSkin3DBackgroundTexture(command.Asset, command.BackgroundColor.Value);
 
         var textureWidth = Math.Max(1, texture.Width);
@@ -5866,7 +6590,11 @@ public sealed class SkinRuntime : IDisposable
         }
     }
 
-    public void OnSongStart() => InvokeOptional("on_song_start", true);
+    public void OnSongStart()
+    {
+        SetPlayfieldLifecycle("playing", "song_start");
+        InvokeOptional("on_song_start", true);
+    }
 
     internal void InvokeOptionalPauseOpen() => InvokeOptional("on_open", false);
 
@@ -5876,7 +6604,13 @@ public sealed class SkinRuntime : IDisposable
 
     internal void InvokeOptionalResultClose() => InvokeOptional("on_close", false);
 
-    public void OnSongEnd() => InvokeOptional("on_song_end", true);
+    public void OnSongEnd()
+    {
+        // Editor preview intentionally has no gameplay outro; OnOutroStart will
+        // immediately replace this state for ordinary completed gameplay.
+        SetPlayfieldLifecycle("idle", "song_end");
+        InvokeOptional("on_song_end", true);
+    }
 
     public void OnLastPlayableTick(string clearType)
     {
@@ -5904,6 +6638,42 @@ public sealed class SkinRuntime : IDisposable
             DynValue.NewNumber(offsetMs));
     }
 
+    public bool OnHitEffect(
+        SkinNoteView note,
+        string judgement,
+        double offsetMs,
+        double realTime,
+        double chartTime,
+        string view)
+    {
+        if (!SupportsHitEffectRenderer || _script is null)
+            return false;
+
+        try
+        {
+            var function = _script.Globals.Get("on_hit_effect");
+            if (function.Type != DataType.Function)
+                return false;
+
+            LastCallback = "on_hit_effect";
+            CallbackCount++;
+            _script.Call(
+                function,
+                UserData.Create(note),
+                DynValue.NewString(NormalizeJudgement(judgement)),
+                DynValue.NewNumber(offsetMs),
+                DynValue.NewNumber(Math.Max(0.0, realTime)),
+                DynValue.NewNumber(Math.Max(0.0, chartTime)),
+                DynValue.NewString(string.Equals(view, "editor", StringComparison.OrdinalIgnoreCase) ? "editor" : "gameplay"));
+            return LastError is null;
+        }
+        catch (Exception ex)
+        {
+            HandleScriptRuntimeFailure(ex, "on_hit_effect");
+            return false;
+        }
+    }
+
     public void OnNoteMiss(SkinNoteView note, double offsetMs)
     {
         _game.SetLastJudgement("miss");
@@ -5912,6 +6682,19 @@ public sealed class SkinRuntime : IDisposable
             true,
             UserData.Create(note),
             DynValue.NewNumber(offsetMs));
+    }
+
+    /// <summary>
+    /// Notifies custom hit-effect renderers that a sustained note was dropped.
+    /// This is optional so existing skins remain compatible.
+    /// </summary>
+    public void OnHoldDropped(SkinNoteView note, double realTime)
+    {
+        InvokeOptional(
+            "on_hold_dropped",
+            true,
+            UserData.Create(note),
+            DynValue.NewNumber(Math.Max(0.0, realTime)));
     }
 
     private Table CreateAssetsApi(Script script)
@@ -5942,12 +6725,62 @@ public sealed class SkinRuntime : IDisposable
                 {
                     Program.LogRuntime($"SKIN_TEXTURE_MISSING requested={requested} skin={Path.GetFileName(_skinDirectory)}");
                 }
+                else if (SkinAssetStore.IsVideoPath(requested))
+                {
+                    Program.LogRuntime($"SKIN_VIDEO_MISSING_OR_UNAVAILABLE requested={requested} skin={Path.GetFileName(_skinDirectory)}");
+                }
                 return DynValue.Nil;
             }
 
             return UserData.Create(asset);
         }));
         return table;
+    }
+
+    private Table CreateShadersApi(Script script)
+    {
+        var table = new Table(script);
+        table.Set("load", DynValue.NewCallback((_, args) =>
+        {
+            if (args.Count < 2 || args[0].Type != DataType.String || args[1].Type != DataType.String)
+                throw new ScriptRuntimeException("shaders.load(vertex_path.vs, fragment_path.fs) expects two relative file paths");
+
+            try
+            {
+                var shader = _shaderStore.Load(args[0].String ?? string.Empty, args[1].String ?? string.Empty);
+                WriteLog($"[skin] GLSL shader loaded: {shader.vertex_path} + {shader.fragment_path}");
+                return UserData.Create(shader);
+            }
+            catch (Exception ex)
+            {
+                var message = ex.Message;
+                WriteLog($"[skin] GLSL shader load failed: {message}");
+                // A failed shader should not take down the whole skin. Returning
+                // nil lets a draw command fall back to the regular MonoGame path.
+                return DynValue.Nil;
+            }
+        }));
+        return table;
+    }
+
+    private static SkinShaderHandle? GetShaderHandle(Table options, string key)
+    {
+        var value = options.Get(key);
+        if (value.Type == DataType.Nil)
+            return null;
+        if (value.Type == DataType.UserData && value.UserData?.Object is SkinShaderHandle shader && shader.valid)
+            return shader;
+        throw new ScriptRuntimeException($"draw option '{key}' expects a valid shader returned by shaders.load() or nil");
+    }
+
+    private static Table? GetShaderUniforms(Table options)
+    {
+        var value = options.Get("uniforms");
+        if (value.Type == DataType.Nil)
+            return null;
+        if (value.Type == DataType.Table && value.Table is not null)
+            return value.Table;
+        throw new ScriptRuntimeException("draw shader option 'uniforms' expects a table or nil");
     }
 
     private DynValue ImportModule(Script script, string requestedPath)
@@ -6998,6 +7831,49 @@ public sealed class SkinRuntime : IDisposable
         return null;
     }
 
+    /// <summary>Whether the active skin provides the unified gameplay/editor playfield configuration API.</summary>
+    internal bool HasPlayfieldConfigProvider
+        => _script is not null && LastError is null &&
+           PathEquals(_activeScriptPath ?? string.Empty, _scriptPath) &&
+           _script.Globals.Get("get_playfield_config").Type == DataType.Function;
+
+    /// <summary>
+    /// Evaluates get_playfield_config("gameplay"|"editor") on demand. This is called
+    /// only on load, explicit reload, or viewport changes; never from the frame loop.
+    /// Only a configuration callback from the selected skin's own entry script opts
+    /// into this API. A Default entry script loaded only as a legacy fallback must not
+    /// override an older skin's renderConfig.lua/editorRenderConfig.lua files.
+    /// A false return with no error means the legacy config path should be used.
+    /// </summary>
+    internal bool TryGetPlayfieldConfig(string view, out RenderConfig config, out string? error)
+    {
+        config = new RenderConfig();
+        error = null;
+        if (_script is null || LastError is not null ||
+            !PathEquals(_activeScriptPath ?? string.Empty, _scriptPath))
+            return false;
+
+        var function = _script.Globals.Get("get_playfield_config");
+        if (function.Type != DataType.Function)
+            return false;
+
+        try
+        {
+            var normalizedView = string.Equals(view, "editor", StringComparison.OrdinalIgnoreCase)
+                ? "editor" : "gameplay";
+            var result = _script.Call(function, DynValue.NewString(normalizedView));
+            config = RenderConfigLuaLoader.DeserializeLuaConfigTable(
+                result, $"get_playfield_config(\"{normalizedView}\")");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            WriteLog($"[skin] playfield config failed ({view}): {ex.Message}");
+            return false;
+        }
+    }
+
     public double GetIntroHoldSeconds() => InvokeDuration("intro_duration");
     public double GetOutroHoldSeconds() => InvokeDuration("outro_duration");
     private double InvokeDuration(string functionName)
@@ -7008,11 +7884,439 @@ public sealed class SkinRuntime : IDisposable
     }
     public void PrepareGameplayAnimationFonts() => InvokeOptional("prepare_gameplay_animation_fonts", true, DynValue.NewBoolean(true));
     public void OnGameplayPreparing() => InvokeOptional("on_gameplay_preparing", true);
-    public void OnIntroStart() => InvokeOptional("on_intro_start", true);
-    public void OnOutroStart() => InvokeOptional("on_outro_start", true);
-    public void OnGameplayRetry() => InvokeOptional("on_gameplay_retry", true);
+    public void OnIntroStart()
+    {
+        SetPlayfieldLifecycle("intro", "gameplay_start");
+        InvokeOptional("on_intro_start", true);
+    }
+    public void OnOutroStart()
+    {
+        SetPlayfieldLifecycle("outro", "song_end");
+        InvokeOptional("on_outro_start", true);
+    }
+    public void OnGameplayRetry()
+    {
+        SetPlayfieldLifecycle("idle", "retry");
+        InvokeOptional("on_gameplay_retry", true);
+    }
 
     public void OnHardGaugeFailure() => InvokeOptional("on_hard_gauge_failure", true);
+
+    internal bool InvokePlayfieldSurfaceRenderer(
+        IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
+        double time,
+        double tick)
+        => InvokePlayfieldSurfaceGeometryRenderer("render_playfield", geometry, time, tick);
+
+    internal bool InvokeLaneHighlightRenderer(
+        IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
+        double time,
+        double tick,
+        double realTime)
+        => InvokePlayfieldSurfaceGeometryRenderer("render_lane_highlights", geometry, time, tick, realTime);
+
+    internal bool InvokeTransitionFlashRenderer(
+        IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
+        double time,
+        double tick)
+        => InvokePlayfieldSurfaceGeometryRenderer("render_transition_flashes", geometry, time, tick);
+
+    private bool InvokePlayfieldSurfaceGeometryRenderer(
+        string callbackName,
+        IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
+        double time,
+        double tick,
+        double? realTime = null)
+    {
+        _playfieldSurfaceDrawRequests.Clear();
+        if (_script is null || LastError is not null)
+            return false;
+
+        if (!ReferenceEquals(_playfieldSurfaceTableOwner, _script) ||
+            _playfieldSurfaceFrameTable is null ||
+            _playfieldSurfaceGeometryTable is null)
+        {
+            _playfieldSurfaceTableOwner = _script;
+            _playfieldSurfaceFrameTable = new Table(_script);
+            _playfieldSurfaceGeometryTable = new Table(_script);
+        }
+
+        _playfieldSurfaceGeometryFrameId++;
+        var frame = _playfieldSurfaceFrameTable;
+        var geometryTable = _playfieldSurfaceGeometryTable;
+        for (var i = 0; i < geometry.Count; i++)
+        {
+            var handle = new SkinPlayfieldSurfaceGeometryHandle(
+                geometry[i], _playfieldSurfaceGeometryFrameId);
+            geometryTable.Set(i + 1, UserData.Create(handle));
+        }
+        for (var i = geometry.Count + 1; i <= _playfieldSurfacePreviousGeometryCount; i++)
+            geometryTable.Remove(i);
+        _playfieldSurfacePreviousGeometryCount = geometry.Count;
+
+        frame.Set("version", DynValue.NewNumber(
+            string.Equals(callbackName, "render_playfield", StringComparison.Ordinal) ? 1 : 2));
+        frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
+        frame.Set("real_time", DynValue.NewNumber(Math.Max(0.0, realTime ?? time)));
+        frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
+        frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
+        frame.Set("geometry", DynValue.NewTable(geometryTable));
+        frame.Set("geometry_count", DynValue.NewNumber(geometry.Count));
+        if (_playfieldLifecycleTable is null)
+            _playfieldLifecycleTable = new Table(_script);
+        _playfieldLifecycleTable.Set("phase", DynValue.NewString(_playfieldLifecyclePhase));
+        _playfieldLifecycleTable.Set("elapsed", DynValue.NewNumber(Math.Max(0.0, _playfieldLifecycleElapsed)));
+        _playfieldLifecycleTable.Set("reason", DynValue.NewString(_playfieldLifecycleReason));
+        _playfieldLifecycleTable.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
+        frame.Set("lifecycle", DynValue.NewTable(_playfieldLifecycleTable));
+
+        try
+        {
+            var function = _script.Globals.Get(callbackName);
+            if (function.Type != DataType.Function)
+                return false;
+
+            _insidePlayfieldSurfaceRenderer = true;
+            var result = _script.Call(function, DynValue.NewTable(frame));
+            return result.Type == DataType.Boolean && result.Boolean;
+        }
+        catch (Exception ex)
+        {
+            _playfieldSurfaceDrawRequests.Clear();
+            HandleScriptRuntimeFailure(ex, callbackName);
+            return false;
+        }
+        finally
+        {
+            _insidePlayfieldSurfaceRenderer = false;
+        }
+    }
+
+    private void InvokeHitEffectRenderer(
+        double realTime,
+        double chartTime,
+        int width,
+        int height,
+        string view)
+    {
+        if (!SupportsHitEffectRenderer || _script is null)
+            return;
+
+        if (!ReferenceEquals(_hitEffectFrameTableOwner, _script) || _hitEffectFrameTable is null)
+        {
+            _hitEffectFrameTableOwner = _script;
+            _hitEffectFrameTable = new Table(_script);
+        }
+
+        var frame = _hitEffectFrameTable;
+        frame.Set("version", DynValue.NewNumber(1));
+        frame.Set("time", DynValue.NewNumber(Math.Max(0.0, realTime)));
+        frame.Set("real_time", DynValue.NewNumber(Math.Max(0.0, realTime)));
+        frame.Set("chart_time", DynValue.NewNumber(Math.Max(0.0, chartTime)));
+        frame.Set("width", DynValue.NewNumber(Math.Max(1, width)));
+        frame.Set("height", DynValue.NewNumber(Math.Max(1, height)));
+        frame.Set("view", DynValue.NewString(string.Equals(view, "editor", StringComparison.OrdinalIgnoreCase) ? "editor" : "gameplay"));
+
+        try
+        {
+            _insideHitEffectRenderer = true;
+            var function = _script.Globals.Get("render_hit_effects");
+            if (function.Type == DataType.Function)
+            {
+                LastCallback = "render_hit_effects";
+                CallbackCount++;
+                _script.Call(function, DynValue.NewTable(frame));
+            }
+        }
+        catch (Exception ex)
+        {
+            HandleScriptRuntimeFailure(ex, "render_hit_effects");
+        }
+        finally
+        {
+            _insideHitEffectRenderer = false;
+        }
+    }
+
+    internal bool InvokeJudgementLineRenderer(
+        IReadOnlyList<SkinPlayfieldSpriteGeometrySnapshot> geometry,
+        double time,
+        double tick)
+    {
+        _judgementLineSpriteDrawRequests.Clear();
+        if (!SupportsJudgementLineRenderer || _script is null)
+            return false;
+
+        if (!ReferenceEquals(_judgementLineTableOwner, _script) ||
+            _judgementLineFrameTable is null ||
+            _judgementLineGeometryTable is null)
+        {
+            _judgementLineTableOwner = _script;
+            _judgementLineFrameTable = new Table(_script);
+            _judgementLineGeometryTable = new Table(_script);
+        }
+
+        _judgementLineGeometryFrameId++;
+        var frame = _judgementLineFrameTable;
+        var geometryTable = _judgementLineGeometryTable;
+        for (var i = 0; i < geometry.Count; i++)
+        {
+            var handle = new SkinPlayfieldSpriteGeometryHandle(
+                geometry[i], _judgementLineGeometryFrameId);
+            geometryTable.Set(i + 1, UserData.Create(handle));
+        }
+        for (var i = geometry.Count + 1; i <= _judgementLinePreviousGeometryCount; i++)
+            geometryTable.Remove(i);
+        _judgementLinePreviousGeometryCount = geometry.Count;
+
+        frame.Set("version", DynValue.NewNumber(1));
+        frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
+        frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
+        frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
+        frame.Set("lines", DynValue.NewTable(geometryTable));
+        frame.Set("line_count", DynValue.NewNumber(geometry.Count));
+
+        try
+        {
+            var function = _script.Globals.Get("render_judgement_line");
+            if (function.Type != DataType.Function)
+                return false;
+
+            _insideJudgementLineRenderer = true;
+            var result = _script.Call(function, DynValue.NewTable(frame));
+            return result.Type == DataType.Boolean && result.Boolean;
+        }
+        catch (Exception ex)
+        {
+            _judgementLineSpriteDrawRequests.Clear();
+            HandleScriptRuntimeFailure(ex, "render_judgement_line");
+            return false;
+        }
+        finally
+        {
+            _insideJudgementLineRenderer = false;
+        }
+    }
+
+    internal bool InvokePlayfieldNoteRenderer(
+        IReadOnlyList<SkinPlayfieldGeometrySnapshot> geometry,
+        IReadOnlyList<SkinPlayfieldSpriteGeometrySnapshot> spriteGeometry,
+        double time,
+        double tick,
+        double realTime)
+    {
+        _playfieldGeometryDrawRequests.Clear();
+        _playfieldSpriteDrawRequests.Clear();
+        if (!SupportsPlayfieldNoteRenderer || _script is null)
+            return false;
+
+        EnsurePlayfieldNoteFrameTables(_script);
+        _playfieldGeometryFrameId++;
+        _playfieldNoteIndices.Clear();
+        _playfieldNoteGeometryCounts.Clear();
+
+        var notes = _playfieldNotesTable!;
+        var frame = _playfieldNoteFrameTable!;
+        var noteCount = 0;
+        var geometryCount = 0;
+
+        for (var i = 0; i < geometry.Count; i++)
+        {
+            var item = geometry[i];
+            var key = (item.Track, item.Tick, item.EventIndex);
+            if (!_playfieldNoteIndices.TryGetValue(key, out var noteIndex))
+            {
+                noteIndex = noteCount++;
+                _playfieldNoteIndices.Add(key, noteIndex);
+                EnsurePlayfieldNoteTableCapacity(noteIndex + 1);
+
+                var note = _playfieldNoteTables[noteIndex];
+                note.Set("type", DynValue.NewString(item.NoteType));
+                note.Set("track", DynValue.NewNumber(item.Track));
+                note.Set("tick", DynValue.NewNumber(item.Tick));
+                note.Set("attr", DynValue.NewNumber(item.Attr));
+                note.Set("duration_ticks", DynValue.NewNumber(item.DurationTicks));
+                note.Set("side", DynValue.NewString(item.Side));
+                note.Set("bank", DynValue.NewString(item.Bank));
+                note.Set("geometry", DynValue.NewTable(_playfieldNoteGeometryTables[noteIndex]));
+                notes.Set(noteCount, DynValue.NewTable(note));
+                _playfieldNoteGeometryCounts.Add(0);
+            }
+
+            var currentNote = _playfieldNoteTables[noteIndex];
+            currentNote.Set("hit", DynValue.NewBoolean(item.Hit));
+            currentNote.Set("missed", DynValue.NewBoolean(item.Missed));
+            currentNote.Set("simultaneous", DynValue.NewBoolean(item.Simultaneous));
+
+            geometryCount++;
+            var handle = new SkinPlayfieldGeometryHandle(item, _playfieldGeometryFrameId);
+            var noteGeometryIndex = ++_playfieldNoteGeometryCounts[noteIndex];
+            _playfieldNoteGeometryTables[noteIndex].Set(
+                noteGeometryIndex,
+                UserData.Create(handle));
+        }
+
+        for (var i = 0; i < spriteGeometry.Count; i++)
+        {
+            var item = spriteGeometry[i];
+            var key = (item.Track, item.Tick, item.EventIndex);
+            if (!_playfieldNoteIndices.TryGetValue(key, out var noteIndex))
+            {
+                noteIndex = noteCount++;
+                _playfieldNoteIndices.Add(key, noteIndex);
+                EnsurePlayfieldNoteTableCapacity(noteIndex + 1);
+
+                var note = _playfieldNoteTables[noteIndex];
+                note.Set("type", DynValue.NewString(item.NoteType));
+                note.Set("track", DynValue.NewNumber(item.Track));
+                note.Set("tick", DynValue.NewNumber(item.Tick));
+                note.Set("attr", DynValue.NewNumber(item.Attr));
+                note.Set("duration_ticks", DynValue.NewNumber(item.DurationTicks));
+                note.Set("side", DynValue.NewString(item.Side));
+                note.Set("bank", DynValue.NewString(item.Bank));
+                note.Set("family", DynValue.NewString(item.Family));
+                note.Set("geometry", DynValue.NewTable(_playfieldNoteGeometryTables[noteIndex]));
+                notes.Set(noteCount, DynValue.NewTable(note));
+                _playfieldNoteGeometryCounts.Add(0);
+            }
+
+            var currentNote = _playfieldNoteTables[noteIndex];
+            currentNote.Set("hit", DynValue.NewBoolean(item.Hit));
+            currentNote.Set("missed", DynValue.NewBoolean(item.Missed));
+            currentNote.Set("simultaneous", DynValue.NewBoolean(item.Simultaneous));
+            currentNote.Set("family", DynValue.NewString(item.Family));
+
+            var handle = new SkinPlayfieldSpriteGeometryHandle(item, _playfieldGeometryFrameId);
+            var noteGeometryIndex = ++_playfieldNoteGeometryCounts[noteIndex];
+            _playfieldNoteGeometryTables[noteIndex].Set(
+                noteGeometryIndex,
+                UserData.Create(handle));
+        }
+
+        for (var i = noteCount + 1; i <= _playfieldPreviousNoteCount; i++)
+        {
+            notes.Remove(i);
+            _playfieldNoteGeometryTables[i - 1].Clear();
+            _playfieldNotePreviousGeometryCounts[i - 1] = 0;
+        }
+        _playfieldPreviousNoteCount = noteCount;
+
+        for (var i = 0; i < noteCount; i++)
+        {
+            var currentCount = _playfieldNoteGeometryCounts[i];
+            var previousCount = _playfieldNotePreviousGeometryCounts[i];
+            var geometryTable = _playfieldNoteGeometryTables[i];
+            for (var key = currentCount + 1; key <= previousCount; key++)
+                geometryTable.Remove(key);
+            _playfieldNotePreviousGeometryCounts[i] = currentCount;
+        }
+
+        frame.Set("version", DynValue.NewNumber(3));
+        frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
+        frame.Set("real_time", DynValue.NewNumber(Math.Max(0.0, realTime)));
+        frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
+        frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
+        frame.Set("notes", DynValue.NewTable(notes));
+        frame.Set("note_count", DynValue.NewNumber(noteCount));
+        frame.Set("geometry_count", DynValue.NewNumber(geometryCount + spriteGeometry.Count));
+        frame.Set("sprite_geometry_count", DynValue.NewNumber(spriteGeometry.Count));
+
+        try
+        {
+            var function = _script.Globals.Get("render_notes");
+            if (function.Type != DataType.Function)
+                return false;
+
+            _insidePlayfieldNoteRenderer = true;
+            var result = _script.Call(function, DynValue.NewTable(frame));
+            return result.Type == DataType.Boolean && result.Boolean;
+        }
+        catch (Exception ex)
+        {
+            _playfieldGeometryDrawRequests.Clear();
+            _playfieldSpriteDrawRequests.Clear();
+            HandleScriptRuntimeFailure(ex, "render_notes");
+            return false;
+        }
+        finally
+        {
+            _insidePlayfieldNoteRenderer = false;
+        }
+    }
+
+    private void EnsurePlayfieldNoteFrameTables(Script script)
+    {
+        if (ReferenceEquals(_playfieldTableOwner, script) &&
+            _playfieldNoteFrameTable is not null &&
+            _playfieldNotesTable is not null)
+            return;
+
+        _playfieldTableOwner = script;
+        _playfieldNoteFrameTable = new Table(script);
+        _playfieldNotesTable = new Table(script);
+        _playfieldNoteTables.Clear();
+        _playfieldNoteGeometryTables.Clear();
+        _playfieldNoteGeometryCounts.Clear();
+        _playfieldNotePreviousGeometryCounts.Clear();
+        _playfieldNoteIndices.Clear();
+        _playfieldPreviousNoteCount = 0;
+    }
+
+    private void EnsurePlayfieldNoteTableCapacity(int required)
+    {
+        while (_playfieldNoteTables.Count < required)
+        {
+            _playfieldNoteTables.Add(new Table(_playfieldTableOwner!));
+            _playfieldNoteGeometryTables.Add(new Table(_playfieldTableOwner!));
+            _playfieldNotePreviousGeometryCounts.Add(0);
+        }
+    }
+
+
+    private DynValue SubmitPlayfieldGeometryQuad(SkinAssetHandle? asset, Table options)
+    {
+        if (options.Get("shader").Type != DataType.Nil)
+            throw new ScriptRuntimeException("Shader overrides are not yet available for playfield geometry handles; use draw.sprite() or a regular draw.quad3d() command.");
+        var geometryValue = options.Get("geometry");
+        if (geometryValue.Type == DataType.Nil)
+            return DynValue.Nil;
+        if (geometryValue.Type != DataType.UserData || geometryValue.UserData?.Object is null)
+            throw new ScriptRuntimeException("draw.quad3d option 'geometry' expects a geometry handle from the current playfield callback");
+
+        var tint = GetColor(options, "color", XnaColor.White);
+        var alpha = Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f);
+        if (geometryValue.UserData.Object is SkinPlayfieldSurfaceGeometryHandle surfaceGeometry)
+        {
+            if (!_insidePlayfieldSurfaceRenderer || surfaceGeometry.FrameId != _playfieldSurfaceGeometryFrameId)
+                throw new ScriptRuntimeException("draw.quad3d surface geometry handles are only valid inside the current playfield surface callback");
+            var layer = (int)Math.Clamp(Math.Round(GetNumber(options, "layer", surfaceGeometry.layer)), -32.0, 32.0);
+            var scaleX = (float)Math.Clamp(GetNumber(options, "scale_x", 1f), 0.001, 100.0);
+            var scaleY = (float)Math.Clamp(GetNumber(options, "scale_y", 1f), 0.001, 100.0);
+            var offsetX = (float)Math.Clamp(GetNumber(options, "offset_x", 0f), -10.0, 10.0);
+            var offsetY = (float)Math.Clamp(GetNumber(options, "offset_y", 0f), -10.0, 10.0);
+            var anchorX = (float)Math.Clamp(GetNumber(options, "anchor_x", 0.5f), 0.0, 1.0);
+            var anchorY = (float)Math.Clamp(GetNumber(options, "anchor_y", 0.5f), 0.0, 1.0);
+            var blend = GetString(options, "blend", "normal");
+            _playfieldSurfaceDrawRequests.Add(new SkinPlayfieldSurfaceDrawRequest(
+                asset, surfaceGeometry, tint, alpha, layer,
+                scaleX, scaleY, offsetX, offsetY, anchorX, anchorY, blend));
+            return DynValue.Nil;
+        }
+
+        if (geometryValue.UserData.Object is SkinPlayfieldGeometryHandle geometry)
+        {
+            if (!_insidePlayfieldNoteRenderer || geometry.FrameId != _playfieldGeometryFrameId)
+                throw new ScriptRuntimeException("draw.quad3d note geometry handles are only valid inside the current render_notes(frame) call");
+            var layer = (int)Math.Round(GetNumber(options, "layer", geometry.layer));
+            var scaleX = (float)Math.Clamp(GetNumber(options, "scale_x", 1f), 0.001, 100.0);
+            var scaleY = (float)Math.Clamp(GetNumber(options, "scale_y", 1f), 0.001, 100.0);
+            _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
+                asset, geometry, tint, alpha, layer, scaleX, scaleY));
+            return DynValue.Nil;
+        }
+
+        throw new ScriptRuntimeException("draw.quad3d option 'geometry' expects a note or lane geometry handle from the current playfield callback");
+    }
 
     private Table CreateDrawApi(Script script)
     {
@@ -7042,6 +8346,43 @@ public sealed class SkinRuntime : IDisposable
         return table;
     }
 
+    private DynValue SubmitPlayfieldSpriteGeometry(SkinAssetHandle asset, Table options)
+    {
+        if (options.Get("shader").Type != DataType.Nil)
+            throw new ScriptRuntimeException("Shader overrides are not yet available for playfield sprite geometry handles; use draw.sprite() without a geometry handle.");
+        var geometryValue = options.Get("geometry");
+        if (geometryValue.Type != DataType.UserData ||
+            geometryValue.UserData?.Object is not SkinPlayfieldSpriteGeometryHandle geometry)
+        {
+            throw new ScriptRuntimeException("draw.sprite option 'geometry' expects a screen-sprite geometry handle from the current playfield callback");
+        }
+
+        var request = new SkinPlayfieldSpriteDrawRequest(
+            asset,
+            geometry,
+            GetColor(options, "color", XnaColor.White),
+            Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f),
+            (int)Math.Round(GetNumber(options, "layer", geometry.layer)),
+            GetBool(options, "flip_x", false),
+            GetBool(options, "flip_y", false),
+            (float)Math.Clamp(GetNumber(options, "scale_x", 1f), 0.001, 100.0),
+            (float)Math.Clamp(GetNumber(options, "scale_y", 1f), 0.001, 100.0));
+
+        if (_insideJudgementLineRenderer && geometry.FrameId == _judgementLineGeometryFrameId)
+        {
+            _judgementLineSpriteDrawRequests.Add(request);
+            return DynValue.Nil;
+        }
+
+        if (_insidePlayfieldNoteRenderer && geometry.FrameId == _playfieldGeometryFrameId)
+        {
+            _playfieldSpriteDrawRequests.Add(request);
+            return DynValue.Nil;
+        }
+
+        throw new ScriptRuntimeException("draw.sprite geometry handles are only valid inside their current render_notes(frame) or render_judgement_line(frame) callback");
+    }
+
     private DynValue DrawSprite(ScriptExecutionContext _, CallbackArguments args)
     {
         var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
@@ -7051,6 +8392,9 @@ public sealed class SkinRuntime : IDisposable
             throw new ScriptRuntimeException("draw.sprite(asset, options) expects an asset from assets.load()");
 
         var options = GetOptions(args, 1);
+        if (options.Get("geometry").Type != DataType.Nil)
+            return SubmitPlayfieldSpriteGeometry(asset, options);
+
         var position = GetPosition(options);
         var anchor = GetAnchor(options);
         var scale = GetScale(options);
@@ -7059,6 +8403,10 @@ public sealed class SkinRuntime : IDisposable
         var crop = GetString(options, "crop", string.Empty);
         var cropCover = string.Equals(crop, "cover", StringComparison.OrdinalIgnoreCase);
         var nineSlice = ParseNineSlice(options.Get("nine_slice"));
+        var shader = GetShaderHandle(options, "shader");
+        var shaderUniforms = GetShaderUniforms(options);
+        if (shader is not null && nineSlice is not null)
+            throw new ScriptRuntimeException("draw.sprite with a shader does not support nine_slice; draw separate shader quads instead");
 
         if (width > 0f || height > 0f)
         {
@@ -7126,6 +8474,8 @@ public sealed class SkinRuntime : IDisposable
         var command = AcquireDrawCommand();
         command.Kind = SkinDrawCommandKind.Sprite;
         command.Asset = asset;
+        command.Shader = shader;
+        command.ShaderUniforms = shaderUniforms;
         command.Id = id;
         command.ParentId = parentId;
         command.Position = position;
@@ -7355,6 +8705,15 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue SubmitCachedQuad3D(SkinAssetHandle? asset, Table options)
     {
+        // A custom shader needs a program/uniform set per command and therefore
+        // bypasses the persistent-style command cache. The general submitter still
+        // preserves batching order and routes the command through the GLSL path.
+        if (options.Get("shader").Type != DataType.Nil)
+            return SubmitQuad3D(asset, options);
+
+        if (options.Get("geometry").Type != DataType.Nil)
+            return SubmitQuad3D(asset, options);
+
         // The fast API is for rectangular quads with a numeric width. Keep any
         // unsupported case on the fully general path rather than changing its
         // behavior. Cached style fields are opt-in and must remain static.
@@ -7477,7 +8836,11 @@ public sealed class SkinRuntime : IDisposable
             throw new ScriptRuntimeException("draw.quad3d option 'uv' expects a table with left/top/right/bottom or nil");
         }
 
-        var command = entry.Command;
+        // Cached commands bypass AcquireDrawCommand(). Keep separate cached
+        // instances for hit effects and ordinary UI so the same option table can
+        // be submitted from both callbacks without changing either command's stage.
+        var command = _insideHitEffectRenderer ? entry.HitEffectCommand : entry.Command;
+        command.IsHitEffect = _insideHitEffectRenderer;
         command.Kind = SkinDrawCommandKind.Quad3D;
         command.Asset = asset;
         command.MaskAsset = entry.MaskAsset;
@@ -7529,7 +8892,13 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue SubmitQuad3D(SkinAssetHandle? asset, Table options)
     {
-            SkinAssetHandle? maskAsset = null;
+        var playfieldGeometry = options.Get("geometry");
+        if (playfieldGeometry.Type != DataType.Nil)
+            return SubmitPlayfieldGeometryQuad(asset, options);
+
+        var shader = GetShaderHandle(options, "shader");
+        var shaderUniforms = GetShaderUniforms(options);
+        SkinAssetHandle? maskAsset = null;
             var maskValue = options.Get("mask");
             if (maskValue.Type != DataType.Nil)
             {
@@ -7741,6 +9110,8 @@ public sealed class SkinRuntime : IDisposable
             var command = AcquireDrawCommand();
             command.Kind = SkinDrawCommandKind.Quad3D;
             command.Asset = asset;
+            command.Shader = shader;
+            command.ShaderUniforms = shaderUniforms;
             command.MaskAsset = maskAsset;
             command.MaskUv = maskUv;
             command.ClipRect = clipRect;
@@ -9369,6 +10740,8 @@ public sealed class SkinRuntime : IDisposable
         _fallbackSparkleAssetSet = null;
         foreach (var sound in _skinSounds.Values) sound?.Dispose();
         _skinSounds.Clear();
+        _shaderStore.Dispose();
+        _shaderRenderer.Dispose();
         _assets.Dispose();
         ClearTextLayoutCache();
         _fonts.Dispose();

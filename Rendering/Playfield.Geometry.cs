@@ -91,14 +91,15 @@ public sealed partial class Playfield
         Texture2D? overlayTexture,
         float baseWidth,
         float overlayWidth,
-        bool pulseOverlay = false,
         double currentTick = 0,
         float travelPixels = float.NaN,
         float rotationRadians = 0f,
         bool flipU = false,
         BankSurface? surfaceOverride = null,
         StandingNoteBasis? basisOverride = null,
-        StandingNoteBasis? bankJudgeBasisOverride = null)
+        StandingNoteBasis? bankJudgeBasisOverride = null,
+        string? baseComponent = null,
+        string? overlayComponent = null)
     {
         // All active note callers now provide travelPixels. The old screen-space
         // standing-note fallback is retired; notes are always built from the
@@ -132,29 +133,19 @@ public sealed partial class Playfield
             _head3DCommands.Add(BuildNoteCommand(
                 baseTexture, point, track, baseWidth, baseTint, 0, travelPixels,
                 rotationRadians, flipU, surface, noteBasis, bankJudgeBasis,
-                side, bank, normalizedX));
+                side, bank, normalizedX, baseComponent));
         }
 
         if (overlayTexture is not null)
         {
-            var width = overlayWidth;
-            Color? overlayTint = null;
-            if (pulseOverlay || bankOpacity < 0.999f)
-            {
-                var pulse = pulseOverlay ? BeatPulseEnvelope(currentTick) : 1f;
-                var alpha = (1f - _projection.LightPulseOpacity * (1f - pulse)) * bankOpacity;
-                if (!pulseOverlay)
-                    alpha = bankOpacity;
-                overlayTint = new Color(255, 255, 255,
-                    Math.Clamp((int)MathF.Round(alpha * 255f), 0, 255));
-                if (pulseOverlay)
-                    width = overlayWidth + (_projection.LightPulseWidth - overlayWidth) * pulse;
-            }
+            Color? overlayTint = bankOpacity < 0.999f
+                ? new Color(255, 255, 255, Math.Clamp((int)MathF.Round(bankOpacity * 255f), 0, 255))
+                : null;
 
             _head3DCommands.Add(BuildNoteCommand(
-                overlayTexture, point, track, width, overlayTint, 1, travelPixels,
+                overlayTexture, point, track, overlayWidth, overlayTint, 1, travelPixels,
                 rotationRadians, flipU, surface, noteBasis, bankJudgeBasis,
-                side, bank, normalizedX));
+                side, bank, normalizedX, overlayComponent));
         }
     }
 
@@ -393,7 +384,8 @@ public sealed partial class Playfield
         StandingNoteBasis? bankJudgeBasis = null,
         string? sideOverride = null,
         string? bankOverride = null,
-        float normalizedXOverride = float.NaN)
+        float normalizedXOverride = float.NaN,
+        string? componentOverride = null)
     {
         var vertices = BuildCardVertices(
             texture,
@@ -420,6 +412,7 @@ public sealed partial class Playfield
         var side = sideOverride ?? position?.Side ?? (point.Position.X < _projection.JudgeX ? "left" : "right");
         var bank = bankOverride ?? position?.Bank;
         var effectiveFlipU = ResolveFlipU(side, flipU);
+        var noteContext = _skinNoteGeometryContext;
         return new Textured3DQuadCommand(
             texture,
             vertices,
@@ -427,7 +420,17 @@ public sealed partial class Playfield
             _projection.BankSwitchFlipV(side, bank),
             tint,
             layer,
-            effectiveFlipU);
+            effectiveFlipU,
+            noteContext?.Track ?? track,
+            noteContext?.Tick ?? -1,
+            noteContext?.EventIndex ?? -1,
+            noteContext?.Attr ?? 0,
+            noteContext?.Duration ?? 0,
+            noteContext is null ? string.Empty : GetSkinPlayfieldNoteType(noteContext),
+            componentOverride ?? (layer == 0 ? "head" : layer == 1 ? "indicator" : "overlay"),
+            _skinNoteSimultaneousContext,
+            track,
+            _skinNoteMissedContext);
     }
 
     private VertexPositionColorTexture[] BuildFlatCardVerticesFromBasis(
@@ -525,6 +528,7 @@ public sealed partial class Playfield
         var position = GearState.Position(track);
         var side = position?.Side ?? (point.Position.X < _projection.JudgeX ? "left" : "right");
         var bank = position?.Bank;
+        var noteContext = _skinNoteGeometryContext;
         return new Textured3DQuadCommand(
             texture,
             vertices,
@@ -532,7 +536,17 @@ public sealed partial class Playfield
             _projection.BankSwitchFlipV(side, bank),
             tint,
             layer,
-            ResolveFlipU(side, flipU));
+            ResolveFlipU(side, flipU),
+            noteContext?.Track ?? track,
+            noteContext?.Tick ?? -1,
+            noteContext?.EventIndex ?? -1,
+            noteContext?.Attr ?? 0,
+            noteContext?.Duration ?? 0,
+            noteContext is null ? string.Empty : GetSkinPlayfieldNoteType(noteContext),
+            "endpoint",
+            _skinNoteSimultaneousContext,
+            track,
+            _skinNoteMissedContext);
     }
 
     private Textured3DQuadCommand BuildBodyCommand(
@@ -638,6 +652,7 @@ public sealed partial class Playfield
             }
         }
 
+        var noteContext = _skinNoteGeometryContext;
         return new Textured3DQuadCommand(
             texture,
             vertices,
@@ -645,7 +660,17 @@ public sealed partial class Playfield
             flipV,
             null,
             (int)layer,
-            false);
+            false,
+            noteContext?.Track ?? -1,
+            noteContext?.Tick ?? -1,
+            noteContext?.EventIndex ?? -1,
+            noteContext?.Attr ?? 0,
+            noteContext?.Duration ?? 0,
+            noteContext is null ? string.Empty : GetSkinPlayfieldNoteType(noteContext),
+            "body",
+            _skinNoteSimultaneousContext,
+            noteContext?.Track ?? -1,
+            _skinNoteMissedContext);
     }
 
 
@@ -673,7 +698,11 @@ public sealed partial class Playfield
             texture, side, bank, normalizedX, startSeconds, endSeconds,
             widthBase, allowPastJudgement);
         if (body3D.Vertices is not null && body3D.Vertices.Length > 0)
+        {
+            if (bodySourceKey is { } sourceKey)
+                body3D = body3D with { GeometryTrack = sourceKey.Track };
             AddLaneBodyCommandIfUniqueForSource(body3D, bodySourceKey);
+        }
     }
 
 
@@ -1398,17 +1427,18 @@ public sealed partial class Playfield
             var opacity = (state is not null
                 ? GetEditorBankOpacity(command.Side, command.Bank, state)
                 : 1f) * command.Opacity;
-            if (opacity < 0.9999f)
+            var tint = command.Tint ?? Color.White;
+            if (opacity < 0.9999f || tint != Color.White)
             {
                 for (var vertexIndex = 0; vertexIndex < count; vertexIndex++)
                 {
                     var destinationIndex = writeOffset + vertexIndex;
                     var vertex = _laneTextureBatchScratch[destinationIndex];
                     var sourceColor = vertex.Color;
-                    var red = (byte)Math.Clamp((int)MathF.Round(sourceColor.R * opacity), 0, 255);
-                    var green = (byte)Math.Clamp((int)MathF.Round(sourceColor.G * opacity), 0, 255);
-                    var blue = (byte)Math.Clamp((int)MathF.Round(sourceColor.B * opacity), 0, 255);
-                    var alpha = (byte)Math.Clamp((int)MathF.Round(sourceColor.A * opacity), 0, 255);
+                    var red = (byte)Math.Clamp((int)MathF.Round(sourceColor.R * (tint.R / 255f) * opacity), 0, 255);
+                    var green = (byte)Math.Clamp((int)MathF.Round(sourceColor.G * (tint.G / 255f) * opacity), 0, 255);
+                    var blue = (byte)Math.Clamp((int)MathF.Round(sourceColor.B * (tint.B / 255f) * opacity), 0, 255);
+                    var alpha = (byte)Math.Clamp((int)MathF.Round(sourceColor.A * (tint.A / 255f) * opacity), 0, 255);
                     _laneTextureBatchScratch[destinationIndex] = new VertexPositionColorTexture(
                         vertex.Position, new Color(red, green, blue, alpha), vertex.TextureCoordinate);
                 }
@@ -1554,22 +1584,18 @@ public sealed partial class Playfield
                 var opacity = (state is not null
                     ? GetEditorBankOpacity(command.Side, command.Bank, state)
                     : 1f) * command.Opacity;
-                if (opacity < 0.9999f)
+                var tint = command.Tint ?? Color.White;
+                if (opacity < 0.9999f || tint != Color.White)
                 {
                     for (var vertexIndex = 0; vertexIndex < command.Vertices.Length; vertexIndex++)
                     {
                         var destinationIndex = writeOffset + vertexIndex;
                         var vertex = _laneTextureBatchScratch[destinationIndex];
                         var sourceColor = vertex.Color;
-                        // These meshes are drawn with NonPremultiplied blending.
-                        // Scaling alpha alone leaves RGB fully bright, so an alpha-0
-                        // bank can still paint over the active bank in collapsed mode.
-                        // Scale all channels to apply true opacity (and make 0 opacity
-                        // genuinely invisible).
-                        var red = (byte)Math.Clamp((int)MathF.Round(sourceColor.R * opacity), 0, 255);
-                        var green = (byte)Math.Clamp((int)MathF.Round(sourceColor.G * opacity), 0, 255);
-                        var blue = (byte)Math.Clamp((int)MathF.Round(sourceColor.B * opacity), 0, 255);
-                        var alpha = (byte)Math.Clamp((int)MathF.Round(sourceColor.A * opacity), 0, 255);
+                        var red = (byte)Math.Clamp((int)MathF.Round(sourceColor.R * (tint.R / 255f) * opacity), 0, 255);
+                        var green = (byte)Math.Clamp((int)MathF.Round(sourceColor.G * (tint.G / 255f) * opacity), 0, 255);
+                        var blue = (byte)Math.Clamp((int)MathF.Round(sourceColor.B * (tint.B / 255f) * opacity), 0, 255);
+                        var alpha = (byte)Math.Clamp((int)MathF.Round(sourceColor.A * (tint.A / 255f) * opacity), 0, 255);
                         _laneTextureBatchScratch[destinationIndex] = new VertexPositionColorTexture(
                             vertex.Position,
                             new Color(red, green, blue, alpha),
@@ -1880,11 +1906,13 @@ public sealed partial class Playfield
     private void ReturnQuad3DVertices(List<Textured3DQuadCommand> commands)
     {
         for (var i = 0; i < commands.Count; i++)
-        {
-            var vertices = commands[i].Vertices;
-            if (vertices.Length == 6)
-                _quad3DVertexPool.Push(vertices);
-        }
+            ReturnQuad3DVertexArray(commands[i].Vertices);
+    }
+
+    private void ReturnQuad3DVertexArray(VertexPositionColorTexture[] vertices)
+    {
+        if (vertices.Length == 6)
+            _quad3DVertexPool.Push(vertices);
     }
 
     private VertexPositionColorTexture[] RentBody3DVertices(int vertexCount)
@@ -1956,27 +1984,29 @@ public sealed partial class Playfield
     private void ReturnBody3DVertices(List<Textured3DQuadCommand> commands)
     {
         for (var i = 0; i < commands.Count; i++)
+            ReturnBody3DVertexArray(commands[i].Vertices);
+    }
+
+    private void ReturnBody3DVertexArray(VertexPositionColorTexture[] vertices)
+    {
+        if (vertices.Length == 0)
+            return;
+
+        // Link connectors are exactly one 6-vertex quad and are stored in the
+        // same body3D command list as segmented bodies. Return those to the
+        // fixed-size quad pool instead of creating a fresh array per segment.
+        if (vertices.Length == 6)
         {
-            var vertices = commands[i].Vertices;
-            if (vertices.Length == 0)
-                continue;
-
-            // Link connectors are exactly one 6-vertex quad and are stored in the
-            // same body3D command list as segmented bodies. Return those to the
-            // fixed-size quad pool instead of creating a fresh array per segment.
-            if (vertices.Length == 6)
-            {
-                _quad3DVertexPool.Push(vertices);
-                continue;
-            }
-
-            if (!_body3DVertexPools.TryGetValue(vertices.Length, out var pool))
-            {
-                pool = new Stack<VertexPositionColorTexture[]>();
-                _body3DVertexPools[vertices.Length] = pool;
-            }
-            pool.Push(vertices);
+            _quad3DVertexPool.Push(vertices);
+            return;
         }
+
+        if (!_body3DVertexPools.TryGetValue(vertices.Length, out var pool))
+        {
+            pool = new Stack<VertexPositionColorTexture[]>();
+            _body3DVertexPools[vertices.Length] = pool;
+        }
+        pool.Push(vertices);
     }
 
     private void DrawTexturedBodyCommands(List<TexturedBodyCommand> commands, bool alreadySorted = false)
@@ -2308,12 +2338,12 @@ public sealed partial class Playfield
                 ? IsLinkChainSimultaneous(ev, counts)
                 : IsSimultaneous(ev, counts));
             var textureMissing = ev.IsFlick
-                ? _textures.Get(simultaneous ? "note-flick-multi" : "note-flick") is null
+                ? _textures.Get(simultaneous ? NoteTextureAsset.NoteFlickMulti : NoteTextureAsset.NoteFlick) is null
                 : ev.NoteType switch
                 {
-                    NoteType.LinkTail => _textures.Get(simultaneous ? "tail-multi" : "tail") is null,
-                    NoteType.LinkHead => _textures.Get(simultaneous ? "note-multi" : "note-long") is null,
-                    _ => _textures.Get(simultaneous ? "note-multi" : "note-regular") is null
+                    NoteType.LinkTail => _textures.Get(simultaneous ? NoteTextureAsset.TailMulti : NoteTextureAsset.Tail) is null,
+                    NoteType.LinkHead => _textures.Get(simultaneous ? NoteTextureAsset.NoteMulti : NoteTextureAsset.NoteLong) is null,
+                    _ => _textures.Get(simultaneous ? NoteTextureAsset.NoteMulti : NoteTextureAsset.NoteRegular) is null
                 };
             if (!textureMissing)
                 continue;

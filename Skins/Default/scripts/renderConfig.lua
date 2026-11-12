@@ -1,3 +1,8 @@
+-- LEGACY COMPATIBILITY FALLBACK ONLY. The Default skin's active settings are
+-- provided by playfieldConfig.lua through get_playfield_config(view) in skin.lua.
+-- This file is retained so older third-party skins without the new API still have
+-- a Default layout to fall back to.
+
 -- Playfield/camera configuration only.
 
 -- Use the 16:9 virtual width as the maximum geometry width.
@@ -84,6 +89,8 @@ return {
             widthScale = lane.texture.widthScale,
         },
 
+        -- Native compatibility fallback only. The Default skin's visible
+        -- lane-highlight animation is authored in skin.lua.
         highlight = {
             riseDuration = 0.2,
             alpha = 1,
@@ -93,10 +100,6 @@ return {
 
     judge = {
         width = judgeWidth,
-
-        pulse = {
-            width = judgeWidth * 1.1,
-        },
     },
 
     note = {
@@ -116,11 +119,6 @@ return {
 
         light = {
             width = noteWidth * 3,
-
-            pulse = {
-                width = noteWidth * 3 * 1.1,
-                opacity = 0.35,
-            },
         },
 
         body = {
@@ -198,6 +196,8 @@ return {
         behind = 100,
     },
 
+    -- Native compatibility fallback only. The Default skin's visible
+    -- transition-flash animation is authored in skin.lua.
     transitionFlash = {
         delaySeconds = 0.1,
         fadeInSeconds = 0.045,

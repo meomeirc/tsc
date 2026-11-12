@@ -248,10 +248,19 @@ public sealed class RenderPositionConfig
     public float Y { get; set; }
 }
 
+public sealed class RenderBankGapConfig
+{
+    // Spacing between adjacent banks on the same side, measured in virtual pixels.
+    // Nullable values preserve the historical 13%-of-bank-width default for older skins.
+    public float? Start { get; set; }
+    public float? Judge { get; set; }
+}
+
 public sealed class RenderGapConfig
 {
     public float Start { get; set; }
     public float Judge { get; set; }
+    public RenderBankGapConfig Bank { get; set; } = new();
 }
 
 public sealed class RenderRotationConfig
@@ -294,7 +303,6 @@ public sealed class RenderLaneHighlightConfig
 
 public sealed class RenderJudgeConfig : RenderVisualConfig
 {
-    public RenderVisualConfig Pulse { get; set; } = new();
 }
 
 public sealed class RenderNoteConfig
@@ -315,16 +323,9 @@ public sealed class RenderHoldComponentConfig
     public float Width { get; set; } = ChartProjection.DefaultHoldIndicatorWidth;
 }
 
-public sealed class RenderLightPulseConfig
-{
-    public float Width { get; set; } = ChartProjection.DefaultLightPulseWidth;
-    public float Opacity { get; set; } = ChartProjection.DefaultLightPulseOpacity;
-}
-
 public sealed class RenderLightConfig
 {
     public float Width { get; set; } = ChartProjection.DefaultLightIndicatorWidth;
-    public RenderLightPulseConfig Pulse { get; set; } = new();
 }
 
 public sealed class RenderHoldConfig
@@ -445,7 +446,8 @@ public sealed class RenderLaneConfig
 public sealed class RenderEditorConfig
 {
     // Opacity multiplier for banks that are not currently active on their side.
-    // This setting is read from editorRenderConfig.lua by the chart editor.
+    // This setting is provided by get_playfield_config("editor"); older skins
+    // may still supply it through editorRenderConfig.lua.
     public float InactiveBankOpacity { get; set; } = 0.35f;
 }
 
@@ -558,6 +560,12 @@ public static class SkinConfigStore
         var primaryPath = SkinScriptPathResolver.Preferred(skin.SkinDirectory, "renderConfig.lua");
         var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
         var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "renderConfig.lua");
+        if (!File.Exists(primaryPath) && !File.Exists(defaultPath))
+        {
+            skin.RenderConfig = RenderConfigLuaLoader.LoadBuiltInDefault(outputWidth, outputHeight);
+            error = null;
+            return true;
+        }
         if (!RenderConfigLuaLoader.TryLoadWithFallback(
                 primaryPath, defaultPath, outputWidth, outputHeight, out var config, out error))
         {
@@ -582,6 +590,13 @@ public static class SkinConfigStore
                                   ?? UserDataPaths.GameRootDirectory;
         var defaultSkinDirectory = Path.Combine(skinParentDirectory, "Default");
         var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "renderConfig.lua");
+        // New skins provide playfield settings through get_playfield_config() in
+        // skin.lua. Do not generate obsolete config files when neither the selected
+        // skin nor Default has a legacy file to load. The gameplay SkinRuntime will
+        // apply the new API as soon as its script is initialized.
+        if (!File.Exists(primaryPath) && !File.Exists(defaultPath))
+            return RenderConfigLuaLoader.LoadBuiltInDefault(outputWidth, outputHeight);
+
         _ = RenderConfigLuaLoader.TryLoadWithFallback(
             primaryPath, defaultPath, outputWidth, outputHeight, out var config, out _);
         return config;

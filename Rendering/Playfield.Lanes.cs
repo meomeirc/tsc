@@ -40,6 +40,8 @@ public sealed partial class Playfield
         hash.Add(_projection.LaneJudgePositionY);
         hash.Add(_projection.LaneStartGap);
         hash.Add(_projection.LaneJudgeGap);
+        hash.Add(_projection.LaneBankGapStart);
+        hash.Add(_projection.LaneBankGapJudge);
         hash.Add(_projection.LaneBankWidth);
         hash.Add(_projection.LaneTrackWidth);
         hash.Add(_projection.LaneRotationDegrees);

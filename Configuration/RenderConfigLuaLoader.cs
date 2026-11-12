@@ -122,6 +122,21 @@ public static class RenderConfigLuaLoader
             paths.Add(fullPath);
     }
 
+    /// <summary>
+    /// Converts the plain table returned by skin.lua's get_playfield_config(view)
+    /// into the same validated configuration model used by legacy renderConfig.lua.
+    /// </summary>
+    internal static RenderConfig DeserializeLuaConfigTable(DynValue result, string configName)
+    {
+        if (result.Type != DataType.Table || result.Table is null)
+            throw new ScriptRuntimeException($"{configName} must return a configuration table.");
+
+        var plainValue = LuaValueToPlainObject(result, configName);
+        var json = JsonSerializer.Serialize(plainValue, JsonOptions);
+        return JsonSerializer.Deserialize<RenderConfig>(json, JsonOptions)
+            ?? new RenderConfig();
+    }
+
     public static bool TryLoadOrCreate(
         string path,
         int outputWidth,
@@ -303,7 +318,7 @@ return {
             x = screen.width / 2,
             y = screen.height - 145,
         },
-        gap = { start = 0, judge = 0 },
+        gap = { start = 0, judge = 0, bank = { start = bank * 0.13, judge = bank * 0.13 } },
         rotation = {
             degrees = rotation,
             depthDegrees = 0,
@@ -335,7 +350,6 @@ return {
         width = judgeWidth,
         alpha = 1,
         blend = normal,
-        pulse = { width = judgeWidth * 1.12 },
     },
 
     note = {
@@ -350,13 +364,7 @@ return {
 
     hold = {
         indicator = { width = track / 2 },
-        light = {
-            width = track / 2,
-            pulse = {
-                width = (track / 2) * 1.12,
-                opacity = 0.35,
-            },
-        },
+        light = { width = track / 2 },
         body = { width = track / 2 },
         tail = { width = track / 2 },
         dim = { width = track / 2 },

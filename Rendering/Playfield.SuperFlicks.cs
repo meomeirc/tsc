@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using TSC;
 using TSC.Ares;
 using TSC.Input;
@@ -5,12 +6,6 @@ using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
 using Microsoft.Xna.Framework.Input;
 using Color = Microsoft.Xna.Framework.Color;
-using Keys = Microsoft.Xna.Framework.Input.Keys;
-using Rectangle = Microsoft.Xna.Framework.Rectangle;
-using System.Globalization;
-using System.Diagnostics;
-using System.Runtime.CompilerServices;
-using System.Reflection;
 
 namespace TSC.Rendering;
 
@@ -49,12 +44,14 @@ public sealed partial class Playfield
 
         foreach (var (_, ev, _, side, bank, family) in superFlicks)
         {
+            if (IsSkinSuperFlickComponentReplaced(ev, "highlight"))
+                continue;
             var bankOpacity = _chartEditorMode
                 ? GetEditorBankOpacity(side, bank, RenderGearState(currentTick))
                 : 1f;
             if (bankOpacity <= 0.001f)
                 continue;
-            var texture = _textures.Get(family == SuperFlickFamily.Inner ? "light-inner" : "light-outer");
+            var texture = _textures.Get(family == SuperFlickFamily.Inner ? NoteTextureAsset.LightInner : NoteTextureAsset.LightOuter);
             if (texture is null)
                 continue;
 
@@ -100,72 +97,180 @@ public sealed partial class Playfield
         _spriteBatch.End();
     }
 
-    private void DrawSuperFlickHighlights3D(List<(float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family)> superFlicks)
-    {
-        var commands = _command3DBatchScratch;
-        commands.Clear();
-        foreach (var (_, ev, _, side, bank, family) in superFlicks)
-        {
-            var currentTick = _tempo!.SecondsToTick(_playSeconds);
-            var bankOpacity = _chartEditorMode
-                ? GetEditorBankOpacity(side, bank, RenderGearState(currentTick))
-                : 1f;
-            if (bankOpacity <= 0.001f)
-                continue;
-            var texture = _textures.Get(family == SuperFlickFamily.Inner ? "light-inner" : "light-outer");
-            if (texture is null)
-                continue;
+    private bool IsSkinSuperFlickComponentReplaced(ChartEvent ev, string component)
+        => _skinReplacedSuperFlickComponents.Contains(
+            new SkinSuperFlickComponentKey(ev.Track, ev.Tick, ev.EventIndex, component));
 
-            var travel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, currentTick);
-            var (bankLeft, bankRight) = SuperFlickSpanEdges(side, bank);
-            var relativeSeconds = (float)(_playSeconds - _tempo.TickToSeconds(ev.Tick));
-            var directionSign = family == SuperFlickFamily.Outer
-                ? (side == "right" ? 1f : -1f)
-                : (side == "right" ? -1f : 1f);
-            var phase = relativeSeconds * _projection.SuperFlickHighlightSpeed * directionSign;
+    private void AddSkinSuperFlickSpriteCommand(
+        SkinPlayfieldSpriteDrawRequest request,
+        (float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family) flick,
+        double currentTick,
+        List<TexturedQuadCommand> commands)
+    {
+        if (_tempo is null || request.Asset is null)
+            return;
+
+        var ev = flick.Event;
+        var side = flick.Side;
+        var bank = flick.Bank;
+        var family = flick.Family;
+        var texture = request.Asset.Texture;
+        var bankOpacity = _chartEditorMode
+            ? GetEditorBankOpacity(side, bank, RenderGearState(currentTick))
+            : 1f;
+        var commandAlpha = request.Alpha * bankOpacity;
+        if (commandAlpha <= 0.001f)
+            return;
+
+        var (bankLeft, bankRight) = SuperFlickSpanEdges(side, bank);
+        var relativeSeconds = (float)(_playSeconds - _tempo.TickToSeconds(ev.Tick));
+        var visualDirectionSign = family == SuperFlickFamily.Outer
+            ? (side == "right" ? 1f : -1f)
+            : (side == "right" ? -1f : 1f);
+        var travel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, currentTick);
+        var surface = _projection.BuildBankSurface(side, bank);
+        var textureAspect = texture.Width / (float)Math.Max(1, texture.Height);
+
+        if (string.Equals(request.Geometry.role, "highlight", StringComparison.OrdinalIgnoreCase))
+        {
+            var phase = relativeSeconds * _projection.SuperFlickHighlightSpeed * visualDirectionSign;
             phase -= MathF.Floor(phase);
             var normalizedX = MathHelper.Lerp(bankLeft, bankRight, phase);
-            var surface = _projection.BuildBankSurface(side, bank);
-            var noteContext = _projection.BuildStandingNoteTravelContext(
-                surface, normalizedX, side, bank);
-            var basis = _projection.BuildStandingNoteBasis(noteContext, travel);
-            var judgeBasis = _projection.BuildStandingNoteBasis(noteContext, 0f);
+            var context = _projection.BuildStandingNoteTravelContext(surface, normalizedX, side, bank);
+            var basis = _projection.BuildStandingNoteBasis(context, travel);
+            var judgeBasis = _projection.BuildStandingNoteBasis(context, 0f);
+            var center = _projection.ScreenPositionFromCameraSpace(basis.Center);
+            var left = _projection.ScreenPositionFromCameraSpace(
+                basis.Center - basis.Across * (surface.NearOuter - surface.NearInner).Length() * 0.5f);
+            var right = _projection.ScreenPositionFromCameraSpace(
+                basis.Center + basis.Across * (surface.NearOuter - surface.NearInner).Length() * 0.5f);
+            var axis = right - left;
+            if (axis.LengthSquared() < 0.0001f)
+                axis = Vector2.UnitX;
+            else
+                axis.Normalize();
 
-            var highlightWidth = Math.Max(4f, _projection.SuperFlickHighlightWidth *
-                (texture.Width / (float)Math.Max(1, texture.Height)));
-            var highlightHeight = Math.Max(3f, _projection.SuperFlickHighlightWidth);
-            var vertices = BuildFlatCardVerticesFromBasis(
-                texture,
-                basis,
-                judgeBasis,
-                highlightWidth,
-                highlightHeight,
-                basis.Center,
-                0f,
-                false,
-                side,
-                bank,
-                out var depth);
-            var alpha = Math.Clamp(_projection.SuperFlickHighlightOpacity * bankOpacity, 0f, 1f);
-            var tint = Color.White * alpha;
-            for (var i = 0; i < vertices.Length; i++)
-                vertices[i].Color = tint;
-            commands.Add(new Textured3DQuadCommand(
-                texture,
-                vertices,
-                depth,
-                _projection.BankSwitchFlipV(side, bank),
-                tint,
-                1,
-                false));
+            var referenceAcross = Math.Max(0.0001f,
+                _projection.ScreenPixelsPerWorldUnit(judgeBasis.Center, judgeBasis.Across));
+            var currentAcross = Math.Max(0.0001f,
+                _projection.ScreenPixelsPerWorldUnit(basis.Center, basis.Across));
+            var perspectiveScale = currentAcross / referenceAcross;
+            var height = Math.Max(3f, _projection.SuperFlickHighlightWidth * perspectiveScale);
+            var width = Math.Max(4f, height * textureAspect);
+            AddSkinSpriteQuad(
+                request, commands, texture, center, axis, width, height,
+                flick.Depth, commandAlpha * Math.Clamp(_projection.SuperFlickHighlightOpacity, 0f, 1f),
+                false, request.FlipY);
+            return;
         }
-        DrawTextured3DCommands(commands);
-        ReturnQuad3DVertices(commands);
-        commands.Clear();
+
+        if (!string.Equals(request.Geometry.role, "strip", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var leftContext = _projection.BuildStandingNoteTravelContext(surface, bankLeft, side, bank);
+        var rightContext = _projection.BuildStandingNoteTravelContext(surface, bankRight, side, bank);
+        var leftBasis = _projection.BuildStandingNoteBasis(leftContext, travel);
+        var rightBasis = _projection.BuildStandingNoteBasis(rightContext, travel);
+        var leftScreen = _projection.ScreenPositionFromCameraSpace(leftBasis.Center);
+        var rightScreen = _projection.ScreenPositionFromCameraSpace(rightBasis.Center);
+        var axisVector = rightScreen - leftScreen;
+        var axisLength = axisVector.Length();
+        if (axisLength < 1f)
+            return;
+        var axisDirection = axisVector / axisLength;
+
+        var centerNormalized = (bankLeft + bankRight) * 0.5f;
+        var centerContext = _projection.BuildStandingNoteTravelContext(surface, centerNormalized, side, bank);
+        var centerJudgeBasis = _projection.BuildStandingNoteBasis(centerContext, 0f);
+        var centerTravelBasis = _projection.BuildStandingNoteBasis(centerContext, travel);
+        var currentAcrossAtMid = _projection.ScreenPixelsPerWorldUnit(
+            centerTravelBasis.Center, centerJudgeBasis.Across);
+        var referenceAcrossAtMid = Math.Max(0.0001f,
+            _projection.ScreenPixelsPerWorldUnit(centerJudgeBasis.Center, centerJudgeBasis.Across));
+        var perspectiveScaleAtMid = Math.Max(0.05f, currentAcrossAtMid / referenceAcrossAtMid);
+        var stripHeightPixels = Math.Max(3f, _projection.SuperFlickTextureWidth * perspectiveScaleAtMid);
+        var arrowLengthPixels = Math.Max(4f, stripHeightPixels * textureAspect);
+        var gapPixels = Math.Max(0f, _projection.SuperFlickScrollGap) * arrowLengthPixels;
+        var stepPixels = Math.Max(1f, arrowLengthPixels + gapPixels);
+        var phasePixels = relativeSeconds * _projection.SuperFlickScrollRate * arrowLengthPixels * visualDirectionSign;
+        phasePixels %= stepPixels;
+        if (phasePixels < 0f)
+            phasePixels += stepPixels;
+
+        var fadeLength = Math.Max(20f, axisLength * 0.18f);
+        var start = -stepPixels * 2f;
+        var count = (int)Math.Ceiling((axisLength + stepPixels * 4f) / stepPixels) + 1;
+        var perpendicular = new Vector2(-axisDirection.Y, axisDirection.X);
+        for (var i = 0; i < count; i++)
+        {
+            var along = start + i * stepPixels + phasePixels;
+            var normalized = along / axisLength;
+            if (normalized < -0.35f || normalized > 1.35f)
+                continue;
+
+            var fadeIn = Math.Clamp((along + fadeLength) / fadeLength, 0f, 1f);
+            var fadeOut = Math.Clamp((axisLength + fadeLength - along) / fadeLength, 0f, 1f);
+            var arrowAlpha = Math.Min(fadeIn, fadeOut);
+            if (arrowAlpha <= 0.001f)
+                continue;
+
+            var normalizedX = MathHelper.Lerp(bankLeft, bankRight, normalized);
+            var arrowContext = _projection.BuildStandingNoteTravelContext(surface, normalizedX, side, bank);
+            var arrowBasis = _projection.BuildStandingNoteBasis(arrowContext, travel);
+            var arrowReference = _projection.BuildStandingNoteBasis(arrowContext, 0f);
+            var currentPixelsPerWorld = Math.Max(0.0001f,
+                _projection.ScreenPixelsPerWorldUnit(arrowBasis.Center, arrowBasis.Across));
+            var referencePixelsPerWorld = Math.Max(0.0001f,
+                _projection.ScreenPixelsPerWorldUnit(arrowReference.Center, arrowReference.Across));
+            var localScale = currentPixelsPerWorld / referencePixelsPerWorld;
+            var localHeight = Math.Max(3f, _projection.SuperFlickTextureWidth * localScale);
+            var localWidth = Math.Max(4f, localHeight * textureAspect);
+            var center = _projection.ScreenPositionFromCameraSpace(arrowBasis.Center);
+            AddSkinSpriteQuad(
+                request, commands, texture, center, axisDirection, localWidth, localHeight,
+                flick.Depth, commandAlpha * arrowAlpha, visualDirectionSign > 0f,
+                request.FlipY);
+        }
+    }
+
+    private static void AddSkinSpriteQuad(
+        SkinPlayfieldSpriteDrawRequest request,
+        List<TexturedQuadCommand> commands,
+        Texture2D texture,
+        Vector2 center,
+        Vector2 axis,
+        float width,
+        float height,
+        float depth,
+        float alpha,
+        bool flipU,
+        bool flipV)
+    {
+        if (alpha <= 0.001f || width <= 0f || height <= 0f)
+            return;
+        if (request.FlipX)
+            flipU = !flipU;
+        var normal = new Vector2(-axis.Y, axis.X);
+        var along = axis * (width * 0.5f);
+        var across = normal * (height * 0.5f);
+        commands.Add(new TexturedQuadCommand(
+            texture,
+            center - along - across,
+            center + along - across,
+            center + along + across,
+            center - along + across,
+            depth,
+            flipV,
+            request.Tint * Math.Clamp(alpha, 0f, 1f),
+            request.Layer,
+            flipU));
     }
 
     private void DrawTransitionFlashes()
     {
+        if (TryDrawSkinTransitionFlashes())
+            return;
+
         if (_disableTransitionFlash || _tempo is null)
             return;
 
@@ -362,6 +467,8 @@ public sealed partial class Playfield
 
         foreach (var (_, ev, _, side, bank, family) in superFlicks)
         {
+            if (IsSkinSuperFlickComponentReplaced(ev, "strip"))
+                continue;
             // A SuperFlick must obey the current preview's bank opacity just like
             // a note on that physical bank. Do not force chart-route-invalid flicks
             // to full opacity; doing so made inactive-bank flicks look active.
@@ -371,7 +478,7 @@ public sealed partial class Playfield
             if (bankOpacity <= 0.001f)
                 continue;
             var missed = _gameplayMode && _missedEvents.Contains(KeyOf(ev));
-            var textureName = missed ? "note-miss" : (family == SuperFlickFamily.Inner ? "super-flick-inner" : "super-flick-outer");
+            var textureName = missed ? NoteTextureAsset.NoteMiss : (family == SuperFlickFamily.Inner ? NoteTextureAsset.SuperFlickInner : NoteTextureAsset.SuperFlickOuter);
             var texture = _textures.Get(textureName);
             if (texture is null)
                 continue;
@@ -466,109 +573,6 @@ public sealed partial class Playfield
         _spriteBatch.End();
     }
 
-    private void DrawSuperFlickStrips3D(List<(float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family)> superFlicks)
-    {
-        if (_tempo is null)
-            return;
-
-        var commands = _command3DBatchScratch;
-        commands.Clear();
-        foreach (var (_, ev, _, side, bank, family) in superFlicks)
-        {
-            var textureName = _gameplayMode && _missedEvents.Contains(KeyOf(ev))
-                ? "note-miss"
-                : (family == SuperFlickFamily.Inner ? "super-flick-inner" : "super-flick-outer");
-            var texture = _textures.Get(textureName);
-            if (texture is null)
-                continue;
-
-            var travel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, _tempo.SecondsToTick(_playSeconds));
-            var (bankLeft, bankRight) = SuperFlickSpanEdges(side, bank);
-            var surface = _projection.BuildBankSurface(side, bank);
-            var leftContext = _projection.BuildStandingNoteTravelContext(
-                surface, bankLeft, side, bank);
-            var rightContext = _projection.BuildStandingNoteTravelContext(
-                surface, bankRight, side, bank);
-            var leftBasis = _projection.BuildStandingNoteBasis(leftContext, travel);
-            var rightBasis = _projection.BuildStandingNoteBasis(rightContext, travel);
-            var leftScreen = _projection.ScreenPositionFromCameraSpace(leftBasis.Center);
-            var rightScreen = _projection.ScreenPositionFromCameraSpace(rightBasis.Center);
-            var axisLength = Vector2.Distance(leftScreen, rightScreen);
-            if (axisLength < 1f)
-                continue;
-
-            var textureAspect = texture.Width / (float)Math.Max(1, texture.Height);
-            var stripHeightPixels = Math.Max(3f, _projection.SuperFlickTextureWidth);
-            var arrowLengthPixels = Math.Max(4f, stripHeightPixels * textureAspect);
-            var gapPixels = Math.Max(0f, _projection.SuperFlickScrollGap) * arrowLengthPixels;
-            var stepPixels = Math.Max(1f, arrowLengthPixels + gapPixels);
-            var relativeSeconds = (float)(_playSeconds - _tempo.TickToSeconds(ev.Tick));
-            var visualDirectionSign = family == SuperFlickFamily.Outer
-                ? (side == "right" ? 1f : -1f)
-                : (side == "right" ? -1f : 1f);
-            var phase = relativeSeconds * _projection.SuperFlickScrollRate * arrowLengthPixels * visualDirectionSign;
-            phase %= stepPixels;
-            if (phase < 0f)
-                phase += stepPixels;
-
-            var start = -stepPixels * 2f;
-            var count = (int)Math.Ceiling((axisLength + stepPixels * 4f) / stepPixels) + 1;
-            for (var i = 0; i < count; i++)
-            {
-                var alongPixels = start + i * stepPixels + phase;
-                var u = alongPixels / axisLength;
-                if (u < -0.35f || u > 1.35f)
-                    continue;
-
-                var fadeLength = Math.Max(20f, axisLength * 0.18f);
-                var fadeIn = Math.Clamp((alongPixels + fadeLength) / fadeLength, 0f, 1f);
-                var fadeOut = Math.Clamp((axisLength + fadeLength - alongPixels) / fadeLength, 0f, 1f);
-                var alpha = Math.Min(fadeIn, fadeOut);
-                if (alpha <= 0.001f)
-                    continue;
-
-                var normalizedX = MathHelper.Lerp(bankLeft, bankRight, u);
-                var basis = _projection.BuildStandingNoteBasis(
-                    surface, normalizedX, travel, side, bank);
-                var judgeBasis = _projection.BuildStandingNoteBasis(
-                    surface, normalizedX, 0f, side, bank);
-                var halfWidthWorld = (arrowLengthPixels * 0.5f) /
-                    Math.Max(0.0001f, _projection.ScreenPixelsPerWorldUnit(judgeBasis.Center, judgeBasis.Across));
-                var halfHeightWorld = (stripHeightPixels * 0.5f) /
-                    Math.Max(0.0001f, _projection.ScreenPixelsPerWorldUnit(judgeBasis.Center, judgeBasis.Along));
-                var a = basis.Across;
-                var b = basis.Along;
-                var center = basis.Center;
-                var tl = center - a * halfWidthWorld + b * halfHeightWorld;
-                var tr = center + a * halfWidthWorld + b * halfHeightWorld;
-                var br = center + a * halfWidthWorld - b * halfHeightWorld;
-                var bl = center - a * halfWidthWorld - b * halfHeightWorld;
-                var vertices = RentQuad3DVertices();
-                var flipU = visualDirectionSign > 0f;
-                var effectiveFlipU = flipU ^ string.Equals(side, "left", StringComparison.OrdinalIgnoreCase);
-                var uLeft = effectiveFlipU ? 1f : 0f;
-                var uRight = effectiveFlipU ? 0f : 1f;
-                var flipV = _projection.BankSwitchFlipV(side, bank);
-                var vTop = flipV ? 1f : 0f;
-                var vBottom = flipV ? 0f : 1f;
-                var tint = Color.White * alpha;
-                vertices[0] = new VertexPositionColorTexture(tl, tint, new Vector2(uLeft, vTop));
-                vertices[1] = new VertexPositionColorTexture(tr, tint, new Vector2(uRight, vTop));
-                vertices[2] = new VertexPositionColorTexture(br, tint, new Vector2(uRight, vBottom));
-                vertices[3] = new VertexPositionColorTexture(tl, tint, new Vector2(uLeft, vTop));
-                vertices[4] = new VertexPositionColorTexture(br, tint, new Vector2(uRight, vBottom));
-                vertices[5] = new VertexPositionColorTexture(bl, tint, new Vector2(uLeft, vBottom));
-                commands.Add(new Textured3DQuadCommand(texture, vertices,
-                    Math.Max(Math.Max(-tl.Z, -tr.Z), Math.Max(-br.Z, -bl.Z)),
-                    flipV, tint, 0, effectiveFlipU));
-            }
-        }
-
-        DrawTextured3DCommands(commands);
-        ReturnQuad3DVertices(commands);
-        commands.Clear();
-    }
-
     private void DrawSuperFlickStrips(
         List<(float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family)> superFlicks,
         double currentTick,
@@ -580,141 +584,41 @@ public sealed partial class Playfield
         DrawSuperFlickStripsBillboard3D(superFlicks, currentTick, forceBankOpacity);
     }
 
-    private void DrawSuperFlick(ChartEvent ev, ProjectedPoint p)
+    private static void ScaleScreenQuad(
+        ref Vector2 topLeft,
+        ref Vector2 topRight,
+        ref Vector2 bottomRight,
+        ref Vector2 bottomLeft,
+        float scaleX,
+        float scaleY)
     {
-        if (_tempo is null)
+        if (MathF.Abs(scaleX - 1f) < 0.0001f && MathF.Abs(scaleY - 1f) < 0.0001f)
             return;
 
-        var position = GearState.Position(ev.Track);
-        if (position is null)
+        var center = (topLeft + topRight + bottomRight + bottomLeft) * 0.25f;
+        var across = (topRight - topLeft) + (bottomRight - bottomLeft);
+        var along = (bottomLeft - topLeft) + (bottomRight - topRight);
+        if (across.LengthSquared() < 0.000001f || along.LengthSquared() < 0.000001f)
             return;
-        var routeBeforeEvent = _gear?.AtTick(ev.Tick, includeTickChanges: false);
-        var family = ev.GetSuperFlickFamily(routeBeforeEvent);
-        var side = ev.GetSuperFlickRenderSide() ?? position.Value.Side;
-        var bank = ev.GetSuperFlickSourceBank(routeBeforeEvent) ?? position.Value.Bank;
+        across.Normalize();
+        along -= across * Vector2.Dot(along, across);
+        if (along.LengthSquared() < 0.000001f)
+            return;
+        along.Normalize();
 
-        var texture = _textures.Get(family == SuperFlickFamily.Inner ? "super-flick-inner" : "super-flick-outer");
-        if (texture is null)
+        Vector2 ScalePoint(Vector2 point)
         {
-            DrawSuperFlickFallback(ev, p);
-            return;
+            var delta = point - center;
+            var x = Vector2.Dot(delta, across);
+            var y = Vector2.Dot(delta, along);
+            var residual = delta - across * x - along * y;
+            return center + across * (x * scaleX) + along * (y * scaleY) + residual;
         }
 
-        var (bankLeft, bankRight) = BankEdges(side, bank);
-        var superFlickTravel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, _tempo.SecondsToTick(_playSeconds));
-        var left = _projection.ProjectSideTravel(bankLeft, superFlickTravel, side, bank).Position;
-        var right = _projection.ProjectSideTravel(bankRight, superFlickTravel, side, bank).Position;
-        var axis = right - left;
-        var axisLength = axis.Length();
-        if (axisLength < 0.001f)
-            return;
-        axis /= axisLength;
-
-        var eventSeconds = _tempo.TickToSeconds(ev.Tick);
-        var relativeSeconds = (float)(_playSeconds - eventSeconds);
-        const float scrollPixelsPerSecond = 250f;
-        var directionSign = family == SuperFlickFamily.Outer
-            ? (side == "right" ? 1f : -1f)
-            : (side == "right" ? -1f : 1f);
-
-        // Repeating arrow sprites travel across the superFlick span. The phase is
-        // centered on the event time so the motion is deterministic when
-        // seeking, while the fade at both ends prevents hard cutoffs.
-        var spriteLength = Math.Max(10f, _projection.SuperFlickTextureWidth * Math.Abs(p.Scale) * 0.82f);
-        var step = Math.Max(12f, spriteLength);
-        var phase = relativeSeconds * scrollPixelsPerSecond * directionSign;
-        var rotation = MathF.Atan2(axis.Y, axis.X) + (directionSign < 0f ? MathHelper.Pi : 0f);
-        var origin = new Vector2(texture.Width * 0.5f, texture.Height * 0.5f);
-        var spriteHeight = Math.Max(4f, spriteLength);
-        var spriteWidth = spriteHeight * texture.Width / Math.Max(1f, texture.Height);
-        var spriteScale = new Vector2(
-            Math.Max(0.01f, spriteWidth / Math.Max(1, texture.Width)),
-            Math.Max(0.01f, spriteHeight / Math.Max(1, texture.Height)));
-
-        // Start slightly before the span so arrows can fade in naturally.
-        var start = -step * 2f;
-        var count = (int)Math.Ceiling((axisLength + step * 4f) / step) + 1;
-        var center = (left + right) * 0.5f;
-        var fadeLength = Math.Max(20f, axisLength * 0.18f);
-
-        for (var i = 0; i < count; i++)
-        {
-            var along = start + i * step + phase;
-            along %= axisLength + step;
-            if (along < -step)
-                along += axisLength + step;
-
-            var pathPosition = left + axis * along;
-            var normalized = along / axisLength;
-            if (normalized < -0.35f || normalized > 1.35f)
-                continue;
-
-            var fadeIn = Math.Clamp((along + fadeLength) / fadeLength, 0f, 1f);
-            var fadeOut = Math.Clamp((axisLength + fadeLength - along) / fadeLength, 0f, 1f);
-            var alpha = Math.Min(fadeIn, fadeOut);
-            if (alpha <= 0.001f)
-                continue;
-
-            // The texture is a single arrow; its orientation follows the actual
-            // projected bank axis, including depth rotation and screen rotation.
-            _spriteBatch.Draw(texture, pathPosition, null, Color.White * alpha, rotation,
-                origin, spriteScale, SpriteEffects.None, 0f);
-        }
-    }
-
-    private void DrawSuperFlickFallback(ChartEvent ev, ProjectedPoint p)
-    {
-        var position = GearState.Position(ev.Track);
-        if (position is null)
-            return;
-        var routeBeforeEvent = _gear?.AtTick(ev.Tick, includeTickChanges: false);
-        var family = ev.GetSuperFlickFamily(routeBeforeEvent);
-        var color = family == SuperFlickFamily.Inner ? InnerSuperFlick : OuterSuperFlick;
-        var side = ev.GetSuperFlickRenderSide() ?? position.Value.Side;
-        var bank = ev.GetSuperFlickSourceBank(routeBeforeEvent) ?? position.Value.Bank;
-        var (bankLeft, bankRight) = BankEdges(side, bank);
-        var travel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, _tempo!.SecondsToTick(_playSeconds));
-        var left = _projection.ProjectSideTravel(bankLeft, travel, side, bank).Position;
-        var right = _projection.ProjectSideTravel(bankRight, travel, side, bank).Position;
-        var axis = right - left;
-        var axisLength = axis.Length();
-        if (axisLength < 0.001f)
-            return;
-        axis /= axisLength;
-        var normal = new Vector2(-axis.Y, axis.X);
-        var directionSign = family == SuperFlickFamily.Outer
-            ? (side == "right" ? 1f : -1f)
-            : (side == "right" ? -1f : 1f);
-        for (var i = 0; i < 5; i++)
-        {
-            var center = Vector2.Lerp(left, right, (i + 0.5f) / 5f);
-            var tip = center + axis * (directionSign * 9f * p.Scale);
-            var back = center - axis * (directionSign * 14f * p.Scale);
-            var top = back - normal * (12f * p.Scale);
-            var bottom = back + normal * (12f * p.Scale);
-            DrawPolyline(_spriteBatch, new[] { top, tip, bottom }, Math.Max(1f, _projection.NoteWidth * p.Scale * SuperFlickStrokeFraction), color);
-        }
-    }
-
-    private float BeatPulseEnvelope(double currentTick)
-    {
-        if (_tempo is null || _tempo.TicksPerBeat <= 0)
-            return 0f;
-
-        var beatPhase = currentTick / _tempo.TicksPerBeat;
-        var phase = beatPhase - Math.Floor(beatPhase);
-        const float attack = 0.14f;
-
-        if (phase < attack)
-        {
-            var x = (float)(phase / attack);
-            return 1f - MathF.Pow(1f - x, 4f);
-        }
-
-        var decayX = (float)((phase - attack) / (1.0 - attack));
-        decayX = MathHelper.Clamp(decayX, 0f, 1f);
-        var smooth = decayX * decayX * (3f - 2f * decayX);
-        return 1f - smooth;
+        topLeft = ScalePoint(topLeft);
+        topRight = ScalePoint(topRight);
+        bottomRight = ScalePoint(bottomRight);
+        bottomLeft = ScalePoint(bottomLeft);
     }
 
     private static BlendState ResolveSpriteBlendState(string? blend)
@@ -727,10 +631,129 @@ public sealed partial class Playfield
     private void DrawJudgementLine(double currentTick)
     {
         var state = RenderGearState(currentTick);
+        if (TryDrawSkinJudgementLine(currentTick, state))
+            return;
+
+        DrawNativeJudgementLine(state);
+    }
+
+    private bool TryDrawSkinJudgementLine(double currentTick, GearState state)
+    {
+        if (!_skinRuntime.SupportsJudgementLineRenderer)
+            return false;
+
+        var geometry = _skinJudgementLineGeometryScratch;
+        geometry.Clear();
+        var judgeTexture = _textures.Get("judge");
+        var baseWidth = Math.Max(0f, _projection.JudgeWidth);
+        var autoHeight = judgeTexture is null
+            ? 4f
+            : baseWidth * judgeTexture.Height / (float)Math.Max(1, judgeTexture.Width);
+        var baseHeight = Math.Max(0f, _projection.JudgeHeight ?? autoHeight);
+
+        foreach (var bank in VisibleBanks(state))
+        {
+            if (!ShouldRenderBankInCurrentEditorPass(bank.Side, bank.Bank, state))
+                continue;
+            var bankOpacity = _chartEditorMode
+                ? GetEditorBankOpacity(bank.Side, bank.Bank, state)
+                : 1f;
+            var opacity = MathHelper.Clamp(_projection.JudgeAlpha * bankOpacity, 0f, 1f);
+            if (opacity <= 0.001f)
+                continue;
+
+            var activeColumns = ActiveColumns(bank.Side, bank.Bank);
+            for (var column = 0; column < 3; column++)
+            {
+                if (bank.Bank != "Backward" && !activeColumns.Contains(column))
+                    continue;
+
+                var (columnLeft, columnRight) = ColumnEdges(bank.Side, bank.Bank, column);
+                var columnCenter = (columnLeft + columnRight) * 0.5f;
+                var judgeSurface = _projection.BuildBankSurface(bank.Side, bank.Bank);
+                var judgeBasis = _projection.BuildStandingNoteBasis(
+                    judgeSurface, columnCenter, 0f, bank.Side, bank.Bank);
+                var point = _projection.ScreenPositionFromCameraSpace(judgeBasis.Center);
+                var edgeLeftBasis = _projection.BuildStandingNoteBasis(
+                    judgeSurface, columnLeft, 0f, bank.Side, bank.Bank);
+                var edgeRightBasis = _projection.BuildStandingNoteBasis(
+                    judgeSurface, columnRight, 0f, bank.Side, bank.Bank);
+                var projectedAcross =
+                    _projection.ScreenPositionFromCameraSpace(edgeRightBasis.Center) -
+                    _projection.ScreenPositionFromCameraSpace(edgeLeftBasis.Center);
+                if (projectedAcross.LengthSquared() < 0.0001f)
+                    projectedAcross = Vector2.UnitX;
+                else
+                    projectedAcross.Normalize();
+
+                var across = projectedAcross;
+                var along = new Vector2(-across.Y, across.X);
+                var halfWidth = baseWidth * 0.5f;
+                var halfHeight = baseHeight * 0.5f;
+                geometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
+                    -1, -1, -1, 0, 0,
+                    "judge_line", "judge_line", bank.Side, bank.Bank, string.Empty,
+                    false, false, false, Math.Max(0f, -judgeBasis.Center.Z),
+                    point - across * halfWidth - along * halfHeight,
+                    point + across * halfWidth - along * halfHeight,
+                    point + across * halfWidth + along * halfHeight,
+                    point - across * halfWidth + along * halfHeight,
+                    true, false, false, 0, opacity));
+            }
+        }
+
+        var replaced = _skinRuntime.InvokeJudgementLineRenderer(geometry, _playSeconds, currentTick);
+        var requests = _skinRuntime.JudgementLineSpriteDrawRequests;
+        var commands = _skinJudgementLineCommandScratch;
+        commands.Clear();
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            var snapshot = request.Geometry.Snapshot;
+            if (!snapshot.HasScreenQuad)
+                continue;
+
+            var topLeft = snapshot.TopLeft;
+            var topRight = snapshot.TopRight;
+            var bottomRight = snapshot.BottomRight;
+            var bottomLeft = snapshot.BottomLeft;
+            ScaleScreenQuad(ref topLeft, ref topRight, ref bottomRight, ref bottomLeft,
+                request.ScaleX, request.ScaleY);
+
+            var tint = request.Tint;
+            tint.A = (byte)Math.Clamp((int)MathF.Round(tint.A * request.Alpha), 0, 255);
+            commands.Add(new TexturedQuadCommand(
+                request.Asset.Texture,
+                topLeft,
+                topRight,
+                bottomRight,
+                bottomLeft,
+                snapshot.Depth,
+                snapshot.FlipV ^ request.FlipY,
+                tint,
+                request.Layer,
+                snapshot.FlipU ^ request.FlipX,
+                snapshot.Track,
+                snapshot.Tick,
+                snapshot.EventIndex,
+                snapshot.Attr,
+                snapshot.DurationTicks,
+                snapshot.NoteType,
+                snapshot.Component));
+        }
+
+        if (commands.Count > 0)
+            DrawTexturedCommands(commands);
+        commands.Clear();
+        _skinRuntime.ClearJudgementLineSpriteDrawRequests();
+        return replaced;
+    }
+
+    private void DrawNativeJudgementLine(GearState state)
+    {
         var judgeTexture = _textures.Get("judge");
         if (judgeTexture is null)
         {
-            // Preserve a simple fallback for incomplete texture folders.
             _spriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
             foreach (var side in new[] { "left", "right" })
             {
@@ -759,14 +782,9 @@ public sealed partial class Playfield
         }
 
         var origin = new Vector2(judgeTexture.Width * 0.5f, judgeTexture.Height * 0.5f);
-        var currentBlendName = _projection.JudgeBlend;
-        _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: ResolveSpriteBlendState(currentBlendName));
-        // One pulse per beat. It grows quickly immediately after the beat and
-        // returns to normal size slowly. Only size is pulsed; judge opacity stays
-        // constant.
-        var pulse = BeatPulseEnvelope(currentTick);
-        var baseJudgeWidth = Math.Max(0f, _projection.JudgeWidth);
-        var pulseJudgeWidth = Math.Max(0f, _projection.JudgePulseWidth);
+        _spriteBatch.Begin(
+            samplerState: SamplerState.LinearClamp,
+            blendState: ResolveSpriteBlendState(_projection.JudgeBlend));
 
         foreach (var bank in VisibleBanks(state))
         {
@@ -775,22 +793,17 @@ public sealed partial class Playfield
             var bankOpacity = _chartEditorMode
                 ? GetEditorBankOpacity(bank.Side, bank.Bank, state)
                 : 1f;
-            if (bankOpacity <= 0.001f)
+            var alpha = MathHelper.Clamp(_projection.JudgeAlpha * bankOpacity, 0f, 1f);
+            if (alpha <= 0.001f)
                 continue;
+
             var activeColumns = ActiveColumns(bank.Side, bank.Bank);
             for (var column = 0; column < 3; column++)
             {
-                // In 1K/2K, judge markers exist only on playable lanes.
-                // 3K keeps all three judge markers.
                 if (bank.Bank != "Backward" && !activeColumns.Contains(column))
                     continue;
                 var (columnLeft, columnRight) = ColumnEdges(bank.Side, bank.Bank, column);
                 var columnCenter = (columnLeft + columnRight) * 0.5f;
-
-                // Judge markers remain 2D billboards, but their anchor now lives on
-                // the same 3D judge surface as the notes and lane. This keeps
-                // them attached to the actual rotated/skewed lane instead of the
-                // legacy projected lane.
                 var judgeSurface = _projection.BuildBankSurface(bank.Side, bank.Bank);
                 var judgeBasis = _projection.BuildStandingNoteBasis(
                     judgeSurface, columnCenter, 0f, bank.Side, bank.Bank);
@@ -799,10 +812,6 @@ public sealed partial class Playfield
                     judgeSurface, columnLeft, 0f, bank.Side, bank.Bank);
                 var edgeRightBasis = _projection.BuildStandingNoteBasis(
                     judgeSurface, columnRight, 0f, bank.Side, bank.Bank);
-                // The billboard should use the actual screen-left -> screen-right
-                // direction of the judge column. On the left bank the physical
-                // inner->outer basis runs the other way, so using basis.Across
-                // directly would rotate the entire judge texture by 180 degrees.
                 var projectedAcross =
                     _projection.ScreenPositionFromCameraSpace(edgeRightBasis.Center) -
                     _projection.ScreenPositionFromCameraSpace(edgeLeftBasis.Center);
@@ -811,35 +820,16 @@ public sealed partial class Playfield
                 else
                     projectedAcross.Normalize();
                 var angle = MathF.Atan2(projectedAcross.Y, projectedAcross.X);
-                // Height follows the source texture aspect ratio.
-                var tintAlpha = MathHelper.Lerp(_projection.JudgeAlpha, _projection.JudgePulseAlpha, pulse);
-                var tint = Color.White * (Math.Clamp(tintAlpha, 0f, 1f) * bankOpacity);
-                var desiredBlendName = pulse > 0.0001f ? _projection.JudgePulseBlend : _projection.JudgeBlend;
-                if (!string.Equals(desiredBlendName, currentBlendName, StringComparison.OrdinalIgnoreCase))
-                {
-                    _spriteBatch.End();
-                    currentBlendName = desiredBlendName;
-                    _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: ResolveSpriteBlendState(currentBlendName));
-                }
-                // judgePulseWidth is the total width at the pulse peak, not an extra width.
-                // Equal judgeWidth and judgePulseWidth therefore produce no visible pulse.
-                // Match the judge marker's width to the same lateral depth
-                // foreshortening used by notes on the rotated lane. Both the
-                // normal and peak pulse widths are physical widths first; the
-                // lane-rotation depth scale is applied afterward.
-                var targetWidth = baseJudgeWidth + (pulseJudgeWidth - baseJudgeWidth) * pulse;
-                var baseAutoHeight = baseJudgeWidth * judgeTexture.Height / (float)Math.Max(1, judgeTexture.Width);
-                var pulseAutoHeight = pulseJudgeWidth * judgeTexture.Height / (float)Math.Max(1, judgeTexture.Width);
-                var baseHeight = _projection.JudgeHeight ?? baseAutoHeight;
-                var pulseHeight = _projection.JudgePulseHeight ?? pulseAutoHeight;
-                var targetHeight = baseHeight + (pulseHeight - baseHeight) * pulse;
-                var scaleX = targetWidth / Math.Max(1f, judgeTexture.Width);
-                var scaleY = targetHeight / Math.Max(1f, judgeTexture.Height);
+                var width = Math.Max(0f, _projection.JudgeWidth);
+                var height = Math.Max(0f, _projection.JudgeHeight ??
+                    width * judgeTexture.Height / (float)Math.Max(1, judgeTexture.Width));
+                var scaleX = width / Math.Max(1f, judgeTexture.Width);
+                var scaleY = height / Math.Max(1f, judgeTexture.Height);
                 _spriteBatch.Draw(
                     judgeTexture,
                     point,
                     null,
-                    tint,
+                    Color.White * alpha,
                     angle,
                     origin,
                     new Vector2(Math.Max(0f, scaleX), Math.Max(0f, scaleY)),
@@ -990,12 +980,17 @@ public sealed partial class Playfield
 
             if (transition.FlashActive)
             {
+                // Keep the event timestamp alive for Lua while its callback owns
+                // the effect. Older skins retain the finite native fallback.
                 transition.FlashElapsedSeconds += clampedDt;
-                var flashDuration = Math.Max(0f, _projection.TransitionFlashDelaySeconds)
-                                   + Math.Max(0f, _projection.TransitionFlashFadeInSeconds)
-                                   + Math.Max(0f, _projection.TransitionFlashFadeOutSeconds);
-                if (flashDuration <= 0f || transition.FlashElapsedSeconds >= flashDuration)
-                    transition.FlashActive = false;
+                if (!CanUseSkinPlayfieldEffects || !_skinRuntime.SupportsTransitionFlashRenderer)
+                {
+                    var fallbackDuration = Math.Max(0f, _projection.TransitionFlashDelaySeconds)
+                                         + Math.Max(0f, _projection.TransitionFlashFadeInSeconds)
+                                         + Math.Max(0f, _projection.TransitionFlashFadeOutSeconds);
+                    if (fallbackDuration <= 0f || transition.FlashElapsedSeconds >= fallbackDuration)
+                        transition.FlashActive = false;
+                }
             }
         }
     }
@@ -1016,6 +1011,22 @@ public sealed partial class Playfield
             highlight.Held = false;
             highlight.AutoplayHeld = false;
             highlight.AutoplayHoldUntilSeconds = 0.0;
+            highlight.PressedAtSeconds = -1.0;
+            highlight.ReleasedAtSeconds = -1.0;
+            highlight.IsAutoplay = false;
+            highlight.RiseDepth = 0f;
+        }
+    }
+
+    private void ReleasePhysicalLaneHighlightsForPause()
+    {
+        foreach (var highlight in _laneHighlights)
+        {
+            if (!highlight.Held || highlight.AutoplayHeld)
+                continue;
+
+            highlight.Held = false;
+            highlight.ReleasedAtSeconds = _uiTimeSeconds;
             highlight.RiseDepth = 0f;
         }
     }
@@ -1049,6 +1060,9 @@ public sealed partial class Playfield
             }
         }
 
+        // Keep the native release state ready for the compatibility renderer.
+        // When render_lane_highlights(frame) returns true, Lua draws the visible
+        // effect from the input timestamps and never consumes this RiseDepth.
         var riseDuration = Math.Max(0.001f,
             _skin.RenderConfig.Lane.Highlight.RiseDuration ?? ChartProjection.DefaultLaneHighlightRiseDuration);
         for (var track = 0; track < _laneHighlights.Length; track++)
@@ -1056,10 +1070,16 @@ public sealed partial class Playfield
             var h = _laneHighlights[track];
             if (pressedTracks[track])
             {
-                // Physical gameplay input owns the normal held state.
+                // Physical gameplay input owns the normal held state. The Lua
+                // renderer receives only the input transition timestamp and can
+                // choose any visual response it wants.
+                if (!h.Held)
+                    h.PressedAtSeconds = _uiTimeSeconds;
                 h.Held = true;
                 h.AutoplayHeld = false;
                 h.AutoplayHoldUntilSeconds = 0.0;
+                h.IsAutoplay = false;
+                h.ReleasedAtSeconds = -1.0;
                 h.RiseDepth = 0f;
             }
             else if (h.AutoplayHeld && _playSeconds < h.AutoplayHoldUntilSeconds)
@@ -1074,9 +1094,7 @@ public sealed partial class Playfield
                 h.Held = false;
                 h.AutoplayHeld = false;
                 h.AutoplayHoldUntilSeconds = 0.0;
-                // Start the release animation immediately. The highlight moves
-                // forward along the lane rather than being translated in screen
-                // space, so its whole shape remains glued to the lane.
+                h.ReleasedAtSeconds = _uiTimeSeconds;
                 h.RiseDepth += LaneHighlightRiseStep(track, state, riseDuration, dt);
                 if (h.RiseDepth >= LaneHighlightRiseDepthDistance(track))
                     h.RiseDepth = 0f;
@@ -1133,6 +1151,9 @@ public sealed partial class Playfield
 
         var h = _laneHighlights[track];
         h.Held = true;
+        h.PressedAtSeconds = _uiTimeSeconds;
+        h.ReleasedAtSeconds = -1.0;
+        h.IsAutoplay = true;
         h.RiseDepth = 0f;
 
         // Taps should look like an actual microscopic key press instead of
@@ -1146,6 +1167,322 @@ public sealed partial class Playfield
 
         h.AutoplayHeld = true;
         h.AutoplayHoldUntilSeconds = Math.Max(_playSeconds, holdUntil);
+    }
+
+    // Playfield callbacks are shared by gameplay, menu autoplay, editor preview,
+    // and the normal chart editor. Editor-only features without Lua callbacks
+    // (selection, beat/tempo guides, placement previews, etc.) remain native.
+    private bool CanUseSkinPlayfieldEffects
+        => _tempo is not null && (_gameplayMode || _chartEditorMode || _editorPreviewMode || _lockMenuPlayMode);
+
+    private bool TryDrawSkinLaneHighlights()
+    {
+        if (!CanUseSkinPlayfieldEffects || !_skinRuntime.SupportsLaneHighlightRenderer)
+            return false;
+
+        var currentTick = _tempo!.SecondsToTick(_playSeconds);
+        var state = _gameplayMode ? _gameplayState : RenderGearState(currentTick);
+        var geometry = _skinPlayfieldEffectGeometryScratch;
+        var ownedVertices = _skinPlayfieldEffectGeometryVerticesScratch;
+        geometry.Clear();
+        ownedVertices.Clear();
+
+        try
+        {
+            BuildLaneHighlightSkinGeometry(state, geometry, ownedVertices);
+            var replaceNative = _skinRuntime.InvokeLaneHighlightRenderer(
+                geometry, _playSeconds, currentTick, _uiTimeSeconds);
+            DrawSkinPlayfieldSurfaceEffectRequests();
+            return replaceNative;
+        }
+        finally
+        {
+            for (var i = 0; i < ownedVertices.Count; i++)
+                ReturnQuad3DVertexArray(ownedVertices[i]);
+            ownedVertices.Clear();
+            geometry.Clear();
+        }
+    }
+
+    private bool TryDrawSkinTransitionFlashes()
+    {
+        if (!CanUseSkinPlayfieldEffects || !_skinRuntime.SupportsTransitionFlashRenderer)
+            return false;
+
+        var currentTick = _tempo!.SecondsToTick(_playSeconds);
+        var state = _gameplayMode ? _gameplayState : RenderGearState(currentTick);
+        var geometry = _skinPlayfieldEffectGeometryScratch;
+        var ownedVertices = _skinPlayfieldEffectGeometryVerticesScratch;
+        geometry.Clear();
+        ownedVertices.Clear();
+
+        try
+        {
+            BuildTransitionFlashSkinGeometry(state, geometry, ownedVertices);
+            var replaceNative = _skinRuntime.InvokeTransitionFlashRenderer(
+                geometry, _playSeconds, currentTick);
+            DrawSkinPlayfieldSurfaceEffectRequests();
+            return replaceNative;
+        }
+        finally
+        {
+            for (var i = 0; i < ownedVertices.Count; i++)
+                ReturnQuad3DVertexArray(ownedVertices[i]);
+            ownedVertices.Clear();
+            geometry.Clear();
+        }
+    }
+
+    private void BuildLaneHighlightSkinGeometry(
+        GearState state,
+        List<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
+        List<VertexPositionColorTexture[]> ownedVertices)
+    {
+        foreach (var bank in VisibleBanks(state))
+        {
+            if (_gameplayMode && !string.Equals(
+                    GearTimeline.ActiveBankForSide(state, bank.Side),
+                    bank.Bank,
+                    StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!ShouldRenderBankInCurrentEditorPass(bank.Side, bank.Bank, state))
+                continue;
+
+            var opacity = Math.Clamp(_projection.LaneHighlightOpacity, 0f, 1f) *
+                          GetEditorBankOpacity(bank.Side, bank.Bank, state);
+            if (opacity <= 0.001f)
+                continue;
+
+            var surface = _projection.BuildBankSurface(bank.Side, bank.Bank);
+            var halfWidth = LaneColumnHalfWidth(bank.Side, bank.Bank);
+            foreach (var column in HighlightColumns(bank.Side, bank.Bank))
+            {
+                if (!TryGetTrackForBankColumn(bank.Side, bank.Bank, column, out var track))
+                    continue;
+
+                var centerX = _projection.LaneNormalizedX(track);
+                var leftX = centerX - halfWidth;
+                var rightX = centerX + halfWidth;
+                var judgeTravel = Math.Max(1f,
+                    _projection.LaneTravelDistanceForNormalizedX(centerX, bank.Side, bank.Bank));
+                var postJudgeTravel = LaneHighlightEndTravel();
+
+                // This is a fixed, unanimated lane quad: V=0 is the far/horizon
+                // edge and V=1 is just beyond the judge. Lua can scale/offset it
+                // around either edge or anywhere between them.
+                var farLeft = _projection.BuildStandingNoteBasis(
+                    surface, leftX, judgeTravel, bank.Side, bank.Bank).Center;
+                var farRight = _projection.BuildStandingNoteBasis(
+                    surface, rightX, judgeTravel, bank.Side, bank.Bank).Center;
+                var endRight = _projection.BuildStandingNoteBasis(
+                    surface, rightX, postJudgeTravel, bank.Side, bank.Bank).Center;
+                var endLeft = _projection.BuildStandingNoteBasis(
+                    surface, leftX, postJudgeTravel, bank.Side, bank.Bank).Center;
+
+                var depth = Math.Max(1f,
+                    Math.Max(-farLeft.Z,
+                    Math.Max(-farRight.Z,
+                    Math.Max(-endRight.Z, -endLeft.Z))));
+                var vertices = RentQuad3DVertices();
+                vertices[0] = new VertexPositionColorTexture(farLeft, Color.White, new Vector2(0f, 0f));
+                vertices[1] = new VertexPositionColorTexture(farRight, Color.White, new Vector2(1f, 0f));
+                vertices[2] = new VertexPositionColorTexture(endRight, Color.White, new Vector2(1f, 1f));
+                vertices[3] = new VertexPositionColorTexture(farLeft, Color.White, new Vector2(0f, 0f));
+                vertices[4] = new VertexPositionColorTexture(endRight, Color.White, new Vector2(1f, 1f));
+                vertices[5] = new VertexPositionColorTexture(endLeft, Color.White, new Vector2(0f, 1f));
+                ownedVertices.Add(vertices);
+
+                var highlight = _laneHighlights[track];
+                geometry.Add(new SkinPlayfieldSurfaceGeometrySnapshot(
+                    vertices,
+                    depth,
+                    bank.Side,
+                    bank.Bank,
+                    centerX,
+                    halfWidth,
+                    IsActiveBankSwitchTransition(bank.Side, bank.Bank),
+                    false,
+                    0f,
+                    opacity,
+                    "lane_highlight",
+                    track,
+                    highlight.Held,
+                    highlight.IsAutoplay,
+                    highlight.PressedAtSeconds,
+                    highlight.ReleasedAtSeconds));
+            }
+        }
+    }
+
+    private void BuildTransitionFlashSkinGeometry(
+        GearState state,
+        List<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
+        List<VertexPositionColorTexture[]> ownedVertices)
+    {
+        if (_disableTransitionFlash)
+            return;
+
+        foreach (var (side, transition) in _bankSwitchTransitions)
+        {
+            if (!transition.FlashActive || string.IsNullOrWhiteSpace(transition.Bank) ||
+                !ShouldRenderBankInCurrentEditorPass(side, transition.Bank, state))
+                continue;
+
+            var opacity = Math.Clamp(_projection.TransitionFlashOpacity, 0f, 1f) *
+                          GetEditorBankOpacity(side, transition.Bank, state);
+            if (opacity <= 0.001f)
+                continue;
+
+            var (leftNormalized, rightNormalized) = FlashEdges(side, transition.Bank);
+            var centerNormalized = (leftNormalized + rightNormalized) * 0.5f;
+            var halfNormalizedWidth = Math.Abs(rightNormalized - leftNormalized) * 0.5f;
+            var nearDepth = _projection.LaneEndDepthForNormalizedX(
+                centerNormalized, side, transition.Bank);
+            var vertices = BuildLaneTextureMeshTinted(
+                _skinRuntime.PlayfieldGeometryWhiteTexture,
+                side,
+                centerNormalized,
+                nearDepth,
+                halfNormalizedWidth,
+                Color.White,
+                transition.Bank);
+            ownedVertices.Add(vertices);
+
+            var depth = 1f;
+            for (var i = 0; i < vertices.Length; i++)
+                depth = Math.Max(depth, -vertices[i].Position.Z);
+
+            geometry.Add(new SkinPlayfieldSurfaceGeometrySnapshot(
+                vertices,
+                depth,
+                side,
+                transition.Bank,
+                centerNormalized,
+                halfNormalizedWidth,
+                true,
+                false,
+                nearDepth,
+                opacity,
+                "transition_flash",
+                -1,
+                false,
+                false,
+                -1.0,
+                -1.0,
+                transition.FlashElapsedSeconds,
+                transition.Direction));
+        }
+    }
+
+    private void DrawSkinPlayfieldSurfaceEffectRequests()
+    {
+        var requests = _skinRuntime.PlayfieldSurfaceDrawRequests;
+        if (requests.Count == 0)
+        {
+            _skinRuntime.ClearPlayfieldSurfaceDrawRequests();
+            return;
+        }
+
+        var commands = _skinPlayfieldEffectCommandScratch;
+        commands.Clear();
+        string? activeBlend = null;
+
+        void Flush(string? blend)
+        {
+            if (commands.Count == 0)
+                return;
+            DrawTextured3DCommands(commands, ResolveSpriteBlendState(blend));
+            ReturnQuad3DVertices(commands);
+            commands.Clear();
+        }
+
+        try
+        {
+            for (var i = 0; i < requests.Count; i++)
+            {
+                var request = requests[i];
+                var handle = request.Geometry;
+                var snapshot = handle.Snapshot;
+                var blend = string.IsNullOrWhiteSpace(request.Blend) ? "normal" : request.Blend;
+                if (activeBlend is not null && !string.Equals(
+                        activeBlend, blend, StringComparison.OrdinalIgnoreCase))
+                    Flush(activeBlend);
+                activeBlend = blend;
+
+                var source = handle.Vertices;
+                if (source.Length == 0)
+                    continue;
+                var vertices = RentBody3DVertices(source.Length);
+                var opacity = Math.Clamp(snapshot.Opacity * request.Alpha, 0f, 1f);
+                var tint = request.Tint;
+                for (var vertexIndex = 0; vertexIndex < source.Length; vertexIndex++)
+                {
+                    var vertex = source[vertexIndex];
+                    var sourceColor = vertex.Color;
+                    vertex.Color = new Color(
+                        (byte)Math.Clamp((int)MathF.Round(sourceColor.R * (tint.R / 255f)), 0, 255),
+                        (byte)Math.Clamp((int)MathF.Round(sourceColor.G * (tint.G / 255f)), 0, 255),
+                        (byte)Math.Clamp((int)MathF.Round(sourceColor.B * (tint.B / 255f)), 0, 255),
+                        (byte)Math.Clamp((int)MathF.Round(sourceColor.A * (tint.A / 255f) * opacity), 0, 255));
+                    vertices[vertexIndex] = vertex;
+                }
+
+                if (string.Equals(snapshot.Role, "lane_highlight", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Lane highlights follow a perspective-projected bank surface.
+                    // Remap their UVs over the two actual lane edges so release
+                    // scaling scrolls along the lane without peeling off it.
+                    TransformPlayfieldQuadOnSurface(
+                        vertices,
+                        request.ScaleX,
+                        request.ScaleY,
+                        request.OffsetX,
+                        request.OffsetY,
+                        request.AnchorX,
+                        request.AnchorY);
+                }
+                else
+                {
+                    TransformPlayfieldQuadInPlane(
+                        vertices,
+                        request.ScaleX,
+                        request.ScaleY,
+                        request.OffsetX,
+                        request.OffsetY,
+                        request.AnchorX,
+                        request.AnchorY);
+                }
+
+                commands.Add(new Textured3DQuadCommand(
+                    request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture,
+                    vertices,
+                    handle.depth,
+                    string.Equals(snapshot.Role, "transition_flash", StringComparison.OrdinalIgnoreCase) &&
+                        _projection.BankSwitchFlipV(snapshot.Side, snapshot.Bank),
+                    Color.White,
+                    request.Layer,
+                    false,
+                    snapshot.Track,
+                    -1,
+                    -1,
+                    0,
+                    0,
+                    string.Empty,
+                    snapshot.Role));
+            }
+
+            Flush(activeBlend);
+        }
+        finally
+        {
+            // A failed draw must not strand rented vertex arrays or stale Lua handles.
+            if (commands.Count > 0)
+            {
+                ReturnQuad3DVertices(commands);
+                commands.Clear();
+            }
+            _skinRuntime.ClearPlayfieldSurfaceDrawRequests();
+        }
     }
 
     private void DrawLaneHighlights3D(Texture2D texture)
@@ -1255,6 +1592,9 @@ public sealed partial class Playfield
 
     private void DrawLaneHighlights()
     {
+        if (TryDrawSkinLaneHighlights())
+            return;
+
         var texture = _textures.Get("lane-highlight");
         if (texture is null)
             return;

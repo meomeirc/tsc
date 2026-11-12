@@ -1,19 +1,58 @@
--- Seamless horizontally scrolling background.
+-- Five pre-baked transparent star layers with leftward parallax scrolling.
+-- The video and original scrolling PNG remain fallbacks if any layer is missing.
 
-local texture = nil
+local star_layers = {
+    { file = "stars_layer_1.png", phase = 0.0, pulse_cycles = 2 },
+    { file = "stars_layer_2.png", phase = 1.1, pulse_cycles = 3 },
+    { file = "stars_layer_3.png", phase = 2.2, pulse_cycles = 4 },
+    { file = "stars_layer_4.png", phase = 3.3, pulse_cycles = 5 },
+    { file = "stars_layer_5.png", phase = 4.4, pulse_cycles = 6 },
+}
+
+local star_layers_ready = false
+local background_video = nil
+local texture = nil -- Original scrolling PNG fallback if video is unavailable.
 local stage_window = nil
 local gradient = nil
-local scroll_x = 0
+local elapsed = 0
+local fallback_scroll_x = 0
 
--- Pixels per second at the skin's current render resolution.
-local SCROLL_SPEED = 25
+local LOOP_DURATION = 30.0
+local TAU = 6.28318530718
+local FALLBACK_SCROLL_SPEED = 25
+local LAYER_PULSE_MIN = 0.70
+local LAYER_PULSE_RANGE = 0.30
 
--- Reuse draw option tables across frames.
-local tile_draw_options = {
+local black_background_options = {
+    x = 0, y = 0, width = 0, height = 0,
+    anchor = "top-left",
+    color = "#000000",
+    layer = -1001,
+}
+
+local video_background_draw_options = {
+    x = 0, y = 0, width = 0, height = 0,
+    anchor = "top-left",
+    layer = -1000,
+    alpha = 1.0,
+    blend = "normal",
+}
+
+local fallback_tile_draw_options = {
     x = 0, y = 0, width = 0, height = 0,
     anchor = "top-left",
     layer = -1000,
 }
+
+local function make_star_layer_options(layer, index)
+    layer.draw_options = {
+        x = 0, y = 0, width = 0, height = 0,
+        anchor = "top-left",
+        layer = -1000 + index,
+        alpha = 1.0,
+        blend = "add",
+    }
+end
 
 local stage_window_draw_options = {
     x = 0, y = 0, width = 0, height = 0,
@@ -90,22 +129,46 @@ local function get_texture_size(asset)
            asset.height or asset.Height or 0
 end
 
+local function load_star_layers()
+    local all_loaded = true
+    for index, layer in ipairs(star_layers) do
+        layer.texture = assets.load(layer.file)
+        make_star_layer_options(layer, index)
+        if layer.texture == nil then
+            all_loaded = false
+        end
+    end
+    return all_loaded
+end
+
 function init()
     gradient = assets.load("gradient.png")
-    texture = assets.load("background.png")
+    star_layers_ready = load_star_layers()
+
+    -- Avoid starting the video decoder during normal layered-PNG playback.
+    -- Keep the previous video and scrolling PNG as fallbacks for incomplete skins.
+    if not star_layers_ready then
+        background_video = assets.load("background.mp4")
+        if background_video == nil then
+            texture = assets.load("background.png")
+        end
+    end
+
     stage_window = assets.load("stage-window.png")
-    scroll_x = 0
+    elapsed = 0
+    fallback_scroll_x = 0
 end
 
 -- Initialize on import and allow later reset through init().
 init()
 
 function update(dt)
-    if texture == nil then
-        return
-    end
+    local delta = math.max(0, tonumber(dt) or 0)
+    elapsed = (elapsed + delta) % LOOP_DURATION
 
-    scroll_x = scroll_x - SCROLL_SPEED * (dt or 0)
+    if not star_layers_ready and background_video == nil and texture ~= nil then
+        fallback_scroll_x = fallback_scroll_x - FALLBACK_SCROLL_SPEED * delta
+    end
 end
 
 function render(display)
@@ -127,24 +190,70 @@ function render(display)
         return
     end
 
-    if draw_tiles and texture ~= nil and texture_width > 0 and texture_height > 0 then
--- Match the image to the screen height while preserving its aspect ratio.
-        local tile_height = screen_height
-        local tile_width = tile_height * texture_width / texture_height
+    if draw_tiles then
+        if star_layers_ready then
+            -- Transparent PNG layers are additive over a black base. Each tile
+            -- completes one horizontal wrap per 30 seconds, preserving a native loop.
+            black_background_options.width = screen_width
+            black_background_options.height = screen_height
+            draw.rect(black_background_options)
 
-        if tile_width > 0 then
-            -- Keep the scroll value bounded to one tile so it never grows forever.
-            scroll_x = scroll_x % tile_width
+            local loop_phase = elapsed / LOOP_DURATION
+            local pulse_angle = loop_phase * TAU
 
--- Draw enough repeated tiles to cover the screen.
-            local start_x = scroll_x - tile_width
-            local count = math.ceil(screen_width / tile_width) + 2
+            for _, layer in ipairs(star_layers) do
+                local layer_width, layer_height = get_texture_size(layer.texture)
+                if layer_width > 0 and layer_height > 0 then
+                    local tile_height = screen_height
+                    local tile_width = tile_height * layer_width / layer_height
 
-            for index = 0, count - 1 do
-                tile_draw_options.x = start_x + index * tile_width
-                tile_draw_options.width = tile_width
-                tile_draw_options.height = tile_height
-                draw.sprite(texture, tile_draw_options)
+                    if tile_width > 0 then
+                        -- One tile per loop; tile aspect ratios encode depth speed.
+                        local scroll_x = -loop_phase * tile_width
+                        local start_x = scroll_x - tile_width
+                        local count = math.ceil(screen_width / tile_width) + 2
+                        -- Use different integer pulse cycle counts so every layer
+                        -- fades at its own pace while repeating exactly with the
+                        -- shared 30-second background loop. A half-cycle is one
+                        -- fade from minimum to maximum opacity.
+                        local pulse_wave = 0.5 - 0.5 * math.cos(
+                            pulse_angle * layer.pulse_cycles + layer.phase
+                        )
+                        local pulse = LAYER_PULSE_MIN + LAYER_PULSE_RANGE * pulse_wave
+
+                        local options = layer.draw_options
+                        options.width = tile_width
+                        options.height = tile_height
+                        options.alpha = pulse
+
+                        for tile_index = 0, count - 1 do
+                            options.x = start_x + tile_index * tile_width
+                            draw.sprite(layer.texture, options)
+                        end
+                    end
+                end
+            end
+        elseif background_video ~= nil then
+            -- Fallback for skins missing one or more baked star layers.
+            video_background_draw_options.width = screen_width
+            video_background_draw_options.height = screen_height
+            draw.sprite(background_video, video_background_draw_options)
+        elseif texture ~= nil and texture_width > 0 and texture_height > 0 then
+            -- Last-resort fallback: original seamless scrolling PNG.
+            local tile_height = screen_height
+            local tile_width = tile_height * texture_width / texture_height
+
+            if tile_width > 0 then
+                fallback_scroll_x = fallback_scroll_x % tile_width
+                local start_x = fallback_scroll_x - tile_width
+                local count = math.ceil(screen_width / tile_width) + 2
+
+                for index = 0, count - 1 do
+                    fallback_tile_draw_options.x = start_x + index * tile_width
+                    fallback_tile_draw_options.width = tile_width
+                    fallback_tile_draw_options.height = tile_height
+                    draw.sprite(texture, fallback_tile_draw_options)
+                end
             end
         end
     end

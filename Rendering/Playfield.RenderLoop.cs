@@ -147,10 +147,17 @@ public sealed partial class Playfield
         // Build the Lua skin once for this frame. Negative layers are rendered
         // between the default background and the 3D playfield; non-negative
         // layers are rendered after the normal HUD.
+        _skinRuntime.SetCompactMode(_compact);
         _skinRuntime.DebugMeasureApiAllocations = _performanceDebugInstrumentFrame;
         var allocStart = GC.GetAllocatedBytesForCurrentThread();
         var skinBuildStartTimestamp = Stopwatch.GetTimestamp();
-        _skinDrawCommands = _skinRuntime.BuildDrawCommands(virtualWidth, virtualHeight, _font);
+        _skinDrawCommands = _skinRuntime.BuildDrawCommands(
+            virtualWidth,
+            virtualHeight,
+            _font,
+            _uiTimeSeconds,
+            _playSeconds,
+            _chartEditorMode && _topDownViewEnabled ? "editor" : "gameplay");
         _debugSkinBuildMs = ElapsedMilliseconds(skinBuildStartTimestamp);
         _debugAllocSkinBuildBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
 
@@ -283,6 +290,7 @@ public sealed partial class Playfield
             var feedbackVerticesStart = _debugTexturedVertices;
             allocStart = GC.GetAllocatedBytesForCurrentThread();
             DrawHitAnimations();
+            DrawSkinScriptUiLayers(_skinDrawCommands, false, _skinRuntime, hitEffectsOnly: true);
             if (_chartEditorMode && !_editorPreviewMode && !_editorPanelsViewEnabled)
                 DrawEditorNotePlacementPreview(currentTick, currentState);
             if (!_editorPreviewMode)
@@ -650,7 +658,9 @@ public sealed partial class Playfield
                 _skinRuntime.SetEditorMode(false);
                 _skinRuntime.SetEditorPreviewMode(true);
                 _skinRuntime.PrepareGameplayAnimationFonts();
-                var commands = _skinRuntime.BuildDrawCommands(width, height, _font);
+                var commands = _skinRuntime.BuildDrawCommands(
+                    width, height, _font, _uiTimeSeconds, _playSeconds,
+                    _chartEditorMode && _topDownViewEnabled ? "editor" : "gameplay");
                 warmed = commands.Count > 0;
                 DrawSkinScriptUiLayers(commands, true, _skinRuntime);
                 DrawSkinScriptUiLayers(commands, false, _skinRuntime);
@@ -829,20 +839,23 @@ public sealed partial class Playfield
         // The first SpriteBatch submission can still initialize its internal
         // batch/shader state, so exercise that path before the first judgement.
         var textures = new List<Texture2D>();
-        foreach (var (variant, frameCount) in new[]
-                 {
-                     ("regular", _skin.RenderConfig.HitAnimation.Regular.FrameCount),
-                     ("multi", _skin.RenderConfig.HitAnimation.Multi.FrameCount),
-                     ("long", _skin.RenderConfig.HitAnimation.Long.FrameCount),
-                     ("superFlickOuter", _skin.RenderConfig.HitAnimation.SuperFlick.Outer.FrameCount),
-                     ("superFlickInner", _skin.RenderConfig.HitAnimation.SuperFlick.Inner.FrameCount)
-                 })
+        if (!_skinRuntime.SupportsHitEffectRenderer)
         {
-            for (var frame = 1; frame <= Math.Max(0, frameCount); frame++)
+            foreach (var (variant, frameCount) in new[]
+                     {
+                         ("regular", _skin.RenderConfig.HitAnimation.Regular.FrameCount),
+                         ("multi", _skin.RenderConfig.HitAnimation.Multi.FrameCount),
+                         ("long", _skin.RenderConfig.HitAnimation.Long.FrameCount),
+                         ("superFlickOuter", _skin.RenderConfig.HitAnimation.SuperFlick.Outer.FrameCount),
+                         ("superFlickInner", _skin.RenderConfig.HitAnimation.SuperFlick.Inner.FrameCount)
+                     })
             {
-                var texture = _textures.GetHitFrame(variant, frame);
-                if (texture is not null)
-                    textures.Add(texture);
+                for (var frame = 1; frame <= Math.Max(0, frameCount); frame++)
+                {
+                    var texture = _textures.GetHitFrame(variant, frame);
+                    if (texture is not null)
+                        textures.Add(texture);
+                }
             }
         }
 
@@ -918,7 +931,8 @@ public sealed partial class Playfield
                 StartJudgementUiLifetime();
                 StartTimingUi(1.0, JudgementTier.Perfect);
                 RecordHitDelta(1.0, JudgementTier.Perfect);
-                StartHitAnimation(primeEvent);
+                if (!_skinRuntime.SupportsHitEffectRenderer)
+                    StartHitAnimation(primeEvent);
 
                 DrawHitAnimations();
                 DrawHud(RenderGearState(_tempo.SecondsToTick(_playSeconds)),
@@ -984,6 +998,16 @@ public sealed partial class Playfield
         var state = RenderGearState(currentTick);
         var laneTexture = _textures.Get("lane");
         var lineTexture = _textures.Get("line");
+        // Lane surfaces and their guide-line textures are Lua-rendered in every
+        // playfield mode that has a chart clock, including the normal editor.
+        // Native editor-only overlays (beat lines, selection, tempo guides, etc.)
+        // are drawn separately and are intentionally unaffected by this switch.
+        var useSkinRenderer = CanUseSkinPlayfieldEffects && _skinRuntime.SupportsPlayfieldRenderer;
+        if (useSkinRenderer)
+        {
+            laneTexture ??= _skinRuntime.PlayfieldGeometryWhiteTexture;
+            lineTexture ??= _skinRuntime.PlayfieldGeometryWhiteTexture;
+        }
         if (laneTexture is null && lineTexture is null)
             return;
 
@@ -1024,10 +1048,163 @@ public sealed partial class Playfield
                 _laneBankMeshCache[(bank.Side, bank.Bank)] = built;
         }
 
+        if (useSkinRenderer)
+            ApplySkinPlayfieldSurfaceRenderer(laneCommands, lineCommands, currentTick);
+
         _graphics.BlendState = BlendState.AlphaBlend;
         _graphics.RasterizerState = RasterizerState.CullNone;
-        DrawLaneTextureMeshes(laneCommands, debugOrbitKind: 1, state: state);
-        DrawLaneTextureMeshes(lineCommands, debugOrbitKind: 2, state: state);
+        DrawLaneTextureMeshLayers(laneCommands, lineCommands, state);
+    }
+
+    private void DrawLaneTextureMeshLayers(
+        List<LaneTextureMeshCommand> laneCommands,
+        List<LaneTextureMeshCommand> lineCommands,
+        GearState state)
+    {
+        if (laneCommands.Count == 0 && lineCommands.Count == 0)
+            return;
+
+        var minimumLayer = int.MaxValue;
+        var maximumLayer = int.MinValue;
+        for (var i = 0; i < laneCommands.Count; i++)
+        {
+            minimumLayer = Math.Min(minimumLayer, laneCommands[i].Layer);
+            maximumLayer = Math.Max(maximumLayer, laneCommands[i].Layer);
+        }
+        for (var i = 0; i < lineCommands.Count; i++)
+        {
+            minimumLayer = Math.Min(minimumLayer, lineCommands[i].Layer);
+            maximumLayer = Math.Max(maximumLayer, lineCommands[i].Layer);
+        }
+
+        var lanesAtLayer = _laneLayerScratch;
+        var linesAtLayer = _lineLayerScratch;
+        for (var layer = minimumLayer; layer <= maximumLayer; layer++)
+        {
+            lanesAtLayer.Clear();
+            for (var i = 0; i < laneCommands.Count; i++)
+            {
+                if (laneCommands[i].Layer == layer)
+                    lanesAtLayer.Add(laneCommands[i]);
+            }
+            if (lanesAtLayer.Count > 0)
+                DrawLaneTextureMeshes(lanesAtLayer, debugOrbitKind: 1, state: state);
+
+            linesAtLayer.Clear();
+            for (var i = 0; i < lineCommands.Count; i++)
+            {
+                if (lineCommands[i].Layer == layer)
+                    linesAtLayer.Add(lineCommands[i]);
+            }
+            if (linesAtLayer.Count > 0)
+                DrawLaneTextureMeshes(linesAtLayer, debugOrbitKind: 2, state: state);
+        }
+        lanesAtLayer.Clear();
+        linesAtLayer.Clear();
+    }
+
+    private void ApplySkinPlayfieldSurfaceRenderer(
+        List<LaneTextureMeshCommand> laneCommands,
+        List<LaneTextureMeshCommand> lineCommands,
+        double currentTick)
+    {
+        var geometry = _skinPlayfieldSurfaceScratch;
+        geometry.Clear();
+        for (var i = 0; i < laneCommands.Count; i++)
+        {
+            var item = laneCommands[i];
+            geometry.Add(new SkinPlayfieldSurfaceGeometrySnapshot(
+                item.Vertices, item.Depth, item.Side, item.Bank,
+                item.CenterNormalized, item.HalfNormalizedWidth,
+                item.IsTransition, false, item.NearDepth, item.Opacity, Role: "lane"));
+        }
+        for (var i = 0; i < lineCommands.Count; i++)
+        {
+            var item = lineCommands[i];
+            geometry.Add(new SkinPlayfieldSurfaceGeometrySnapshot(
+                item.Vertices, item.Depth, item.Side, item.Bank,
+                item.CenterNormalized, item.HalfNormalizedWidth,
+                item.IsTransition, true, item.NearDepth, item.Opacity, Role: "line"));
+        }
+
+        var replaced = _skinReplacedLaneVertices;
+        replaced.Clear();
+        var customLanes = _skinLaneCommandScratch;
+        var customLines = _skinLineCommandScratch;
+        customLanes.Clear();
+        customLines.Clear();
+
+        var replaceRequested = _skinRuntime.InvokePlayfieldSurfaceRenderer(
+            geometry, _playSeconds, currentTick);
+        var requests = _skinRuntime.PlayfieldSurfaceDrawRequests;
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            var snapshot = request.Geometry.Snapshot;
+            var customCommand = new LaneTextureMeshCommand(
+                request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture,
+                snapshot.Vertices,
+                snapshot.Depth,
+                snapshot.IsTransition,
+                snapshot.Side,
+                snapshot.Bank,
+                snapshot.CenterNormalized,
+                snapshot.HalfNormalizedWidth,
+                snapshot.IsLine,
+                snapshot.NearDepth,
+                snapshot.Opacity * request.Alpha,
+                request.Tint,
+                request.Layer);
+
+            if (snapshot.IsLine)
+                customLines.Add(customCommand);
+            else
+                customLanes.Add(customCommand);
+
+            if (replaceRequested)
+                replaced.Add(snapshot.Vertices);
+        }
+
+        if (replaceRequested && replaced.Count > 0)
+        {
+            for (var i = laneCommands.Count - 1; i >= 0; i--)
+            {
+                var source = laneCommands[i].Vertices;
+                if (ContainsVertexArrayReference(replaced, source))
+                    laneCommands.RemoveAt(i);
+            }
+            for (var i = lineCommands.Count - 1; i >= 0; i--)
+            {
+                var source = lineCommands[i].Vertices;
+                if (ContainsVertexArrayReference(replaced, source))
+                    lineCommands.RemoveAt(i);
+            }
+        }
+
+        if (customLanes.Count > 0)
+        {
+            laneCommands.AddRange(customLanes);
+            customLanes.Clear();
+        }
+        if (customLines.Count > 0)
+        {
+            lineCommands.AddRange(customLines);
+            customLines.Clear();
+        }
+
+        _skinRuntime.ClearPlayfieldSurfaceDrawRequests();
+    }
+
+    private static bool ContainsVertexArrayReference(
+        List<VertexPositionColorTexture[]> arrays,
+        VertexPositionColorTexture[] candidate)
+    {
+        for (var i = 0; i < arrays.Count; i++)
+        {
+            if (ReferenceEquals(arrays[i], candidate))
+                return true;
+        }
+        return false;
     }
 
     private (List<LaneTextureMeshCommand> Lane, List<LaneTextureMeshCommand> Line) BuildLaneBankMeshes(
@@ -1068,7 +1245,7 @@ public sealed partial class Playfield
                     halfWidth,
                     bank,
                     _projection.LaneLineNearWidth,
-                    _projection.LaneLineFarWidth) with { Opacity = columnOpacity });
+                    _projection.LaneLineFarWidth) with { Opacity = columnOpacity, Layer = 1 });
             }
 
             if (laneTexture is not null)

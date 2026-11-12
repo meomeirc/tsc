@@ -3,6 +3,45 @@ using Microsoft.Xna.Framework.Graphics;
 
 namespace TSC.Rendering;
 
+public enum NoteTextureAsset
+{
+    NoteRegular,
+    NoteMiss,
+    NoteMulti,
+    NoteLong,
+    NoteFlick,
+    NoteFlickMulti,
+    LightRegular,
+    LightMulti,
+    LightLong,
+    LightVibrato,
+    IndicatorLong,
+    IndicatorLongMulti,
+    IndicatorLongMiss,
+    IndicatorVibrato,
+    IndicatorVibratoMulti,
+    IndicatorFlick,
+    IndicatorFlickMulti,
+    AttachFlick,
+    AttachFlickMulti,
+    Dim,
+    DimMulti,
+    DimVibrato,
+    DimMiss,
+    Tail,
+    TailMulti,
+    TailMiss,
+    Body,
+    BodyMulti,
+    BodyMiss,
+    Vibrato,
+    VibratoMulti,
+    SuperFlickInner,
+    SuperFlickOuter,
+    LightInner,
+    LightOuter
+}
+
 public sealed class NoteTextures : IDisposable
 {
     private readonly GraphicsDevice _graphics;
@@ -88,6 +127,45 @@ public sealed class NoteTextures : IDisposable
     public IReadOnlyList<string> MissingFiles { get; private set; } = Array.Empty<string>();
 
     public Texture2D? Get(string name) => _textures.TryGetValue(name, out var texture) ? texture : null;
+    public Texture2D? Get(NoteTextureAsset asset) => Get(asset switch
+    {
+        NoteTextureAsset.NoteRegular => "note-regular",
+        NoteTextureAsset.NoteMiss => "note-miss",
+        NoteTextureAsset.NoteMulti => "note-multi",
+        NoteTextureAsset.NoteLong => "note-long",
+        NoteTextureAsset.NoteFlick => "note-flick",
+        NoteTextureAsset.NoteFlickMulti => "note-flick-multi",
+        NoteTextureAsset.LightRegular => "light-regular",
+        NoteTextureAsset.LightMulti => "light-multi",
+        NoteTextureAsset.LightLong => "light-long",
+        NoteTextureAsset.LightVibrato => "light-vibrato",
+        NoteTextureAsset.IndicatorLong => "indicator-long",
+        NoteTextureAsset.IndicatorLongMulti => "indicator-long-multi",
+        NoteTextureAsset.IndicatorLongMiss => "indicator-long-miss",
+        NoteTextureAsset.IndicatorVibrato => "indicator-vibrato",
+        NoteTextureAsset.IndicatorVibratoMulti => "indicator-vibrato-multi",
+        NoteTextureAsset.IndicatorFlick => "indicator-flick",
+        NoteTextureAsset.IndicatorFlickMulti => "indicator-flick-multi",
+        NoteTextureAsset.AttachFlick => "attach-flick",
+        NoteTextureAsset.AttachFlickMulti => "attach-flick-multi",
+        NoteTextureAsset.Dim => "dim",
+        NoteTextureAsset.DimMulti => "dim-multi",
+        NoteTextureAsset.DimVibrato => "dim-vibrato",
+        NoteTextureAsset.DimMiss => "dim-miss",
+        NoteTextureAsset.Tail => "tail",
+        NoteTextureAsset.TailMulti => "tail-multi",
+        NoteTextureAsset.TailMiss => "tail-miss",
+        NoteTextureAsset.Body => "body",
+        NoteTextureAsset.BodyMulti => "body-multi",
+        NoteTextureAsset.BodyMiss => "body-miss",
+        NoteTextureAsset.Vibrato => "vibrato",
+        NoteTextureAsset.VibratoMulti => "vibrato-multi",
+        NoteTextureAsset.SuperFlickInner => "super-flick-inner",
+        NoteTextureAsset.SuperFlickOuter => "super-flick-outer",
+        NoteTextureAsset.LightInner => "light-inner",
+        NoteTextureAsset.LightOuter => "light-outer",
+        _ => string.Empty
+    });
 
     // variant is one of: regular, multi, long, superFlickOuter, superFlickInner.
     // These map to hit-regular/, hit-multi/, hit-long/, hit-superFlickOuter/, and

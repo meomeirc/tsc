@@ -18,6 +18,19 @@ public sealed partial class Playfield
 {
     // Judgements, hit animations, audio feedback, and timing feedback.
 
+    private void QueueLegacyHitAnimationPreload(RenderConfig config)
+    {
+        if (_skinRuntime.SupportsHitEffectRenderer)
+            return;
+
+        _textures.QueueHitAnimationPreload(
+            ("regular", config.HitAnimation.Regular.FrameCount),
+            ("multi", config.HitAnimation.Multi.FrameCount),
+            ("long", config.HitAnimation.Long.FrameCount),
+            ("superFlickOuter", config.HitAnimation.SuperFlick.Outer.FrameCount),
+            ("superFlickInner", config.HitAnimation.SuperFlick.Inner.FrameCount));
+    }
+
     private JudgementTier RegisterHit(double offsetMs, ChartEvent? eventForScore = null)
     {
         if (_performanceDebugInstrumentFrame)
@@ -75,7 +88,35 @@ public sealed partial class Playfield
             AwardEventScore(eventForScore, tier);
     }
 
-    private void StartHitAnimation(ChartEvent ev)
+    private void StartHitAnimation(ChartEvent ev, JudgementTier judgement = JudgementTier.PerfectPlus)
+    {
+        if (_tempo is null || _chart is null)
+            return;
+
+        // New skins receive the hit signal and own the complete visual response.
+        // The old sprite-sheet renderer remains only for skins that have not yet
+        // implemented both hit-effect callbacks.
+        if (_skinRuntime.SupportsHitEffectRenderer)
+        {
+            var view = _chartEditorMode && _topDownViewEnabled ? "editor" : "gameplay";
+            if (_skinRuntime.OnHitEffect(
+                    BuildSkinNoteView(ev, hit: true, missed: false),
+                    SkinJudgementName(judgement),
+                    GetCurrentOffsetMs(ev) ?? 0.0,
+                    _uiTimeSeconds,
+                    _playSeconds,
+                    view))
+            {
+                return;
+            }
+        }
+
+        // If no complete Lua implementation is present, or its event callback
+        // fails, retain the native effect for this hit instead of losing feedback.
+        StartLegacyHitAnimation(ev);
+    }
+
+    private void StartLegacyHitAnimation(ChartEvent ev)
     {
         if (_tempo is null || _chart is null)
             return;
@@ -258,7 +299,7 @@ public sealed partial class Playfield
         var frameDuration = totalDuration / frameCount;
         var elapsedFrames = (int)Math.Floor(animation.ElapsedSeconds / frameDuration);
 
-        if (animation.LoopOnly)
+        if (animation.LoopOnly && !animation.PostLoopStartElapsedSeconds.HasValue)
         {
             if (_playSeconds >= animation.HoldEndSeconds)
                 return animation.HoldLoopEndFrame;
@@ -338,16 +379,20 @@ public sealed partial class Playfield
                 ? _hitEvents.Contains(animation.HoldTransitionKey.Value) ||
                   _playSeconds >= animation.HoldEndSeconds + GameplayHitWindowSeconds
                 : _playSeconds >= animation.HoldEndSeconds;
-            if ((animation.StopAtHoldEnd && reachedHoldEnd) ||
-                (animation.LoopOnly && _playSeconds >= animation.HoldEndSeconds) ||
-                (!animation.LoopOnly && frame >= animation.FrameCount))
+            var outroStarted = animation.PostLoopStartElapsedSeconds.HasValue;
+            // Keep the final frame visible for one frame interval; the animation
+            // is removed only after its frame index advances beyond the sequence.
+            var reachedFinalFrame = frame > animation.FrameCount;
+            if ((!outroStarted && animation.StopAtHoldEnd && reachedHoldEnd) ||
+                (!outroStarted && animation.LoopOnly && _playSeconds >= animation.HoldEndSeconds) ||
+                ((!animation.LoopOnly || outroStarted) && reachedFinalFrame))
                 _hitAnimations.RemoveAt(i);
         }
     }
 
     private void DrawHitAnimations()
     {
-        if (_hitAnimations.Count == 0)
+        if (_skinRuntime.SupportsHitEffectRenderer || _hitAnimations.Count == 0)
             return;
 
         _spriteBatch.Begin(
@@ -416,7 +461,7 @@ public sealed partial class Playfield
         }
         StartJudgementUiLifetime();
         if (tier != JudgementTier.Miss && eventForAnimation is not null)
-            StartHitAnimation(eventForAnimation);
+            StartHitAnimation(eventForAnimation, tier);
         if (offsetMs.HasValue)
             StartTimingUi(offsetMs.Value, tier);
     }
@@ -480,6 +525,14 @@ public sealed partial class Playfield
         var rotation = position is null
             ? 0f
             : _projection.SpriteRotationRadians(side, bank, point.Depth);
+        var hitPosition = point.Position;
+        if (position is { } trackInfo)
+        {
+            var normalizedX = _projection.LaneNormalizedX(ev.Track);
+            var judgeBasis = _projection.BuildStandingNoteBasis(
+                normalizedX, 0f, trackInfo.Side, trackInfo.Bank);
+            hitPosition = _projection.ScreenPositionFromCameraSpace(judgeBasis.Center);
+        }
 
         var noteSeconds = _tempo?.TickToSeconds(ev.Tick) ?? _playSeconds;
         var endSeconds = _tempo?.TickToSeconds(ev.EndTick) ?? noteSeconds;
@@ -499,16 +552,36 @@ public sealed partial class Playfield
         };
 
         var active = IsActiveEvent(ev);
+        var simultaneous = SimultaneousCounts(renderState);
+        var isMulti = !ev.IsSuperFlick && IsSimultaneous(ev, simultaneous);
+        var superFlickFamily = ev.IsSuperFlick
+            ? ev.GetSuperFlickFamily(_gear?.AtTick(ev.Tick, includeTickChanges: false)).ToString().ToLowerInvariant()
+            : string.Empty;
+        var hitAnimationConfig = GetActiveViewRenderConfig().HitAnimation;
+        var selectedHitConfig = ev.IsSuperFlick
+            ? string.Equals(superFlickFamily, "inner", StringComparison.OrdinalIgnoreCase)
+                ? hitAnimationConfig.SuperFlick.Inner
+                : hitAnimationConfig.SuperFlick.Outer
+            : ev.IsHoldNote || ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
+                ? hitAnimationConfig.Long
+                : isMulti ? hitAnimationConfig.Multi : hitAnimationConfig.Regular;
+        var hitWidth = Math.Max(1f,
+            selectedHitConfig.Width * point.Scale * point.LaneRotationDepthScale);
+        var hitRotation = selectedHitConfig.RotateWithLane ? rotation : 0f;
         return new SkinNoteView(
             type,
             noteSeconds,
             duration,
+            ev.Track,
             lane,
             side,
             bank,
             new SkinVector2View(point.Position.X, point.Position.Y),
+            new SkinVector2View(hitPosition.X, hitPosition.Y),
             rotation,
             point.Scale,
+            hitWidth,
+            hitRotation,
             progress,
             hit,
             missed,
@@ -516,7 +589,9 @@ public sealed partial class Playfield
             !OutsideNoteView(point, point),
             ev.IsHoldNote,
             ev.NoteType is NoteType.LinkHead or NoteType.LinkTail,
-            ev.IsSuperFlick);
+            ev.IsSuperFlick,
+            isMulti,
+            superFlickFamily);
     }
 
     private void StartTimingUi(double offsetMs, JudgementTier tier)

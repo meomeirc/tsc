@@ -219,9 +219,6 @@ public sealed class ChartProjection
     public const float DefaultLaneTextureWidth = DefaultLaneTrackWidth;
     public const float DefaultLaneLineNearWidth = DefaultLaneTrackWidth;
     public const float DefaultLaneLineFarWidth = DefaultLaneTrackWidth;
-    public const float DefaultJudgePulseWidth = DefaultJudgeWidth * 1.12f;
-    public const float DefaultLightPulseWidth = DefaultLightIndicatorWidth * 1.12f;
-    public const float DefaultLightPulseOpacity = 0.35f;
     public const float DefaultSuperFlickTextureWidth = DefaultLaneTrackWidth;
     // Culling is split by direction from the judgement/camera plane.
     // Positive travel is ahead (toward spawn); negative travel is behind (past camera).
@@ -315,15 +312,14 @@ public sealed class ChartProjection
     public float LaneJudgePositionY { get; set; } = DefaultLaneJudgePositionY;
     public float LaneStartGap { get; set; } = DefaultLaneStartGap;
     public float LaneJudgeGap { get; set; } = DefaultLaneJudgeGap;
+    public float LaneBankGapStart { get; set; } = DefaultLaneBankWidth * InternalInterBankGapRatio;
+    public float LaneBankGapJudge { get; set; } = DefaultLaneBankWidth * InternalInterBankGapRatio;
     public float LaneBankWidth { get; set; } = DefaultLaneBankWidth;
     public float LaneTrackWidth { get; set; } = DefaultLaneTrackWidth;
     public float JudgeWidth { get; set; } = DefaultJudgeWidth;
     public float? JudgeHeight { get; set; }
-    public float? JudgePulseHeight { get; set; }
     public float JudgeAlpha { get; set; } = 1f;
-    public float JudgePulseAlpha { get; set; } = 1f;
     public string JudgeBlend { get; set; } = "normal";
-    public string JudgePulseBlend { get; set; } = "normal";
 
     public float HoldIndicatorWidth { get; set; } = DefaultHoldIndicatorWidth;
     public float LightIndicatorWidth { get; set; } = DefaultLightIndicatorWidth;
@@ -341,9 +337,6 @@ public sealed class ChartProjection
     public float OuterTrackOpacity { get; set; } = 0.5f;
     public float LaneLineNearWidth { get; set; } = DefaultLaneLineNearWidth;
     public float LaneLineFarWidth { get; set; } = DefaultLaneLineFarWidth;
-    public float JudgePulseWidth { get; set; } = DefaultJudgePulseWidth;
-    public float LightPulseWidth { get; set; } = DefaultLightPulseWidth;
-    public float LightPulseOpacity { get; set; } = DefaultLightPulseOpacity;
     // Lane length in scroll/depth units. This is deliberately independent of
     // aspect-ratio profiles so the note travel duration is identical on narrow
     // and wide screens.
@@ -611,20 +604,19 @@ public sealed class ChartProjection
         LaneRotationDegrees = config.Lane.Rotation.Degrees;
         LaneRotationDepthDegrees = config.Lane.Rotation.DepthDegrees;
         LaneBankWidth = Math.Max(1f, config.Lane.Width.Bank);
+        var legacyBankGap = LaneBankWidth * InternalInterBankGapRatio;
+        LaneFarCameraDistance = Math.Max(0f, config.Lane.Depth.FarCameraDistance);
+        var legacyFarGapScale = FocalLength / Math.Max(1f, EffectiveLaneFarCameraDistance);
+        LaneBankGapStart = Math.Max(0f, config.Lane.Gap.Bank.Start ?? legacyBankGap * legacyFarGapScale);
+        LaneBankGapJudge = Math.Max(0f, config.Lane.Gap.Bank.Judge ?? legacyBankGap);
         LaneTrackWidth = Math.Max(1f, config.Lane.Width.Track);
 
         var judgeWidth = config.Judge.Width ?? LaneTrackWidth;
-        var judgePulseWidth = config.Judge.Pulse.Width ?? (judgeWidth * 1.12f);
         JudgeWidth = Math.Max(0f, judgeWidth);
-        JudgePulseWidth = Math.Max(0f, judgePulseWidth);
         JudgeHeight = config.Judge.Height;
-        JudgePulseHeight = config.Judge.Pulse.Height;
         JudgeAlpha = MathHelper.Clamp(config.Judge.Alpha ?? 1f, 0f, 1f);
-        JudgePulseAlpha = MathHelper.Clamp(config.Judge.Pulse.Alpha ?? JudgeAlpha, 0f, 1f);
         JudgeBlend = NormalizeBlendName(config.Judge.Blend, "normal");
-        JudgePulseBlend = NormalizeBlendName(config.Judge.Pulse.Blend, JudgeBlend);
 
-        LaneFarCameraDistance = Math.Max(0f, config.Lane.Depth.FarCameraDistance);
         LaneLength = Math.Max(0f, config.Lane.Depth.Length);
         LaneEndLength = Math.Max(0f, config.Lane.Depth.EndLength);
 
@@ -649,8 +641,6 @@ public sealed class ChartProjection
         LaneLineNearWidth = Math.Max(0f, config.Lane.Line.Width.Near);
         LaneLineFarWidth = Math.Max(0f, config.Lane.Line.Width.Far);
 
-        LightPulseWidth = config.Hold.Light.Pulse.Width;
-        LightPulseOpacity = config.Hold.Light.Pulse.Opacity;
         SuperFlickTextureWidth = config.SuperFlick.Texture.Width;
         RenderDistanceAhead = Math.Max(0f, config.RenderDistance.Ahead);
         RenderDistanceBehind = Math.Max(0f, config.RenderDistance.Behind);
@@ -1428,7 +1418,14 @@ public sealed class ChartProjection
         // LaneStartY still controls the screen-space endpoint; LaneFarCameraDistance
         // controls how much actual depth is between that endpoint and the judge plane.
         var farGapWorld = sideSign * startGapPx * 0.5f * farCameraDistance / focal;
-        var farCenterX = judgeCenterNoGapX + farGapWorld;
+        // Bank spacing can differ between the judge row and far row. Each outer
+        // bank accumulates one additional inter-bank gap, so shift its far center
+        // by the gap delta while keeping its own surface width unchanged.
+        var bankIndex = Compact ? 0 : BankIndexFromInner(bank);
+        var bankGapDeltaWorld = sideSign * bankIndex * scale *
+            (Math.Max(0f, LaneBankGapStart) * farCameraDistance / focal -
+             Math.Max(0f, LaneBankGapJudge));
+        var farCenterX = judgeCenterNoGapX + farGapWorld + bankGapDeltaWorld;
         var farScreenY = LaneStartY;
         var farHalfHeight = Math.Max(1f, _height * 0.5f);
         var farCenterY = (farHalfHeight - farScreenY) * farCameraDistance / focal;
@@ -1739,7 +1736,7 @@ public sealed class ChartProjection
 
     private float BankWidthPixels => Math.Max(1f, LaneBankWidth * _resolutionScale);
     private float TrackWidthPixels => Math.Min(BankWidthPixels / 3f, Math.Max(1f, LaneTrackWidth * _resolutionScale));
-    private float InterBankGapPixels => BankWidthPixels * InternalInterBankGapRatio;
+    private float InterBankGapPixels => Math.Max(0f, LaneBankGapJudge * _resolutionScale);
 
     private static int BankIndexFromInner(string bank)
         => bank switch

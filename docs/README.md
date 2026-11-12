@@ -1,0 +1,2 @@
+- [Chart Parsing and Rendering](CHART_PARSING_AND_RENDERING.md): input loaders, normalized chart model, note attributes, track/bank mapping, route timeline, tempo/play-end normalization, link graph construction, radar display scale, and skin panel rendering
+- [Chart Radar and Combo Distribution Calculations](CHART_RADAR_AND_COMBO_CALCULATIONS.md): Combo Distribution counts and percentages, checkpoint logic, all six radar formulas, calibration references, and replication pseudocode

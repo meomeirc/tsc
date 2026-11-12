@@ -4041,9 +4041,9 @@ public sealed partial class Playfield
             _editorIndicatorProjectionHeight = virtualHeight;
         }
 
-        // Keep a separate projection loaded with editorRenderConfig.lua. Never
-        // derive indicator positions from the live projection, because it may be
-        // compact/collapsed or using the FPV renderConfig.lua view.
+        // Keep a separate projection loaded with get_playfield_config("editor")
+        // (or the legacy editorRenderConfig.lua fallback). Never derive indicator
+        // positions from the live gameplay projection, which may be compact/collapsed.
         if (!ReferenceEquals(_editorIndicatorProjectionConfig, _editorRenderConfig))
         {
             _editorIndicatorProjection.LoadRenderConfig(_editorRenderConfig);
@@ -9730,13 +9730,13 @@ public sealed partial class Playfield
             float distance;
             Texture2D? selectionTexture = null;
             if (ev.IsFlick)
-                selectionTexture = _textures.Get("note-flick");
+                selectionTexture = _textures.Get(NoteTextureAsset.NoteFlick);
             else if (ev.NoteType == NoteType.Vibrato)
-                selectionTexture = _textures.Get("indicator-vibrato");
+                selectionTexture = _textures.Get(NoteTextureAsset.IndicatorVibrato);
             else if (ev.NoteType == NoteType.SingleLong || ev.NoteType is NoteType.LinkHead or NoteType.LinkTail)
-                selectionTexture = _textures.Get("note-long");
+                selectionTexture = _textures.Get(NoteTextureAsset.NoteLong);
             else
-                selectionTexture = _textures.Get("note-regular");
+                selectionTexture = _textures.Get(NoteTextureAsset.NoteRegular);
 
             var noteAngle = _projection.NoteStandAngleDegrees;
             var selectionWidth = ev.IsFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
@@ -10039,12 +10039,12 @@ public sealed partial class Playfield
         var noteType = ev?.NoteType ?? _editorNoteType;
         var width = isFlick ? _projection.SmallFlickNoteWidth : _projection.NoteWidth;
         var texture = isFlick
-            ? _textures.Get("note-flick")
+            ? _textures.Get(NoteTextureAsset.NoteFlick)
             : noteType == NoteType.Vibrato
-                ? _textures.Get("indicator-vibrato")
+                ? _textures.Get(NoteTextureAsset.IndicatorVibrato)
                 : noteType is NoteType.SingleLong or NoteType.LinkHead or NoteType.LinkTail
-                    ? _textures.Get("note-long")
-                    : _textures.Get("note-regular");
+                    ? _textures.Get(NoteTextureAsset.NoteLong)
+                    : _textures.Get(NoteTextureAsset.NoteRegular);
 
         var position = GearState.Position(track);
         var side = position?.Side ?? (projected.Position.X < _projection.JudgeX ? "left" : "right");

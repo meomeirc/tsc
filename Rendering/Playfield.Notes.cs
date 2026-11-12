@@ -20,6 +20,7 @@ public sealed partial class Playfield
 
     private void DrawNotes(double currentTick, GearState currentState)
     {
+        _skinReplacedSuperFlickComponents.Clear();
         if (_chart is null || _tempo is null || _gear is null)
             return;
 
@@ -66,6 +67,9 @@ public sealed partial class Playfield
         }
 
         ClearNoteGeometryCache();
+        _skinNoteGeometryContext = null;
+        _skinNoteSimultaneousContext = false;
+        _skinNoteMissedContext = false;
         var counts = SimultaneousCounts(currentState);
         var showEditorAttributes = _chartEditorMode && !_editorPreviewMode && _editorShowAttributes;
         _editorNoteAttributeLabels.Clear();
@@ -123,28 +127,28 @@ public sealed partial class Playfield
 
         // Resolve texture assets once per frame instead of hashing the texture-key
         // strings for every event in the render loop.
-        var noteRegularTexture = _textures.Get("note-regular");
-        var noteMissTexture = _textures.Get("note-miss");
-        var noteMultiTexture = _textures.Get("note-multi");
-        var noteLongTexture = _textures.Get("note-long");
-        var lightRegularTexture = _textures.Get("light-regular");
-        var lightMultiTexture = _textures.Get("light-multi");
-        var lightLongTexture = _textures.Get("light-long");
-        var lightVibratoTexture = _textures.Get("light-vibrato");
-        var indicatorLongTexture = _textures.Get("indicator-long");
-        var indicatorLongMultiTexture = _textures.Get("indicator-long-multi");
-        var indicatorVibratoTexture = _textures.Get("indicator-vibrato");
-        var indicatorVibratoMultiTexture = _textures.Get("indicator-vibrato-multi");
-        var dimTexture = _textures.Get("dim");
-        var dimMultiTexture = _textures.Get("dim-multi");
-        var dimVibratoTexture = _textures.Get("dim-vibrato");
-        var tailTextureDefault = _textures.Get("tail");
-        var tailMultiTextureDefault = _textures.Get("tail-multi");
-        var tailMissTexture = _textures.Get("tail-miss");
-        var bodyTextureDefault = _textures.Get("body");
-        var bodyMultiTextureDefault = _textures.Get("body-multi");
-        var vibratoTextureDefault = _textures.Get("vibrato");
-        var vibratoMultiTextureDefault = _textures.Get("vibrato-multi");
+        var noteRegularTexture = _textures.Get(NoteTextureAsset.NoteRegular);
+        var noteMissTexture = _textures.Get(NoteTextureAsset.NoteMiss);
+        var noteMultiTexture = _textures.Get(NoteTextureAsset.NoteMulti);
+        var noteLongTexture = _textures.Get(NoteTextureAsset.NoteLong);
+        var lightRegularTexture = _textures.Get(NoteTextureAsset.LightRegular);
+        var lightMultiTexture = _textures.Get(NoteTextureAsset.LightMulti);
+        var lightLongTexture = _textures.Get(NoteTextureAsset.LightLong);
+        var lightVibratoTexture = _textures.Get(NoteTextureAsset.LightVibrato);
+        var indicatorLongTexture = _textures.Get(NoteTextureAsset.IndicatorLong);
+        var indicatorLongMultiTexture = _textures.Get(NoteTextureAsset.IndicatorLongMulti);
+        var indicatorVibratoTexture = _textures.Get(NoteTextureAsset.IndicatorVibrato);
+        var indicatorVibratoMultiTexture = _textures.Get(NoteTextureAsset.IndicatorVibratoMulti);
+        var dimTexture = _textures.Get(NoteTextureAsset.Dim);
+        var dimMultiTexture = _textures.Get(NoteTextureAsset.DimMulti);
+        var dimVibratoTexture = _textures.Get(NoteTextureAsset.DimVibrato);
+        var tailTextureDefault = _textures.Get(NoteTextureAsset.Tail);
+        var tailMultiTextureDefault = _textures.Get(NoteTextureAsset.TailMulti);
+        var tailMissTexture = _textures.Get(NoteTextureAsset.TailMiss);
+        var bodyTextureDefault = _textures.Get(NoteTextureAsset.Body);
+        var bodyMultiTextureDefault = _textures.Get(NoteTextureAsset.BodyMulti);
+        var vibratoTextureDefault = _textures.Get(NoteTextureAsset.Vibrato);
+        var vibratoMultiTextureDefault = _textures.Get(NoteTextureAsset.VibratoMulti);
         var bodyCommands = _bodyCommands;
         var connectorCommands = _connectorCommands;
         var headCommands = _headCommands;
@@ -288,6 +292,17 @@ public sealed partial class Playfield
                 var linkMarkerPoint = _projection.ProjectAtTravel(ev.Track, startTravel, currentState);
                 AddEditorNoteGroupMarker(ev, linkGroupId, linkInstanceId, linkMarkerPoint, null);
             }
+
+            _skinNoteGeometryContext = ev;
+            var noteIsInActiveBank = notePosition.Side == "left"
+                ? string.Equals(activeLeftBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase)
+                : string.Equals(activeRightBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase);
+            var simultaneous = noteIsInActiveBank &&
+                (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
+                    ? IsLinkChainSimultaneous(ev, counts)
+                    : IsSimultaneous(ev, counts));
+            _skinNoteSimultaneousContext = simultaneous;
+            _skinNoteMissedContext = _gameplayMode && _missedEvents.Contains(eventKey);
 
             if (showEditorAttributes && ev.Track is >= 0 and <= 15 && renderInBank &&
                 (_editorNoteGroupPlacementPreviewRendering || _chart.PlayTick <= 0 || ev.Tick <= _chart.PlayTick) &&
@@ -564,13 +579,6 @@ public sealed partial class Playfield
                 continue;
             }
 
-            var noteIsInActiveBank = notePosition.Side == "left"
-                ? string.Equals(activeLeftBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase)
-                : string.Equals(activeRightBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase);
-            var simultaneous = (noteIsInActiveBank) && (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
-                ? IsLinkChainSimultaneous(ev, counts)
-                : IsSimultaneous(ev, counts));
-
             if (ev.IsFlick)
             {
                 if (!startPastJudgement)
@@ -657,15 +665,15 @@ public sealed partial class Playfield
                         endDim,
                         endLight,
                         _projection.VibratoEndTextureWidth,
-                        _projection.VibratoEndTextureWidth,
-                        true,
-                        currentTick,
+                        _projection.VibratoEndTextureWidth, currentTick,
                         (float)endTravel,
                         0f,
                         false,
                         surface,
                         endBasis,
-                        bankJudgeBasis);
+                        bankJudgeBasis,
+                        baseComponent: "end_cap",
+                        overlayComponent: "end_indicator");
                 }
             }
             else if ((ev.NoteType == NoteType.SingleLong || isTerminalLinkTail || isLinkHeadHoldWithoutSegment) &&
@@ -681,15 +689,15 @@ public sealed partial class Playfield
                     dim,
                     light,
                     _projection.DimTextureWidth,
-                    _projection.LightIndicatorWidth,
-                    true,
-                    currentTick,
+                    _projection.LightIndicatorWidth, currentTick,
                     (float)endTravel,
                     0f,
                     false,
                     surface,
                     endBasis,
-                    bankJudgeBasis);
+                    bankJudgeBasis,
+                    baseComponent: "end_cap",
+                    overlayComponent: "end_indicator");
             }
 
             if (ev.NoteType == NoteType.SingleLong || isLinkHeadHoldWithoutSegment)
@@ -741,7 +749,7 @@ public sealed partial class Playfield
                     if (!startPastJudgement)
                     {
                         AddNoteOverlayCommands(headCommands, p, ev.Track, null, indicator, 0f,
-                            _projection.VibratoIndicatorWidth, false, currentTick, (float)startTravel,
+                            _projection.VibratoIndicatorWidth, currentTick, (float)startTravel,
                             0f, false, surface, startBasis, bankJudgeBasis);
                     }
                 }
@@ -752,7 +760,7 @@ public sealed partial class Playfield
                     if (!startPastJudgement && !IsEditorConnectorPreviewReplacingTargetHead(ev) &&
                         !IsEditorConnectorPreviewReplacingSourceTapHead(ev))
                         AddNoteOverlayCommands(headCommands, p, ev.Track, baseTexture, indicator, _projection.NoteWidth,
-                            _projection.HoldIndicatorWidth, false, currentTick, (float)startTravel,
+                            _projection.HoldIndicatorWidth, currentTick, (float)startTravel,
                             0f, false, surface, startBasis, bankJudgeBasis);
                 }
                 if (ev.NoteType == NoteType.LinkHead && ev.Duration > 6 && showAutoplayEndpointOverlay)
@@ -769,11 +777,15 @@ public sealed partial class Playfield
                     var missed = _gameplayMode && _missedEvents.Contains(eventKey);
                     var baseTexture = missed ? noteMissTexture : (simultaneous ? noteMultiTexture : noteRegularTexture);
                     var indicator = missed ? null : simultaneous ? lightMultiTexture : lightRegularTexture;
-                    AddNoteOverlayCommands(headCommands, p, ev.Track, baseTexture, indicator, _projection.NoteWidth, _projection.LightIndicatorWidth, true, currentTick, (float)startTravel,
+                    AddNoteOverlayCommands(headCommands, p, ev.Track, baseTexture, indicator, _projection.NoteWidth, _projection.LightIndicatorWidth, currentTick, (float)startTravel,
                         0f, false, surface, startBasis, bankJudgeBasis);
                 }
             }
         }
+
+        _skinNoteGeometryContext = null;
+        _skinNoteSimultaneousContext = false;
+        _skinNoteMissedContext = false;
 
         // A dragged grouped note can move outside the cached render-index interval
         // because that index is based on its previous tick. Resolve only those few
@@ -819,6 +831,13 @@ public sealed partial class Playfield
         // instead of maintaining a separate autoplay link pass.
 
         AddEditorConnectorPreviewCommands(currentTick, currentState, counts);
+
+        // Notes with Lua-supported geometry use the same skin renderer in manual
+        // gameplay, menu autoplay, editor preview, and the normal chart editor.
+        // Editor-only decorations and interactions (selection, problem markers,
+        // placement previews, etc.) are drawn in their separate native passes.
+        if (CanUseSkinPlayfieldEffects && _skinRuntime.SupportsPlayfieldNoteRenderer)
+            ApplySkinPlayfieldNoteRenderer(currentTick, superFlicks, headCommands);
 
         _debugHeadCommands = headCommands.Count;
         _debug3DHeadCommands = head3DCommands.Count;
@@ -870,6 +889,395 @@ public sealed partial class Playfield
         if (showEditorAttributes)
             DrawEditorNoteAttributeLabels();
         DrawEditorNoteGroupMarkers();
+    }
+
+    private static string GetSkinPlayfieldNoteType(ChartEvent ev)
+    {
+        if (ev.IsSuperFlick)
+            return "super_flick";
+        if (ev.IsFlick)
+            return "flick";
+        return ev.NoteType switch
+        {
+            NoteType.SingleLong => "hold",
+            NoteType.Vibrato => "vibrato",
+            NoteType.LinkHead => "link",
+            NoteType.LinkTail => "link_tail",
+            _ => "tap",
+        };
+    }
+
+    // Surface quads such as lane highlights are perspective-projected trapezoids,
+    // not rectangles. Transforming them around one averaged 3D axis makes the
+    // moving edge drift away from the actual lane edges in 3D. Remap each vertex
+    // through the quad's own UV coordinates instead: both side edges are
+    // interpolated independently, so a release scale travels along the projected
+    // bank surface rather than cutting diagonally across it.
+    private static void TransformPlayfieldQuadOnSurface(
+        VertexPositionColorTexture[] vertices,
+        float scaleX,
+        float scaleY,
+        float offsetX,
+        float offsetY,
+        float anchorX,
+        float anchorY)
+    {
+        if (vertices.Length < 6 ||
+            (MathF.Abs(scaleX - 1f) < 0.0001f &&
+             MathF.Abs(scaleY - 1f) < 0.0001f &&
+             MathF.Abs(offsetX) < 0.0001f &&
+             MathF.Abs(offsetY) < 0.0001f &&
+             MathF.Abs(anchorX - 0.5f) < 0.0001f &&
+             MathF.Abs(anchorY - 0.5f) < 0.0001f))
+            return;
+
+        // The quad uses the standard two-triangle order: TL, TR, BR, TL, BR, BL.
+        // Keep the unmodified corners while remapping all six vertices.
+        var topLeft = vertices[0].Position;
+        var topRight = vertices[1].Position;
+        var bottomRight = vertices[2].Position;
+        var bottomLeft = vertices[5].Position;
+
+        for (var i = 0; i < vertices.Length; i++)
+        {
+            var vertex = vertices[i];
+            var u = anchorX + (vertex.TextureCoordinate.X - anchorX) * scaleX + offsetX;
+            var v = anchorY + (vertex.TextureCoordinate.Y - anchorY) * scaleY + offsetY;
+            var top = Vector3.Lerp(topLeft, topRight, u);
+            var bottom = Vector3.Lerp(bottomLeft, bottomRight, u);
+            vertex.Position = Vector3.Lerp(top, bottom, v);
+            vertices[i] = vertex;
+        }
+    }
+
+    private static void TransformPlayfieldQuadInPlane(
+        VertexPositionColorTexture[] vertices,
+        float scaleX,
+        float scaleY,
+        float offsetX,
+        float offsetY,
+        float anchorX,
+        float anchorY)
+    {
+        if (vertices.Length < 6 ||
+            (MathF.Abs(scaleX - 1f) < 0.0001f &&
+             MathF.Abs(scaleY - 1f) < 0.0001f &&
+             MathF.Abs(offsetX) < 0.0001f &&
+             MathF.Abs(offsetY) < 0.0001f &&
+             MathF.Abs(anchorX - 0.5f) < 0.0001f &&
+             MathF.Abs(anchorY - 0.5f) < 0.0001f))
+            return;
+
+        var topLeft = vertices[0].Position;
+        var topRight = vertices[1].Position;
+        var bottomRight = vertices[2].Position;
+        var bottomLeft = vertices[5].Position;
+        var center = (topLeft + topRight + bottomRight + bottomLeft) * 0.25f;
+        var across = (topRight - topLeft) + (bottomRight - bottomLeft);
+        var along = (bottomLeft - topLeft) + (bottomRight - topRight);
+        if (across.LengthSquared() < 0.000001f || along.LengthSquared() < 0.000001f)
+            return;
+
+        var axisX = Vector3.Normalize(across);
+        along -= axisX * Vector3.Dot(along, axisX);
+        if (along.LengthSquared() < 0.000001f)
+            return;
+        var axisY = Vector3.Normalize(along);
+        var normal = Vector3.Normalize(Vector3.Cross(axisX, axisY));
+        var fullWidth = across.Length() * 0.5f;
+        var fullHeight = along.Length() * 0.5f;
+        var anchorLocalX = (Math.Clamp(anchorX, 0f, 1f) - 0.5f) * fullWidth;
+        var anchorLocalY = (Math.Clamp(anchorY, 0f, 1f) - 0.5f) * fullHeight;
+
+        for (var i = 0; i < vertices.Length; i++)
+        {
+            var vertex = vertices[i];
+            var delta = vertex.Position - center;
+            var x = Vector3.Dot(delta, axisX);
+            var y = Vector3.Dot(delta, axisY);
+            var depth = Vector3.Dot(delta, normal);
+            var transformedX = anchorLocalX + (x - anchorLocalX) * scaleX + offsetX * fullWidth;
+            var transformedY = anchorLocalY + (y - anchorLocalY) * scaleY + offsetY * fullHeight;
+            vertex.Position = center +
+                axisX * transformedX +
+                axisY * transformedY +
+                normal * depth;
+            vertices[i] = vertex;
+        }
+    }
+
+    private void ApplySkinPlayfieldNoteRenderer(
+        double currentTick,
+        List<(float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family)> superFlicks,
+        List<TexturedQuadCommand> headCommands)
+    {
+        var geometry = _skinPlayfieldGeometryScratch;
+        var spriteGeometry = _skinPlayfieldSpriteGeometryScratch;
+        geometry.Clear();
+        spriteGeometry.Clear();
+
+        void AddGeometry(in Textured3DQuadCommand command)
+        {
+            if (command.Track < 0 || command.Tick < 0 || command.EventIndex < 0 ||
+                command.Vertices is not { Length: > 0 } || string.IsNullOrEmpty(command.Component))
+                return;
+
+            var geometryTrack = command.GeometryTrack >= 0 ? command.GeometryTrack : command.Track;
+            var position = GearState.Position(geometryTrack);
+            var eventKey = new ChartEventKey(command.Tick, command.Track, command.EventIndex);
+            geometry.Add(new SkinPlayfieldGeometrySnapshot(
+                command.Vertices,
+                command.Depth,
+                command.Layer,
+                command.Track,
+                command.Tick,
+                command.EventIndex,
+                command.Attr,
+                command.DurationTicks,
+                command.NoteType,
+                command.Component,
+                position?.Side ?? string.Empty,
+                position?.Bank ?? string.Empty,
+                _hitEvents.Contains(eventKey),
+                command.SkinMissed || _missedEvents.Contains(eventKey),
+                command.Simultaneous,
+                geometryTrack));
+        }
+
+        for (var i = 0; i < _head3DCommands.Count; i++)
+            AddGeometry(_head3DCommands[i]);
+        for (var i = 0; i < _body3DCommands.Count; i++)
+            AddGeometry(_body3DCommands[i]);
+
+        for (var i = 0; i < superFlicks.Count; i++)
+        {
+            var item = superFlicks[i];
+            var ev = item.Event;
+            var key = KeyOf(ev);
+            var family = item.Family == SuperFlickFamily.Inner ? "inner" : "outer";
+            var missed = _gameplayMode && _missedEvents.Contains(key);
+            var hit = _gameplayMode && _hitEvents.Contains(key);
+            spriteGeometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
+                ev.Track, ev.Tick, ev.EventIndex, ev.Attr, ev.Duration,
+                "super_flick", "strip", item.Side, item.Bank, family,
+                hit, missed, false, item.Depth));
+            spriteGeometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
+                ev.Track, ev.Tick, ev.EventIndex, ev.Attr, ev.Duration,
+                "super_flick", "highlight", item.Side, item.Bank, family,
+                hit, missed, false, item.Depth));
+        }
+
+        for (var i = 0; i < headCommands.Count; i++)
+        {
+            var command = headCommands[i];
+            if (!string.Equals(command.Component, "flick_attachment", StringComparison.OrdinalIgnoreCase) ||
+                command.Track < 0 || command.Tick < 0 || command.EventIndex < 0)
+                continue;
+
+            var position = GearState.Position(command.Track);
+            spriteGeometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
+                command.Track,
+                command.Tick,
+                command.EventIndex,
+                command.Attr,
+                command.DurationTicks,
+                string.IsNullOrEmpty(command.NoteType) ? "flick" : command.NoteType,
+                "flick_attachment",
+                position?.Side ?? string.Empty,
+                position?.Bank ?? string.Empty,
+                "flick",
+                _hitEvents.Contains(new ChartEventKey(command.Tick, command.Track, command.EventIndex)),
+                command.SkinMissed || _missedEvents.Contains(new ChartEventKey(command.Tick, command.Track, command.EventIndex)),
+                command.Simultaneous,
+                command.Depth,
+                command.TopLeft,
+                command.TopRight,
+                command.BottomRight,
+                command.BottomLeft,
+                true,
+                command.FlipU,
+                command.FlipV,
+                command.Layer));
+        }
+
+        var replaceRequested = _skinRuntime.InvokePlayfieldNoteRenderer(
+            geometry, spriteGeometry, _playSeconds, currentTick, _uiTimeSeconds);
+        var requests = _skinRuntime.PlayfieldGeometryDrawRequests;
+        var customHeads = _skinPlayfieldHeadScratch;
+        var customBodies = _skinPlayfieldBodyScratch;
+        var replacedVertices = _skinPlayfieldReplacedGeometryVertices;
+        customHeads.Clear();
+        customBodies.Clear();
+        replacedVertices.Clear();
+
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            var source = request.Geometry.Vertices;
+            if (source.Length == 0)
+                continue;
+
+            if (replaceRequested)
+                replacedVertices.Add(source);
+
+            var vertices = RentBody3DVertices(source.Length);
+            for (var vertexIndex = 0; vertexIndex < source.Length; vertexIndex++)
+            {
+                var vertex = source[vertexIndex];
+                var sourceColor = vertex.Color;
+                var tint = request.Tint;
+                var alpha = request.Alpha;
+                vertex.Color = new Color(
+                    (byte)Math.Clamp((sourceColor.R * tint.R + 127) / 255, 0, 255),
+                    (byte)Math.Clamp((sourceColor.G * tint.G + 127) / 255, 0, 255),
+                    (byte)Math.Clamp((sourceColor.B * tint.B + 127) / 255, 0, 255),
+                    (byte)Math.Clamp((int)MathF.Round(sourceColor.A * (tint.A / 255f) * alpha), 0, 255));
+                vertices[vertexIndex] = vertex;
+            }
+            TransformPlayfieldQuadInPlane(
+                vertices, request.ScaleX, request.ScaleY,
+                0f, 0f, 0.5f, 0.5f);
+
+            var handle = request.Geometry;
+            var command = new Textured3DQuadCommand(
+                request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture,
+                vertices,
+                handle.depth,
+                false,
+                null,
+                request.Layer,
+                false,
+                handle.track,
+                handle.tick,
+                handle.event_index,
+                handle.attr,
+                handle.duration_ticks,
+                handle.note_type,
+                handle.role,
+                handle.simultaneous);
+
+            if (string.Equals(handle.role, "body", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(handle.role, "connector", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(handle.role, "endpoint", StringComparison.OrdinalIgnoreCase))
+                customBodies.Add(command);
+            else
+                customHeads.Add(command);
+        }
+
+        if (replaceRequested && replacedVertices.Count > 0)
+        {
+            for (var i = _body3DCommands.Count - 1; i >= 0; i--)
+            {
+                var command = _body3DCommands[i];
+                if (!replacedVertices.Contains(command.Vertices))
+                    continue;
+                ReturnBody3DVertexArray(command.Vertices);
+                _body3DCommands.RemoveAt(i);
+            }
+
+            for (var i = _head3DCommands.Count - 1; i >= 0; i--)
+            {
+                var command = _head3DCommands[i];
+                if (!replacedVertices.Contains(command.Vertices))
+                    continue;
+                ReturnQuad3DVertexArray(command.Vertices);
+                _head3DCommands.RemoveAt(i);
+            }
+        }
+
+        if (customBodies.Count > 0)
+        {
+            _body3DCommands.AddRange(customBodies);
+            customBodies.Clear();
+        }
+        if (customHeads.Count > 0)
+        {
+            _head3DCommands.AddRange(customHeads);
+            customHeads.Clear();
+        }
+
+        var attachmentCommands = _skinPlayfieldAttachmentScratch;
+        attachmentCommands.Clear();
+        _skinReplacedFlickAttachments.Clear();
+        var spriteRequests = _skinRuntime.PlayfieldSpriteDrawRequests;
+        for (var requestIndex = 0; requestIndex < spriteRequests.Count; requestIndex++)
+        {
+            var request = spriteRequests[requestIndex];
+            var handle = request.Geometry;
+            var spriteSnapshot = handle.Snapshot;
+            if (string.Equals(handle.role, "flick_attachment", StringComparison.OrdinalIgnoreCase) &&
+                spriteSnapshot.HasScreenQuad)
+            {
+                var tint = request.Tint;
+                tint.A = (byte)Math.Clamp((int)MathF.Round(tint.A * request.Alpha), 0, 255);
+                var topLeft = spriteSnapshot.TopLeft;
+                var topRight = spriteSnapshot.TopRight;
+                var bottomRight = spriteSnapshot.BottomRight;
+                var bottomLeft = spriteSnapshot.BottomLeft;
+                ScaleScreenQuad(ref topLeft, ref topRight, ref bottomRight, ref bottomLeft,
+                    request.ScaleX, request.ScaleY);
+                attachmentCommands.Add(new TexturedQuadCommand(
+                    request.Asset.Texture,
+                    topLeft,
+                    topRight,
+                    bottomRight,
+                    bottomLeft,
+                    spriteSnapshot.Depth,
+                    spriteSnapshot.FlipV ^ request.FlipY,
+                    tint,
+                    request.Layer,
+                    spriteSnapshot.FlipU ^ request.FlipX,
+                    spriteSnapshot.Track,
+                    spriteSnapshot.Tick,
+                    spriteSnapshot.EventIndex,
+                    spriteSnapshot.Attr,
+                    spriteSnapshot.DurationTicks,
+                    spriteSnapshot.NoteType,
+                    spriteSnapshot.Component,
+                    spriteSnapshot.Simultaneous,
+                    spriteSnapshot.Missed));
+                if (replaceRequested)
+                    _skinReplacedFlickAttachments.Add(new ChartEventKey(
+                        spriteSnapshot.Tick, spriteSnapshot.Track, spriteSnapshot.EventIndex));
+                continue;
+            }
+
+            for (var flickIndex = 0; flickIndex < superFlicks.Count; flickIndex++)
+            {
+                var flick = superFlicks[flickIndex];
+                var ev = flick.Event;
+                if (ev.Track != handle.track || ev.Tick != handle.tick || ev.EventIndex != handle.event_index)
+                    continue;
+
+                AddSkinSuperFlickSpriteCommand(request, flick, currentTick, _headCommands);
+                if (replaceRequested)
+                    _skinReplacedSuperFlickComponents.Add(new SkinSuperFlickComponentKey(
+                        ev.Track, ev.Tick, ev.EventIndex, handle.role));
+                break;
+            }
+        }
+
+        if (replaceRequested && _skinReplacedFlickAttachments.Count > 0)
+        {
+            for (var i = headCommands.Count - 1; i >= 0; i--)
+            {
+                var command = headCommands[i];
+                if (command.Component != "flick_attachment")
+                    continue;
+                if (_skinReplacedFlickAttachments.Contains(new ChartEventKey(
+                    command.Tick, command.Track, command.EventIndex)))
+                    headCommands.RemoveAt(i);
+            }
+        }
+        if (attachmentCommands.Count > 0)
+        {
+            headCommands.AddRange(attachmentCommands);
+            attachmentCommands.Clear();
+        }
+
+        replacedVertices.Clear();
+        _skinRuntime.ClearPlayfieldGeometryDrawRequests();
+        _skinRuntime.ClearPlayfieldSpriteDrawRequests();
     }
 
     // Filled by the ordinary note render pass in its existing far-to-near order.
@@ -1721,8 +2129,8 @@ public sealed partial class Playfield
         var simultaneous = sourceIsActive && (root.NoteType is NoteType.LinkHead or NoteType.LinkTail
             ? IsLinkChainSimultaneous(root, counts)
             : IsSimultaneous(root, counts));
-        var bodyTexture = _textures.Get(simultaneous ? "body-multi" : "body");
-        var tailTexture = _textures.Get(simultaneous ? "tail-multi" : "tail");
+        var bodyTexture = _textures.Get(simultaneous ? NoteTextureAsset.BodyMulti : NoteTextureAsset.Body);
+        var tailTexture = _textures.Get(simultaneous ? NoteTextureAsset.TailMulti : NoteTextureAsset.Tail);
         var targetSeconds = _tempo.TickToSeconds(previewEndTick);
         var connectionSeconds = _tempo.TickToSeconds(horizontalFirst ? connectionTick : targetTick);
         var connectionTravel = (float)_projection.ScrollPixels(connectionSeconds, _playSeconds);
@@ -1858,8 +2266,8 @@ public sealed partial class Playfield
             if (_projection.WithinRenderDistance(sourceTravel))
             {
                 var sourcePoint = _projection.ProjectAtTicks(source.Track, source.Tick, currentTick, currentState);
-                var longHead = _textures.Get(simultaneous ? "note-multi" : "note-long");
-                var longIndicator = _textures.Get(simultaneous ? "indicator-long-multi" : "indicator-long");
+                var longHead = _textures.Get(simultaneous ? NoteTextureAsset.NoteMulti : NoteTextureAsset.NoteLong);
+                var longIndicator = _textures.Get(simultaneous ? NoteTextureAsset.IndicatorLongMulti : NoteTextureAsset.IndicatorLong);
                 var sourceSurface = GetNoteSurface(sourcePosition.Value.Side, sourcePosition.Value.Bank);
                 var sourceNormalizedX = _projection.LaneNormalizedX(source.Track);
                 var sourceBasis = GetNoteBasis(
@@ -2153,9 +2561,9 @@ public sealed partial class Playfield
         var rotation = direction == 3 ? -MathF.PI * 0.5f : 0f;
         var flipU = direction == 5;
 
-        var noteTexture = _textures.Get(simultaneous ? "note-flick-multi" : "note-flick");
-        var indicatorTexture = _textures.Get(simultaneous ? "indicator-flick-multi" : "indicator-flick");
-        var attachTexture = _textures.Get(simultaneous ? "attach-flick-multi" : "attach-flick");
+        var noteTexture = _textures.Get(simultaneous ? NoteTextureAsset.NoteFlickMulti : NoteTextureAsset.NoteFlick);
+        var indicatorTexture = _textures.Get(simultaneous ? NoteTextureAsset.IndicatorFlickMulti : NoteTextureAsset.IndicatorFlick);
+        var attachTexture = _textures.Get(simultaneous ? NoteTextureAsset.AttachFlickMulti : NoteTextureAsset.AttachFlick);
 
         AddNoteOverlayCommands(
             headCommands,
@@ -2164,9 +2572,7 @@ public sealed partial class Playfield
             noteTexture,
             indicatorTexture,
             _projection.SmallFlickNoteWidth,
-            _projection.SmallFlickIndicatorWidth,
-            false,
-            currentTick,
+            _projection.SmallFlickIndicatorWidth, currentTick,
             travelPixels,
             rotation,
             flipU,
@@ -2186,7 +2592,20 @@ public sealed partial class Playfield
                 _projection.SmallFlickAttachGap, flipU,
                 surfaceOverride, basisOverride, bankJudgeBasisOverride);
             if (billboard is not null)
-                headCommands.Add(billboard.Value);
+            {
+                headCommands.Add(billboard.Value with
+                {
+                    Track = ev.Track,
+                    Tick = ev.Tick,
+                    EventIndex = ev.EventIndex,
+                    Attr = ev.Attr,
+                    DurationTicks = ev.Duration,
+                    NoteType = GetSkinPlayfieldNoteType(ev),
+                    Component = "flick_attachment",
+                    Simultaneous = simultaneous,
+                    SkinMissed = _gameplayMode && _missedEvents.Contains(KeyOf(ev)),
+                });
+            }
             return;
         }
 
@@ -2270,7 +2689,16 @@ public sealed partial class Playfield
             _projection.BankSwitchFlipV(side, bank),
             null,
             2,
-            attachFlipU));
+            attachFlipU,
+            ev.Track,
+            ev.Tick,
+            ev.EventIndex,
+            ev.Attr,
+            ev.Duration,
+            GetSkinPlayfieldNoteType(ev),
+            "flick_attachment",
+            simultaneous,
+            _gameplayMode && _missedEvents.Contains(KeyOf(ev))));
     }
 
     private TexturedQuadCommand? BuildFlickAttachBillboardCommand(
@@ -2293,7 +2721,7 @@ public sealed partial class Playfield
         // surface. In particular, noteStandAngle and lane skew can change the
         // projected note edges, so offsetting from the lane basis makes the attach
         // appear pivoted to the lane instead of directly attached to the note.
-        var effectiveNoteTexture = noteTexture ?? _textures.Get("note-flick");
+        var effectiveNoteTexture = noteTexture ?? _textures.Get(NoteTextureAsset.NoteFlick);
         if (effectiveNoteTexture is null)
             return null;
 
@@ -2441,7 +2869,7 @@ public sealed partial class Playfield
         var basis = basisOverride ?? GetNoteBasis(surface, normalizedX, travelPixels, side, bank);
         var judgeBasis = bankJudgeBasisOverride ?? GetBankJudgeBasis(surface, side, bank);
 
-        var noteTexture = _textures.Get("note-flick");
+        var noteTexture = _textures.Get(NoteTextureAsset.NoteFlick);
         var noteAspect = noteTexture is null
             ? 1f
             : noteTexture.Height / (float)Math.Max(1, noteTexture.Width);
@@ -2489,6 +2917,7 @@ public sealed partial class Playfield
             side,
             bank,
             out var depth);
+        var noteContext = _skinNoteGeometryContext;
         return new Textured3DQuadCommand(
             texture,
             vertices,
@@ -2496,7 +2925,15 @@ public sealed partial class Playfield
             _projection.BankSwitchFlipV(side, bank),
             null,
             2,
-            direction == 5 || flipU);
+            direction == 5 || flipU,
+            track,
+            noteContext?.Tick ?? -1,
+            noteContext?.EventIndex ?? -1,
+            noteContext?.Attr ?? 0,
+            noteContext?.Duration ?? 0,
+            noteContext is null ? string.Empty : GetSkinPlayfieldNoteType(noteContext),
+            "flick_attachment",
+            _skinNoteSimultaneousContext);
     }
 
     private void DrawGameplayRegularHold(ChartEvent ev, GearState currentState, Dictionary<int, int> counts,
@@ -2543,10 +2980,10 @@ public sealed partial class Playfield
                 : string.Equals(activeRight, holdPosition.Bank, StringComparison.OrdinalIgnoreCase));
         var simultaneous = inActiveBank && IsSimultaneous(ev, counts);
         var body = ev.NoteType == NoteType.Vibrato
-            ? _textures.Get(simultaneous ? "vibrato-multi" : "vibrato")
+            ? _textures.Get(simultaneous ? NoteTextureAsset.VibratoMulti : NoteTextureAsset.Vibrato)
             : _textures.Get(missVisual
-                ? "body-miss"
-                : (simultaneous ? "body-multi" : "body"));
+                ? NoteTextureAsset.BodyMiss
+                : (simultaneous ? NoteTextureAsset.BodyMulti : NoteTextureAsset.Body));
         if (body is not null && position is not null)
         {
             // Before the hold head is actually hit, let the authored body continue
@@ -2576,37 +3013,43 @@ public sealed partial class Playfield
         {
             if (ev.NoteType == NoteType.Vibrato)
             {
-                var indicator = _textures.Get(simultaneous ? "indicator-vibrato-multi" : "indicator-vibrato");
+                var indicator = _textures.Get(simultaneous ? NoteTextureAsset.IndicatorVibratoMulti : NoteTextureAsset.IndicatorVibrato);
                 AddNoteOverlayCommands(headCommands, startPoint, ev.Track, null, indicator, 0f,
-                    _projection.VibratoIndicatorWidth, false, currentTick, (float)_projection.ScrollPixels(startSeconds, _playSeconds));
+                    _projection.VibratoIndicatorWidth, currentTick, (float)_projection.ScrollPixels(startSeconds, _playSeconds));
             }
             else
             {
                 var baseTexture = missVisual
-                    ? _textures.Get("note-miss")
-                    : _textures.Get(simultaneous ? "note-multi" : "note-long");
+                    ? _textures.Get(NoteTextureAsset.NoteMiss)
+                    : _textures.Get(simultaneous ? NoteTextureAsset.NoteMulti : NoteTextureAsset.NoteLong);
                 var indicator = missVisual
-                    ? _textures.Get("indicator-long-miss")
-                    : _textures.Get(simultaneous ? "indicator-long-multi" : "indicator-long");
+                    ? _textures.Get(NoteTextureAsset.IndicatorLongMiss)
+                    : _textures.Get(simultaneous ? NoteTextureAsset.IndicatorLongMulti : NoteTextureAsset.IndicatorLong);
                 AddNoteOverlayCommands(headCommands, startPoint, ev.Track, baseTexture, indicator, _projection.NoteWidth,
-                    _projection.HoldIndicatorWidth, false, currentTick, (float)_projection.ScrollPixels(startSeconds, _playSeconds));
+                    _projection.HoldIndicatorWidth, currentTick, (float)_projection.ScrollPixels(startSeconds, _playSeconds));
             }
         }
 
         if (ev.NoteType == NoteType.Vibrato)
         {
-            var endDim = simultaneous ? _textures.Get("dim-multi") : _textures.Get("dim-vibrato");
-            var endLight = simultaneous ? _textures.Get("light-multi") : _textures.Get("light-vibrato");
-            if (endDim is not null && !OutsideNoteView(endPoint, endPoint))
+            // Match missed holds: a dropped/missed vibrato keeps its miss body,
+            // but must not show the normal dim end-cap or light end-indicator.
+            if (!missVisual)
             {
-                AddNoteOverlayCommands(headCommands, endPoint, ev.Track, endDim, endLight,
-                    _projection.VibratoEndTextureWidth, _projection.VibratoEndTextureWidth, true, currentTick,
-                    (float)_projection.ScrollPixels(endSeconds, _playSeconds));
+                var endDim = simultaneous ? _textures.Get(NoteTextureAsset.DimMulti) : _textures.Get(NoteTextureAsset.DimVibrato);
+                var endLight = simultaneous ? _textures.Get(NoteTextureAsset.LightMulti) : _textures.Get(NoteTextureAsset.LightVibrato);
+                if (endDim is not null && !OutsideNoteView(endPoint, endPoint))
+                {
+                    AddNoteOverlayCommands(headCommands, endPoint, ev.Track, endDim, endLight,
+                        _projection.VibratoEndTextureWidth, _projection.VibratoEndTextureWidth, currentTick,
+                        (float)_projection.ScrollPixels(endSeconds, _playSeconds),
+                        baseComponent: "end_cap", overlayComponent: "end_indicator");
+                }
             }
         }
         else
         {
-            var endTailTexture = missVisual ? _textures.Get("tail-miss") : _textures.Get(simultaneous ? "tail-multi" : "tail");
+            var endTailTexture = missVisual ? _textures.Get(NoteTextureAsset.TailMiss) : _textures.Get(simultaneous ? NoteTextureAsset.TailMulti : NoteTextureAsset.Tail);
             if (endTailTexture is not null && !OutsideNoteView(endPoint, endPoint))
             {
                 AddLanePlaneTailCommand(
@@ -2619,16 +3062,17 @@ public sealed partial class Playfield
                     layer: 2);
             }
 
-            var dim = _textures.Get(missVisual ? "dim-miss" : (simultaneous ? "dim-multi" : "dim"));
-            var light = missVisual ? null : _textures.Get(simultaneous ? "light-multi" : "light-long");
-            var endTexture = missVisual ? _textures.Get("tail-miss") : dim;
+            var dim = _textures.Get(missVisual ? NoteTextureAsset.DimMiss : (simultaneous ? NoteTextureAsset.DimMulti : NoteTextureAsset.Dim));
+            var light = missVisual ? null : _textures.Get(simultaneous ? NoteTextureAsset.LightMulti : NoteTextureAsset.LightLong);
+            var endTexture = missVisual ? _textures.Get(NoteTextureAsset.TailMiss) : dim;
             if (!OutsideNoteView(endPoint, endPoint))
             {
                 AddNoteOverlayCommands(headCommands, endPoint, ev.Track, endTexture,
                     missVisual ? null : light,
                     missVisual ? _projection.TailTextureWidth : _projection.DimTextureWidth,
-                    missVisual ? 0f : _projection.LightIndicatorWidth, true, currentTick,
-                    (float)_projection.ScrollPixels(endSeconds, _playSeconds));
+                    missVisual ? 0f : _projection.LightIndicatorWidth, currentTick,
+                    (float)_projection.ScrollPixels(endSeconds, _playSeconds),
+                    baseComponent: "end_cap", overlayComponent: "end_indicator");
             }
         }
     }

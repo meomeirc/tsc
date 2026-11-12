@@ -3450,7 +3450,11 @@ public sealed partial class Playfield
         }
     }
 
-    private void DrawSkinScriptUiLayers(IReadOnlyList<SkinDrawCommand> allCommands, bool belowLane, SkinRuntime runtime)
+    private void DrawSkinScriptUiLayers(
+        IReadOnlyList<SkinDrawCommand> allCommands,
+        bool belowLane,
+        SkinRuntime runtime,
+        bool hitEffectsOnly = false)
     {
         // BuildDrawCommands() has already sorted these by Lua layer/order. Keep that
         // exact ordering across both 2D SpriteBatch commands and real 3D quads.
@@ -3464,7 +3468,9 @@ public sealed partial class Playfield
         for (var i = 0; i < allCommands.Count; i++)
         {
             var command = allCommands[i];
-            if (belowLane ? command.Layer < 0 : command.Layer >= 0)
+            if (command.IsHitEffect != hitEffectsOnly)
+                continue;
+            if (hitEffectsOnly || (belowLane ? command.Layer < 0 : command.Layer >= 0))
                 commands.Add(command);
         }
 
@@ -3590,6 +3596,40 @@ public sealed partial class Playfield
                         _graphics.Viewport.Height);
                     _graphics.ScissorRectangle = originalScissor;
                     continue;
+                }
+
+                // Like RenderDrawCommands(), the gameplay/editor renderer must
+                // break out of SpriteBatch for shader-backed sprites. Otherwise
+                // MonoGame draws the carrier texture with its normal sprite shader
+                // and silently ignores command.Shader (the Shadertoy background
+                // then appears as a stretched background.png image).
+                if (command.Kind == SkinDrawCommandKind.Sprite && command.Shader is not null)
+                {
+                    EndBatch();
+                    _graphics.ScissorRectangle = commandScissor ?? originalScissor;
+                    var rendered = false;
+                    try
+                    {
+                        rendered = runtime.RenderShaderSprite(
+                            command,
+                            _graphics.Viewport.Width,
+                            _graphics.Viewport.Height,
+                            commandScissor.HasValue
+                                ? _skinUiScissorRasterizerState
+                                : RasterizerState.CullNone);
+                    }
+                    finally
+                    {
+                        _graphics.ScissorRectangle = originalScissor;
+                    }
+
+                    if (rendered)
+                        continue;
+
+                    // If the native GLSL draw was rejected, retain a visible
+                    // carrier-image fallback instead of silently dropping the
+                    // entire background command.
+                    BeginBatch(command, commandScissor);
                 }
 
                 BeginBatch(command, commandScissor);

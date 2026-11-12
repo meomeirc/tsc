@@ -58,8 +58,9 @@ public sealed partial class Playfield
                 : string.Equals(activeRightBank, activePosition.Bank, StringComparison.OrdinalIgnoreCase));
         var simultaneous = rootIsInActiveBank && IsLinkChainSimultaneous(root, counts);
         var missVisual = interactive && (runtime!.StartMissed || runtime.Dropped);
-        var body = _textures.Get(missVisual ? "body-miss" : (simultaneous ? "body-multi" : "body"));
-        var tailTexture = _textures.Get(missVisual ? "tail-miss" : (simultaneous ? "tail-multi" : "tail"));
+        _skinNoteMissedContext = missVisual;
+        var body = _textures.Get(missVisual ? NoteTextureAsset.BodyMiss : (simultaneous ? NoteTextureAsset.BodyMulti : NoteTextureAsset.Body));
+        var tailTexture = _textures.Get(missVisual ? NoteTextureAsset.TailMiss : (simultaneous ? NoteTextureAsset.TailMulti : NoteTextureAsset.Tail));
 
         var rootStartSeconds = _tempo.TickToSeconds(root.Tick);
         var rootHasReachedJudge = _playSeconds >= rootStartSeconds;
@@ -81,13 +82,13 @@ public sealed partial class Playfield
                 headPoint,
                 root.Track,
                 missedHead
-                    ? _textures.Get("note-miss")
-                    : _textures.Get(simultaneous ? "note-multi" : "note-long"),
+                    ? _textures.Get(NoteTextureAsset.NoteMiss)
+                    : _textures.Get(simultaneous ? NoteTextureAsset.NoteMulti : NoteTextureAsset.NoteLong),
                 missedHead
-                    ? _textures.Get("indicator-long-miss")
-                    : _textures.Get(simultaneous ? "indicator-long-multi" : "indicator-long"),
+                    ? _textures.Get(NoteTextureAsset.IndicatorLongMiss)
+                    : _textures.Get(simultaneous ? NoteTextureAsset.IndicatorLongMulti : NoteTextureAsset.IndicatorLong),
                 _projection.NoteWidth,
-                _projection.HoldIndicatorWidth, false, currentTick, (float)_projection.ScrollPixels(rootStartSeconds, _playSeconds));
+                _projection.HoldIndicatorWidth, currentTick, (float)_projection.ScrollPixels(rootStartSeconds, _playSeconds));
         }
 
         // A short/standalone LinkHead is still handled by the normal note path.
@@ -219,7 +220,8 @@ public sealed partial class Playfield
                     tailTravel,
                     connectorThicknessPixels,
                     _projection.BankSwitchFlipV(headPosition.Value.Side, headPosition.Value.Bank),
-                    connectorTint));
+                    connectorTint,
+                    geometryTrack: head.Track));
                 if (_performanceDebugInstrumentFrame)
                 {
                     _debugLinkConnectorQuads++;
@@ -413,8 +415,8 @@ public sealed partial class Playfield
 
         var terminalEndTick = GetLinkBodyEndTick(terminal, true);
         var terminalEnd = _projection.ProjectAtTicks(terminal.Track, terminalEndTick, currentTick, currentState);
-        var dim = _textures.Get(simultaneous ? "dim-multi" : "dim");
-        var light = _textures.Get(simultaneous ? "light-multi" : "light-long");
+        var dim = _textures.Get(simultaneous ? NoteTextureAsset.DimMulti : NoteTextureAsset.Dim);
+        var light = _textures.Get(simultaneous ? NoteTextureAsset.LightMulti : NoteTextureAsset.LightLong);
 
         var terminalPassed = !placementPreview && currentTick >= terminalEndTick;
         if (!terminalPassed && tailTexture is not null && !missVisual)
@@ -426,10 +428,10 @@ public sealed partial class Playfield
                 dim,
                 light,
                 _projection.DimTextureWidth,
-                _projection.LightIndicatorWidth,
-                true,
-                currentTick,
-                (float)_projection.ScrollPixels(_tempo.TickToSeconds(terminalEndTick), _playSeconds));
+                _projection.LightIndicatorWidth, currentTick,
+                (float)_projection.ScrollPixels(_tempo.TickToSeconds(terminalEndTick), _playSeconds),
+                baseComponent: "end_cap",
+                overlayComponent: "end_indicator");
         }
 
         if (isSplitPreview)
@@ -554,7 +556,8 @@ public sealed partial class Playfield
         float connectorThicknessPixels,
         bool flipV,
         Color? tint = null,
-        int layer = 0)
+        int layer = 0,
+        int geometryTrack = -1)
     {
         var surfaceA = GetNoteSurface(sideA, bankA);
         var surfaceB = GetNoteSurface(sideB, bankB);
@@ -606,7 +609,19 @@ public sealed partial class Playfield
                 vertices[i].Color = tint.Value;
         }
         var depth = Math.Max(Math.Max(-aNear.Z, -aFar.Z), Math.Max(-bNear.Z, -bFar.Z));
-        return new Textured3DQuadCommand(texture, vertices, depth, flipV, tint, layer, false);
+        var noteContext = _skinNoteGeometryContext;
+        return new Textured3DQuadCommand(
+            texture, vertices, depth, flipV, tint, layer, false,
+            noteContext?.Track ?? -1,
+            noteContext?.Tick ?? -1,
+            noteContext?.EventIndex ?? -1,
+            noteContext?.Attr ?? 0,
+            noteContext?.Duration ?? 0,
+            noteContext is null ? string.Empty : GetSkinPlayfieldNoteType(noteContext),
+            "connector",
+            _skinNoteSimultaneousContext,
+            geometryTrack >= 0 ? geometryTrack : noteContext?.Track ?? -1,
+            _skinNoteMissedContext);
     }
 
     private void AddLinkBodyEndTailCommand(
