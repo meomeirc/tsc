@@ -593,7 +593,24 @@ public sealed class Game1 : Game
 
         if (_transitionPhase != TransitionPhase.None)
         {
+            var gameplayFadeWasActive =
+                _transitionPhase == TransitionPhase.In &&
+                _transitionToScreen == StartupScreen.Gameplay &&
+                _transitionReason != "chart_editor_load";
+
             UpdateTransition(gameTime);
+
+            var gameplayFadeIsActive =
+                _transitionPhase == TransitionPhase.In &&
+                _transitionToScreen == StartupScreen.Gameplay &&
+                _transitionReason != "chart_editor_load";
+
+            // Advance the non-chart game clock for the full incoming fade,
+            // including the final interval on which the transition completes.
+            // Music/chart time and intro callbacks remain stopped until handoff.
+            var advanceGameClockUnderFade = gameplayFadeWasActive || gameplayFadeIsActive;
+            if (advanceGameClockUnderFade)
+                _playfield?.AdvanceGameClockDuringTransition(gameTime);
 
             // A gameplay destination is prepared underneath the opaque loading
             // transition. Only begin its skin intro after the reveal has finished,
@@ -604,7 +621,16 @@ public sealed class Game1 : Game
                 _startupScreen == StartupScreen.Gameplay &&
                 _playfield is not null)
             {
-                _playfield.Update(gameTime);
+                // Keep the gameplay intro in its transparent prewarm state until
+                // the incoming transition has completely disappeared.
+                _playfield.ReleaseGameplayIntroTransitionHold();
+                // The final fade interval was already applied to the game clock
+                // above. Use a zero-delta handoff update so the intro starts on
+                // this frame without advancing either clock twice.
+                var handoffGameTime = advanceGameClockUnderFade
+                    ? new GameTime(gameTime.TotalGameTime, TimeSpan.Zero, gameTime.IsRunningSlowly)
+                    : gameTime;
+                _playfield.Update(handoffGameTime);
             }
 
             _previousKeyboard = inputActive ? keyboard : Keyboard.GetState();
@@ -823,6 +849,7 @@ public sealed class Game1 : Game
         IsFixedTimeStep = true;
         var targetFrameRate = requestedFrameRate > 0 ? requestedFrameRate : 60;
         TargetElapsedTime = TimeSpan.FromSeconds(1.0 / targetFrameRate);
+        FrameLoopDiagnostics.SetTargetFrameRate(targetFrameRate);
 
         // Frame limiting and VSync are separate controls. Never infer VSync from
         // a 60 FPS cap; enable it only when gameConfig explicitly requests it.
@@ -1127,6 +1154,11 @@ public sealed class Game1 : Game
             return;
         }
 
+        // Leaving the editor for the main menu ends the page lifetime. Release
+        // its song/audio player, skin runtimes, textures, render targets, and
+        // editor caches instead of retaining a warmed Playfield between pages.
+        _playfield?.Dispose();
+        _playfield = null;
         _startupScreen = StartupScreen.Menu;
     }
 
@@ -3588,6 +3620,12 @@ public sealed class Game1 : Game
                 return;
             targetCommit?.Invoke();
             _startupScreen = to;
+            // When a transition skin is unavailable there is no fade to overlap
+            // with playback. Release the intro hold so the ordinary warm-up and
+            // intro path can proceed instead of waiting for a transition that
+            // will never run.
+            if (to == StartupScreen.Gameplay && !string.Equals(reason, "chart_editor_load", StringComparison.Ordinal))
+                _playfield?.ReleaseGameplayIntroTransitionHold();
             return;
         }
 
@@ -5006,7 +5044,10 @@ public sealed class Game1 : Game
                         _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
                         _chartEditorLoadPlayfield = new Playfield(GraphicsDevice, _font!, _skin, _laneLineEffect!, _skinSparklesEffect, _skinQuad3DEffect);
                         _chartEditorLoadPlayfield.ConfigureMenuPlayMode(false);
-                        _chartEditorLoadPlayfield.ConfigureChartEditor(true);
+                        // Defer chart-dependent projection paths until the actual
+                        // chart is loaded in the next stage; the pre-chart default
+                        // view would otherwise build an unused empty-path cache.
+                        _chartEditorLoadPlayfield.ConfigureChartEditor(true, deferChartDependentWork: true);
                         _chartEditorLoadPlayfield.SaveTscOnlyRequested += HandleSaveTscOnlyRequested;
                         _chartEditorLoadPlayfield.SaveJsonRequested += HandleSaveJsonRequested;
                         _chartEditorLoadPlayfield.SaveTscZipRequested += HandleSaveTscZipRequested;

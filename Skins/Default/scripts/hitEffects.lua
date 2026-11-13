@@ -45,6 +45,17 @@ local function settings_for(note, view)
     return "regular", hit.regular
 end
 
+local function section_for_variant(hit, variant)
+    if type(hit) ~= "table" then return nil end
+    if variant == "superFlickOuter" or variant == "superFlickInner" then
+        local family = variant == "superFlickInner" and "inner" or "outer"
+        return type(hit.superFlick) == "table" and hit.superFlick[family] or nil
+    end
+    if variant == "multi" then return hit.multi end
+    if variant == "long" then return hit.long end
+    return hit.regular
+end
+
 local function texture_for(variant, frame_number)
     local variant_cache = textures[variant]
     if type(variant_cache) ~= "table" then return nil end
@@ -155,6 +166,7 @@ function on_hit_effect(note, judgement, offset_ms, real_time, chart_time, view)
         x = x,
         y = y,
         width = math.max(1, tonumber(note.hit_width) or read_number(section, "width", 100) * (tonumber(note.scale) or 1)),
+        configured_width = read_number(section, "width", tonumber(note.hit_width) or 100),
         rotation = tonumber(note.hit_rotation) or 0,
     }
 end
@@ -186,6 +198,30 @@ local function current_frame(effect, real_time, chart_time)
     return effect.loop_start + ((elapsed_frames - intro_end) % loop_length)
 end
 
+function on_view_changed(view, projections)
+    if type(projections) ~= "table" then return end
+
+    local config = playfield_config.get(view or "gameplay")
+    local hit = type(config) == "table" and config.hitAnimation or nil
+
+    for index = 1, #effects do
+        local effect = effects[index]
+        local projection = projections[effect.note_track + 1]
+        if type(projection) == "table" then
+            effect.x = tonumber(projection.x) or effect.x
+            effect.y = tonumber(projection.y) or effect.y
+
+            local section = section_for_variant(hit, effect.variant)
+            local base_width = read_number(section, "width", effect.configured_width or effect.width)
+            local scale = tonumber(projection.scale) or 1
+            local depth_scale = tonumber(projection.lane_rotation_depth_scale) or 1
+            effect.width = math.max(1, base_width * scale * depth_scale)
+            effect.rotation = type(section) == "table" and section.rotateWithLane == true
+                and (tonumber(projection.rotation) or 0) or 0
+        end
+    end
+end
+
 function on_hold_dropped(note, real_time)
     if type(note) ~= "userdata" then return end
 
@@ -211,6 +247,28 @@ function reset()
     -- Retry/restart should discard transient effects, but keep the preloaded
     -- textures and preload cursor so the next run is ready immediately.
     effects = {}
+end
+
+function on_chart_time_jump(previous_chart_time, current_chart_time)
+    local previous_time = math.max(0, tonumber(previous_chart_time) or 0)
+    local current_time = math.max(0, tonumber(current_chart_time) or 0)
+    if current_time >= previous_time then return end
+
+    -- Effects are started on the monotonic UI clock so they can animate while
+    -- gameplay is paused. A backwards chart seek must still remove an effect
+    -- when its triggering judgement is now in the future.
+    for index = #effects, 1, -1 do
+        local effect = effects[index]
+        if current_time + 0.000001 < effect.chart_time then
+            table.remove(effects, index)
+        elseif effect.use_loop and effect.post_loop_started_at ~= nil and
+            current_time < effect.hold_end_time then
+            -- The playhead moved back inside this hold after previously crossing
+            -- its end. Re-enter the looping body instead of continuing the outro
+            -- that was started at the old, later chart position.
+            effect.post_loop_started_at = nil
+        end
+    end
 end
 
 function render(frame)
@@ -246,5 +304,7 @@ return {
     reset = reset,
     on_hit_effect = on_hit_effect,
     on_hold_dropped = on_hold_dropped,
+    on_view_changed = on_view_changed,
+    on_chart_time_jump = on_chart_time_jump,
     render = render,
 }

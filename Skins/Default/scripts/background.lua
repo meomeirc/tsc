@@ -10,6 +10,7 @@ local star_layers = {
 }
 
 local star_layers_ready = false
+local star_layers_loaded_count = 0
 local background_video = nil
 local texture = nil -- Original scrolling PNG fallback if video is unavailable.
 local stage_window = nil
@@ -74,36 +75,25 @@ local shadow_gradient_options = {
     layer = -900,
 }
 
-local sparkle_images = {
-    "light-vibrato.png",
-    "light-multi.png",
-    "light-long.png",
-    "light-regular.png",
-}
-
 local sparkle_draw_options = {
+    -- Procedural crowd baker: eight static 720p layers plus one reusable
+    -- purple flash sprite. Runtime animation only moves/fades the layers and
+    -- instances the flash sprite; no per-particle shader runs during gameplay.
+    bake_mode = "crowd_layers",
+    bake_width = 1280,
+    bake_height = 720,
+    layer_count = 8,
+    seed = 0.0,
     screen_space = true,
-    images = sparkle_images,
-    bake_width = 720,
-    bake_height = 240,
-    fps = 30,
     x = 0, y = 0, width = 0, height = 0,
     layer = -800,
     anchor = "bottom",
+    -- Match the original crowd sparkle plane: tilted back and anchored to
+    -- the bottom edge instead of filling the screen as a front-facing layer.
     rotation_x = -20,
-    density = 100,
-    distribution_bias = 0,
-    brightness = 1.0,
-    grid_x = 50,
-    grid_y = 50,
-    min_size = 0.04,
-    max_size = 0.1,
-    cycle_min = 1,
-    cycle_max = 2,
-    flash_width_min = 0.2,
-    flash_width_max = 0.3,
-    min_jump = 0.02,
-    max_jump = 0.04,
+    -- The baked layers and flash sprite carry premultiplied alpha, matching
+    -- the source shader's normal compositing (not additive blending).
+    blend = "normal",
 }
 
 local bottom_gradient_options = {
@@ -131,14 +121,47 @@ end
 
 local function load_star_layers()
     local all_loaded = true
+    star_layers_loaded_count = 0
     for index, layer in ipairs(star_layers) do
         layer.texture = assets.load(layer.file)
         make_star_layer_options(layer, index)
         if layer.texture == nil then
             all_loaded = false
+        else
+            star_layers_loaded_count = star_layers_loaded_count + 1
         end
     end
     return all_loaded
+end
+
+local function log_background_source()
+    local mode
+    if star_layers_ready then
+        mode = "layered_png"
+    elseif background_video ~= nil then
+        mode = "video_fallback"
+    elseif texture ~= nil then
+        mode = "scrolling_png_fallback"
+    else
+        mode = "no_background_asset"
+    end
+
+    local dimensions = {}
+    for _, layer in ipairs(star_layers) do
+        if layer.texture ~= nil then
+            local width, height = get_texture_size(layer.texture)
+            dimensions[#dimensions + 1] = string.format("%s:%dx%d", layer.file, width, height)
+        end
+    end
+    if texture ~= nil then
+        local width, height = get_texture_size(texture)
+        dimensions[#dimensions + 1] = string.format("background.png:%dx%d", width, height)
+    end
+
+    print(string.format(
+        "[background] source=%s loaded_star_layers=%d/%d assets=%s",
+        mode, star_layers_loaded_count, #star_layers,
+        #dimensions > 0 and table.concat(dimensions, ",") or "none"))
 end
 
 function init()
@@ -157,6 +180,7 @@ function init()
     stage_window = assets.load("stage-window.png")
     elapsed = 0
     fallback_scroll_x = 0
+    log_background_source()
 end
 
 -- Initialize on import and allow later reset through init().
@@ -211,7 +235,11 @@ function render(display)
                         -- One tile per loop; tile aspect ratios encode depth speed.
                         local scroll_x = -loop_phase * tile_width
                         local start_x = scroll_x - tile_width
-                        local count = math.ceil(screen_width / tile_width) + 2
+                        -- start_x is already one full tile behind the current
+                        -- wrapped scroll position. Compute the exact number of
+                        -- tiles needed to cover the viewport instead of always
+                        -- submitting two extra tiles.
+                        local count = math.max(1, math.ceil((screen_width - start_x) / tile_width))
                         -- Use different integer pulse cycle counts so every layer
                         -- fades at its own pace while repeating exactly with the
                         -- shared 30-second background loop. A half-cycle is one
@@ -246,7 +274,9 @@ function render(display)
             if tile_width > 0 then
                 fallback_scroll_x = fallback_scroll_x % tile_width
                 local start_x = fallback_scroll_x - tile_width
-                local count = math.ceil(screen_width / tile_width) + 2
+                -- Keep only the tiles that intersect the viewport. The previous
+                -- fixed +2 overdraw could submit an unnecessary full-screen tile.
+                local count = math.max(1, math.ceil((screen_width - start_x) / tile_width))
 
                 for index = 0, count - 1 do
                     fallback_tile_draw_options.x = start_x + index * tile_width

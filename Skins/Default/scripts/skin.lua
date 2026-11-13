@@ -24,8 +24,15 @@ function on_hit_effect(note, judgement, offset_ms, real_time, chart_time, view)
     return _TSC_DEFAULT_HIT_EFFECTS.on_hit_effect(
         note, judgement, offset_ms, real_time, chart_time, view)
 end
+
+function on_chart_time_jump(previous_chart_time, current_chart_time)
+    _TSC_DEFAULT_HIT_EFFECTS.on_chart_time_jump(previous_chart_time, current_chart_time)
+end
 function on_hold_dropped(note, real_time)
     return _TSC_DEFAULT_HIT_EFFECTS.on_hold_dropped(note, real_time)
+end
+function on_hit_effect_view_changed(view, projections)
+    _TSC_DEFAULT_HIT_EFFECTS.on_view_changed(view, projections)
 end
 function render_hit_effects(frame)
     return _TSC_DEFAULT_HIT_EFFECTS.render(frame)
@@ -708,6 +715,25 @@ function prepare_gameplay_animation_fonts(use_gameplay_display)
     end
 end
 
+-- The C# startup transition calls this once per frame so background panel
+-- textures are uploaded incrementally instead of on the first visible intro.
+function prepare_gameplay_intro_resources_step(max_assets)
+    refresh_display_config()
+    if resolved_display.background_panels == false then return true end
+    return background_panels.preload_assets_step(max_assets or 1)
+end
+
+function gameplay_intro_assets_ready()
+    refresh_display_config()
+    return resolved_display.background_panels == false or background_panels.are_assets_loaded()
+end
+
+function gameplay_intro_warmup_ready()
+    refresh_display_config()
+    return resolved_display.background_panels == false or
+        (background_panels.are_assets_loaded() and background_panels.is_prewarm_render_complete())
+end
+
 local function start_rank_up(new_grade)
     rank_up_grade = tostring(new_grade or "")
     if rank_up_grade ~= "" then
@@ -1237,7 +1263,23 @@ function on_gameplay_preparing()
     stage_elapsed = 0
     hud_fade_elapsed = 0
     hud_fade_alpha = 0
-    background_panels.wait_for_intro()
+    background_panels.wait_for_intro(true)
+end
+
+-- Build the exact initial intro frame while the global loading transition is
+-- still opaque. The panel module keeps the frame fully transparent until
+-- on_intro_start() runs after the transition has disappeared.
+function prepare_gameplay_intro_frame()
+    stage_active = true
+    stage_elapsed = 0
+    hud_fade_elapsed = 0
+    hud_fade_alpha = 0
+    if background_panels.prepare_intro_frame ~= nil then
+        background_panels.prepare_intro_frame()
+    else
+        -- Compatibility with an older/custom backgroundPanels module.
+        background_panels.wait_for_intro(true)
+    end
 end
 
 function intro_duration()

@@ -20,8 +20,8 @@ return {
     animation = {
         character = {
             windowScale = 0.72,
-            flashOpacity = 0.80,
-            flashDuration = 1.0,
+            flashOpacity = 0.70,
+            flashDuration = 0.7,
             neutralBreathing = { maxZoom = 1.05, zoomInDuration = 3.0, zoomOutDuration = 3.0 },
 
             [101] = { kind = "vertical", from = { 0.50, 0.5 }, to = { 0.50, 0.9 }, zoom = 0.75, duration = 5.0, fadeOutDuration = 2,
@@ -46,12 +46,17 @@ return {
                 padding = { left = 0.70, right = 0.70, top = 0.0, bottom = 0.0 },
             },
 
-            [105] = { kind = "horizontal", from = { 1, 0.5 }, to = { 0.0, 0.5 }, windowScale = 0.72, movementDuration = 5.0, duration = 5.0, fadeOutDuration = 2 },
+            -- Horizontal animations use one duration for both travel and fade timing.
+            -- fadeOutDuration is the final part of duration, overlapping the movement.
+            [105] = { kind = "horizontal", from = { 0.9, 0.5 }, to = { 0.1, 0.5 }, windowScale = 0.72, duration = 4.0, fadeOutDuration = 2 },
 
-            [106] = { kind = "horizontal", from = { 0.0, 0.5 }, to = { 1, 0.5 }, windowScale = 0.72, movementDuration = 5.0, duration = 5.0, fadeOutDuration = 2 },
+            [106] = { kind = "horizontal", from = { 0.1, 0.5 }, to = { 0.9, 0.5 }, windowScale = 0.72, duration = 4.0, fadeOutDuration = 2 },
 
             [107] = {
                 kind = "specialSnap",
+                -- Per-animation flash settings override the character-wide defaults above.
+                flashOpacity = 0.70,
+                flashDuration = 0.5,
                 snapPositions = {
                     [1] = { x = 0.4, y = 0.36 }, [2] = { x = 0.6, y = 0.36 },
                     [3] = { x = 0.4, y = 0.64 }, [0] = { x = 0.6, y = 0.64 }
@@ -60,6 +65,9 @@ return {
 
             [108] = {
                 kind = "specialZoom", movementDuration = 3.0, holdDuration = 1.0, pivotY = 0.3,
+                -- Per-animation flash settings override the character-wide defaults above.
+                flashOpacity = 0.70,
+                flashDuration = 0.5,
                 cycleScales = { [1] = { 0.40, 0.50 }, [2] = { 0.50, 0.60 }, [3] = { 0.60, 0.70 }, [0] = { 0.80, 0.90 } },
             },
         },

@@ -124,6 +124,8 @@ public sealed partial class Playfield
         _debugOrbitLineVertices = 0;
         _debugPrimitiveDrawCalls = 0;
         _debugPrimitiveVertices = 0;
+        _debugBackgroundDrawMs = 0;
+        _debugBackgroundDrawCommandCount = 0;
     }
 
     private static float ScreenTriangleArea(Vector2 a, Vector2 b, Vector2 c)
@@ -148,7 +150,7 @@ public sealed partial class Playfield
     {
         const int left = 12;
         const int top = 12;
-        const int width = 1240;
+        const int width = 1500;
         const int lineHeight = 18;
 
         var now = Stopwatch.GetTimestamp();
@@ -193,6 +195,10 @@ public sealed partial class Playfield
             : _debugDrawLateIntervalsInWindow;
         var memory = GetMemoryDebug();
         var native = NativeResourceDiagnostics.GetSnapshot();
+        var backgroundLuaRenderMs = _skinRuntime.GetDebugSkinSectionMilliseconds(1);
+        var backgroundLuaRenderKb = _skinRuntime.GetDebugSkinSectionAllocatedBytes(1) / 1024.0;
+        var spriteApiCalls = _skinRuntime.DebugLastSpriteApiCalls;
+        var spriteApiKb = _skinRuntime.DebugLastSpriteApiAllocatedBytes / 1024.0;
         const double bytesToMb = 1.0 / (1024.0 * 1024.0);
         var lines = new[]
         {
@@ -203,6 +209,8 @@ public sealed partial class Playfield
             $"GPU     Render targets {native.RenderTargetCount} / {native.RenderTargetBytes * bytesToMb:0.0} MB   menu textures {native.MenuTextureBytes * bytesToMb:0.0} MB",
             $"AUDIO   Buffers {native.AudioBufferCount} / {native.AudioBufferBytes * bytesToMb:0.0} MB   music {native.MusicBufferBytes * bytesToMb:0.0}   SFX {native.SoundEffectBufferBytes * bytesToMb:0.0}   instances {native.AudioInstanceCount} (music {native.MusicInstanceCount} / SFX {native.SoundEffectInstanceCount})",
             $"PERF    FPS {instantCadenceFps:0.0} now / {averageCadenceFps:0.0} avg   CPU-only {cpuBoundFps:0} FPS   draw {_debugFrameMs:0.00} ms   max gap {maxInterval:0.00} ms   late {lateIntervals}",
+            $"BG      Lua render {backgroundLuaRenderMs:0.000} ms / {backgroundLuaRenderKb:0.0} KB   draw {_debugBackgroundDrawMs:0.000} ms   cmds {_debugBackgroundDrawCommandCount}",
+            $"SKIN    build {_debugSkinBuildMs:0.00} ms   draw {_debugSkinDrawMs:0.00} ms   sprite API {spriteApiCalls} calls / {spriteApiKb:0.0} KB",
             "*GPU/audio are TSC-owned estimates; GPU uses width×height×4, audio uses PCM bytes; internal driver allocations are excluded.",
             "*Managed used is an estimate; GC heap/fragmentation/LOH are last-GC snapshots.",
             "Ctrl+Shift+F8 copy   Ctrl+F8 compacting full GC   F8 hide",

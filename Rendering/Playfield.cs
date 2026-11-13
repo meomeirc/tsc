@@ -470,6 +470,12 @@ public sealed partial class Playfield
     private double _pendingAudioRecoveryClockCorrectionSeconds;
     private long _nextUnexpectedAudioResyncAt;
     private bool _playbackStartPending;
+    // Keep the Default skin intro in its hidden prewarm state until the global
+    // incoming transition has fully disappeared. This prevents panels from
+    // appearing underneath a partially transparent screen fade.
+    private bool _holdGameplayIntroUntilTransitionComplete;
+    private int _gameplayStartupHiddenDrawFrames;
+    private const int GameplayStartupHiddenDrawFramesRequired = 3;
     private double _startupWarmupRemainingSeconds;
     private long _startupWarmupLastTimestamp;
     private double _skinIntroRemainingSeconds;
@@ -492,14 +498,15 @@ public sealed partial class Playfield
     private readonly double _pauseScrollSpeedMax = 9.0;
     private const double PauseScrollSpeedStep = 0.05;
     // Give the freshly loaded gameplay screen a little time to render before
-    // starting the chart/audio clocks. This is intentionally non-blocking: the
-    // game keeps drawing during the warm-up instead of sleeping the thread.
+    // revealing it. For menu gameplay, the chart/audio clock can already be
+    // running underneath the covered transition during this warm-up.
     private const double StartupWarmupSeconds = 1.0;
 
     private void BeginGameplayStartupWarmup()
     {
         _startupWarmupRemainingSeconds = StartupWarmupSeconds;
         _startupWarmupLastTimestamp = Stopwatch.GetTimestamp();
+        _gameplayStartupHiddenDrawFrames = 0;
     }
 
     private void AdvanceGameplayStartupWarmup(GameTime gameTime)
@@ -522,6 +529,29 @@ public sealed partial class Playfield
         // the entire warm-up in one update.
         elapsedSeconds = Math.Min(elapsedSeconds, 0.25);
         _startupWarmupRemainingSeconds = Math.Max(0.0, _startupWarmupRemainingSeconds - elapsedSeconds);
+    }
+
+    /// <summary>
+    /// Advances the non-chart game/UI clock while the incoming gameplay screen
+    /// is loading and fading in. This drives skin animation and background
+    /// scrolling without starting chart playback, music, judgements, or intro
+    /// callbacks.
+    /// </summary>
+    public void AdvanceGameClockDuringTransition(GameTime gameTime)
+    {
+        if (!_holdGameplayIntroUntilTransitionComplete || !_playbackStartPending || _chart is null)
+            return;
+
+        var elapsedSeconds = Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
+        _uiTimeSeconds += elapsedSeconds;
+        AdvanceSkinGameClock(elapsedSeconds);
+    }
+
+    private void AdvanceSkinGameClock(double elapsedSeconds)
+    {
+        var safeElapsedSeconds = Math.Max(0.0, elapsedSeconds);
+        _skinRuntime.Update((float)safeElapsedSeconds);
+        _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
     }
 
     private string? _lastLoadedSourceName;
@@ -580,6 +610,10 @@ public sealed partial class Playfield
     private bool _chartEditorMode;
     private bool _editorPreviewMode;
     private bool _editorGameplayPreviewSkinWarmupAttempted;
+    private int _editorStartupViewWarmupFrames;
+    private bool _editorStartupWarmupUpdateActive;
+    private const int EditorStartupViewWarmupFramesRequired = 8;
+    private static readonly TimeSpan EditorStartupWarmupFrameDuration = TimeSpan.FromTicks(TimeSpan.TicksPerSecond / 60);
     private bool _editorPreviewPreviousBeatLines;
     private bool _editorPreviewPreviousTempoLines;
     private bool _editorPreviewPreviousTopDownViewEnabled;
@@ -1108,11 +1142,18 @@ public sealed partial class Playfield
     public bool HandlesResultActionInput => _gameplayResultActive || _hardGaugeGameOverActive;
     public bool HandlesDifficultyConfirmationInput =>
         _editorCreateDifficultyConfirmOpen || _editorMetaDeleteConfirmOpen;
-    // The destination can leave the opaque PREPARING transition as soon as the
-    // hidden renderer/audio warm-up is done. Playback remains pending until the
-    // transition has fully faded away and the skin intro has finished.
+    // The destination can leave the opaque PREPARING transition only after the
+    // hidden renderer/audio warm-up and the skin's first gameplay render are ready.
+    // _playbackStartPending remains true until the skin intro finishes, even when
+    // the chart/audio clock is already running underneath the loading transition.
+    private bool GameplayStartupGraphicsReady =>
+        _textures.PendingHitAnimationFrames == 0 &&
+        _feedbackRenderWarmupDone &&
+        _skinRuntime.IsGameplayIntroWarmupReady &&
+        _gameplayStartupHiddenDrawFrames >= GameplayStartupHiddenDrawFramesRequired;
+
     public bool StartupWarmupComplete =>
-        _startupWarmupRemainingSeconds <= 0.0 && _textures.PendingHitAnimationFrames == 0;
+        _startupWarmupRemainingSeconds <= 0.0 && GameplayStartupGraphicsReady && !_audio.IsLoading;
     public AresChart? Chart => _chart;
     public bool ChartEditorMode => _chartEditorMode;
     public bool EditorTextInputActive => _chartEditorMode &&
@@ -1363,7 +1404,7 @@ public sealed partial class Playfield
     public event Action? SaveTstsRequested;
     public event Action? QuickSaveRequested;
 
-    public void ConfigureChartEditor(bool enabled)
+    public void ConfigureChartEditor(bool enabled, bool deferChartDependentWork = false)
     {
         if (!enabled && _editorPreviewMode)
             SetEditorPreviewMode(false);
@@ -1386,7 +1427,7 @@ public sealed partial class Playfield
             _editorPreferredCompact = _compact;
             _topDownViewEnabled = true;
             _compact = _editorPreferredCompact;
-            ApplyActiveViewRenderConfig();
+            ApplyActiveViewRenderConfig(rebuildChartMotionPaths: !deferChartDependentWork);
         }
         var gameplaySkinEditorMode = enabled && !_editorPreviewMode;
         _skinRuntime.SetEditorMode(gameplaySkinEditorMode);
@@ -1446,7 +1487,7 @@ public sealed partial class Playfield
             // gameplay startup; load it before refreshing editor layout/config.
             using (new LoadTimingScope("skin_runtime_editor_activation"))
                 _chartEditorInterfaceRuntime.EnsureLoaded();
-            RefreshChartEditorInterfaceLayoutForActiveScript(force: true);
+            RefreshChartEditorInterfaceLayoutForActiveScript();
             var editorStatus = _statusMessage;
             ReloadSkinForCurrentViewport();
             _statusMessage = editorStatus;
@@ -1652,6 +1693,8 @@ public sealed partial class Playfield
 
     public void StopPlaybackForEditorExit(bool preserveEditorModeForTransition = false)
     {
+        _holdGameplayIntroUntilTransitionComplete = false;
+        _gameplayStartupHiddenDrawFrames = 0;
         StopEditorPreviewPlayback();
         _editorPreviewEditorOpen = false;
         _playing = false;
@@ -1707,8 +1750,20 @@ public sealed partial class Playfield
     /// <summary>Notifies the skin that gameplay is preparing.</summary>
     public void OnGameplayPreparing()
     {
+        _holdGameplayIntroUntilTransitionComplete = true;
+        _gameplayStartupHiddenDrawFrames = 0;
         PrewarmGameplayAnimationFontsIfActive();
         _skinRuntime.OnGameplayPreparing();
+        // The first intro frame has slightly different panel geometry from the
+        // later representative prewarm frame. Prepare its real initial state now,
+        // but keep all panel components transparent until the transition ends.
+        _skinRuntime.PrepareGameplayIntroFrame();
+    }
+
+    /// <summary>Releases the hidden intro after the global gameplay transition has completely faded out.</summary>
+    public void ReleaseGameplayIntroTransitionHold()
+    {
+        _holdGameplayIntroUntilTransitionComplete = false;
     }
 
     public void SetScoreRecordPath(string? chartPath)
@@ -4681,6 +4736,7 @@ public sealed partial class Playfield
         _editorRectSelecting = false;
         _editorSelectedHoldEnd = false;
         _chart = chart;
+        _editorStartupViewWarmupFrames = 0;
         if (_chartEditorMode)
             _projection.SongBaseBpm = _chart.MetadataBpm;
         _scoreSavedForCurrentRun = false;
@@ -4754,7 +4810,9 @@ public sealed partial class Playfield
         ResetJudgementCounts();
         _lastJudgement = string.Empty;
         _lastJudgementColor = Text;
-        _feedbackRenderWarmupDone = false;
+        // Feedback rendering is tied to this Playfield's skin/GPU resources, not
+        // to an individual chart. Keep its warmup when replacing a chart inside
+        // the same editor session; a skin switch explicitly invalidates it.
         _selectedEventKey = null;
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -11573,8 +11631,19 @@ public sealed partial class Playfield
 
     public void RetryGameplayForTransition()
     {
+        _holdGameplayIntroUntilTransitionComplete = true;
         _resultSkinRuntime.InvokeOptionalResultClose();
         RetryGameplay();
+
+        // Retry first resets the skin's gameplay state. Re-enter the same hidden
+        // preparation lifecycle used by a fresh chart load afterwards; otherwise
+        // the Default skin can remain in its "waiting" panel state with
+        // prewarm_render_complete=false. StartupWarmupComplete then waits forever
+        // because waiting mode deliberately does not render the prewarm frame.
+        if (_playbackStartPending)
+            OnGameplayPreparing();
+        else
+            _holdGameplayIntroUntilTransitionComplete = false;
     }
 
     public void CommitGameplayResultTransition()
@@ -11856,6 +11925,11 @@ public sealed partial class Playfield
         }
         catch (Exception ex)
         {
+            _playing = false;
+            _playbackStartPending = false;
+            _holdGameplayIntroUntilTransitionComplete = false;
+            _audioResyncPending = false;
+            _audio.Stop();
             _statusMessage = $"Retry failed: {ex.Message}";
             _gameplayPaused = true;
         }
@@ -12011,7 +12085,16 @@ public sealed partial class Playfield
                 ContinueGameplay();
                 break;
             case 1:
-                RetryGameplay();
+                // Route pause-menu retries through Game1's transition coordinator.
+                // Calling RetryGameplay() here restarted the Playfield immediately,
+                // bypassing RetryGameplayForTransition() and its skin preparation
+                // callback. The Default skin consequently remained in its
+                // "waiting" presentation state, while startup readiness waited
+                // forever for a hidden prewarm render that could never complete.
+                // Game1 consumes this request after Playfield.Update and runs the
+                // same covered retry flow used by the result screen.
+                _gameplayRetryTransitionRequested = true;
+                Program.LogRuntime("GAMEPLAY_RETRY_REQUESTED source=pause_menu");
                 break;
             case 2:
                 _pauseBackRequested = true;
@@ -12051,12 +12134,13 @@ public sealed partial class Playfield
         return _topDownViewEnabled ? _editorRenderConfig : _skin.RenderConfig;
     }
 
-    private void ApplyActiveViewRenderConfig()
+    private void ApplyActiveViewRenderConfig(bool rebuildChartMotionPaths = true)
     {
         var activeConfig = GetActiveViewRenderConfig();
         _projection.LoadRenderConfig(activeConfig);
         _projection.Compact = _compact;
-        _projection.RebuildPrecomputedNoteMotionPaths();
+        if (rebuildChartMotionPaths)
+            _projection.RebuildPrecomputedNoteMotionPaths();
         QueueLegacyHitAnimationPreload(activeConfig);
         InvalidateLaneMeshCache();
         _editorHoverCacheValid = false;
@@ -12092,6 +12176,7 @@ public sealed partial class Playfield
         _projection.InvalidateGeometryCaches();
         InvalidateLaneMeshCache();
         _editorHoverCacheValid = false;
+        NotifySkinHitEffectViewChanged();
         _statusMessage = _chartEditorMode
             ? (_topDownViewEnabled ? "Top-down 2D view enabled." : "3D view enabled.")
             : (_topDownViewEnabled
@@ -12473,6 +12558,7 @@ public sealed partial class Playfield
         _resultSkinRuntime = nextResultRuntime!;
         _chartEditorInterfaceRuntime = nextEditorInterfaceRuntime!;
         _editorGameplayPreviewSkinWarmupAttempted = false;
+        _feedbackRenderWarmupDone = false;
         _hitSounds = nextHitSounds!;
         _textures = nextTextures!;
 
@@ -12622,13 +12708,17 @@ public sealed partial class Playfield
             return;
         }
 
-        var keyboard = Keyboard.GetState();
+        var keyboard = _editorStartupWarmupUpdateActive
+            ? default
+            : Keyboard.GetState();
         var wasPlaying = _playing;
         var timeBeforeInput = _playSeconds;
-        var editorRestartPressed = _chartEditorMode && !EditorTextInputActive &&
+        var editorRestartPressed = !_editorStartupWarmupUpdateActive &&
+            _chartEditorMode && !EditorTextInputActive &&
             (!_editorPreviewEditorOpen || _editorPreviewPendingChartTickTarget >= 0) &&
             KeybindSettings.IsPressed("editor_restart_preview");
-        HandleInput(keyboard, gameTime);
+        if (!_editorStartupWarmupUpdateActive)
+            HandleInput(keyboard, gameTime);
         if (_audioLoadFailed && (_playing || _playbackStartPending))
         {
             // A failed asynchronous decode must not silently turn a music-backed
@@ -12654,6 +12744,12 @@ public sealed partial class Playfield
         var inputTimeChanged = Math.Abs(_playSeconds - timeBeforeInput) > 0.0000001;
         if (inputTimeChanged)
         {
+            // Let skin-owned transient effects reconcile with the new chart
+            // position. In particular, hit-long effects must be removed when a
+            // backwards seek moves before the judgement that created them, and
+            // their hold loop must resume if the seek moves back inside the hold.
+            _skinRuntime.OnChartTimeJump(timeBeforeInput, _playSeconds);
+
             // Capture the actual preview route reached at the old playhead. A
             // manual bank selection is an intentional route override, so seeking
             // must only apply SuperFlick transitions crossed by this seek rather
@@ -12682,14 +12778,16 @@ public sealed partial class Playfield
         }
 
         var playbackStartedThisFrame = false;
-        // After loading from the main-menu Play flow, spend a short period
-        // letting the gameplay screen, GPU resources, audio backend, etc. run
-        // normally before the actual song/chart clocks are started. This is a
-        // warm-up, not a gameplay delay: _playSeconds stays frozen at zero and
-        // no audio is played during this period.
-        if (_playbackStartPending && _startupWarmupRemainingSeconds > 0)
+
+        // After loading from the main-menu Play flow, keep the non-chart game
+        // clock and skin animations advancing while the covered transition
+        // exercises the real first gameplay draw. Chart time and audio remain
+        // stopped until the skin intro has completed after the handoff.
+        if (_playbackStartPending && !_chartEditorMode &&
+            (_startupWarmupRemainingSeconds > 0 || !GameplayStartupGraphicsReady))
         {
-            AdvanceGameplayStartupWarmup(gameTime);
+            if (_startupWarmupRemainingSeconds > 0)
+                AdvanceGameplayStartupWarmup(gameTime);
             RefreshSkinGameState();
             _skinRuntime.Update((float)gameTime.ElapsedGameTime.TotalSeconds);
             _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
@@ -12697,9 +12795,9 @@ public sealed partial class Playfield
             return;
         }
 
-        // Do not start the chart clock if decoding outlasts the normal startup
-        // warm-up. Keep the gameplay skin alive while waiting; once the task
-        // completes, audio starts before the chart advances as before.
+        // If audio decoding outlasts the graphics warm-up, keep waiting until the
+        // native audio upload is complete. The startup clock begins as soon as
+        // this load finishes, without waiting for the transition fade or intro.
         if (_playbackStartPending && (_audio.IsLoading || _textures.PendingHitAnimationFrames > 0))
         {
             if (_textures.PendingHitAnimationFrames > 0 && !_audio.IsLoading)
@@ -12719,6 +12817,16 @@ public sealed partial class Playfield
             RefreshSkinGameState();
             _skinRuntime.Update((float)gameTime.ElapsedGameTime.TotalSeconds);
             _pauseSkinRuntime.UpdatePauseState(_projection.ScrollSpeedScale, false, _pauseSelection);
+            _previousKeyboard = keyboard;
+            return;
+        }
+
+        if (_playbackStartPending && !_chartEditorMode && _holdGameplayIntroUntilTransitionComplete)
+        {
+            // The transition is still holding the destination screen. Advance
+            // only the game/skin clock; chart time and audio start after the
+            // transition and skin intro have completed.
+            AdvanceSkinGameClock(gameTime.ElapsedGameTime.TotalSeconds);
             _previousKeyboard = keyboard;
             return;
         }
@@ -12759,13 +12867,17 @@ public sealed partial class Playfield
 
         if (_playbackStartPending && _chart is not null)
         {
-            // Start the audio at the current chart time before advancing the
-            // software clock for this frame. Starting it later in the frame made
-            // the first chart frame race ahead of the actual song start.
-            _playing = true;
+            // Transition-driven gameplay may already have been running under
+            // the fade and intro. Do not restart its audio source here. Direct
+            // starts still begin playback at this point as before.
+            if (!_playing)
+            {
+                _playing = true;
+                playbackStartedThisFrame = true;
+                _audioResyncPending = true;
+                SyncAudio(wasPlaying: false);
+            }
             _playbackStartPending = false;
-            playbackStartedThisFrame = true;
-            SyncAudio(wasPlaying: false);
             RefreshSkinGameState();
             _skinRuntime.OnSongStart();
         }
@@ -12783,7 +12895,8 @@ public sealed partial class Playfield
             _pendingAudioRecoveryClockCorrectionSeconds -= correction;
         }
         var songEndedThisFrame = false;
-        if (!wasPlaying && _playing && _chart is not null && !playbackStartedThisFrame)
+        if (!wasPlaying && _playing && _chart is not null &&
+            !playbackStartedThisFrame && !_playbackStartPending)
         {
             RefreshSkinGameState();
             _skinRuntime.OnSongStart();

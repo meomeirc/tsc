@@ -126,6 +126,11 @@ local panel_base = nil
 local character_assets = {}
 local stage_light = nil
 local assets_loaded = false
+local asset_preload_index = 1
+local prewarm_render_complete = false
+-- Keeps the real intro's first frame hidden while the loading transition is still visible.
+local intro_prepare_hold = false
+local intro_prepare_render_count = 0
 local special_indices_built = false
 local special_indices_source = nil
 
@@ -252,11 +257,24 @@ local function get_character_visual_scale(zoom)
     return 1.0 / zoom
 end
 
-local function get_flash_opacity()
-    -- flashOpacity is the configurable peak alpha for character flash effects.
-    -- Keep it within the valid alpha range, but do not impose a lower hard cap.
-    local configured = tonumber(ANIMATION_CONFIG.character.flashOpacity) or 0.80
-    return clamp(configured, 0.0, 1.0)
+local function get_flash_opacity(animation_config)
+    -- Individual animation settings take precedence over the character-wide default.
+    -- Keep alpha within its valid range, without imposing an artificial lower cap.
+    local configured = animation_config ~= nil and tonumber(animation_config.flashOpacity) or nil
+    if configured == nil then
+        configured = tonumber(ANIMATION_CONFIG.character.flashOpacity)
+    end
+    return clamp(configured or 0.80, 0.0, 1.0)
+end
+
+local function get_flash_duration(animation_config)
+    -- Animations 107/108 can each use a separate flash duration; other animations
+    -- continue to use the character-wide value.
+    local configured = animation_config ~= nil and tonumber(animation_config.flashDuration) or nil
+    if configured == nil then
+        configured = tonumber(ANIMATION_CONFIG.character.flashDuration)
+    end
+    return math.max(0.001, configured or 1.0)
 end
 
 local function position_character(
@@ -295,17 +313,40 @@ local function config_width(value)
     return value
 end
 
-local function ensure_assets()
+-- Upload at most a few panel textures per preparation frame. The previous
+-- all-at-once lazy load happened on the first visible gameplay intro because
+-- wait_for_intro() suppressed render(), leaving six GPU texture uploads queued
+-- until the screen was already visible.
+local function preload_assets_step(max_assets)
     if assets_loaded then
-        return
+        return true
     end
 
-    assets_loaded = true
-    panel_base = assets.load(PANEL_BASE_PATH)
-    for index = 1, 4 do
-        character_assets[index] = assets.load(CHARACTER_PATHS[index])
+    local budget = math.max(1, math.floor(tonumber(max_assets) or 1))
+    local processed = 0
+    while asset_preload_index <= 6 and processed < budget do
+        local index = asset_preload_index
+        if index == 1 then
+            panel_base = assets.load(PANEL_BASE_PATH)
+        elseif index <= 5 then
+            character_assets[index - 1] = assets.load(CHARACTER_PATHS[index - 1])
+        else
+            stage_light = assets.load(LIGHT_PATH)
+        end
+        asset_preload_index = asset_preload_index + 1
+        processed = processed + 1
     end
-    stage_light = assets.load(LIGHT_PATH)
+
+    assets_loaded = asset_preload_index > 6
+    return assets_loaded
+end
+
+local function are_assets_loaded()
+    return assets_loaded
+end
+
+local function is_prewarm_render_complete()
+    return prewarm_render_complete
 end
 
 local function get_cover_uv(asset, destination_width, destination_height, output)
@@ -804,9 +845,8 @@ local function get_character_view(track, base_uv, event, current_time)
         -- travel. 1 and 0 therefore land exactly on the far and near edges,
         -- just like CornerLoop, without waiting for a clamped center to enter
         -- its valid range.
-        local movement_duration = math.max(0.001,
-            tonumber(cfg.movementDuration) or tonumber(cfg.duration) or 5.0)
-        local t = clamp(elapsed / movement_duration, 0, 1)
+        local duration = math.max(0.001, tonumber(cfg.duration) or 5.0)
+        local t = clamp(elapsed / duration, 0, 1)
         local from_x, from_y = cfg.from[1], cfg.from[2]
         local to_x, to_y = cfg.to[1], cfg.to[2]
         local position_x = lerp(from_x, to_x, t)
@@ -817,10 +857,10 @@ local function get_character_view(track, base_uv, event, current_time)
         window_from_position(base_uv, position_x, position_y,
             window_scale, cfg.padding, output_uv)
 
-        -- Complete the full five-second travel before fading out.
+        -- Fade during the final fadeOutDuration seconds of the movement.
         local fade_duration = math.max(0, tonumber(cfg.fadeOutDuration) or 0)
         local alpha = fade_duration > 0
-            and fade_out_alpha(elapsed, movement_duration + fade_duration, fade_duration)
+            and fade_out_alpha(elapsed, duration, fade_duration)
             or 1
         return output_uv, alpha, 0
     end
@@ -834,8 +874,8 @@ local function get_character_view(track, base_uv, event, current_time)
             ANIMATION_CONFIG.character.windowScale,
             output_uv
         )
-        local flash_t = animation_t(elapsed, ANIMATION_CONFIG.character.flashDuration)
-        local flash_alpha = get_flash_opacity() * (1.0 - smoothstep(flash_t))
+        local flash_t = animation_t(elapsed, get_flash_duration(cfg))
+        local flash_alpha = get_flash_opacity(cfg) * (1.0 - smoothstep(flash_t))
         return output_uv, 1, flash_alpha
     end
 
@@ -845,8 +885,8 @@ local function get_character_view(track, base_uv, event, current_time)
         local zoom_t = animation_t(elapsed, cfg.movementDuration)
         local scale = lerp(scale_pair[1], scale_pair[2], smoothstep(zoom_t))
         window_from_center(base_uv, 0.5, cfg.pivotY, scale, output_uv)
-        local flash_t = animation_t(elapsed, ANIMATION_CONFIG.character.flashDuration)
-        local flash_alpha = get_flash_opacity() * (1.0 - smoothstep(flash_t))
+        local flash_t = animation_t(elapsed, get_flash_duration(cfg))
+        local flash_alpha = get_flash_opacity(cfg) * (1.0 - smoothstep(flash_t))
         return output_uv, 1, flash_alpha
     end
 
@@ -905,7 +945,7 @@ local function set_light_geometry(
 end
 
 local function apply_presentation_light_animation(track, neutral_left, neutral_right, current_mode, elapsed, ref)
-    if current_mode ~= "intro" and current_mode ~= "outro" then
+    if current_mode ~= "intro" and current_mode ~= "prewarm" and current_mode ~= "outro" then
         return
     end
 
@@ -913,7 +953,7 @@ local function apply_presentation_light_animation(track, neutral_left, neutral_r
     local neutral = ANIMATION_CONFIG.light.neutral
     local wide_width = tonumber(ANIMATION_CONFIG.light.wideWidth) or 1000
 
-    if current_mode == "intro" then
+    if current_mode == "intro" or current_mode == "prewarm" then
         local progress = smoothstep(animation_t(elapsed, PRESENTATION_LIGHT_INTRO_DURATION))
         local neutral_left_angle = neutral_left.angle or 0
         local neutral_right_angle = neutral_right.angle or 0
@@ -942,32 +982,67 @@ local function apply_presentation_light_animation(track, neutral_left, neutral_r
     options.right.color = neutral.color or neutral.rightColor
 end
 
-local function wait_for_intro()
-    presentation_mode = "waiting"
+local function wait_for_intro(prewarm)
+    -- Initial gameplay preparation happens underneath the opaque transition.
+    -- Keep the existing representative-frame prewarm available as a fallback;
+    -- the C# loader also prepares the actual intro's initial frame below.
+    intro_prepare_hold = false
+    intro_prepare_render_count = 0
+    if prewarm == true then
+        presentation_mode = "prewarm"
+        presentation_elapsed = PRESENTATION_PANEL_TIME + PRESENTATION_CHARACTER_FADE_IN
+        prewarm_render_complete = false
+    else
+        presentation_mode = "waiting"
+        presentation_elapsed = 0
+    end
+end
+
+local function prepare_intro_frame()
+    -- Exercise the same geometry and cached 3D batch as the first real intro
+    -- frame, but keep every panel/light/character component transparent until
+    -- the global loading transition has completely disappeared.
+    presentation_mode = "intro"
     presentation_elapsed = 0
+    intro_prepare_hold = true
+    intro_prepare_render_count = 0
+    prewarm_render_complete = false
 end
 
 local function start_intro()
     presentation_mode = "intro"
     presentation_elapsed = 0
+    intro_prepare_hold = false
 end
 
 local function start_outro()
     presentation_mode = "outro"
     presentation_elapsed = 0
+    intro_prepare_hold = false
+    intro_prepare_render_count = 0
 end
 
 local function cancel_presentation()
     presentation_mode = "idle"
     presentation_elapsed = 0
+    intro_prepare_hold = false
+    intro_prepare_render_count = 0
 end
 
 local function is_waiting_for_intro()
-    return presentation_mode == "waiting"
+    return presentation_mode == "waiting" or presentation_mode == "prewarm" or intro_prepare_hold
 end
 
 local function update_presentation(dt)
     local frame_dt = math.max(0, tonumber(dt) or 0)
+    if not assets_loaded then
+        preload_assets_step(1)
+    end
+    if presentation_mode == "prewarm" or intro_prepare_hold then
+        -- Keep both representative and actual-intro warmup frames stationary.
+        -- on_intro_start() releases the hold after the screen fade has finished.
+        return
+    end
     neutral_breath_elapsed = neutral_breath_elapsed + frame_dt
 
     if presentation_mode == "intro" or presentation_mode == "outro" then
@@ -1004,16 +1079,27 @@ local function render(display)
     end
 
     if not show_panel_bases and not show_stage_lights and not show_character_panels then
+        if presentation_mode == "prewarm" or intro_prepare_hold then
+            prewarm_render_complete = true
+        end
         return
     end
 
-    ensure_assets()
+    -- Never upload textures from the render callback. Gameplay Update and the
+    -- editor loading transition advance the queue one asset at a time, keeping
+    -- upload work out of the first visible frame.
+    if not assets_loaded then
+        return
+    end
 
     if panel_base == nil
         or panel_base.width == nil
         or panel_base.height == nil
         or panel_base.width <= 0
         or panel_base.height <= 0 then
+        if presentation_mode == "prewarm" or intro_prepare_hold then
+            prewarm_render_complete = true
+        end
         return
     end
 
@@ -1026,12 +1112,13 @@ local function render(display)
     if show_stage_lights then
         get_neutral_lights(current_time, neutral_light_frame_cache.left, neutral_light_frame_cache.right)
     end
-    local presentation_character_alpha = 1.0
-    local presentation_flash_alpha = nil
+    local is_hidden_prewarm = presentation_mode == "prewarm" or intro_prepare_hold
+    local presentation_character_alpha = is_hidden_prewarm and 0.0 or 1.0
+    local presentation_flash_alpha = is_hidden_prewarm and 0.0 or nil
     local clip_progress = 1.0
     local presentation_clip = nil
 
-    if presentation_mode == "intro" then
+    if presentation_mode == "intro" or presentation_mode == "prewarm" then
         local wipe_t = math.min(1.0, presentation_elapsed / PRESENTATION_PANEL_TIME)
         clip_progress = 1.0 - (1.0 - wipe_t) * (1.0 - wipe_t)
         if presentation_elapsed <= PRESENTATION_PANEL_TIME then
@@ -1051,7 +1138,7 @@ local function render(display)
         clip_progress = (1.0 - panel_t) * (1.0 - panel_t)
     end
 
-    if presentation_mode == "intro" or presentation_mode == "outro" then
+    if presentation_mode == "intro" or presentation_mode == "outro" or presentation_mode == "prewarm" then
         local halfClipHeight = screen_height * 0.5 * clip_progress
         presentation_clip_rect.left = 0
         presentation_clip_rect.top = screen_height * 0.5 - halfClipHeight
@@ -1092,6 +1179,10 @@ local function render(display)
         panel_options.x, panel_options.y, panel_options.z = center_x, panel_y, depth
         panel_options.width, panel_options.rotation_y = width, yaw
         panel_options.color, panel_options.clip = panel_color, presentation_clip
+        -- Prewarm still submits the real 3D panel commands so the renderer caches
+        -- their styles and GPU pipeline, but must never reveal the panels through
+        -- a partially transparent loading transition.
+        panel_options.alpha = is_hidden_prewarm and 0.0 or 1.0
 
         -- Place each light on its own panel plane. The x offset is panel-local,
         -- so rotate it into world space just like the panel and character. Keep
@@ -1177,6 +1268,12 @@ local function render(display)
                 presentation_elapsed,
                 ref
             )
+            if is_hidden_prewarm then
+                -- Keep submitting these quads to exercise the cached 3D renderer,
+                -- but make every prewarm component fully transparent.
+                light_quad_options[track].left.alpha = 0.0
+                light_quad_options[track].right.alpha = 0.0
+            end
             if profile then skinperf.stop(10) end
         end
 
@@ -1305,8 +1402,32 @@ local function render(display)
     end
 
     if profile then skinperf.begin(15) end
+    if is_hidden_prewarm then
+        -- Guarantee that every submitted component is invisible, including
+        -- event-triggered flashes whose alpha may otherwise override the intro
+        -- fade alpha. The zero-alpha commands still prime the cached 3D renderer.
+        for index = 1, quad3d_batch_count do
+            local item = quad3d_batch_items[index]
+            if item ~= nil and item.options ~= nil then
+                item.options.alpha = 0.0
+            end
+        end
+    end
     if quad3d_batch_count > 0 then
         draw.quad3d_cached_batch(quad3d_batch_items, quad3d_batch_count)
+    end
+    if intro_prepare_hold then
+        intro_prepare_render_count = intro_prepare_render_count + 1
+        if intro_prepare_render_count == 1 then
+            -- The initial wipe clips to the center line. Also build the fully
+            -- expanded intro frame while still hidden so both GPU geometries are
+            -- ready before the loading transition can reveal the page.
+            presentation_elapsed = PRESENTATION_PANEL_TIME + PRESENTATION_CHARACTER_FADE_IN
+        else
+            prewarm_render_complete = true
+        end
+    elseif presentation_mode == "prewarm" then
+        prewarm_render_complete = true
     end
     if profile then skinperf.stop(15) end
 end
@@ -1314,9 +1435,13 @@ end
 return {
     render = render,
     wait_for_intro = wait_for_intro,
+    prepare_intro_frame = prepare_intro_frame,
     start_intro = start_intro,
     start_outro = start_outro,
     cancel_presentation = cancel_presentation,
     is_waiting_for_intro = is_waiting_for_intro,
     update_presentation = update_presentation,
+    preload_assets_step = preload_assets_step,
+    are_assets_loaded = are_assets_loaded,
+    is_prewarm_render_complete = is_prewarm_render_complete,
 }

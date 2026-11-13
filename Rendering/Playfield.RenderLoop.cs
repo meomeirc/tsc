@@ -17,6 +17,8 @@ namespace TSC.Rendering;
 public sealed partial class Playfield
 {
     // Frame update/render orchestration and playfield/background rendering.
+    private double _debugBackgroundDrawMs;
+    private int _debugBackgroundDrawCommandCount;
 
     private bool Pressed(KeyboardState keyboard, Keys key) => keyboard.IsKeyDown(key) && !_previousKeyboard.IsKeyDown(key);
 
@@ -185,8 +187,24 @@ public sealed partial class Playfield
 
         allocStart = GC.GetAllocatedBytesForCurrentThread();
         var skinDrawStartTimestamp = Stopwatch.GetTimestamp();
+        var backgroundDrawStartTimestamp = _performanceDebugInstrumentFrame
+            ? Stopwatch.GetTimestamp()
+            : 0L;
         DrawSkinScriptUiLayers(_skinDrawCommands, true, _skinRuntime);
         _debugSkinDrawMs = ElapsedMilliseconds(skinDrawStartTimestamp);
+        if (_performanceDebugInstrumentFrame)
+        {
+            _debugBackgroundDrawMs = ElapsedMilliseconds(backgroundDrawStartTimestamp);
+            var backgroundCommandCount = 0;
+            for (var commandIndex = 0; commandIndex < _skinDrawCommands.Count; commandIndex++)
+            {
+                var command = _skinDrawCommands[commandIndex];
+                if (command.Layer < 0 && !command.IsHitEffect &&
+                    (command.Kind == SkinDrawCommandKind.Sprite || command.Kind == SkinDrawCommandKind.Sparkles))
+                    backgroundCommandCount++;
+            }
+            _debugBackgroundDrawCommandCount = backgroundCommandCount;
+        }
         _debugAllocSkinDrawBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
 
         // The editor owns its background dimmer: dim background/skin layers by
@@ -443,6 +461,24 @@ public sealed partial class Playfield
             _debugClearGc1 += _debugGc1Delta;
             _debugClearGc2 += _debugGc2Delta;
         }
+
+        // Count only complete gameplay renders made while the opaque transition
+        // is holding the intro. The transition cannot reveal the playfield until
+        // these full passes have exercised the real chart, skin, and GPU paths.
+        if (_playbackStartPending && !_chartEditorMode &&
+            _holdGameplayIntroUntilTransitionComplete &&
+            _textures.PendingHitAnimationFrames == 0 &&
+            _feedbackRenderWarmupDone &&
+            _skinRuntime.IsGameplayIntroWarmupReady)
+        {
+            _gameplayStartupHiddenDrawFrames = Math.Min(
+                GameplayStartupHiddenDrawFramesRequired,
+                _gameplayStartupHiddenDrawFrames + 1);
+            Program.LogRuntime(
+                $"GAMEPLAY_STARTUP_HIDDEN_FRAME frame={_gameplayStartupHiddenDrawFrames}/{GameplayStartupHiddenDrawFramesRequired} " +
+                $"frameMs={_debugFrameMs:0.00} skinBuildMs={_debugSkinBuildMs:0.00} skinDrawMs={_debugSkinDrawMs:0.00} " +
+                $"allocatedBytes={_debugAllocatedBytes} gc0={_debugGc0Delta} gc1={_debugGc1Delta} gc2={_debugGc2Delta}");
+        }
     }
 
     private (Rectangle Panel, Rectangle[] Buttons, Rectangle SpeedRow) GetFallbackPauseLayout(int width, int height)
@@ -609,9 +645,21 @@ public sealed partial class Playfield
         // An absent/failed Lua skin uses the built-in C# fallback and has no
         // deferred skin render resources to prepare. Mark the attempt so toggling
         // preview cannot retry a known-unavailable runtime on the interactive path.
-        _editorGameplayPreviewSkinWarmupAttempted = true;
         if (!_skinRuntime.IsLoaded)
+        {
+            _editorGameplayPreviewSkinWarmupAttempted = true;
             return;
+        }
+
+        // The Default skin's background panels are lazy GPU assets. Upload them
+        // a little at a time while the editor loading overlay is still active;
+        // don't let the first visible preview frame pay those uploads.
+        using (new LoadTimingScope("editor_gameplay_intro_assets_step"))
+            _ = _skinRuntime.PrepareGameplayIntroResourcesStep(1);
+        if (!_skinRuntime.AreGameplayIntroAssetsReady)
+            return;
+
+        _editorGameplayPreviewSkinWarmupAttempted = true;
 
         var (width, height) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
         var previousTargets = _graphics.GetRenderTargets();
@@ -758,6 +806,10 @@ public sealed partial class Playfield
         if (_textures.PendingHitAnimationFrames > 0)
             return false;
 
+        PrewarmEditorGameplayPreviewSkin();
+        if (!_editorGameplayPreviewSkinWarmupAttempted)
+            return false;
+
         var (width, height) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
         EnsureGameplayRenderTarget(width, height);
 
@@ -773,8 +825,56 @@ public sealed partial class Playfield
             WarmFeedbackRenderingOnHiddenTarget(width, height);
         }
 
+        if (_editorStartupViewWarmupFrames < EditorStartupViewWarmupFramesRequired &&
+            _gameplayRenderTarget is not null)
+        {
+            // Run several complete, input-suppressed editor update/render cycles
+            // under the loading cover. A single hidden draw was not enough to
+            // exercise all first-use JIT, chart-render caches, Lua UI layout, and
+            // GPU pipeline paths before the editor became interactive.
+            var warmupStarted = Stopwatch.GetTimestamp();
+            try
+            {
+                _editorStartupWarmupUpdateActive = true;
+                try
+                {
+                    var elapsed = EditorStartupWarmupFrameDuration;
+                    var total = TimeSpan.FromTicks(elapsed.Ticks * (_editorStartupViewWarmupFrames + 1));
+                    using (new LoadTimingScope("editor_startup_hidden_update"))
+                        Update(new GameTime(total, elapsed));
+                    _previousKeyboard = Keyboard.GetState();
+                }
+                finally
+                {
+                    _editorStartupWarmupUpdateActive = false;
+                }
+
+                using (new LoadTimingScope("editor_startup_hidden_view_render"))
+                    Draw();
+                _editorStartupViewWarmupFrames++;
+                Program.LogRuntime(
+                    $"EDITOR_STARTUP_HIDDEN_FRAME frame={_editorStartupViewWarmupFrames}/{EditorStartupViewWarmupFramesRequired} " +
+                    $"elapsedMs={Stopwatch.GetElapsedTime(warmupStarted).TotalMilliseconds:0.00}");
+                if (_editorStartupViewWarmupFrames >= EditorStartupViewWarmupFramesRequired)
+                    Program.LogRuntime("EDITOR_STARTUP_WARMUP_DONE frames=" + EditorStartupViewWarmupFramesRequired);
+            }
+            catch (Exception ex)
+            {
+                // A hidden warmup is an optimization. Keep a working fallback
+                // path if a custom skin or graphics driver rejects preparation.
+                _editorStartupViewWarmupFrames = EditorStartupViewWarmupFramesRequired;
+                Program.LogFatal("EDITOR_STARTUP_HIDDEN_VIEW_WARMUP", ex);
+            }
+            finally
+            {
+                _editorStartupWarmupUpdateActive = false;
+                _previousKeyboard = Keyboard.GetState();
+            }
+        }
+
         return _textures.PendingHitAnimationFrames == 0 && _feedbackRenderWarmupDone &&
                _gameplayRenderTarget is not null &&
+               _editorStartupViewWarmupFrames >= EditorStartupViewWarmupFramesRequired &&
                (!needsInactiveBankTarget || _editorInactiveBankRenderTarget is not null);
     }
 

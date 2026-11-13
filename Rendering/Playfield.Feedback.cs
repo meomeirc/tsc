@@ -399,20 +399,46 @@ public sealed partial class Playfield
             samplerState: SamplerState.LinearClamp,
             blendState: BlendState.NonPremultiplied);
 
+        var activeHitConfig = GetActiveViewRenderConfig().HitAnimation;
         foreach (var animation in _hitAnimations)
         {
-            // Hold effects follow the active projection while the hold is still live.
-            // This lets them switch between top-down 2D and perspective 3D immediately,
-            // rather than keeping the view captured at the initial hit until release.
-            if (animation.IsHold && _tempo is not null && _chart is not null)
+            // Every native hit effect follows the active projection, not only
+            // sustained notes. This keeps tap and hold animations aligned when
+            // switching between top-down 2D and perspective 3D mid-animation.
+            if (_tempo is not null && _chart is not null)
             {
                 var tick = _tempo.SecondsToTick(_playSeconds);
                 var gearState = RenderGearState(tick);
                 var projected = _projection.Project(animation.Track, _playSeconds, _playSeconds, gearState);
-                animation.Position = projected.Position;
-                var holdConfig = GetActiveViewRenderConfig().HitAnimation.Long;
-                animation.BaseWidth = Math.Max(1f, holdConfig.Width * projected.Scale * projected.LaneRotationDepthScale);
-                animation.Rotation = 0f;
+                var trackPosition = GearState.Position(animation.Track);
+                var position = projected.Position;
+                var rotation = 0f;
+                if (trackPosition is { } trackInfo)
+                {
+                    var normalizedX = _projection.LaneNormalizedX(animation.Track);
+                    var judgeBasis = _projection.BuildStandingNoteBasis(
+                        normalizedX, 0f, trackInfo.Side, trackInfo.Bank);
+                    position = _projection.ScreenPositionFromCameraSpace(judgeBasis.Center);
+                }
+
+                var animationConfig = animation.Variant switch
+                {
+                    "multi" => activeHitConfig.Multi,
+                    "long" => activeHitConfig.Long,
+                    "superFlickOuter" => activeHitConfig.SuperFlick.Outer,
+                    "superFlickInner" => activeHitConfig.SuperFlick.Inner,
+                    _ => activeHitConfig.Regular,
+                };
+                animation.BaseWidth = Math.Max(1f,
+                    animationConfig.Width * projected.Scale * projected.LaneRotationDepthScale);
+                if (animationConfig.RotateWithLane && trackPosition is { } laneInfo)
+                {
+                    rotation = _projection.SpriteRotationRadians(
+                        laneInfo.Side, laneInfo.Bank, projected.Depth);
+                }
+
+                animation.Position = position;
+                animation.Rotation = rotation;
             }
             var frame = GetHitAnimationFrame(animation);
             var texture = _textures.GetHitFrame(animation.Variant, frame);
@@ -511,6 +537,47 @@ public sealed partial class Playfield
         JudgementTier.Good => "good",
         _ => "miss"
     };
+
+    private void NotifySkinHitEffectViewChanged()
+    {
+        if (!_skinRuntime.SupportsHitEffectRenderer ||
+            _chart is null || _tempo is null || _gear is null)
+            return;
+
+        var currentTick = _tempo.SecondsToTick(_playSeconds);
+        var renderState = RenderGearState(currentTick);
+        var projections = new List<SkinHitEffectProjectionView>(16);
+
+        // TSC's playable note tracks occupy 0..15. Rebuild all judge-line
+        // projections after the new render config has been applied so every
+        // currently active hit effect can move immediately with the view.
+        for (var track = 0; track < 16; track++)
+        {
+            var trackPosition = GearState.Position(track);
+            if (trackPosition is not { } position)
+                continue;
+
+            var point = _projection.Project(track, _playSeconds, _playSeconds, renderState);
+            var normalizedX = _projection.LaneNormalizedX(track);
+            var judgeBasis = _projection.BuildStandingNoteBasis(
+                normalizedX, 0f, position.Side, position.Bank);
+            var hitPosition = _projection.ScreenPositionFromCameraSpace(judgeBasis.Center);
+            var rotation = _projection.SpriteRotationRadians(
+                position.Side, position.Bank, point.Depth);
+
+            projections.Add(new SkinHitEffectProjectionView(
+                track,
+                hitPosition.X,
+                hitPosition.Y,
+                point.Scale,
+                point.LaneRotationDepthScale,
+                rotation));
+        }
+
+        _skinRuntime.OnHitEffectViewChanged(
+            _chartEditorMode && _topDownViewEnabled ? "editor" : "gameplay",
+            projections);
+    }
 
     private SkinNoteView BuildSkinNoteView(ChartEvent ev, bool hit, bool missed)
     {

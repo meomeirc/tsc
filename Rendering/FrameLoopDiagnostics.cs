@@ -10,6 +10,17 @@ namespace TSC.Rendering;
 /// </summary>
 internal static class FrameLoopDiagnostics
 {
+    // Keep late-frame reporting aligned with TSC's configured fixed-step rate.
+    // A fixed 20 ms threshold silently misses missed frames at the default 60 FPS.
+    public static double TargetFrameIntervalMs { get; private set; } = 1000.0 / 60.0;
+    public static double LateFrameThresholdMs => TargetFrameIntervalMs + 0.5;
+
+    public static void SetTargetFrameRate(int framesPerSecond)
+    {
+        var safeRate = Math.Clamp(framesPerSecond, 1, 1000);
+        TargetFrameIntervalMs = 1000.0 / safeRate;
+    }
+
     private static long _updateStartTimestamp;
     private static long _updateStartAllocatedBytes;
     private static int _updateStartGc0;

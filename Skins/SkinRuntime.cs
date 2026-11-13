@@ -609,6 +609,18 @@ internal readonly record struct SkinPlayfieldSurfaceDrawRequest(
     float AnchorY,
     string Blend);
 
+/// <summary>
+/// Current-view screen projection for a judgement-line track. Supplied to skin hit
+/// effect renderers when the editor switches between top-down and perspective views.
+/// </summary>
+public readonly record struct SkinHitEffectProjectionView(
+    int Track,
+    float X,
+    float Y,
+    float Scale,
+    float LaneRotationDepthScale,
+    float Rotation);
+
 public sealed class SkinNoteView
 {
     public string type { get; }
@@ -1960,6 +1972,7 @@ public sealed class SkinSparkleSettings
     public float MaxJump { get; init; } = 0.07f;
     public float DistributionBias { get; init; } = 0f;
     public float Seed { get; init; } = 0f;
+    public int LayerCount { get; init; } = 8;
 }
 
 public struct SkinQuad3DWidth
@@ -1975,15 +1988,25 @@ public struct SkinQuad3DWidth
     public float BoundingHeight => MathF.Max(Left, Right);
 }
 
+public readonly record struct SkinSparkleFlashInstance(
+    float SizeScale,
+    float Phase,
+    float CycleSeconds,
+    float RandomSeed);
+
 public sealed class SkinSparkleAnimation : IDisposable
 {
     public Texture2D Texture { get; }
+    public Texture2D? FlashTexture { get; }
+    public SkinSparkleFlashInstance[] FlashInstances { get; }
+    public bool IsLayeredCrowd { get; }
     public int FrameWidth { get; }
     public int FrameHeight { get; }
     public int FrameCount { get; }
     public int Columns { get; }
     public int Rows { get; }
     public float Fps { get; }
+    internal VertexPositionColorTexture[]? FlashVertices { get; }
 
     public SkinSparkleAnimation(Texture2D texture, int frameWidth, int frameHeight, int frameCount, int columns, int rows, float fps)
     {
@@ -1994,9 +2017,39 @@ public sealed class SkinSparkleAnimation : IDisposable
         Columns = columns;
         Rows = rows;
         Fps = fps;
+        FlashInstances = Array.Empty<SkinSparkleFlashInstance>();
     }
 
-    public void Dispose() => Texture.Dispose();
+    public SkinSparkleAnimation(
+        Texture2D texture,
+        Texture2D flashTexture,
+        int frameWidth,
+        int frameHeight,
+        int layerCount,
+        int columns,
+        int rows,
+        SkinSparkleFlashInstance[] flashInstances)
+    {
+        Texture = texture;
+        FlashTexture = flashTexture;
+        FrameWidth = frameWidth;
+        FrameHeight = frameHeight;
+        FrameCount = layerCount;
+        Columns = columns;
+        Rows = rows;
+        Fps = 0f;
+        FlashInstances = flashInstances;
+        FlashVertices = flashInstances.Length > 0
+            ? new VertexPositionColorTexture[flashInstances.Length * 6]
+            : Array.Empty<VertexPositionColorTexture>();
+        IsLayeredCrowd = true;
+    }
+
+    public void Dispose()
+    {
+        Texture.Dispose();
+        FlashTexture?.Dispose();
+    }
 }
 
 public sealed class SkinDrawCommand
@@ -2569,7 +2622,8 @@ public sealed class SkinRuntime : IDisposable
         float CycleMin, float CycleMax,
         float FlashWidthMin, float FlashWidthMax,
         float Brightness, float Sharpness, float BurstChance,
-        float MinJump, float MaxJump, float DistributionBias, float Seed);
+        float MinJump, float MaxJump, float DistributionBias, float Seed,
+        bool LayeredCrowd, int LayerCount);
 
     private sealed class SkinLayoutNode
     {
@@ -5538,7 +5592,8 @@ public sealed class SkinRuntime : IDisposable
             settings.CycleMin, settings.CycleMax,
             settings.FlashWidthMin, settings.FlashWidthMax,
             settings.Brightness, settings.Sharpness, settings.BurstChance,
-            settings.MinJump, settings.MaxJump, settings.DistributionBias, settings.Seed);
+            settings.MinJump, settings.MaxJump, settings.DistributionBias, settings.Seed,
+            LayeredCrowd: false, LayerCount: 0);
 
         if (_skinSparkleAnimations.TryGetValue(key, out var cached))
             return cached;
@@ -5681,6 +5736,229 @@ public sealed class SkinRuntime : IDisposable
             graphics.RasterizerState = oldRasterizer;
             graphics.SamplerStates[0] = oldSampler;
         }
+    }
+
+    private SkinSparkleAnimation GetOrBakeLayeredCrowdSparkles(
+        SkinSparkleSettings settings,
+        int width,
+        int height,
+        int bakeWidth,
+        int bakeHeight,
+        int layerCount)
+    {
+        layerCount = Math.Clamp(layerCount, 1, 16);
+        const int layerColumns = 2;
+        const int flashSize = 512;
+        const int maxAtlasDimension = 8192;
+        var layerRows = (layerCount + layerColumns - 1) / layerColumns;
+        var atlasWidth = checked(bakeWidth * layerColumns);
+        var atlasHeight = checked(bakeHeight * layerRows);
+        if (atlasWidth > maxAtlasDimension || atlasHeight > maxAtlasDimension)
+        {
+            throw new InvalidOperationException(
+                $"draw.sparkles() layered bake is too large for the {maxAtlasDimension}×{maxAtlasDimension} atlas limit " +
+                $"({atlasWidth}×{atlasHeight}). Lower bake_width, bake_height, or layer_count.");
+        }
+
+        var key = new SkinSparkleBakeKey(
+            $"procedural-crowd-v7-independent-green-chance-original-glow:{layerCount}",
+            0, 0,
+            bakeWidth, bakeHeight, 0f,
+            settings.GridX, settings.GridY, settings.Density,
+            settings.MinSize, settings.MaxSize,
+            settings.CycleMin, settings.CycleMax,
+            settings.FlashWidthMin, settings.FlashWidthMax,
+            settings.Brightness, settings.Sharpness, settings.BurstChance,
+            settings.MinJump, settings.MaxJump, settings.DistributionBias, settings.Seed,
+            LayeredCrowd: true, LayerCount: layerCount);
+
+        if (_skinSparkleAnimations.TryGetValue(key, out var cached))
+            return cached;
+        if (_skinSparklesEffect is null)
+            throw new InvalidOperationException("Skin sparkle bake effect is unavailable.");
+
+        RenderTarget2D? atlas = null;
+        RenderTarget2D? flash = null;
+        var graphics = _graphics;
+        var oldTarget = graphics.GetRenderTargets();
+        var oldViewport = graphics.Viewport;
+        var oldBlend = graphics.BlendState;
+        var oldDepth = graphics.DepthStencilState;
+        var oldRasterizer = graphics.RasterizerState;
+        var oldSampler = graphics.SamplerStates[0];
+
+        try
+        {
+            atlas = NativeResourceDiagnostics.TrackTexture(
+                new RenderTarget2D(
+                    graphics,
+                    atlasWidth,
+                    atlasHeight,
+                    false,
+                    SurfaceFormat.Color,
+                    DepthFormat.None,
+                    0,
+                    RenderTargetUsage.PreserveContents),
+                NativeResourceCategory.Skin);
+
+            graphics.SetRenderTarget(atlas);
+            graphics.Viewport = new Viewport(0, 0, atlasWidth, atlasHeight);
+            graphics.BlendState = BlendState.Opaque;
+            graphics.DepthStencilState = DepthStencilState.None;
+            graphics.RasterizerState = RasterizerState.CullNone;
+            graphics.SamplerStates[0] = SamplerState.LinearClamp;
+            graphics.Clear(XnaColor.Transparent);
+
+            var ortho = Microsoft.Xna.Framework.Matrix.CreateOrthographicOffCenter(
+                0f, bakeWidth, bakeHeight, 0f, 0f, 1f);
+            var quad = new VertexPositionColorTexture[6]
+            {
+                new(new Vector3(0f, 0f, 0f), XnaColor.White, new Vector2(0f, 0f)),
+                new(new Vector3(bakeWidth, 0f, 0f), XnaColor.White, new Vector2(1f, 0f)),
+                new(new Vector3(bakeWidth, bakeHeight, 0f), XnaColor.White, new Vector2(1f, 1f)),
+                new(new Vector3(0f, 0f, 0f), XnaColor.White, new Vector2(0f, 0f)),
+                new(new Vector3(bakeWidth, bakeHeight, 0f), XnaColor.White, new Vector2(1f, 1f)),
+                new(new Vector3(0f, bakeHeight, 0f), XnaColor.White, new Vector2(0f, 1f))
+            };
+
+            _skinSparklesEffect.Parameters["WorldViewProjection"]?.SetValue(ortho);
+            _skinSparklesEffect.Parameters["CrowdResolution"]?.SetValue(new Vector2(bakeWidth, bakeHeight));
+            _skinSparklesEffect.Parameters["LayerCount"]?.SetValue((float)layerCount);
+            _skinSparklesEffect.Parameters["CrowdSeed"]?.SetValue(settings.Seed);
+
+            foreach (var pass in _skinSparklesEffect.Techniques["BakedCrowdLayer"].Passes)
+            {
+                for (var layer = 0; layer < layerCount; layer++)
+                {
+                    var column = layer % layerColumns;
+                    var row = layer / layerColumns;
+                    graphics.Viewport = new Viewport(
+                        column * bakeWidth,
+                        row * bakeHeight,
+                        bakeWidth,
+                        bakeHeight);
+                    _skinSparklesEffect.Parameters["LayerIndex"]?.SetValue((float)layer);
+                    pass.Apply();
+                    graphics.DrawUserPrimitives(
+                        PrimitiveType.TriangleList,
+                        quad,
+                        0,
+                        2);
+                }
+            }
+
+            flash = NativeResourceDiagnostics.TrackTexture(
+                new RenderTarget2D(
+                    graphics,
+                    flashSize,
+                    flashSize,
+                    false,
+                    SurfaceFormat.Color,
+                    DepthFormat.None,
+                    0,
+                    RenderTargetUsage.PreserveContents),
+                NativeResourceCategory.Skin);
+
+            graphics.SetRenderTarget(flash);
+            graphics.Viewport = new Viewport(0, 0, flashSize, flashSize);
+            graphics.BlendState = BlendState.Opaque;
+            graphics.Clear(XnaColor.Transparent);
+            var flashOrtho = Microsoft.Xna.Framework.Matrix.CreateOrthographicOffCenter(
+                0f, flashSize, flashSize, 0f, 0f, 1f);
+            var flashQuad = new VertexPositionColorTexture[6]
+            {
+                new(new Vector3(0f, 0f, 0f), XnaColor.White, new Vector2(0f, 0f)),
+                new(new Vector3(flashSize, 0f, 0f), XnaColor.White, new Vector2(1f, 0f)),
+                new(new Vector3(flashSize, flashSize, 0f), XnaColor.White, new Vector2(1f, 1f)),
+                new(new Vector3(0f, 0f, 0f), XnaColor.White, new Vector2(0f, 0f)),
+                new(new Vector3(flashSize, flashSize, 0f), XnaColor.White, new Vector2(1f, 1f)),
+                new(new Vector3(0f, flashSize, 0f), XnaColor.White, new Vector2(0f, 1f))
+            };
+            _skinSparklesEffect.Parameters["WorldViewProjection"]?.SetValue(flashOrtho);
+            _skinSparklesEffect.Parameters["CrowdResolution"]?.SetValue(new Vector2(bakeWidth, bakeHeight));
+            foreach (var pass in _skinSparklesEffect.Techniques["BakedPurpleFlash"].Passes)
+            {
+                pass.Apply();
+                graphics.DrawUserPrimitives(
+                    PrimitiveType.TriangleList,
+                    flashQuad,
+                    0,
+                    2);
+            }
+
+            graphics.Viewport = oldViewport;
+            graphics.SetRenderTargets(oldTarget);
+
+            var flashInstances = CreateCrowdFlashInstances(settings.Seed);
+            var animation = new SkinSparkleAnimation(
+                atlas,
+                flash,
+                bakeWidth,
+                bakeHeight,
+                layerCount,
+                layerColumns,
+                layerRows,
+                flashInstances);
+            _skinSparkleAnimations[key] = animation;
+            atlas = null;
+            flash = null;
+            return animation;
+        }
+        catch
+        {
+            atlas?.Dispose();
+            flash?.Dispose();
+            throw;
+        }
+        finally
+        {
+            graphics.Viewport = oldViewport;
+            graphics.SetRenderTargets(oldTarget);
+            graphics.BlendState = oldBlend;
+            graphics.DepthStencilState = oldDepth;
+            graphics.RasterizerState = oldRasterizer;
+            graphics.SamplerStates[0] = oldSampler;
+        }
+    }
+
+    private static SkinSparkleFlashInstance[] CreateCrowdFlashInstances(float seed)
+    {
+        // Use independent, randomly phased timers rather than a spatial grid.
+        // Each instance selects a fresh position every time its flash fires.
+        const int flashCount = 32;
+        var result = new SkinSparkleFlashInstance[flashCount];
+
+        for (var index = 0; index < flashCount; index++)
+        {
+            var cellX = index + 0.731f;
+            var cellY = index * 3.17f + 0.219f;
+            var r1 = HashCrowd21(cellX + 123.4f + seed, cellY + 56.7f + seed);
+            var r2 = HashCrowd21(cellX + 89.1f + seed, cellY + 23.4f + seed);
+            var r3 = HashCrowd21(cellX + 45.6f + seed, cellY + 78.9f + seed);
+            var r4 = HashCrowd21(cellX + 11.2f + seed, cellY + 93.8f + seed);
+
+            result[index] = new SkinSparkleFlashInstance(
+                SizeScale: 0.82f + r1 * 0.36f,
+                Phase: r2,
+                // More instances and shorter intervals produce roughly three
+                // simultaneous camera flashes on average without turning the
+                // effect into a continuous glow.
+                CycleSeconds: 0.55f + r3 * 0.90f,
+                RandomSeed: r4 * 997.0f + index * 13.37f + seed);
+        }
+
+        return result;
+    }
+
+    private static float HashCrowd21(float x, float y)
+    {
+        static float Fract(float value) => value - MathF.Floor(value);
+        var px = Fract(x * 123.34f);
+        var py = Fract(y * 456.21f);
+        var dot = px * (px + 45.32f) + py * (py + 45.32f);
+        px += dot;
+        py += dot;
+        return Fract(px * py);
     }
 
     /// <summary>
@@ -5829,15 +6107,303 @@ public sealed class SkinRuntime : IDisposable
         return new Vector2(worldWidth, worldHeight);
     }
 
+    private void RenderLayeredCrowdSparklesQuad3D(
+        SkinDrawCommand command,
+        SkinSparkleAnimation animation,
+        int width,
+        int height)
+    {
+        if (animation.FrameCount <= 0 || animation.Columns <= 0 || animation.Rows <= 0)
+            return;
+
+        var graphics = _graphics;
+        var oldBlend = graphics.BlendState;
+        var oldDepth = graphics.DepthStencilState;
+        var oldRasterizer = graphics.RasterizerState;
+        var oldSampler = graphics.SamplerStates[0];
+        try
+        {
+            // The procedural crowd textures are baked with premultiplied alpha
+            // using the source shader's normal compositing. Do not use the
+            // legacy additive sparkle blend for this mode.
+            graphics.BlendState = BlendState.AlphaBlend;
+            graphics.DepthStencilState = DepthStencilState.None;
+            graphics.RasterizerState = RasterizerState.CullNone;
+            graphics.SamplerStates[0] = SamplerState.LinearClamp;
+
+            var screenWidth = Math.Max(1f, width);
+            var screenHeight = Math.Max(1f, height);
+            const float fov = MathF.PI / 3f;
+            var cameraDistance = screenHeight / (2f * MathF.Tan(fov * 0.5f));
+            var renderSize = command.ScreenSpaceSizing
+                ? ResolveSkin3DScreenSpaceSize(command, screenWidth, screenHeight)
+                : command.Size;
+            var w = renderSize.X;
+            var h = renderSize.Y;
+            var pivotLocal = new Vector3(
+                w * (command.Pivot.X - command.Anchor.X),
+                h * (command.Anchor.Y - command.Pivot.Y),
+                0f);
+            var rotation = Microsoft.Xna.Framework.Matrix.CreateFromYawPitchRoll(
+                command.RotationY,
+                command.RotationX,
+                command.RotationZ);
+            var worldOrigin = Microsoft.Xna.Framework.Matrix.CreateTranslation(
+                command.Position.X - screenWidth * 0.5f,
+                screenHeight * 0.5f - command.Position.Y,
+                command.Depth);
+            var baseWorld =
+                Microsoft.Xna.Framework.Matrix.CreateTranslation(-pivotLocal) *
+                rotation *
+                Microsoft.Xna.Framework.Matrix.CreateTranslation(pivotLocal) *
+                worldOrigin;
+
+            _skin3DEffect.View = Microsoft.Xna.Framework.Matrix.CreateLookAt(
+                new Vector3(0f, 0f, cameraDistance), Vector3.Zero, Vector3.Up);
+            _skin3DEffect.Projection = Microsoft.Xna.Framework.Matrix.CreatePerspectiveFieldOfView(
+                fov, screenWidth / screenHeight, 1f, Math.Max(4096f, cameraDistance * 8f));
+            var baseDiffuseColor = new Vector3(
+                command.Color.R / 255f,
+                command.Color.G / 255f,
+                command.Color.B / 255f);
+            _skin3DEffect.DiffuseColor = baseDiffuseColor;
+
+            var left = -w * command.Anchor.X;
+            var right = w * (1f - command.Anchor.X);
+            var top = h * command.Anchor.Y;
+            var bottom = -h * (1f - command.Anchor.Y);
+            var atlas = animation.Texture;
+            var baseAlpha = Math.Clamp(command.Alpha * command.Color.A / 255f, 0f, 1f);
+            var layerCount = Math.Min(animation.FrameCount, animation.Columns * animation.Rows);
+            const float jumpSharpness = 0.85f;
+            // Keep the original 0.32s jump-up/down motion, then give each
+            // layer a short 0.10s rest before the next jump. During that rest,
+            // choose the orientation for the upcoming cycle so the baked layer
+            // can be reused in four mirrored variants without extra textures.
+            const float jumpDurationSeconds = 0.32f;
+            const float jumpRestSeconds = 0.10f;
+            var layerCycleSeconds = jumpDurationSeconds + jumpRestSeconds;
+            // Move the layer along the camera axis instead of lifting it in
+            // screen/world Y. Perspective projection makes it grow as it
+            // approaches the camera and shrink as it recedes. The per-layer
+            // variation keeps the eight depth paths from feeling identical.
+            const float depthTravelScale = 0.045f;
+            const float depthTravelVariation = 0.012f;
+            const float pi = MathF.PI;
+
+            // Each texture is one disjoint eighth of the particle field. A
+            // staggered whole-layer jump/fade replaces per-particle animation.
+            for (var layerIndex = 0; layerIndex < layerCount; layerIndex++)
+            {
+                var layerOffsetSeconds = layerCycleSeconds * layerIndex / Math.Max(1, layerCount);
+                var layerElapsed = _skinEffectTime + layerOffsetSeconds;
+                var layerCycleIndex = Math.Floor(layerElapsed / layerCycleSeconds);
+                var layerCycleTime = layerElapsed - layerCycleIndex * layerCycleSeconds;
+                var pulse = 0f;
+                if (layerCycleTime < jumpDurationSeconds)
+                {
+                    var jumpPhase = (float)(layerCycleTime / jumpDurationSeconds);
+                    pulse = MathF.Pow(
+                        MathF.Max(MathF.Sin(pi * jumpPhase), 0f),
+                        jumpSharpness);
+                }
+                var alpha = baseAlpha * pulse;
+                if (alpha <= 0.001f)
+                    continue;
+
+                var variation = HashCrowd21(layerIndex + 17.2f, 93.4f);
+                var depthTravel = screenHeight *
+                    (depthTravelScale + variation * depthTravelVariation);
+                // pulse 0 = closest point; pulse 1 = farthest point.
+                // Each layer starts near the camera, moves away through the
+                // middle of its jump, then returns close before it rests.
+                // The negative Z direction is away from this camera.
+                var depthOffset = (1f - pulse * 2f) * depthTravel;
+                var column = layerIndex % animation.Columns;
+                var row = layerIndex / animation.Columns;
+                // Inset to texel centers so linear filtering cannot sample the
+                // adjacent packed layer at atlas cell boundaries.
+                var u0 = (column * animation.FrameWidth + 0.5f) / atlas.Width;
+                var v0 = (row * animation.FrameHeight + 0.5f) / atlas.Height;
+                var u1 = ((column + 1) * animation.FrameWidth - 0.5f) / atlas.Width;
+                var v1 = ((row + 1) * animation.FrameHeight - 0.5f) / atlas.Height;
+
+                // Select the next orientation during the invisible rest. The
+                // upcoming cycle index is used while resting; once the jump
+                // begins, the same orientation remains for the full jump.
+                var orientationCycleIndex = layerCycleIndex +
+                    (layerCycleTime >= jumpDurationSeconds ? 1d : 0d);
+                var orientationCycleSeed = (float)orientationCycleIndex;
+                var randomFlipHorizontal = HashCrowd21(
+                    layerIndex * 17.71f + 31.3f,
+                    orientationCycleSeed * 53.11f + 7.7f) < 0.5f;
+                var randomFlipVertical = HashCrowd21(
+                    layerIndex * 41.93f + 13.2f,
+                    orientationCycleSeed * 29.73f + 91.4f) < 0.5f;
+                var flipHorizontal = randomFlipHorizontal ^
+                    ((command.SpriteEffects & SpriteEffects.FlipHorizontally) != 0);
+                var flipVertical = randomFlipVertical ^
+                    ((command.SpriteEffects & SpriteEffects.FlipVertically) != 0);
+
+                if (flipHorizontal)
+                    (u0, u1) = (u1, u0);
+                if (flipVertical)
+                    (v0, v1) = (v1, v0);
+
+                // Give each layer an independent 40% chance of using the soft
+                // green tint for this jump only. Hash both the layer and its
+                // cycle index so layers do not change colour in lockstep, and
+                // each layer can make a fresh decision on its next cycle.
+                var greenRoll = HashCrowd21(
+                    layerIndex * 37.17f + 11.3f,
+                    (float)layerCycleIndex * 71.93f + 5.1f);
+                var isGreenCycle = greenRoll < 0.40f;
+                var softGreenTint = new Vector3(0.72f, 1.08f, 0.62f);
+                _skin3DEffect.DiffuseColor = baseDiffuseColor *
+                    (isGreenCycle ? softGreenTint : Vector3.One);
+
+                _skin3DEffect.World = baseWorld *
+                    Microsoft.Xna.Framework.Matrix.CreateTranslation(0f, 0f, depthOffset);
+                _skin3DEffect.Texture = atlas;
+                _skin3DEffect.Alpha = alpha;
+                _skin3DQuadVertices[0] = new VertexPositionColorTexture(
+                    new Vector3(left, top, 0f), XnaColor.White, new Vector2(u0, v0));
+                _skin3DQuadVertices[1] = new VertexPositionColorTexture(
+                    new Vector3(right, top, 0f), XnaColor.White, new Vector2(u1, v0));
+                _skin3DQuadVertices[2] = new VertexPositionColorTexture(
+                    new Vector3(right, bottom, 0f), XnaColor.White, new Vector2(u1, v1));
+                _skin3DQuadVertices[3] = _skin3DQuadVertices[0];
+                _skin3DQuadVertices[4] = _skin3DQuadVertices[2];
+                _skin3DQuadVertices[5] = new VertexPositionColorTexture(
+                    new Vector3(left, bottom, 0f), XnaColor.White, new Vector2(u0, v1));
+
+                foreach (var pass in _skin3DEffect.CurrentTechnique.Passes)
+                {
+                    pass.Apply();
+                    graphics.DrawUserPrimitives(
+                        PrimitiveType.TriangleList,
+                        _skin3DQuadVertices,
+                        0,
+                        2);
+                }
+            }
+
+            // The purple cross/glow is baked once. Each independently timed
+            // instance gets a new pseudo-random plane position on every flash.
+            if (animation.FlashTexture is not null &&
+                animation.FlashInstances.Length > 0 &&
+                animation.FlashVertices is { Length: > 0 } flashVertices)
+            {
+                var activeVertices = 0;
+                // The larger bake contains the complete long ray tails. Scale
+                // the 3D quad from the texture's actual size so the shader-space
+                // star dimensions keep their intended world-space proportions.
+                var spriteSize = animation.FlashTexture.Width * h /
+                    Math.Max(1f, animation.FrameHeight);
+                const float flashDurationSeconds = 0.10f;
+                foreach (var star in animation.FlashInstances)
+                {
+                    // Each flash has its own randomized interval and phase.
+                    // Once it fires, its next event gets a new deterministic
+                    // random position, so the flashes don't remain in a grid.
+                    var cyclePosition = _skinEffectTime / star.CycleSeconds + star.Phase;
+                    var cycleIndex = Math.Floor(cyclePosition);
+                    var cyclePhase = (float)(cyclePosition - cycleIndex);
+                    var flashProgress = cyclePhase * star.CycleSeconds / flashDurationSeconds;
+                    if (flashProgress >= 1f)
+                        continue;
+
+                    // Camera-flash envelope: visible at half size, expands to
+                    // full size quickly, then falls away in a very short burst.
+                    var sizeProgress = Math.Clamp(flashProgress / 0.22f, 0f, 1f);
+                    sizeProgress = sizeProgress * sizeProgress * (3f - 2f * sizeProgress);
+                    var size = star.SizeScale * (0.5f + 0.5f * sizeProgress);
+                    var flash = MathF.Pow(MathF.Max(1f - flashProgress, 0f), 4.5f) * 0.95f;
+                    if (flash <= 0.001f)
+                        continue;
+
+                    var eventSeed = (float)cycleIndex;
+                    var u = 0.05f + 0.90f * HashCrowd21(
+                        eventSeed + star.RandomSeed * 1.71f + 12.3f,
+                        star.RandomSeed + 45.6f);
+                    var v = 0.07f + 0.86f * HashCrowd21(
+                        eventSeed + star.RandomSeed * 2.37f + 78.9f,
+                        star.RandomSeed + 11.2f);
+                    if ((command.SpriteEffects & SpriteEffects.FlipHorizontally) != 0)
+                        u = 1f - u;
+                    if ((command.SpriteEffects & SpriteEffects.FlipVertically) != 0)
+                        v = 1f - v;
+
+                    var centerX = left + u * w;
+                    var centerY = top - v * h;
+                    var half = spriteSize * size * 0.5f;
+                    var x0 = centerX - half;
+                    var x1 = centerX + half;
+                    var y0 = centerY + half;
+                    var y1 = centerY - half;
+                    var vertexColor = new XnaColor((byte)255, (byte)255, (byte)255,
+                        (byte)Math.Clamp((int)MathF.Round(flash * 255f), 0, 255));
+                    var index = activeVertices;
+                    flashVertices[index + 0] = new VertexPositionColorTexture(new Vector3(x0, y0, 0f), vertexColor, new Vector2(0f, 0f));
+                    flashVertices[index + 1] = new VertexPositionColorTexture(new Vector3(x1, y0, 0f), vertexColor, new Vector2(1f, 0f));
+                    flashVertices[index + 2] = new VertexPositionColorTexture(new Vector3(x1, y1, 0f), vertexColor, new Vector2(1f, 1f));
+                    flashVertices[index + 3] = flashVertices[index + 0];
+                    flashVertices[index + 4] = flashVertices[index + 2];
+                    flashVertices[index + 5] = new VertexPositionColorTexture(new Vector3(x0, y1, 0f), vertexColor, new Vector2(0f, 1f));
+                    activeVertices += 6;
+                }
+
+                if (activeVertices > 0)
+                {
+                    // Submit flashes after all dot layers and move the flash
+                    // plane slightly toward the camera. Depth is disabled for
+                    // this effect, so draw order guarantees the flashes blend
+                    // over the jumping dots wherever they overlap.
+                    _skin3DEffect.World = baseWorld *
+                        Microsoft.Xna.Framework.Matrix.CreateTranslation(0f, 0f, 1.5f);
+                    _skin3DEffect.DiffuseColor = baseDiffuseColor;
+                    _skin3DEffect.Texture = animation.FlashTexture;
+                    _skin3DEffect.Alpha = baseAlpha;
+                    foreach (var pass in _skin3DEffect.CurrentTechnique.Passes)
+                    {
+                        pass.Apply();
+                        graphics.DrawUserPrimitives(
+                            PrimitiveType.TriangleList,
+                            flashVertices,
+                            0,
+                            activeVertices / 3);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            graphics.BlendState = oldBlend;
+            graphics.DepthStencilState = oldDepth;
+            graphics.RasterizerState = oldRasterizer;
+            graphics.SamplerStates[0] = oldSampler;
+        }
+    }
+
+    private static float Fraction(double value) => (float)(value - Math.Floor(value));
+
     private void RenderSkinSparklesQuad3D(SkinDrawCommand command, int width, int height)
     {
-        if (command.Asset is null || command.Sparkles is null || width <= 0 || height <= 0 ||
+        if (command.Sparkles is null || width <= 0 || height <= 0 ||
             command.Size.X <= 0f || command.Size.Y <= 0f)
             return;
 
         var animation = command.SparkleAnimation;
         if (animation is null)
             return;
+        if (animation.IsLayeredCrowd)
+        {
+            RenderLayeredCrowdSparklesQuad3D(command, animation, width, height);
+            return;
+        }
+        if (command.Asset is null)
+            return;
+
         var texture = animation.Texture;
         var frame = (int)MathF.Floor((float)(_skinEffectTime * animation.Fps)) % animation.FrameCount;
         if (frame < 0)
@@ -6695,6 +7261,63 @@ public sealed class SkinRuntime : IDisposable
             true,
             UserData.Create(note),
             DynValue.NewNumber(Math.Max(0.0, realTime)));
+    }
+
+    /// <summary>
+    /// Reprojects active skin-owned hit effects immediately after the playfield view
+    /// changes. Optional so existing custom skins remain compatible.
+    /// </summary>
+    public void OnHitEffectViewChanged(
+        string view,
+        IReadOnlyList<SkinHitEffectProjectionView> projections)
+    {
+        if (_script is null)
+            return;
+
+        try
+        {
+            var function = _script.Globals.Get("on_hit_effect_view_changed");
+            if (function.Type != DataType.Function)
+                return;
+
+            var projectionTable = new Table(_script);
+            for (var i = 0; i < projections.Count; i++)
+            {
+                var projection = projections[i];
+                var row = new Table(_script);
+                row.Set("x", DynValue.NewNumber(projection.X));
+                row.Set("y", DynValue.NewNumber(projection.Y));
+                row.Set("scale", DynValue.NewNumber(projection.Scale));
+                row.Set("lane_rotation_depth_scale", DynValue.NewNumber(projection.LaneRotationDepthScale));
+                row.Set("rotation", DynValue.NewNumber(projection.Rotation));
+                projectionTable.Set(projection.Track + 1, DynValue.NewTable(row));
+            }
+
+            LastCallback = "on_hit_effect_view_changed";
+            CallbackCount++;
+            _script.Call(
+                function,
+                DynValue.NewString(string.Equals(view, "editor", StringComparison.OrdinalIgnoreCase) ? "editor" : "gameplay"),
+                DynValue.NewTable(projectionTable));
+        }
+        catch (Exception ex)
+        {
+            HandleScriptRuntimeFailure(ex, "on_hit_effect_view_changed");
+        }
+    }
+
+    /// <summary>
+    /// Notifies a skin that the chart playhead was moved. Optional so existing
+    /// skins remain compatible; the Default hit-effect renderer uses this to
+    /// discard effects from the future after a backwards seek.
+    /// </summary>
+    public void OnChartTimeJump(double previousSeconds, double currentSeconds)
+    {
+        InvokeOptional(
+            "on_chart_time_jump",
+            true,
+            DynValue.NewNumber(Math.Max(0.0, previousSeconds)),
+            DynValue.NewNumber(Math.Max(0.0, currentSeconds)));
     }
 
     private Table CreateAssetsApi(Script script)
@@ -7874,16 +8497,41 @@ public sealed class SkinRuntime : IDisposable
         }
     }
 
-    public double GetIntroHoldSeconds() => InvokeDuration("intro_duration");
-    public double GetOutroHoldSeconds() => InvokeDuration("outro_duration");
-    private double InvokeDuration(string functionName)
+    private const double MaxSkinIntroHoldSeconds = 120.0;
+    private const double MaxSkinOutroHoldSeconds = 30.0;
+
+    public double GetIntroHoldSeconds() => InvokeDuration("intro_duration", MaxSkinIntroHoldSeconds);
+    public double GetOutroHoldSeconds() => InvokeDuration("outro_duration", MaxSkinOutroHoldSeconds);
+
+    private double InvokeDuration(string functionName, double maximumSeconds)
     {
         if (_script is null || LastError is not null) return 0;
-        try { var fn = _script.Globals.Get(functionName); if (fn.Type != DataType.Function) return 0; var v = _script.Call(fn); return v.Type == DataType.Number ? Math.Clamp(v.Number, 0, 30) : 0; }
-        catch (Exception ex) { HandleScriptRuntimeFailure(ex, functionName); return 0; }
+        try
+        {
+            var fn = _script.Globals.Get(functionName);
+            if (fn.Type != DataType.Function) return 0;
+
+            var value = _script.Call(fn);
+            return value.Type == DataType.Number && double.IsFinite(value.Number)
+                ? Math.Clamp(value.Number, 0.0, maximumSeconds)
+                : 0.0;
+        }
+        catch (Exception ex)
+        {
+            HandleScriptRuntimeFailure(ex, functionName);
+            return 0;
+        }
     }
     public void PrepareGameplayAnimationFonts() => InvokeOptional("prepare_gameplay_animation_fonts", true, DynValue.NewBoolean(true));
+    public bool PrepareGameplayIntroResourcesStep(int maxAssets = 1) =>
+        InvokeOptionalBoolean("prepare_gameplay_intro_resources_step", true,
+            DynValue.NewNumber(Math.Max(1, maxAssets)));
+    public bool AreGameplayIntroAssetsReady =>
+        InvokeOptionalBoolean("gameplay_intro_assets_ready", true);
+    public bool IsGameplayIntroWarmupReady =>
+        InvokeOptionalBoolean("gameplay_intro_warmup_ready", true);
     public void OnGameplayPreparing() => InvokeOptional("on_gameplay_preparing", true);
+    public void PrepareGameplayIntroFrame() => InvokeOptional("prepare_gameplay_intro_frame", true);
     public void OnIntroStart()
     {
         SetPlayfieldLifecycle("intro", "gameplay_start");
@@ -9202,9 +9850,10 @@ public sealed class SkinRuntime : IDisposable
     }
 
     /// <summary>
-    /// draw.sparkles(options) submits a dedicated single-quad crowd-sparkle effect.
-    /// The optional images array supplies multiple sparkle textures; each sparkle
-    /// deterministically chooses one image for the baked animation.
+    /// draw.sparkles(options) submits a crowd-sparkle effect. The legacy mode
+    /// bakes supplied sparkle images into an animation atlas; the crowd_layers
+    /// mode bakes a procedural particle field into static layers and instances
+    /// one reusable flash sprite.
     /// </summary>
     private DynValue DrawSparkles(ScriptExecutionContext _, CallbackArguments args)
     {
@@ -9212,8 +9861,15 @@ public sealed class SkinRuntime : IDisposable
         try
         {
             var options = GetOptions(args, 0);
-            var sparkleAssetSet = LoadSparkleAssets(options);
-            var sparkleAssets = sparkleAssetSet.Assets;
+            var bakeMode = GetString(options, "bake_mode", "legacy");
+            var layeredCrowd = string.Equals(bakeMode, "crowd_layers", StringComparison.OrdinalIgnoreCase);
+            SkinSparkleAssetSet? sparkleAssetSet = null;
+            List<SkinAssetHandle>? sparkleAssets = null;
+            if (!layeredCrowd)
+            {
+                sparkleAssetSet = LoadSparkleAssets(options);
+                sparkleAssets = sparkleAssetSet.Assets;
+            }
             var x = GetNumber(options, "x", 0f);
             var y = GetNumber(options, "y", 0f);
             var z = GetNumber(options, "z", 0f);
@@ -9240,6 +9896,7 @@ public sealed class SkinRuntime : IDisposable
                 MaxJump = MathF.Max(0f, GetNumber(options, "max_jump", 0.07f)),
                 DistributionBias = Math.Clamp(GetNumber(options, "distribution_bias", 0f), -4f, 4f),
                 Seed = GetNumber(options, "seed", 0f),
+                LayerCount = Math.Clamp((int)MathF.Round(GetNumber(options, "layer_count", 8f)), 1, 16),
             };
 
             // Normalize dependent ranges just like the old effect implementation.
@@ -9252,7 +9909,8 @@ public sealed class SkinRuntime : IDisposable
                     FlashWidthMin = settings.FlashWidthMin, FlashWidthMax = settings.FlashWidthMax,
                     Brightness = settings.Brightness, Sharpness = settings.Sharpness,
                     BurstChance = settings.BurstChance, MinJump = settings.MinJump, MaxJump = settings.MaxJump,
-                    DistributionBias = settings.DistributionBias, Seed = settings.Seed
+                    DistributionBias = settings.DistributionBias, Seed = settings.Seed,
+                    LayerCount = settings.LayerCount
                 };
 
             var anchor = GetAnchor(options);
@@ -9297,19 +9955,27 @@ public sealed class SkinRuntime : IDisposable
                     ? Math.Max(1, (int)MathF.Round(bakeWidth / MathF.Max(0.0001f, displayAspect)))
                     : Math.Max(1, (int)MathF.Round(displayHeight * 0.25f)));
 
-            var bakedAnimation = GetOrBakeSparkleAnimation(
-                sparkleAssets,
-                sparkleAssetSet.TextureKey,
-                settings,
-                displayWidth,
-                displayHeight,
-                bakeWidth,
-                bakeHeight,
-                fps);
+            var bakedAnimation = layeredCrowd
+                ? GetOrBakeLayeredCrowdSparkles(
+                    settings,
+                    displayWidth,
+                    displayHeight,
+                    bakeWidth,
+                    bakeHeight,
+                    settings.LayerCount)
+                : GetOrBakeSparkleAnimation(
+                    sparkleAssets!,
+                    sparkleAssetSet!.TextureKey,
+                    settings,
+                    displayWidth,
+                    displayHeight,
+                    bakeWidth,
+                    bakeHeight,
+                    fps);
 
             var command = AcquireDrawCommand();
             command.Kind = SkinDrawCommandKind.Sparkles;
-            command.Asset = sparkleAssets[0];
+            command.Asset = sparkleAssets is { Count: > 0 } ? sparkleAssets[0] : null;
             command.Id = id;
             command.ParentId = parentId;
             command.Position = new Vector2((float)x, (float)y);
@@ -10711,6 +11377,27 @@ public sealed class SkinRuntime : IDisposable
         catch (Exception ex)
         {
             HandleScriptRuntimeFailure(ex, functionName);
+        }
+    }
+
+    private bool InvokeOptionalBoolean(string functionName, bool defaultValue, params DynValue[] args)
+    {
+        if (_script is null || LastError is not null)
+            return defaultValue;
+
+        try
+        {
+            var function = _script.Globals.Get(functionName);
+            if (function.IsNil() || function.Type != DataType.Function)
+                return defaultValue;
+
+            var result = _script.Call(function, args);
+            return result.Type == DataType.Boolean ? result.Boolean : defaultValue;
+        }
+        catch (Exception ex)
+        {
+            HandleScriptRuntimeFailure(ex, functionName);
+            return defaultValue;
         }
     }
 
