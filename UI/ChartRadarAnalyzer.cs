@@ -18,8 +18,8 @@ internal readonly record struct ChartComboDistribution(int Taps, int Longs, int 
 internal sealed record ChartRadarResult(
     double DurationSeconds,
     int ActiveEventCount,
-    ChartRadarMetric Taps,
-    ChartRadarMetric Longs,
+    ChartRadarMetric Notes,
+    ChartRadarMetric Chords,
     ChartRadarMetric Slides,
     ChartRadarMetric Flicks,
     ChartRadarMetric Stream,
@@ -32,21 +32,25 @@ internal sealed record ChartRadarResult(
 /// </summary>
 internal static class ChartRadarAnalyzer
 {
-    // TAPS, LONGS, SLIDES and FLICKS use the same combo-per-minute unit and the
-    // exact same intended-route counts as Song Select's Combo Distribution. Each
-    // axis has its own stock-calibrated reference (TAPS 390, LONGS 300, SLIDES
-    // 250, FLICKS 50 combos/min) so one category does not inherit another's
-    // typical density. The skin never needs to implement this.
-    // SC charts are excluded, including SC patterns labelled level 10.
-    // STREAM and TRAVEL remain independent timing measurements with their own
-    // stock references. Values are unbounded; the renderer alone caps overflow
-    // graphics at 200%. Keep calibration values centralized here.
-    private const double TapsReferencePerMinute = 390.0;
-    private const double LongsReferencePerMinute = 300.0;
-    private const double SlidesReferencePerMinute = 250.0;
-    private const double FlicksReferencePerMinute = 50.0;
-    private const double StreamReferencePerSecond = 11.0;
-    private const double TravelReferencePerMinute = 990.0;
+    // NOTES and CHORDS both use active playable note starts. NOTES counts every
+    // distinct start per playable minute; CHORDS counts only additional starts
+    // sharing an exact tick. Include Single, SingleLong, Vibrato, and LinkHead
+    // events (ordinary taps, holds, flicks/SuperFlicks, and slide starts).
+    // LinkTails are continuation points, not independent input starts. SLIDES
+    // measures starts plus lane-path movement and direction reversals; held
+    // duration contributes nothing to that axis.
+    // LONGS remains in Combo Distribution only.
+    // Current provisional nearest-rank P90 references from the 228 stock Expert charts.
+    // FLICKS and TRAVEL use per-minute chart rates; STREAM uses each chart's own
+    // onset-window P90. SC charts are excluded, including SC patterns labelled
+    // level 10. Values are unbounded;
+    // the renderer alone caps overflow graphics at 200%.
+    private const double NotesReferencePerMinute = 404.55508474576266;
+    private const double ChordsReferencePerMinute = 90.57;
+    private const double SlidesReferencePerMinute = 136.08;
+    private const double FlicksReferencePerMinute = 34.28235294117647;
+    private const double StreamReferencePerSecond = 10.0;
+    private const double TravelReferencePerMinute = 858.8734010673323;
     private const double StreamWindowSeconds = 2.0;
 
     private readonly record struct TravelCandidate(
@@ -116,9 +120,9 @@ internal static class ChartRadarAnalyzer
         // Per-category stock references normalize the timing density without
         // changing the underlying category counts or their Combo Distribution.
         var comboDistribution = CalculateComboDistribution(chart, activeEvents, timeline, tempo);
-        var tapRate = comboDistribution.Taps / minutes;
-        var longRate = comboDistribution.Longs / minutes;
-        var slideRate = comboDistribution.Slides / minutes;
+        var noteRate = CountNoteStarts(activeEvents) / minutes;
+        var chordRate = CalculateChordUnits(activeEvents) / minutes;
+        var slideRate = CalculateSlideComplexityUnits(chart, activeEvents) / minutes;
         var flickRate = comboDistribution.Flicks / minutes;
 
         // Stream density is based on actual tap onsets. A LinkHead is tapped,
@@ -137,9 +141,9 @@ internal static class ChartRadarAnalyzer
         return new ChartRadarResult(
             durationSeconds,
             activeEvents.Length,
-            Metric(tapRate, TapsReferencePerMinute, "combos/min"),
-            Metric(longRate, LongsReferencePerMinute, "combos/min"),
-            Metric(slideRate, SlidesReferencePerMinute, "combos/min"),
+            Metric(noteRate, NotesReferencePerMinute, "notes/min"),
+            Metric(chordRate, ChordsReferencePerMinute, "chord units/min"),
+            Metric(slideRate, SlidesReferencePerMinute, "complexity units/min"),
             Metric(flickRate, FlicksReferencePerMinute, "combos/min"),
             Metric(streamRate, StreamReferencePerSecond, "onsets/sec"),
             Metric(travelRate, TravelReferencePerMinute, "travel units/min"),
@@ -159,17 +163,7 @@ internal static class ChartRadarAnalyzer
         GearTimeline routeTimeline,
         TempoMap tempo)
     {
-        var nextLinkByHead = new Dictionary<(int Tick, int Track, int EventIndex), ChartEvent>();
-        foreach (var link in chart.Links)
-        {
-            var headKey = (link.Head.Tick, link.Head.Track, link.Head.EventIndex);
-            if (!nextLinkByHead.TryGetValue(headKey, out var existing) ||
-                link.Tail.Tick < existing.Tick ||
-                (link.Tail.Tick == existing.Tick && link.Tail.Track < existing.Track))
-            {
-                nextLinkByHead[headKey] = link.Tail;
-            }
-        }
+        var nextLinkByHead = BuildNextLinkLookup(chart.Links);
 
         var taps = 0;
         var longs = 0;
@@ -200,6 +194,137 @@ internal static class ChartRadarAnalyzer
         }
 
         return new ChartComboDistribution(taps, longs, slides, flicks);
+    }
+
+
+    private static int CountNoteStarts(ChartEvent[] activeEvents)
+    {
+        // Count each active authored input once. LinkTail is not a new input;
+        // complementary twin records (for example, paired SingleLong/Vibrato
+        // representations) describe one authored start and are collapsed.
+        var count = 0;
+        var seenTwinPairs = new HashSet<(int Tick, int PairId)>();
+
+        foreach (var ev in activeEvents)
+        {
+            if (!IsChordInputStart(ev))
+                continue;
+
+            if (ev.TwinPairId is int pairId && !seenTwinPairs.Add((ev.Tick, pairId)))
+                continue;
+
+            count++;
+        }
+
+        return count;
+    }
+
+    private static int CalculateChordUnits(ChartEvent[] activeEvents)
+    {
+        // A chord is any group of two or more playable input starts at the exact
+        // same chart tick, regardless of note type. LinkTails are deliberately
+        // excluded: they continue an existing link path rather than introducing
+        // another input start. Twin-paired event representations describe one
+        // authored input, so collapse them before counting simultaneous inputs.
+        // Count only the additional inputs: 2 -> 1, 3 -> 2, 4 -> 3.
+        var countsByTick = new Dictionary<int, int>();
+        var seenTwinPairs = new HashSet<(int Tick, int PairId)>();
+
+        foreach (var ev in activeEvents)
+        {
+            if (!IsChordInputStart(ev))
+                continue;
+
+            if (ev.TwinPairId is int pairId && !seenTwinPairs.Add((ev.Tick, pairId)))
+                continue;
+
+            countsByTick[ev.Tick] = countsByTick.GetValueOrDefault(ev.Tick) + 1;
+        }
+
+        return countsByTick.Values.Sum(count => Math.Max(0, count - 1));
+    }
+
+    private static bool IsChordInputStart(ChartEvent ev)
+        => ev.NoteType is NoteType.Single or NoteType.SingleLong or NoteType.LinkHead or NoteType.Vibrato;
+
+    private static double CalculateSlideComplexityUnits(
+        AresChart chart,
+        ChartEvent[] activeEvents)
+    {
+        var nextLinkByHead = BuildNextLinkLookup(chart.Links);
+        var activeSet = new HashSet<ChartEvent>(activeEvents, ReferenceEqualityComparer.Instance);
+        var total = 0.0;
+
+        foreach (var root in activeEvents.Where(ev => ev.NoteType == NoteType.LinkHead))
+        {
+            // Each LinkHead is an executed slide start. Repeated shapes still
+            // count every time; there is no duration bonus or repetition discount.
+            total += 1.0;
+            var nodes = BuildLinkChain(root, nextLinkByHead);
+            var previousDirection = 0;
+
+            for (var i = 1; i < nodes.Count; i++)
+            {
+                var previous = nodes[i - 1];
+                var current = nodes[i];
+
+                // Only score a path segment when both endpoints are playable on
+                // the authored route. A route break starts a fresh direction run.
+                if (!activeSet.Contains(previous) || !activeSet.Contains(current))
+                {
+                    previousDirection = 0;
+                    continue;
+                }
+
+                var previousPosition = GearState.Position(previous.Track);
+                var currentPosition = GearState.Position(current.Track);
+                if (previousPosition is null || currentPosition is null ||
+                    !string.Equals(previousPosition.Value.Side, currentPosition.Value.Side, StringComparison.Ordinal) ||
+                    !string.Equals(previousPosition.Value.Bank, currentPosition.Value.Bank, StringComparison.Ordinal))
+                {
+                    previousDirection = 0;
+                    continue;
+                }
+
+                // Center/2K uses two physical lanes, so map its positions to 0/2
+                // and keep its movement scale consistent with 1K and 3K.
+                var previousLane = previousPosition.Value.Bank == "Center"
+                    ? previousPosition.Value.LocalPos * 2
+                    : previousPosition.Value.LocalPos;
+                var currentLane = currentPosition.Value.Bank == "Center"
+                    ? currentPosition.Value.LocalPos * 2
+                    : currentPosition.Value.LocalPos;
+                var movement = currentLane - previousLane;
+                total += Math.Abs(movement) * 0.25;
+
+                var direction = Math.Sign(movement);
+                if (direction != 0)
+                {
+                    if (previousDirection != 0 && direction != previousDirection)
+                        total += 1.5;
+                    previousDirection = direction;
+                }
+            }
+        }
+
+        return total;
+    }
+
+    private static Dictionary<(int Tick, int Track, int EventIndex), ChartEvent> BuildNextLinkLookup(
+        IEnumerable<LinkSegment> links)
+    {
+        var nextLinkByHead = new Dictionary<(int Tick, int Track, int EventIndex), ChartEvent>();
+        foreach (var link in links)
+        {
+            var headKey = (link.Head.Tick, link.Head.Track, link.Head.EventIndex);
+            if (!nextLinkByHead.TryGetValue(headKey, out var existing) ||
+                link.Tail.Tick < existing.Tick ||
+                (link.Tail.Tick == existing.Tick && link.Tail.Track < existing.Track))
+            {
+                nextLinkByHead[headKey] = link.Tail;
+            }
+        }
+        return nextLinkByHead;
     }
 
     private static List<ChartEvent> BuildLinkChain(

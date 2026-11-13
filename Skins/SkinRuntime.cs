@@ -2143,6 +2143,7 @@ public sealed class SkinDrawCommand
     public XnaColor ChartPanelGuideColor { get; internal set; } = new(115, 153, 174, 195);
     public XnaColor ChartPanelBarBackgroundColor { get; internal set; } = new(27, 40, 53, 225);
     public XnaColor ChartPanelTapsColor { get; internal set; } = new(82, 181, 255);
+    public XnaColor ChartPanelChordsColor { get; internal set; } = new(65, 205, 168);
     public XnaColor ChartPanelLongsColor { get; internal set; } = new(65, 205, 168);
     public XnaColor ChartPanelSlidesColor { get; internal set; } = new(177, 130, 255);
     public XnaColor ChartPanelFlicksColor { get; internal set; } = new(255, 173, 82);
@@ -2226,6 +2227,7 @@ public sealed class SkinDrawCommand
         ChartPanelGuideColor = new XnaColor(115, 153, 174, 195);
         ChartPanelBarBackgroundColor = new XnaColor(27, 40, 53, 225);
         ChartPanelTapsColor = new XnaColor(82, 181, 255);
+        ChartPanelChordsColor = new XnaColor(65, 205, 168);
         ChartPanelLongsColor = new XnaColor(65, 205, 168);
         ChartPanelSlidesColor = new XnaColor(177, 130, 255);
         ChartPanelFlicksColor = new XnaColor(255, 173, 82);
@@ -10328,6 +10330,7 @@ public sealed class SkinRuntime : IDisposable
         command.ChartPanelGuideColor = GetColor(options, "guide_color", command.ChartPanelGuideColor);
         command.ChartPanelBarBackgroundColor = GetColor(options, "bar_background_color", command.ChartPanelBarBackgroundColor);
         command.ChartPanelTapsColor = GetColor(options, "taps_color", command.ChartPanelTapsColor);
+        command.ChartPanelChordsColor = GetColor(options, "chords_color", command.ChartPanelChordsColor);
         command.ChartPanelLongsColor = GetColor(options, "longs_color", command.ChartPanelLongsColor);
         command.ChartPanelSlidesColor = GetColor(options, "slides_color", command.ChartPanelSlidesColor);
         command.ChartPanelFlicksColor = GetColor(options, "flicks_color", command.ChartPanelFlicksColor);

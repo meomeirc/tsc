@@ -139,6 +139,12 @@ public sealed class SongSelectMenu : IDisposable
     private readonly SpriteFont _font;
     private readonly SpriteBatch _spriteBatch;
     private readonly Texture2D _pixel;
+    // Reused for the small value-colored radar overflow mesh. Keeping the effect
+    // and its vertex storage with SongSelectMenu avoids per-frame GPU allocations.
+    private readonly BasicEffect _chartPanelOverflowEffect;
+    private readonly VertexPositionColor[] _chartPanelOverflowVertices = new VertexPositionColor[36];
+    private readonly VertexPositionColor[] _chartPanelOverflowOutlineVertices = new VertexPositionColor[36];
+    private readonly Vector2[] _chartPanelClippedFillVertices = new Vector2[24];
     private readonly string _songsRoot;
     private readonly HashSet<string> _importedBundlePaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _songSelectStateDirectory;
@@ -205,6 +211,58 @@ public sealed class SongSelectMenu : IDisposable
     // The cover overlay cycles through difficulty radar, combo distribution, and hidden.
     // Its mode is controlled by the configurable Gameplay chart-panel keybind.
     private enum ChartPanelMode { DifficultyRadar, ComboDistribution, Hidden }
+
+    // Floating-point display values let both the radar polygon and combo bars
+    // interpolate smoothly even when the underlying chart counts are integers.
+    private readonly record struct ChartPanelDisplayData(
+        ChartRadarMetric Notes,
+        ChartRadarMetric Chords,
+        ChartRadarMetric Slides,
+        ChartRadarMetric Flicks,
+        ChartRadarMetric Stream,
+        ChartRadarMetric Travel,
+        double ComboTaps,
+        double ComboLongs,
+        double ComboSlides,
+        double ComboFlicks)
+    {
+        public static ChartPanelDisplayData FromResult(ChartRadarResult result)
+            => new(
+                result.Notes, result.Chords, result.Slides, result.Flicks,
+                result.Stream, result.Travel,
+                result.ComboDistribution.Taps,
+                result.ComboDistribution.Longs,
+                result.ComboDistribution.Slides,
+                result.ComboDistribution.Flicks);
+
+        public static ChartPanelDisplayData Interpolate(
+            ChartPanelDisplayData from,
+            ChartPanelDisplayData to,
+            double amount)
+        {
+            var t = Math.Clamp(amount, 0.0, 1.0);
+            static double Mix(double a, double b, double t) => a + (b - a) * t;
+            static ChartRadarMetric MixMetric(ChartRadarMetric a, ChartRadarMetric b, double t)
+                => new(Mix(a.RawValue, b.RawValue, t),
+                    Mix(a.NormalizedValue, b.NormalizedValue, t), b.Unit);
+
+            return new ChartPanelDisplayData(
+                MixMetric(from.Notes, to.Notes, t),
+                MixMetric(from.Chords, to.Chords, t),
+                MixMetric(from.Slides, to.Slides, t),
+                MixMetric(from.Flicks, to.Flicks, t),
+                MixMetric(from.Stream, to.Stream, t),
+                MixMetric(from.Travel, to.Travel, t),
+                Mix(from.ComboTaps, to.ComboTaps, t),
+                Mix(from.ComboLongs, to.ComboLongs, t),
+                Mix(from.ComboSlides, to.ComboSlides, t),
+                Mix(from.ComboFlicks, to.ComboFlicks, t));
+        }
+    }
+
+    private const double ChartPanelTransitionDurationSeconds = 0.42;
+    private ChartPanelDisplayData? _chartRadarTransitionFrom;
+    private double _chartRadarTransitionElapsedSeconds;
     private ChartPanelMode _chartPanelMode = ChartPanelMode.DifficultyRadar;
     private string? _chartRadarDesiredKey;
     private string? _chartRadarDesiredPath;
@@ -381,6 +439,14 @@ public sealed class SongSelectMenu : IDisposable
         _spriteBatch = new SpriteBatch(graphics);
         _pixel = NativeResourceDiagnostics.TrackTexture(new Texture2D(graphics, 1, 1), NativeResourceCategory.Menu);
         _pixel.SetData(new[] { XnaColor.White });
+        _chartPanelOverflowEffect = new BasicEffect(graphics)
+        {
+            LightingEnabled = false,
+            TextureEnabled = false,
+            VertexColorEnabled = true,
+            World = Matrix.Identity,
+            View = Matrix.Identity,
+        };
         _songsRoot = FindSongsRoot();
         _songSelectStateDirectory = FindSongSelectStateDirectory(_songsRoot);
 #if !TSC_PUBLISH
@@ -451,6 +517,8 @@ public sealed class SongSelectMenu : IDisposable
         _chartRadarDesiredKey = null;
         _chartRadarDesiredPath = null;
         _chartRadarResult = null;
+        _chartRadarTransitionFrom = null;
+        _chartRadarTransitionElapsedSeconds = 0.0;
         _chartRadarError = null;
         _lastSongSelection = LoadLastSongSelection();
         _restoreLastSelectionPending = !string.IsNullOrWhiteSpace(_lastSongSelection?.Folder);
@@ -528,6 +596,7 @@ public sealed class SongSelectMenu : IDisposable
         if (KeybindSettings.IsPressed("gameplay_toggle_chart_radar"))
             CycleChartPanelMode();
         UpdateChartRadarState();
+        UpdateChartPanelTransition(Math.Max(0.0, deltaSeconds));
 
         if (Pressed(keyboard, previousKeyboard, XnaKeys.F10))
         {
@@ -1130,13 +1199,6 @@ public sealed class SongSelectMenu : IDisposable
             _ => ChartPanelMode.DifficultyRadar,
         };
 
-        if (_chartPanelMode != ChartPanelMode.Hidden)
-        {
-            _chartRadarDesiredKey = null;
-            _chartRadarDesiredPath = null;
-            _chartRadarResult = null;
-            _chartRadarError = null;
-        }
     }
 
     private void HandleSkinAction(SkinUiAction action)
@@ -1484,6 +1546,8 @@ public sealed class SongSelectMenu : IDisposable
                 if (string.Equals(completedKey, _chartRadarDesiredKey, StringComparison.OrdinalIgnoreCase))
                 {
                     _chartRadarResult = null;
+                    _chartRadarTransitionFrom = null;
+                    _chartRadarTransitionElapsedSeconds = 0.0;
                     _chartRadarError = ex.GetBaseException().Message;
                 }
             }
@@ -1497,6 +1561,8 @@ public sealed class SongSelectMenu : IDisposable
             _chartRadarDesiredKey = null;
             _chartRadarDesiredPath = null;
             _chartRadarResult = null;
+            _chartRadarTransitionFrom = null;
+            _chartRadarTransitionElapsedSeconds = 0.0;
             _chartRadarError = "No chart is selected.";
             return;
         }
@@ -1517,12 +1583,18 @@ public sealed class SongSelectMenu : IDisposable
             _chartRadarDesiredKey = null;
             _chartRadarDesiredPath = null;
             _chartRadarResult = null;
+            _chartRadarTransitionFrom = null;
+            _chartRadarTransitionElapsedSeconds = 0.0;
             _chartRadarError = ex.GetBaseException().Message;
             return;
         }
 
         if (!string.Equals(key, _chartRadarDesiredKey, StringComparison.OrdinalIgnoreCase))
         {
+            // Preserve the exact currently visible shape (including an in-flight
+            // transition) while the next chart is analyzed asynchronously.
+            _chartRadarTransitionFrom = GetChartPanelDisplayData();
+            _chartRadarTransitionElapsedSeconds = 0.0;
             _chartRadarDesiredKey = key;
             _chartRadarDesiredPath = path;
             _chartRadarResult = null;
@@ -1543,6 +1615,36 @@ public sealed class SongSelectMenu : IDisposable
             var requestedPath = _chartRadarDesiredPath;
             _chartRadarTaskKey = key;
             _chartRadarTask = Task.Run(() => ChartRadarAnalyzer.Analyze(requestedPath));
+        }
+    }
+
+    private ChartPanelDisplayData? GetChartPanelDisplayData()
+    {
+        if (_chartRadarResult is null)
+            return _chartRadarTransitionFrom;
+
+        var target = ChartPanelDisplayData.FromResult(_chartRadarResult);
+        if (_chartRadarTransitionFrom is not { } from)
+            return target;
+
+        var linear = Math.Clamp(
+            _chartRadarTransitionElapsedSeconds / ChartPanelTransitionDurationSeconds,
+            0.0, 1.0);
+        // Smoothstep avoids an abrupt velocity change at either end of the morph.
+        var eased = linear * linear * (3.0 - 2.0 * linear);
+        return ChartPanelDisplayData.Interpolate(from, target, eased);
+    }
+
+    private void UpdateChartPanelTransition(double deltaSeconds)
+    {
+        if (_chartRadarTransitionFrom is null || _chartRadarResult is null || deltaSeconds <= 0.0)
+            return;
+
+        _chartRadarTransitionElapsedSeconds += deltaSeconds;
+        if (_chartRadarTransitionElapsedSeconds >= ChartPanelTransitionDurationSeconds)
+        {
+            _chartRadarTransitionFrom = null;
+            _chartRadarTransitionElapsedSeconds = ChartPanelTransitionDurationSeconds;
         }
     }
 
@@ -1567,6 +1669,7 @@ public sealed class SongSelectMenu : IDisposable
             return;
 
         UpdateChartRadarState(force: true);
+        var displayData = GetChartPanelDisplayData();
 
         var panelWidth = command.Size.X;
         var panelHeight = command.Size.Y;
@@ -1589,14 +1692,21 @@ public sealed class SongSelectMenu : IDisposable
         var radarFill = ApplyAlpha(command.ChartPanelRadarFillColor, command.Alpha);
         var radarLine = ApplyAlpha(command.ChartPanelRadarLineColor, command.Alpha);
         var guideColor = ApplyAlpha(command.ChartPanelGuideColor, command.Alpha);
-        var categoryColors = new[]
+        var radarColors = new[]
+        {
+            ApplyAlpha(command.ChartPanelTapsColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelChordsColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelSlidesColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelFlicksColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelStreamColor, command.Alpha),
+            ApplyAlpha(command.ChartPanelTravelColor, command.Alpha),
+        };
+        var comboColors = new[]
         {
             ApplyAlpha(command.ChartPanelTapsColor, command.Alpha),
             ApplyAlpha(command.ChartPanelLongsColor, command.Alpha),
             ApplyAlpha(command.ChartPanelSlidesColor, command.Alpha),
             ApplyAlpha(command.ChartPanelFlicksColor, command.Alpha),
-            ApplyAlpha(command.ChartPanelStreamColor, command.Alpha),
-            ApplyAlpha(command.ChartPanelTravelColor, command.Alpha),
         };
 
         _spriteBatch.Begin(
@@ -1643,12 +1753,12 @@ public sealed class SongSelectMenu : IDisposable
 
             if (panelMode == ChartPanelMode.ComboDistribution)
             {
-                if (_chartRadarResult is { } comboResult)
+                if (displayData is { } comboResult)
                 {
                     DrawComboDistributionPanel(
-                        comboResult.ComboDistribution,
+                        comboResult,
                         x, y, panelWidth, panelHeight, unit,
-                        categoryColors,
+                        comboColors,
                         ApplyAlpha(command.ChartPanelBarBackgroundColor, command.Alpha),
                         command.ChartPanelShowHeader);
                 }
@@ -1666,16 +1776,16 @@ public sealed class SongSelectMenu : IDisposable
                         12f * unit, ApplyAlpha(new XnaColor(150, 185, 205), command.Alpha), centered: true);
                 }
             }
-            else if (_chartRadarResult is { } result)
+            else if (displayData is { } result)
             {
                 var metrics = new (string Name, ChartRadarMetric Metric, XnaColor Color)[]
                 {
-                    ("TAPS", result.Taps, categoryColors[0]),
-                    ("LONGS", result.Longs, categoryColors[1]),
-                    ("SLIDES", result.Slides, categoryColors[2]),
-                    ("FLICKS", result.Flicks, categoryColors[3]),
-                    ("STREAM", result.Stream, categoryColors[4]),
-                    ("TRAVEL", result.Travel, categoryColors[5])
+                    ("NOTES", result.Notes, radarColors[0]),
+                    ("CHORDS", result.Chords, radarColors[1]),
+                    ("SLIDES", result.Slides, radarColors[2]),
+                    ("FLICKS", result.Flicks, radarColors[3]),
+                    ("STREAM", result.Stream, radarColors[4]),
+                    ("TRAVEL", result.Travel, radarColors[5])
                 };
 
                 // The 100% guide is the hexagon edge. The 200% overflow radius is
@@ -1711,7 +1821,30 @@ public sealed class SongSelectMenu : IDisposable
                         centerY + dy * radius * radiusFactor);
                 }
 
-                DrawRadarFill(values, radarFill, unit);
+                var hasOverflow = false;
+                for (var i = 0; i < metrics.Length; i++)
+                {
+                    if (double.IsFinite(metrics[i].Metric.NormalizedValue) &&
+                        metrics[i].Metric.NormalizedValue > 100.0)
+                    {
+                        hasOverflow = true;
+                        break;
+                    }
+                }
+
+                if (hasOverflow)
+                {
+                    var clippedFillCount = ClipRadarPolygonToMaximum(
+                        values, outer, _chartPanelClippedFillVertices);
+                    if (clippedFillCount >= 3)
+                        DrawRadarFill(_chartPanelClippedFillVertices, clippedFillCount, radarFill, unit);
+                    DrawRadarOverflowGradient(metrics, outer, values, radarFill,
+                        command.ScissorClip.HasValue);
+                }
+                else
+                {
+                    DrawRadarFill(values, values.Length, radarFill, unit);
+                }
 
                 // Four guide levels establish the 0–100 scale; overflow is drawn
                 // outside the 100% outline and clipped visually at 200%.
@@ -1744,10 +1877,37 @@ public sealed class SongSelectMenu : IDisposable
                 }
 
                 var radarPointSize = 4.8f * unit;
+                var radarOutlineThickness = Math.Max(2f, 2.2f * unit);
                 for (var i = 0; i < values.Length; i++)
                 {
                     var next = (i + 1) % values.Length;
-                    DrawRadarLine(values[i], values[next], radarLine, Math.Max(2f, 2.2f * unit));
+                    var overflowA = double.IsFinite(metrics[i].Metric.NormalizedValue) &&
+                        metrics[i].Metric.NormalizedValue > 100.0;
+                    var overflowB = double.IsFinite(metrics[next].Metric.NormalizedValue) &&
+                        metrics[next].Metric.NormalizedValue > 100.0;
+
+                    if (!overflowA && !overflowB)
+                    {
+                        DrawRadarLine(values[i], values[next], radarLine, radarOutlineThickness);
+                    }
+                    else if (overflowA != overflowB && TryGetSegmentIntersection(
+                                 values[i], values[next], outer[i], outer[next], out var intersection))
+                    {
+                        // Retain the normal theme outline only on the part that
+                        // remains inside the 100% boundary. The outer part is
+                        // drawn below with the same orange-to-red gradient as the fill.
+                        if (overflowA)
+                            DrawRadarLine(intersection, values[next], radarLine, radarOutlineThickness);
+                        else
+                            DrawRadarLine(values[i], intersection, radarLine, radarOutlineThickness);
+                    }
+                }
+
+                DrawRadarOverflowOutline(metrics, outer, values, radarLine,
+                    radarOutlineThickness, command.ScissorClip.HasValue);
+
+                for (var i = 0; i < values.Length; i++)
+                {
                     DrawRect(values[i].X - radarPointSize * 0.5f, values[i].Y - radarPointSize * 0.5f,
                         radarPointSize, radarPointSize, metrics[i].Color);
                 }
@@ -1807,8 +1967,335 @@ public sealed class SongSelectMenu : IDisposable
         return (float)(Math.Min(percentage, 200.0) / 100.0);
     }
 
+    private static XnaColor GetRadarOverflowColor(double percentage, byte alpha)
+    {
+        // The overflow band begins at orange just beyond the 100% guide and
+        // progresses smoothly to red at the 200% visual cap.
+        var amount = (float)Math.Clamp((percentage - 101.0) / 99.0, 0.0, 1.0);
+        var green = (byte)Math.Clamp((int)MathF.Round(165f * (1f - amount)), 0, 255);
+        return new XnaColor((byte)255, green, (byte)0, alpha);
+    }
+
+    private static float Cross2D(Vector2 a, Vector2 b)
+        => a.X * b.Y - a.Y * b.X;
+
+    private static bool TryGetSegmentIntersection(
+        Vector2 segmentA,
+        Vector2 segmentB,
+        Vector2 edgeA,
+        Vector2 edgeB,
+        out Vector2 intersection)
+    {
+        var segmentDirection = segmentB - segmentA;
+        var edgeDirection = edgeB - edgeA;
+        var denominator = Cross2D(segmentDirection, edgeDirection);
+        if (MathF.Abs(denominator) <= 0.0001f)
+        {
+            intersection = Vector2.Zero;
+            return false;
+        }
+
+        var t = Cross2D(edgeA - segmentA, edgeDirection) / denominator;
+        if (!float.IsFinite(t) || t < -0.0001f || t > 1.0001f)
+        {
+            intersection = Vector2.Zero;
+            return false;
+        }
+
+        intersection = segmentA + segmentDirection * Math.Clamp(t, 0f, 1f);
+        return true;
+    }
+
+    private static int AppendRadarGradientTriangle(
+        VertexPositionColor[] vertices,
+        int offset,
+        Vector2 a,
+        XnaColor colorA,
+        Vector2 b,
+        XnaColor colorB,
+        Vector2 c,
+        XnaColor colorC)
+    {
+        vertices[offset++] = new VertexPositionColor(new Vector3(a, 0f), colorA);
+        vertices[offset++] = new VertexPositionColor(new Vector3(b, 0f), colorB);
+        vertices[offset++] = new VertexPositionColor(new Vector3(c, 0f), colorC);
+        return offset;
+    }
+
+    private void DrawRadarOverflowGradient(
+        (string Name, ChartRadarMetric Metric, XnaColor Color)[] metrics,
+        Vector2[] maximumVertices,
+        Vector2[] valueVertices,
+        XnaColor normalFillColor,
+        bool useScissor)
+    {
+        if (metrics.Length != 6 || maximumVertices.Length != 6 || valueVertices.Length != 6)
+            return;
+
+        // Match the configured radar-fill color and alpha at the 100% boundary.
+        // The vertex-color interpolation then blends continuously from the
+        // normal fill into the orange-to-red overflow color toward each tip.
+        var alpha = normalFillColor.A;
+        if (alpha == 0)
+            return;
+
+        var boundaryColor = normalFillColor;
+        Span<XnaColor> tipColors = stackalloc XnaColor[6];
+        Span<bool> overflow = stackalloc bool[6];
+        var anyOverflow = false;
+        for (var i = 0; i < metrics.Length; i++)
+        {
+            var percentage = metrics[i].Metric.NormalizedValue;
+            overflow[i] = double.IsFinite(percentage) && percentage > 100.0;
+            if (!overflow[i])
+                continue;
+
+            tipColors[i] = GetRadarOverflowColor(Math.Max(101.0, percentage), alpha);
+            anyOverflow = true;
+        }
+
+        if (!anyOverflow)
+            return;
+
+        var vertexCount = 0;
+        for (var i = 0; i < 6; i++)
+        {
+            var next = (i + 1) % 6;
+            var overflowA = overflow[i];
+            var overflowB = overflow[next];
+            if (!overflowA && !overflowB)
+                continue;
+
+            if (overflowA && overflowB)
+            {
+                // Full overflow quad between two over-limit axes. The base
+                // edge matches the normal fill exactly; each outer tip carries
+                // the orange-to-red hue for its value.
+                vertexCount = AppendRadarGradientTriangle(
+                    _chartPanelOverflowVertices, vertexCount,
+                    maximumVertices[i], boundaryColor,
+                    maximumVertices[next], boundaryColor,
+                    valueVertices[next], tipColors[next]);
+                vertexCount = AppendRadarGradientTriangle(
+                    _chartPanelOverflowVertices, vertexCount,
+                    maximumVertices[i], boundaryColor,
+                    valueVertices[next], tipColors[next],
+                    valueVertices[i], tipColors[i]);
+                continue;
+            }
+
+            // When only one adjacent axis exceeds 100%, the actual radar edge
+            // crosses the 100% hexagon edge. Draw only the small triangular
+            // portion beyond that intersection, not the region inside maximum.
+            // Both points on the 100% edge use the normal fill color, so the
+            // overflow gradient has no visible color discontinuity at the edge.
+            if (!TryGetSegmentIntersection(
+                    valueVertices[i], valueVertices[next],
+                    maximumVertices[i], maximumVertices[next],
+                    out var intersection))
+                continue;
+
+            if (overflowA)
+            {
+                vertexCount = AppendRadarGradientTriangle(
+                    _chartPanelOverflowVertices, vertexCount,
+                    maximumVertices[i], boundaryColor,
+                    intersection, boundaryColor,
+                    valueVertices[i], tipColors[i]);
+            }
+            else
+            {
+                vertexCount = AppendRadarGradientTriangle(
+                    _chartPanelOverflowVertices, vertexCount,
+                    intersection, boundaryColor,
+                    maximumVertices[next], boundaryColor,
+                    valueVertices[next], tipColors[next]);
+            }
+        }
+
+        if (vertexCount <= 0)
+            return;
+
+        // Flush pending SpriteBatch content before switching to the vertex-color
+        // pipeline. The effect and fixed vertex array are retained for the menu's
+        // lifetime; no per-frame GPU resources are created.
+        _spriteBatch.End();
+        try
+        {
+            var viewport = _graphics.Viewport;
+            _chartPanelOverflowEffect.Projection = Matrix.CreateOrthographicOffCenter(
+                0f, viewport.Width, viewport.Height, 0f, -1f, 1f);
+            _graphics.BlendState = BlendState.NonPremultiplied;
+            _graphics.DepthStencilState = DepthStencilState.None;
+            _graphics.RasterizerState = useScissor
+                ? ChartPanelScissorRasterizer
+                : RasterizerState.CullNone;
+
+            foreach (var pass in _chartPanelOverflowEffect.CurrentTechnique.Passes)
+            {
+                pass.Apply();
+                _graphics.DrawUserPrimitives(
+                    PrimitiveType.TriangleList,
+                    _chartPanelOverflowVertices,
+                    0,
+                    vertexCount / 3);
+            }
+        }
+        finally
+        {
+            // The caller continues drawing guide lines, labels and the panel
+            // footer, so always restore the same SpriteBatch state it started with.
+            _spriteBatch.Begin(
+                SpriteSortMode.Deferred,
+                BlendState.NonPremultiplied,
+                SamplerState.LinearClamp,
+                DepthStencilState.None,
+                useScissor ? ChartPanelScissorRasterizer : RasterizerState.CullNone);
+        }
+    }
+
+    private static int AppendRadarGradientOutlineSegment(
+        VertexPositionColor[] vertices,
+        int offset,
+        Vector2 from,
+        XnaColor fromColor,
+        Vector2 to,
+        XnaColor toColor,
+        float thickness)
+    {
+        var direction = to - from;
+        var length = direction.Length();
+        if (length <= 0.01f || thickness <= 0f)
+            return offset;
+
+        var normal = new Vector2(-direction.Y, direction.X) * (0.5f * thickness / length);
+        var fromOuter = from + normal;
+        var fromInner = from - normal;
+        var toOuter = to + normal;
+        var toInner = to - normal;
+
+        // A two-triangle ribbon gives the outline a true per-vertex gradient
+        // while keeping its thickness consistent along the entire segment.
+        vertices[offset++] = new VertexPositionColor(new Vector3(fromOuter, 0f), fromColor);
+        vertices[offset++] = new VertexPositionColor(new Vector3(fromInner, 0f), fromColor);
+        vertices[offset++] = new VertexPositionColor(new Vector3(toInner, 0f), toColor);
+        vertices[offset++] = new VertexPositionColor(new Vector3(fromOuter, 0f), fromColor);
+        vertices[offset++] = new VertexPositionColor(new Vector3(toInner, 0f), toColor);
+        vertices[offset++] = new VertexPositionColor(new Vector3(toOuter, 0f), toColor);
+        return offset;
+    }
+
+    private void DrawRadarOverflowOutline(
+        (string Name, ChartRadarMetric Metric, XnaColor Color)[] metrics,
+        Vector2[] maximumVertices,
+        Vector2[] valueVertices,
+        XnaColor normalOutlineColor,
+        float thickness,
+        bool useScissor)
+    {
+        if (metrics.Length != 6 || maximumVertices.Length != 6 || valueVertices.Length != 6 ||
+            normalOutlineColor.A == 0 || thickness <= 0f)
+            return;
+
+        var alpha = normalOutlineColor.A;
+        var boundaryColor = normalOutlineColor;
+        Span<XnaColor> tipColors = stackalloc XnaColor[6];
+        Span<bool> overflow = stackalloc bool[6];
+        var anyOverflow = false;
+        for (var i = 0; i < metrics.Length; i++)
+        {
+            var percentage = metrics[i].Metric.NormalizedValue;
+            overflow[i] = double.IsFinite(percentage) && percentage > 100.0;
+            if (!overflow[i])
+                continue;
+
+            tipColors[i] = GetRadarOverflowColor(Math.Max(101.0, percentage), alpha);
+            anyOverflow = true;
+        }
+
+        if (!anyOverflow)
+            return;
+
+        var vertexCount = 0;
+        for (var i = 0; i < 6; i++)
+        {
+            var next = (i + 1) % 6;
+            var overflowA = overflow[i];
+            var overflowB = overflow[next];
+            if (!overflowA && !overflowB)
+                continue;
+
+            if (overflowA && overflowB)
+            {
+                vertexCount = AppendRadarGradientOutlineSegment(
+                    _chartPanelOverflowOutlineVertices, vertexCount,
+                    valueVertices[i], tipColors[i],
+                    valueVertices[next], tipColors[next], thickness);
+                continue;
+            }
+
+            if (!TryGetSegmentIntersection(
+                    valueVertices[i], valueVertices[next],
+                    maximumVertices[i], maximumVertices[next],
+                    out var intersection))
+                continue;
+
+            if (overflowA)
+            {
+                vertexCount = AppendRadarGradientOutlineSegment(
+                    _chartPanelOverflowOutlineVertices, vertexCount,
+                    valueVertices[i], tipColors[i],
+                    intersection, boundaryColor, thickness);
+            }
+            else
+            {
+                vertexCount = AppendRadarGradientOutlineSegment(
+                    _chartPanelOverflowOutlineVertices, vertexCount,
+                    intersection, boundaryColor,
+                    valueVertices[next], tipColors[next], thickness);
+            }
+        }
+
+        if (vertexCount <= 0)
+            return;
+
+        // Flush the normal in-range outline before drawing the gradient ribbon.
+        // Reuse the same effect and GPU buffer as the overflow fill path.
+        _spriteBatch.End();
+        try
+        {
+            var viewport = _graphics.Viewport;
+            _chartPanelOverflowEffect.Projection = Matrix.CreateOrthographicOffCenter(
+                0f, viewport.Width, viewport.Height, 0f, -1f, 1f);
+            _graphics.BlendState = BlendState.NonPremultiplied;
+            _graphics.DepthStencilState = DepthStencilState.None;
+            _graphics.RasterizerState = useScissor
+                ? ChartPanelScissorRasterizer
+                : RasterizerState.CullNone;
+
+            foreach (var pass in _chartPanelOverflowEffect.CurrentTechnique.Passes)
+            {
+                pass.Apply();
+                _graphics.DrawUserPrimitives(
+                    PrimitiveType.TriangleList,
+                    _chartPanelOverflowOutlineVertices,
+                    0,
+                    vertexCount / 3);
+            }
+        }
+        finally
+        {
+            _spriteBatch.Begin(
+                SpriteSortMode.Deferred,
+                BlendState.NonPremultiplied,
+                SamplerState.LinearClamp,
+                DepthStencilState.None,
+                useScissor ? ChartPanelScissorRasterizer : RasterizerState.CullNone);
+        }
+    }
+
     private void DrawComboDistributionPanel(
-        ChartComboDistribution distribution,
+        ChartPanelDisplayData distribution,
         float x,
         float y,
         float width,
@@ -1818,14 +2305,14 @@ public sealed class SongSelectMenu : IDisposable
         XnaColor barBackgroundColor,
         bool showHeader)
     {
-        var items = new (string Label, int Count, XnaColor Color)[]
+        var items = new (string Label, double Count, XnaColor Color)[]
         {
-            ("TAPS", distribution.Taps, categoryColors[0]),
-            ("LONGS", distribution.Longs, categoryColors[1]),
-            ("SLIDES", distribution.Slides, categoryColors[2]),
-            ("FLICKS", distribution.Flicks, categoryColors[3]),
+            ("TAPS", distribution.ComboTaps, categoryColors[0]),
+            ("LONGS", distribution.ComboLongs, categoryColors[1]),
+            ("SLIDES", distribution.ComboSlides, categoryColors[2]),
+            ("FLICKS", distribution.ComboFlicks, categoryColors[3]),
         };
-        var total = Math.Max(0, distribution.Total);
+        var total = Math.Max(0.0, items.Sum(item => Math.Max(0.0, item.Count)));
         var rowLeft = x + 14f * unit;
         var rowWidth = width - 28f * unit;
         var contentTop = y + (showHeader ? 43f : 13f) * unit;
@@ -1839,7 +2326,7 @@ public sealed class SongSelectMenu : IDisposable
         for (var i = 0; i < items.Length; i++)
         {
             var rowY = contentTop + i * (slotHeight + rowGap) + (slotHeight - barHeight) * 0.5f;
-            var percentage = total > 0 ? Math.Clamp(items[i].Count * 100.0 / total, 0.0, 100.0) : 0.0;
+            var percentage = total > 0.0 ? Math.Clamp(items[i].Count * 100.0 / total, 0.0, 100.0) : 0.0;
             DrawRect(rowLeft, rowY, rowWidth, barHeight, barBackgroundColor);
             var fillWidth = rowWidth * (float)(percentage / 100.0);
             if (fillWidth > 0.5f)
@@ -1866,22 +2353,110 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
-    private void DrawRadarFill(Vector2[] vertices, XnaColor color, float unit)
+    private static Vector2 GetRadarLineIntersection(
+        Vector2 segmentA,
+        Vector2 segmentB,
+        Vector2 edgeA,
+        Vector2 edgeB)
     {
-        if (vertices.Length < 3)
+        var segmentDirection = segmentB - segmentA;
+        var edgeDirection = edgeB - edgeA;
+        var denominator = Cross2D(segmentDirection, edgeDirection);
+        if (MathF.Abs(denominator) <= 0.0001f)
+            return (segmentA + segmentB) * 0.5f;
+
+        var amount = Cross2D(edgeA - segmentA, edgeDirection) / denominator;
+        return segmentA + segmentDirection * Math.Clamp(amount, 0f, 1f);
+    }
+
+    private static int ClipRadarPolygonToMaximum(
+        Vector2[] subject,
+        Vector2[] clipPolygon,
+        Vector2[] destination)
+    {
+        if (subject.Length < 3 || clipPolygon.Length < 3 || destination.Length < 3)
+            return 0;
+
+        // Sutherland-Hodgman clipping keeps the normal radar fill inside the
+        // fixed 100% hexagon. The overflow band is drawn separately afterward.
+        Span<Vector2> first = stackalloc Vector2[24];
+        Span<Vector2> second = stackalloc Vector2[24];
+        var input = first;
+        var output = second;
+        var inputCount = Math.Min(subject.Length, input.Length);
+        subject.AsSpan(0, inputCount).CopyTo(input);
+
+        var signedArea = 0.0;
+        for (var i = 0; i < clipPolygon.Length; i++)
+        {
+            var a = clipPolygon[i];
+            var b = clipPolygon[(i + 1) % clipPolygon.Length];
+            signedArea += (double)a.X * b.Y - (double)b.X * a.Y;
+        }
+        var orientation = signedArea >= 0.0 ? 1f : -1f;
+
+        for (var edgeIndex = 0; edgeIndex < clipPolygon.Length && inputCount > 0; edgeIndex++)
+        {
+            var edgeA = clipPolygon[edgeIndex];
+            var edgeB = clipPolygon[(edgeIndex + 1) % clipPolygon.Length];
+            var edge = edgeB - edgeA;
+            var outputCount = 0;
+
+            var previous = input[inputCount - 1];
+            var previousInside = orientation * Cross2D(edge, previous - edgeA) >= -0.001f;
+            for (var pointIndex = 0; pointIndex < inputCount; pointIndex++)
+            {
+                var current = input[pointIndex];
+                var currentInside = orientation * Cross2D(edge, current - edgeA) >= -0.001f;
+
+                if (currentInside)
+                {
+                    if (!previousInside && outputCount < output.Length)
+                        output[outputCount++] = GetRadarLineIntersection(previous, current, edgeA, edgeB);
+                    if (outputCount < output.Length)
+                        output[outputCount++] = current;
+                }
+                else if (previousInside && outputCount < output.Length)
+                {
+                    output[outputCount++] = GetRadarLineIntersection(previous, current, edgeA, edgeB);
+                }
+
+                previous = current;
+                previousInside = currentInside;
+            }
+
+            var swap = input;
+            input = output;
+            output = swap;
+            inputCount = outputCount;
+        }
+
+        var copyCount = Math.Min(inputCount, destination.Length);
+        input[..copyCount].CopyTo(destination);
+        return copyCount;
+    }
+
+    private void DrawRadarFill(Vector2[] vertices, int vertexCount, XnaColor color, float unit)
+    {
+        if (vertexCount < 3)
             return;
 
-        var minY = vertices.Min(point => point.Y);
-        var maxY = vertices.Max(point => point.Y);
+        var minY = vertices[0].Y;
+        var maxY = vertices[0].Y;
+        for (var i = 1; i < vertexCount; i++)
+        {
+            minY = Math.Min(minY, vertices[i].Y);
+            maxY = Math.Max(maxY, vertices[i].Y);
+        }
         const float rowStep = 1f;
-        var intersections = new List<float>(vertices.Length);
+        var intersections = new List<float>(vertexCount);
         for (var scanY = minY; scanY < maxY; scanY += rowStep)
         {
             intersections.Clear();
-            for (var i = 0; i < vertices.Length; i++)
+            for (var i = 0; i < vertexCount; i++)
             {
                 var a = vertices[i];
-                var b = vertices[(i + 1) % vertices.Length];
+                var b = vertices[(i + 1) % vertexCount];
                 if ((a.Y <= scanY && b.Y > scanY) || (b.Y <= scanY && a.Y > scanY))
                 {
                     var t = (scanY - a.Y) / (b.Y - a.Y);
@@ -5620,6 +6195,7 @@ public sealed class SongSelectMenu : IDisposable
         _initialLoadInProgress = false;
         _songListReady = false;
         _skinRuntime?.Dispose();
+        _chartPanelOverflowEffect.Dispose();
         _pixel.Dispose();
         _spriteBatch.Dispose();
     }
