@@ -133,7 +133,8 @@ public sealed class Game1 : Game
         EmptyChart,
         ZipPicker,
         FpkPicker,
-        FpkChart
+        FpkChart,
+        Recovery
     }
 
     private TransitionPhase _transitionPhase = TransitionPhase.None;
@@ -173,6 +174,7 @@ public sealed class Game1 : Game
     private string? _chartEditorLoadError;
     private string? _pendingEditorEmptyDifficulty;
     private string? _chartEditorLoadSourcePath;
+    private EditorRecoveryManifest? _pendingEditorRecoveryManifest;
     private string? _pendingFpkPath;
     private string? _pendingChartName;
     private string? _pendingTscPath;
@@ -182,6 +184,15 @@ public sealed class Game1 : Game
     private bool _editorExitConfirmOpen;
     private bool _closeApplicationAfterEditorExitConfirmation;
     private int _pendingNativeWindowCloseRequest;
+    private const double EditorRecoveryCheckpointIntervalSeconds = 30.0;
+    private long _nextEditorRecoveryCheckpointTimestamp;
+    private Task<bool>? _editorRecoveryCheckpointTask;
+    private long _editorRecoveryCheckpointTaskRevision;
+    private long _lastEditorRecoveryCheckpointRevision = -1;
+    private string _editorRecoveryCheckpointTaskReason = string.Empty;
+    private bool _editorRecoveryCleanStateHandled;
+    private bool _editorRecoveryExitCheckpointAttempted;
+    private bool _editorRecoveryExplicitExitInProgress;
     private readonly WindowSubclassProc _windowCloseSubclassProc;
     private IntPtr _windowCloseSubclassHandle;
     private bool _chartPickerIsTscFolder;
@@ -218,6 +229,7 @@ public sealed class Game1 : Game
     {
         _windowCloseSubclassProc = HandleWindowCloseSubclassMessage;
         _currentInstance = this;
+        Exiting += HandleGameExiting;
         _ = chartArgument;
         _graphics = new GraphicsDeviceManager(this)
         {
@@ -285,18 +297,276 @@ public sealed class Game1 : Game
         // editor load can enter its transition. This keeps first-use Lua/layout/
         // text-renderer work from interfering with the initial fade-in.
         PrewarmTransitionRuntime();
+
+        // An interrupted editor session takes priority over the main menu. Start
+        // the normal staged editor-loading transition only after content and the
+        // transition runtime are ready. Invalid recovery data is kept on disk so
+        // a later build can still inspect or recover it.
+        TryBeginEditorRecoveryOnStartup();
     }
 
     protected override void Update(GameTime gameTime)
     {
         FrameLoopDiagnostics.BeginUpdate(gameTime);
+        var updateCompleted = false;
         try
         {
             UpdateFrameCore(gameTime);
+            updateCompleted = true;
         }
         finally
         {
+            // This runs after every update, including frames spent in Settings
+            // while the editor remains open. When an update throws, make one
+            // immediate best-effort snapshot before the exception escapes.
+            try
+            {
+                if (updateCompleted)
+                    UpdateEditorRecoveryCheckpoint();
+                else
+                    CaptureEditorRecoveryCheckpoint("update_exception", finalAttempt: true);
+            }
+            catch (Exception ex)
+            {
+                Program.LogRuntime($"EDITOR_RECOVERY_UPDATE_HOOK_FAILED error={ex}");
+            }
             FrameLoopDiagnostics.EndUpdate();
+        }
+    }
+
+    private void TryBeginEditorRecoveryOnStartup()
+    {
+        var recoveryPath = EditorRecoveryStorage.RecoveryPath;
+        if (EditorRecoveryStorage.IsDisarmed)
+        {
+            // A failed file deletion must not resurrect work the user explicitly
+            // discarded. The persistent marker stays until a new checkpoint commits.
+            EditorRecoveryStorage.CleanupDisarmedRecoveryArchive();
+            Program.LogRuntime("EDITOR_RECOVERY_STARTUP_SKIPPED reason=explicitly_disarmed");
+            return;
+        }
+        if (!File.Exists(recoveryPath))
+            return;
+
+        if (!EditorRecoveryStorage.TryReadManifest(recoveryPath, out var manifest) || manifest is null)
+        {
+            _errorMessage = "An interrupted editor session was found, but its recovery information could not be read. The recovery file was kept.";
+            Program.LogRuntime("EDITOR_RECOVERY_STARTUP_REJECTED reason=manifest_unavailable");
+            return;
+        }
+
+        _pendingEditorRecoveryManifest = manifest;
+        _pendingFpkPath = null;
+        _pendingChartName = null;
+        _pendingTscPath = null;
+        _pendingAresPath = null;
+        _pendingEditorEmptyDifficulty = null;
+        _chartEditorMode = true;
+        _pendingPlayMode = false;
+        _returnToGameplayAfterLoad = false;
+        _chartEditorLoadKind = ChartEditorLoadKind.Recovery;
+        _chartEditorLoadSourcePath = recoveryPath;
+        _errorMessage = null;
+        Program.LogRuntime(
+            $"EDITOR_RECOVERY_STARTUP_FOUND activeDifficulty={manifest.ActiveDifficultyCode} " +
+            $"source={manifest.SourcePath ?? manifest.BundlePath ?? "<new-chart>"}");
+        BeginChartEditorLoadingTransition(StartupScreen.Gameplay, "INTERRUPTED EDITOR SESSION");
+    }
+
+    private void UpdateEditorRecoveryCheckpoint()
+    {
+        CompleteEditorRecoveryCheckpointTaskIfReady();
+
+        if (_editorRecoveryExplicitExitInProgress)
+        {
+            if (_playfield?.ChartEditorMode != true)
+            {
+                _editorRecoveryExplicitExitInProgress = false;
+                _editorRecoveryExitCheckpointAttempted = false;
+                _nextEditorRecoveryCheckpointTimestamp = 0;
+            }
+            return;
+        }
+
+        // Native close may be accepted during Update. Once its final snapshot is
+        // committed, do not start a redundant periodic write in that same frame.
+        if (_editorRecoveryExitCheckpointAttempted)
+            return;
+
+        if (_playfield is not { ChartEditorMode: true } playfield)
+        {
+            _nextEditorRecoveryCheckpointTimestamp = 0;
+            _editorRecoveryExitCheckpointAttempted = false;
+            _editorRecoveryCleanStateHandled = false;
+            _lastEditorRecoveryCheckpointRevision = -1;
+            return;
+        }
+
+        if (!playfield.HasUnsavedEditorChanges)
+        {
+            // Clear once when the editor becomes clean. Clear also invalidates a
+            // worker that has not committed yet, preventing an old snapshot from
+            // being recreated after Save.
+            if (!_editorRecoveryCleanStateHandled)
+            {
+                if (EditorRecoveryStorage.Exists || _editorRecoveryCheckpointTask is not null)
+                    EditorRecoveryStorage.Clear();
+                _editorRecoveryCleanStateHandled = true;
+            }
+            _nextEditorRecoveryCheckpointTimestamp = 0;
+            _lastEditorRecoveryCheckpointRevision = -1;
+            return;
+        }
+
+        _editorRecoveryCleanStateHandled = false;
+
+        // Only one immutable snapshot is serialized at a time. If the user keeps
+        // editing while it writes, the older checkpoint remains valid and the
+        // next refreshed copy is taken on the normal 30-second cadence.
+        if (_editorRecoveryCheckpointTask is not null)
+            return;
+
+        var now = Stopwatch.GetTimestamp();
+        if (_lastEditorRecoveryCheckpointRevision == playfield.EditorRecoveryRevision)
+        {
+            // A dirty chart does not need to be serialized again until it changes.
+            // This prevents repeated background work (and GC pressure) while the
+            // user simply leaves an unsaved chart open.
+            if (_nextEditorRecoveryCheckpointTimestamp == 0 || now >= _nextEditorRecoveryCheckpointTimestamp)
+                _nextEditorRecoveryCheckpointTimestamp = now + (long)(Stopwatch.Frequency * EditorRecoveryCheckpointIntervalSeconds);
+            return;
+        }
+
+        if (_nextEditorRecoveryCheckpointTimestamp == 0)
+        {
+            _nextEditorRecoveryCheckpointTimestamp = now + (long)(Stopwatch.Frequency * EditorRecoveryCheckpointIntervalSeconds);
+            CaptureEditorRecoveryCheckpoint("first_unsaved_change", finalAttempt: false);
+            return;
+        }
+
+        if (now < _nextEditorRecoveryCheckpointTimestamp)
+            return;
+
+        _nextEditorRecoveryCheckpointTimestamp = now + (long)(Stopwatch.Frequency * EditorRecoveryCheckpointIntervalSeconds);
+        CaptureEditorRecoveryCheckpoint("periodic", finalAttempt: false);
+    }
+
+    private void CompleteEditorRecoveryCheckpointTaskIfReady()
+    {
+        var task = _editorRecoveryCheckpointTask;
+        if (task is null || !task.IsCompleted)
+            return;
+
+        _editorRecoveryCheckpointTask = null;
+        var succeeded = false;
+        try
+        {
+            succeeded = task.GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"EDITOR_RECOVERY_BACKGROUND_TASK_FAILED reason={_editorRecoveryCheckpointTaskReason} error={ex}");
+        }
+
+        if (succeeded)
+        {
+            _lastEditorRecoveryCheckpointRevision = _editorRecoveryCheckpointTaskRevision;
+            Program.LogRuntime($"EDITOR_RECOVERY_BACKGROUND_CAPTURED reason={_editorRecoveryCheckpointTaskReason}");
+        }
+        else
+        {
+            Program.LogRuntime($"EDITOR_RECOVERY_BACKGROUND_CAPTURE_SKIPPED reason={_editorRecoveryCheckpointTaskReason}");
+        }
+
+        if (_playfield is { ChartEditorMode: true, HasUnsavedEditorChanges: true })
+        {
+            // Never schedule a new full snapshot 2 seconds after the previous one.
+            // If edits happened while it was writing, retain the older checkpoint
+            // and take the refreshed snapshot on the regular 30-second cadence.
+            // Failed writes get a short retry, but not a rapid retry loop.
+            var delaySeconds = succeeded ? EditorRecoveryCheckpointIntervalSeconds : 10.0;
+            _nextEditorRecoveryCheckpointTimestamp = Stopwatch.GetTimestamp() +
+                (long)(Stopwatch.Frequency * delaySeconds);
+        }
+    }
+
+    private void CaptureEditorRecoveryCheckpoint(string reason, bool finalAttempt)
+    {
+        if (_editorRecoveryExplicitExitInProgress)
+            return;
+
+        if (_editorRecoveryExitCheckpointAttempted && finalAttempt)
+            return;
+
+        if (_playfield is not { ChartEditorMode: true } playfield)
+        {
+            // A checkpoint may belong to a previous interrupted run. Do not
+            // delete it merely because this process is currently on the menu;
+            // Stage 3 consumes or clears it during startup recovery handling.
+            return;
+        }
+
+        if (!playfield.HasUnsavedEditorChanges)
+        {
+            if (EditorRecoveryStorage.Exists || _editorRecoveryCheckpointTask is not null)
+                EditorRecoveryStorage.Clear();
+            if (finalAttempt)
+                _editorRecoveryExitCheckpointAttempted = true;
+            Program.LogRuntime($"EDITOR_RECOVERY_NOT_NEEDED reason={reason} chart_is_clean=true");
+            return;
+        }
+
+        if (finalAttempt)
+        {
+            // Invalidate any older asynchronous snapshot before making the final
+            // synchronous attempt. The final snapshot is allowed to block during
+            // shutdown; normal editing never performs this full export inline.
+            EditorRecoveryStorage.InvalidatePendingCommits();
+            var saved = playfield.TryCreateEditorRecoveryCheckpoint(out var finalError);
+            if (!saved && !string.IsNullOrWhiteSpace(finalError))
+                Program.LogRuntime($"EDITOR_RECOVERY_FINAL_CAPTURE_FAILED reason={reason} error={finalError}");
+            else if (saved)
+                Program.LogRuntime($"EDITOR_RECOVERY_FINAL_CAPTURED reason={reason}");
+            _editorRecoveryExitCheckpointAttempted = saved;
+            return;
+        }
+
+        if (_editorRecoveryCheckpointTask is not null)
+            return;
+
+        if (!playfield.TryCaptureEditorRecoveryCheckpointSnapshot(out var snapshot, out var snapshotError) || snapshot is null)
+        {
+            if (!string.IsNullOrWhiteSpace(snapshotError))
+                Program.LogRuntime($"EDITOR_RECOVERY_SNAPSHOT_FAILED reason={reason} error={snapshotError}");
+            return;
+        }
+
+        var expectedGeneration = EditorRecoveryStorage.Generation;
+        _editorRecoveryCheckpointTaskRevision = snapshot.Revision;
+        _editorRecoveryCheckpointTaskReason = reason;
+        _editorRecoveryCheckpointTask = Task.Factory.StartNew(() =>
+        {
+            // Recovery serialization is useful background work, but it must not
+            // compete equally with the render/update thread for CPU time.
+            try { Thread.CurrentThread.Priority = ThreadPriority.BelowNormal; } catch { }
+            return EditorRecoveryCheckpointWriter.Write(snapshot, expectedGeneration, out _);
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    }
+
+    private void HandleGameExiting(object? sender, EventArgs e)
+    {
+        CaptureEditorRecoveryCheckpoint("application_exit", finalAttempt: true);
+    }
+
+    internal static void TryCaptureEditorRecoveryForUnhandledException()
+    {
+        try
+        {
+            _currentInstance?.CaptureEditorRecoveryCheckpoint("unhandled_exception", finalAttempt: true);
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"EDITOR_RECOVERY_CRASH_HOOK_FAILED error={ex}");
         }
     }
 
@@ -697,18 +967,18 @@ public sealed class Game1 : Game
         if (Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 0) == 0)
             return;
 
-        if (_playfield is { ChartEditorMode: true, HasUnsavedEditorChanges: true })
+        if (_playfield is { ChartEditorMode: true })
         {
-            _closeApplicationAfterEditorExitConfirmation = true;
-            _editorExitConfirmOpen = true;
-            _editorMenuRuntime?.UpdateEditorExitConfirmation(true, closeApplication: true);
-            Program.LogRuntime("WINDOW_CLOSE_DEFERRED_FOR_UNSAVED_EDITOR_CHANGES");
+            // A native window close (including Alt+F4) is an interruption, not
+            // the editor's explicit discard action. Preserve unsaved work and
+            // close without presenting the in-editor exit confirmation.
+            CaptureEditorRecoveryCheckpoint("native_window_close", finalAttempt: true);
+            Program.LogRuntime("WINDOW_CLOSE_ACCEPTED_AFTER_EDITOR_RECOVERY");
+            Exit();
             return;
         }
 
-        // The chart may have been saved between the native close message and this
-        // game-thread update. In that case there is no reason to keep the window open.
-        Program.LogRuntime("WINDOW_CLOSE_CONFIRMED_WITHOUT_UNSAVED_EDITOR_CHANGES");
+        Program.LogRuntime("WINDOW_CLOSE_CONFIRMED_WITHOUT_ACTIVE_EDITOR");
         Exit();
     }
 
@@ -724,12 +994,12 @@ public sealed class Game1 : Game
         {
             try
             {
-                if (_playfield is { ChartEditorMode: true, HasUnsavedEditorChanges: true })
+                if (_playfield is { ChartEditorMode: true })
                 {
                     // SDL normally translates WM_CLOSE into SDL_WINDOWEVENT_CLOSE,
                     // which MonoGame handles by calling Game.Exit immediately. Swallow
-                    // that native message only while the editor has unsaved changes;
-                    // the game thread will open the existing editor-exit confirmation.
+                    // it while the editor is active so the game thread can checkpoint
+                    // first. Alt+F4/window close intentionally does not ask to discard.
                     Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 1);
                     return IntPtr.Zero;
                 }
@@ -830,6 +1100,10 @@ public sealed class Game1 : Game
     private void CompleteEditorExit()
     {
         var closeApplication = _closeApplicationAfterEditorExitConfirmation;
+        // This is the one intentional discard route. Remove any old autosave
+        // before leaving so the next launch cannot offer already-discarded work.
+        _editorRecoveryExplicitExitInProgress = true;
+        EditorRecoveryStorage.Clear();
         _editorExitConfirmOpen = false;
         _closeApplicationAfterEditorExitConfirmation = false;
         _editorMenuRuntime?.UpdateEditorExitConfirmation(false);
@@ -1404,6 +1678,9 @@ public sealed class Game1 : Game
     {
         if (disposing)
         {
+            // Backup for shutdown paths where the normal Exiting event was not
+            // raised (for example, a failure during Draw or window teardown).
+            CaptureEditorRecoveryCheckpoint("game_dispose", finalAttempt: true);
             RemoveWindowCloseHook();
             Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 0);
             if (ReferenceEquals(_currentInstance, this))
@@ -4765,6 +5042,7 @@ public sealed class Game1 : Game
                         ChartEditorLoadKind.EmptyChart => "CREATING NEW CHART",
                         ChartEditorLoadKind.ZipPicker => "INSPECTING ZIP BUNDLE",
                         ChartEditorLoadKind.FpkPicker or ChartEditorLoadKind.FpkChart => "READING FPK BUNDLE",
+                        ChartEditorLoadKind.Recovery => "RESTORING EDITOR SESSION",
                         _ => "LOADING CHART"
                     };
                     _chartEditorLoadStage = 2;
@@ -4776,6 +5054,28 @@ public sealed class Game1 : Game
 
                     switch (_chartEditorLoadKind)
                     {
+                        case ChartEditorLoadKind.Recovery:
+                        {
+                            var recoveryPath = _chartEditorLoadSourcePath
+                                ?? throw new InvalidOperationException("The editor recovery archive path is missing.");
+                            var recoveryManifest = _pendingEditorRecoveryManifest;
+                            if (recoveryManifest is null &&
+                                !EditorRecoveryStorage.TryReadManifest(recoveryPath, out recoveryManifest))
+                                throw new InvalidDataException("The editor recovery manifest could not be read.");
+                            if (recoveryManifest is null)
+                                throw new InvalidDataException("The editor recovery manifest is empty.");
+
+                            _chartEditorLoadPlayfield.LoadChart(recoveryPath);
+                            _chartEditorLoadPlayfield.RestoreEditorRecoveryState(recoveryManifest);
+                            _pendingEditorRecoveryManifest = null;
+                            _chartEditorLoadProgress = 0.78;
+                            _chartEditorLoadStageLabel = "EDITOR SESSION RESTORED";
+                            _chartEditorLoadStage = 3;
+                            Program.LogRuntime(
+                                $"EDITOR_RECOVERY_RESTORED difficulty={_chartEditorLoadPlayfield.CurrentEditorDifficultyCode} " +
+                                $"source={_chartEditorLoadPlayfield.CurrentEditorSourcePath ?? recoveryPath}");
+                            return;
+                        }
                         case ChartEditorLoadKind.SimpleTsc:
                         {
                             var path = _pendingTscPath ?? throw new InvalidOperationException("No TSC chart was selected.");
@@ -5038,6 +5338,7 @@ public sealed class Game1 : Game
             if (_chartEditorLoadPlayfield is not null && !ReferenceEquals(_chartEditorLoadPlayfield, _playfield))
                 _chartEditorLoadPlayfield.Dispose();
             _chartEditorLoadPlayfield = null;
+            _pendingEditorRecoveryManifest = null;
             _chartEditorLoadStageLabel = "LOAD FAILED";
         }
     }

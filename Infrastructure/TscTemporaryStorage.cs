@@ -25,7 +25,9 @@ internal static class TscTemporaryStorage
         "TSC-preview-convert-",
         "TSC-preview-bake-",
         "TSC-artwork-preview-",
-        "TSC-SkinArtwork-"
+        "TSC-SkinArtwork-",
+        "TSC-EditorRecoveryBuild-",
+        "TSC-EditorRecoveryAudio-"
     };
 
     private static readonly TimeSpan StaleUnmarkedWorkspaceAge = TimeSpan.FromDays(7);
@@ -252,7 +254,9 @@ internal static class TscTemporaryStorage
     {
         return MatchesGeneratedFileName(name, "tsc-ffmpeg-", ".7z") ||
                MatchesGeneratedFileName(name, "tsc_cover_", ".png") ||
-               MatchesGeneratedFileName(name, "tsc_import_", ".opus");
+               MatchesGeneratedFileName(name, "tsc_import_", ".opus") ||
+               MatchesGeneratedFileName(name, "TSC-EditorRecovery-", ".tsts") ||
+               MatchesGeneratedFileName(name, "TSC-EditorRecoveryCover-", ".png");
     }
 
     private static void CleanupKnownAtomicWriteTemps(DateTime cutoff)

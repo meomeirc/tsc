@@ -22,6 +22,7 @@ public static class Program
         InstallGlobalExceptionLogging();
         UserDataPaths.Initialize();
         try { TscTemporaryStorage.CleanupStaleTemporaryData(); } catch { /* Cleanup is best-effort and must not block startup. */ }
+        try { EditorRecoveryStorage.CleanupStartupArtifacts(); } catch { /* Recovery cleanup must never block startup. */ }
         EnforceExistingLogSizeLimit(UserDataPaths.CrashLogPath);
         EnforceExistingLogSizeLimit(UserDataPaths.GetPath("Logs", "song_select_debug.log"));
         EnforceExistingLogSizeLimit(UserDataPaths.GetPath("Logs", "superFlick_debug.log"));
@@ -52,6 +53,10 @@ public static class Program
     {
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
         {
+            // The regular 30-second checkpoint is the main crash-safety net.
+            // When an unhandled exception gives us one final opportunity, attempt
+            // an immediate snapshot before writing the fatal log and terminating.
+            Game1.TryCaptureEditorRecoveryForUnhandledException();
             if (e.ExceptionObject is Exception ex)
                 LogFatal("UNHANDLED_EXCEPTION", ex);
             else

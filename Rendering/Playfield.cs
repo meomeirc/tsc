@@ -584,6 +584,7 @@ public sealed partial class Playfield
     private bool _editorPreviewPreviousTempoLines;
     private bool _editorPreviewPreviousTopDownViewEnabled;
     private bool _editorHasUnsavedChanges;
+    private long _editorRecoveryRevision;
     // Changes to bundle/session assets that are not part of the active ARES chart
     // (audio, artwork, preview, difficulty enablement, etc.) are tracked separately
     // from the chart snapshot comparison.
@@ -1118,6 +1119,7 @@ public sealed partial class Playfield
         (_editorMetaEditingField is not null || _editorBpmInputFocused ||
          _editorDurationInputFocused || _editorStutterInputField != EditorStutterInputField.None ||
          _editorPreviewFocusedField >= 0);
+    internal long EditorRecoveryRevision => _editorRecoveryRevision;
     public bool HasUnsavedEditorChanges
     {
         get
@@ -1582,6 +1584,7 @@ public sealed partial class Playfield
         _editorMetaStatsCacheChart = null;
         if (_chartEditorMode)
         {
+            _editorRecoveryRevision++;
             if (auxiliaryChange)
                 _editorHasAuxiliaryUnsavedChanges = true;
             // A dirty flag should describe the current chart, not whether an edit
@@ -1621,7 +1624,12 @@ public sealed partial class Playfield
             RebuildRenderEventCache();
     }
 
-    private void MarkEditorSaved() => EditorChartBaselineSaved();
+    private void MarkEditorSaved(bool clearRecovery = true)
+    {
+        EditorChartBaselineSaved();
+        if (clearRecovery)
+            EditorRecoveryStorage.Clear();
+    }
 
     public void PausePlaybackForEditorSettings()
     {
@@ -4302,7 +4310,7 @@ public sealed partial class Playfield
         // saved baseline only after those bundle-level fields and media paths have
         // been applied, so they are treated as part of the opened file.
         if (_chartEditorMode)
-            MarkEditorSaved();
+            MarkEditorSaved(clearRecovery: false);
         _statusMessage = $"FPK: {Path.GetFileName(prepared.SourcePath)}";
 
         // Main-menu Play is an actual gameplay session, so start immediately
@@ -5775,7 +5783,7 @@ public sealed partial class Playfield
         return string.IsNullOrWhiteSpace(cleaned) ? "song" : cleaned;
     }
 
-    public void SaveEditorChartAsTsts(string path, bool adoptOutputAsSource = false)
+    public void SaveEditorChartAsTsts(string path, bool adoptOutputAsSource = false, bool markSaved = true, bool includeUnsourcedDifficultiesForRecovery = false, bool updateStatusMessage = true)
     {
         if (!_chartEditorMode || _chart is null)
             throw new InvalidOperationException("No chart is open in Chart Editor.");
@@ -5816,7 +5824,11 @@ public sealed partial class Playfield
                 MusicBytes = _editorSharedMusicBytes ?? _loadedMusicBytes
             };
             var exportableStates = states
-                .Where(pair => ShouldIncludeEditorDifficultyInBundleExport(pair.Key, pair.Value))
+                .Where(pair => ShouldIncludeEditorDifficultyInBundleExport(pair.Key, pair.Value) ||
+                    (includeUnsourcedDifficultiesForRecovery &&
+                     !pair.Value.HasSourceChart &&
+                     !_editorDeletedDifficultyCodes.Contains(pair.Key) &&
+                     !_editorCommittedDeletedDifficultyCodes.Contains(pair.Key)))
                 .ToList();
             if (exportableStates.Count == 0)
                 throw new InvalidOperationException("There are no supplied or authored difficulty charts to export.");
@@ -5968,7 +5980,8 @@ public sealed partial class Playfield
                     RestoreEditorChartMediaState(snapshot.Chart, snapshot.Media);
                 TscTemporaryStorage.DeleteOwnedDirectory(staging);
                 StoreActiveEditorDifficulty();
-                _statusMessage = $"Exported TSTS bundle: {fullTarget}";
+                if (updateStatusMessage)
+                    _statusMessage = $"Exported TSTS bundle: {fullTarget}";
             }
         }
         catch
@@ -5984,7 +5997,477 @@ public sealed partial class Playfield
             try { if (File.Exists(fullTarget + ".tmp")) File.Delete(fullTarget + ".tmp"); } catch { }
             throw;
         }
-        MarkEditorSaved();
+        if (markSaved)
+            MarkEditorSaved();
+    }
+
+    /// <summary>
+    /// Writes a recovery-only TSTS archive without changing the editor's saved
+    /// baseline, source paths, bundle template, or active working directory.
+    /// The recovery manifest retains the mapping to the original source files.
+    /// </summary>
+    public bool TryCreateEditorRecoveryCheckpoint(out string? error)
+    {
+        error = null;
+        if (!_chartEditorMode || _chart is null || !HasUnsavedEditorChanges)
+            return false;
+
+        string? temporaryBundlePath = null;
+        var storageGeneration = EditorRecoveryStorage.Generation;
+        try
+        {
+            // Preserve a metadata field that was being typed when the interruption
+            // occurred. Invalid field values remain in the UI and are not written.
+            if (_editorMetaEditingField is not null)
+                CommitEditorMetaField(preserveEditingState: true);
+            SyncSharedEditorMetadataToDifficultyStates();
+            StoreActiveEditorDifficulty();
+
+            var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+            var manifest = new EditorRecoveryManifest
+            {
+                BundleTemplate = _editorBundleTemplate.ToString(),
+                SourcePath = _loadedSourcePath,
+                BundlePath = _loadedTstsBundlePath,
+                DifficultyDiscoverySourcePath = _editorDifficultyDiscoverySourcePath,
+                SourceName = _sourceName,
+                LastLoadedSourceName = _lastLoadedSourceName,
+                FpkChartName = _loadedFpkChartName,
+                ActiveDifficultyCode = activeCode,
+                ActiveSeries = _bundleSeries ?? _chart.Series,
+                ExtraDifficultyEnabled = _editorExtraDifficultyEnabled,
+                DisabledDifficultyCodes = _editorDisabledDifficultyCodes.OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                DeletedDifficultyCodes = _editorDeletedDifficultyCodes.OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                CommittedDeletedDifficultyCodes = _editorCommittedDeletedDifficultyCodes.OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                CustomJudgementWindowEnabledDifficulties = _editorCustomJudgementWindowEnabledDifficulties
+                    .OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                Difficulties = _editorDifficultyStates.ToDictionary(
+                    pair => pair.Key,
+                    pair => new EditorRecoveryDifficulty
+                    {
+                        SourcePath = pair.Value.SourcePath,
+                        SourceName = pair.Value.SourceName,
+                        FpkChartName = pair.Value.FpkChartName,
+                        Series = pair.Value.Chart.Series,
+                        HasSourceChart = pair.Value.HasSourceChart
+                    },
+                    StringComparer.OrdinalIgnoreCase)
+            };
+
+            temporaryBundlePath = Path.Combine(
+                Path.GetTempPath(),
+                "TSC-EditorRecovery-" + Guid.NewGuid().ToString("N") + ".tsts");
+            SaveEditorChartAsTsts(
+                temporaryBundlePath,
+                adoptOutputAsSource: false,
+                markSaved: false,
+                includeUnsourcedDifficultiesForRecovery: true,
+                updateStatusMessage: false);
+            if (!EditorRecoveryStorage.CommitCheckpoint(temporaryBundlePath, manifest, storageGeneration))
+                return false;
+            Program.LogRuntime(
+                $"EDITOR_RECOVERY_CHECKPOINT_SAVED difficulty={activeCode} " +
+                $"source={_loadedSourcePath ?? _sourceName ?? "<new-chart>"} path={EditorRecoveryStorage.RecoveryPath}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            Program.LogRuntime($"EDITOR_RECOVERY_CHECKPOINT_FAILED error={ex}");
+            return false;
+        }
+        finally
+        {
+            if (!string.IsNullOrWhiteSpace(temporaryBundlePath))
+            {
+                try { if (File.Exists(temporaryBundlePath)) File.Delete(temporaryBundlePath); } catch { }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Captures all mutable editor data into detached chart copies. Call this on
+    /// the game thread; the returned object is safe for background serialization.
+    /// </summary>
+    internal bool TryCaptureEditorRecoveryCheckpointSnapshot(
+        out EditorRecoveryCheckpointSnapshot? snapshot,
+        out string? error)
+    {
+        snapshot = null;
+        error = null;
+        if (!_chartEditorMode || _chart is null || !HasUnsavedEditorChanges)
+            return false;
+
+        var snapshotStartedAt = Stopwatch.GetTimestamp();
+        try
+        {
+            // Preserve an in-progress metadata edit without closing its input UI.
+            if (_editorMetaEditingField is not null)
+                CommitEditorMetaField(preserveEditingState: true);
+            SyncSharedEditorMetadataToDifficultyStates();
+            StoreActiveEditorDifficulty();
+
+            var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+            var states = _editorDifficultyStates.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value,
+                StringComparer.OrdinalIgnoreCase);
+            states.TryGetValue(activeCode, out var previousActiveState);
+            states[activeCode] = new EditorDifficultyState
+            {
+                Chart = _chart,
+                SourcePath = previousActiveState?.SourcePath ?? _loadedSourcePath,
+                SourceName = _sourceName ?? GetAresFileNameForTemplate(activeCode, ChartBundleTemplate.Tsts),
+                FpkChartName = previousActiveState?.FpkChartName ?? _loadedFpkChartName,
+                HasSourceChart = previousActiveState?.HasSourceChart ??
+                    (!string.IsNullOrWhiteSpace(_loadedSourcePath) && File.Exists(_loadedSourcePath)),
+                ImportedSongAudio = previousActiveState?.ImportedSongAudio ?? _editorImportedSongAudio,
+                AresHeaderTemplate = _loadedAresHeaderTemplate,
+                MusicBytes = _editorSharedMusicBytes ?? _loadedMusicBytes
+            };
+
+            var exportableStates = states
+                .Where(pair => ShouldIncludeEditorDifficultyInBundleExport(pair.Key, pair.Value) ||
+                    (!pair.Value.HasSourceChart &&
+                     !_editorDeletedDifficultyCodes.Contains(pair.Key) &&
+                     !_editorCommittedDeletedDifficultyCodes.Contains(pair.Key)))
+                .ToList();
+            if (exportableStates.Count == 0)
+                throw new InvalidOperationException("There are no supplied or authored difficulty charts to recover.");
+
+            var manifest = new EditorRecoveryManifest
+            {
+                BundleTemplate = _editorBundleTemplate.ToString(),
+                SourcePath = _loadedSourcePath,
+                BundlePath = _loadedTstsBundlePath,
+                DifficultyDiscoverySourcePath = _editorDifficultyDiscoverySourcePath,
+                SourceName = _sourceName,
+                LastLoadedSourceName = _lastLoadedSourceName,
+                FpkChartName = _loadedFpkChartName,
+                ActiveDifficultyCode = activeCode,
+                ActiveSeries = _bundleSeries ?? _chart.Series,
+                ExtraDifficultyEnabled = _editorExtraDifficultyEnabled,
+                DisabledDifficultyCodes = _editorDisabledDifficultyCodes.OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                DeletedDifficultyCodes = _editorDeletedDifficultyCodes.OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                CommittedDeletedDifficultyCodes = _editorCommittedDeletedDifficultyCodes.OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                CustomJudgementWindowEnabledDifficulties = _editorCustomJudgementWindowEnabledDifficulties
+                    .OrderBy(code => code, StringComparer.OrdinalIgnoreCase).ToArray(),
+                Difficulties = states.ToDictionary(
+                    pair => pair.Key,
+                    pair => new EditorRecoveryDifficulty
+                    {
+                        SourcePath = pair.Value.SourcePath,
+                        SourceName = pair.Value.SourceName,
+                        FpkChartName = pair.Value.FpkChartName,
+                        Series = pair.Value.Chart.Series,
+                        HasSourceChart = pair.Value.HasSourceChart
+                    },
+                    StringComparer.OrdinalIgnoreCase)
+            };
+
+            // Cloning the chart models is the only chart-sized work left on the
+            // update thread. All encoding, validation, conversions, compression,
+            // and file I/O is deferred to EditorRecoveryCheckpointWriter.
+            var chartSnapshots = exportableStates.Select(pair => new EditorRecoveryChartSnapshot(
+                pair.Key,
+                AresChartCloner.Clone(pair.Value.Chart),
+                pair.Value.AresHeaderTemplate?.ToArray(),
+                !IsEditorDifficultyEnabled(pair.Key))).ToArray();
+
+            byte[]? musicBytes = null;
+            if (_editorMusicVolumePercent >= 100)
+            {
+                // The editor treats imported audio buffers as immutable and
+                // replaces the reference when new audio is loaded. Reuse the
+                // buffer in the snapshot instead of copying a potentially large
+                // song file on the game thread; the background writer only reads it.
+                musicBytes = _editorOriginalMusicOpusBytes is { Length: > 0 } originalOpus
+                    ? originalOpus
+                    : _editorSharedMusicBytes is { Length: > 0 } sharedMusic
+                        ? sharedMusic
+                        : _loadedMusicBytes is { Length: > 0 } loadedMusic
+                            ? loadedMusic
+                            : exportableStates.Select(pair => pair.Value.MusicBytes)
+                                .FirstOrDefault(bytes => bytes is { Length: > 0 });
+
+            }
+            var musicSourcePath = musicBytes is { Length: > 0 }
+                ? null
+                : GetEditorMusicSourcePathForRecoverySnapshot();
+
+            var previewHint = exportableStates.Select(pair => pair.Value.Chart.PreviewPath)
+                .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+            var albumHint = exportableStates.Select(pair => pair.Value.Chart.AlbumPath)
+                .FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
+
+            snapshot = new EditorRecoveryCheckpointSnapshot
+            {
+                Manifest = manifest,
+                Charts = chartSnapshots,
+                Revision = _editorRecoveryRevision,
+                MusicBytes = musicBytes,
+                MusicSourcePath = musicSourcePath,
+                OriginalMusicSourceBytes = _editorOriginalMusicSourceBytes,
+                OriginalMusicSourceExtension = _editorOriginalMusicSourceExtension,
+                MusicVolumePercent = _editorMusicVolumePercent,
+                SharedPreviewBytes = _editorSharedPreviewBytes,
+                SharedAlbumBytes = _editorSharedAlbumBytes,
+                AssetSourceDirectory = GetTstsAssetSourceDirectory(),
+                PreviewHint = previewHint,
+                AlbumHint = albumHint,
+                ExtraDifficultyEnabled = _editorExtraDifficultyEnabled,
+                DisabledDifficultyCodes = new[] { "ez", "nm", "hd", "ex", "xt" }
+                    .Where(code => !IsEditorDifficultyEnabled(code)).ToArray(),
+                CustomJudgementWindowEnabledDifficulties = _editorCustomJudgementWindowEnabledDifficulties.ToArray()
+            };
+            var snapshotDurationMs = (Stopwatch.GetTimestamp() - snapshotStartedAt) * 1000.0 / Stopwatch.Frequency;
+            var eventCount = chartSnapshots.Sum(item => item.Chart.Events.Count);
+            Program.LogRuntime(
+                $"EDITOR_RECOVERY_SNAPSHOT_CAPTURED duration_ms={snapshotDurationMs:0.###} " +
+                $"charts={chartSnapshots.Length} events={eventCount} revision={snapshot.Revision}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            Program.LogRuntime($"EDITOR_RECOVERY_SNAPSHOT_FAILED error={ex}");
+            return false;
+        }
+    }
+
+    private string? GetEditorMusicSourcePathForRecoverySnapshot()
+    {
+        if (string.IsNullOrWhiteSpace(_loadedSourcePath))
+            return null;
+
+        var sourceDirectory = Path.GetDirectoryName(_loadedSourcePath);
+        if (string.IsNullOrWhiteSpace(sourceDirectory) || !Directory.Exists(sourceDirectory))
+            return null;
+
+        if (!string.IsNullOrWhiteSpace(_chart?.MusicPath))
+        {
+            try
+            {
+                var candidate = Path.GetFullPath(Path.Combine(sourceDirectory, _chart.MusicPath));
+                if (File.Exists(candidate))
+                    return candidate;
+            }
+            catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+            {
+                // Try the well-known bundle music names below.
+            }
+        }
+
+        foreach (var name in new[] { "music.opus", "song.opus" })
+        {
+            var candidate = Path.Combine(sourceDirectory, name);
+            if (File.Exists(candidate))
+                return candidate;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Reapplies the original editing context after a recovery TSTS archive has
+    /// been loaded. The archive restores chart/media bytes; the manifest restores
+    /// the source paths and bundle type used by Quick Save.
+    /// </summary>
+    internal void RestoreEditorRecoveryState(EditorRecoveryManifest manifest)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        if (!_chartEditorMode || _chart is null)
+            throw new InvalidOperationException("A chart must be loaded in Chart Editor before recovery state can be applied.");
+
+        if (!Enum.TryParse<ChartBundleTemplate>(manifest.BundleTemplate, ignoreCase: true, out var originalTemplate))
+            throw new InvalidDataException($"Unsupported recovery bundle template '{manifest.BundleTemplate}'.");
+
+        var recoveryWorkspace = _tstsWorkingDirectory;
+        var originalTstsBundle = originalTemplate == ChartBundleTemplate.Tsts &&
+            !string.IsNullOrWhiteSpace(manifest.BundlePath);
+
+        // The recovery archive is always TSTS internally. Re-anchor every loaded
+        // difficulty to its original source path, except a source TSTS bundle,
+        // whose internal chart files now live in this run's extracted workspace.
+        foreach (var pair in manifest.Difficulties)
+        {
+            var code = GetEditorDifficultyCode(pair.Key, pair.Value.SourceName);
+            if (!_editorDifficultyStates.TryGetValue(code, out var state))
+                continue;
+
+            var difficulty = pair.Value;
+            state.SourceName = string.IsNullOrWhiteSpace(difficulty.SourceName)
+                ? state.SourceName
+                : difficulty.SourceName!;
+            state.FpkChartName = difficulty.FpkChartName;
+            state.HasSourceChart = difficulty.HasSourceChart;
+            state.SourcePath = originalTstsBundle
+                ? ResolveRecoveryWorkspaceChartPath(recoveryWorkspace, code, difficulty.SourceName, difficulty.SourcePath)
+                : difficulty.SourcePath;
+            state.Chart.Series = difficulty.Series;
+            ApplyFixedMediaPaths(state.Chart, originalTemplate);
+            if (_loadedMusicBytes is { Length: > 0 })
+                state.MusicBytes = _loadedMusicBytes;
+        }
+
+        var requestedActiveCode = GetEditorDifficultyCode(manifest.ActiveDifficultyCode, manifest.SourceName);
+        var activeStateExists = _editorDifficultyStates.TryGetValue(requestedActiveCode, out var activeState);
+        var activeCode = activeStateExists ? requestedActiveCode : GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+
+        if (activeStateExists && activeState is not null && !ReferenceEquals(activeState.Chart, _chart))
+        {
+            _loadedSourcePath = activeState.SourcePath;
+            _loadedFpkChartName = activeState.FpkChartName;
+            _loadedAresHeaderTemplate = activeState.AresHeaderTemplate?.ToArray();
+            _switchingEditorDifficulty = true;
+            try
+            {
+                LoadChartObject(
+                    activeState.Chart,
+                    activeState.SourceName,
+                    activeState.MusicBytes ?? _loadedMusicBytes,
+                    preservePlayback: true);
+            }
+            finally
+            {
+                _switchingEditorDifficulty = false;
+            }
+        }
+
+        _editorBundleTemplate = originalTemplate;
+        _editorActiveDifficultyCode = activeCode;
+        _editorDifficultySessionActive = true;
+        _editorExtraDifficultyEnabled = manifest.ExtraDifficultyEnabled;
+        _editorExtraDifficultyEnabledFromMetadata = null;
+
+        _editorDisabledDifficultyCodes.Clear();
+        foreach (var code in manifest.DisabledDifficultyCodes)
+            _editorDisabledDifficultyCodes.Add(GetEditorDifficultyCode(code));
+
+        _editorDeletedDifficultyCodes.Clear();
+        foreach (var code in manifest.DeletedDifficultyCodes)
+            _editorDeletedDifficultyCodes.Add(GetEditorDifficultyCode(code));
+
+        _editorCommittedDeletedDifficultyCodes.Clear();
+        foreach (var code in manifest.CommittedDeletedDifficultyCodes)
+            _editorCommittedDeletedDifficultyCodes.Add(GetEditorDifficultyCode(code));
+
+        _editorCustomJudgementWindowEnabledDifficulties.Clear();
+        foreach (var code in manifest.CustomJudgementWindowEnabledDifficulties)
+            _editorCustomJudgementWindowEnabledDifficulties.Add(GetEditorDifficultyCode(code));
+
+        _bundleSeries = manifest.ActiveSeries;
+        if (_chart is not null)
+        {
+            var activeManifestState = manifest.Difficulties.TryGetValue(activeCode, out var activeDifficulty)
+                ? activeDifficulty
+                : null;
+            _chart.Series = activeManifestState?.Series ?? manifest.ActiveSeries;
+            ApplyFixedMediaPaths(_chart, originalTemplate);
+        }
+
+        if (_editorDifficultyStates.TryGetValue(activeCode, out var restoredActiveState))
+        {
+            _loadedSourcePath = restoredActiveState.SourcePath;
+            _loadedFpkChartName = restoredActiveState.FpkChartName;
+            _loadedAresHeaderTemplate = restoredActiveState.AresHeaderTemplate?.ToArray();
+            _sourceName = string.IsNullOrWhiteSpace(manifest.SourceName)
+                ? restoredActiveState.SourceName
+                : manifest.SourceName;
+        }
+        else
+        {
+            _loadedSourcePath = originalTstsBundle
+                ? ResolveRecoveryWorkspaceChartPath(recoveryWorkspace, activeCode, manifest.SourceName, manifest.SourcePath)
+                : manifest.SourcePath;
+            _loadedFpkChartName = manifest.FpkChartName;
+            _sourceName = manifest.SourceName ?? _sourceName;
+        }
+
+        _lastLoadedSourceName = manifest.LastLoadedSourceName ?? _sourceName;
+        _loadedTstsBundlePath = originalTstsBundle ? manifest.BundlePath : null;
+
+        if (originalTstsBundle)
+        {
+            _editorDifficultyDiscoverySourcePath = ResolveRecoveryWorkspaceChartPath(
+                recoveryWorkspace,
+                GetEditorDifficultyCode(null, manifest.DifficultyDiscoverySourcePath),
+                manifest.DifficultyDiscoverySourcePath,
+                manifest.DifficultyDiscoverySourcePath);
+            if (string.IsNullOrWhiteSpace(_editorDifficultyDiscoverySourcePath) &&
+                !string.IsNullOrWhiteSpace(recoveryWorkspace))
+            {
+                var chartsDirectory = Path.Combine(recoveryWorkspace, "charts");
+                _editorDifficultyDiscoverySourcePath = Directory.Exists(chartsDirectory)
+                    ? Directory.EnumerateFiles(chartsDirectory, "*.ares", SearchOption.TopDirectoryOnly).FirstOrDefault()
+                    : null;
+            }
+        }
+        else
+        {
+            _editorDifficultyDiscoverySourcePath = manifest.DifficultyDiscoverySourcePath;
+        }
+
+        _editorSharedMusicBytes = _loadedMusicBytes;
+        foreach (var state in _editorDifficultyStates.Values)
+        {
+            if (state.MusicBytes is null && _loadedMusicBytes is { Length: > 0 })
+                state.MusicBytes = _loadedMusicBytes;
+        }
+
+        // The recovery archive is the saved baseline of this process, but it is
+        // not the user's original save file. Keep the editor dirty until a normal
+        // save or an explicit discard clears the recovery checkpoint.
+        MarkEditorDirty(auxiliaryChange: true);
+        _statusMessage = "Recovered interrupted editor session. Save to write changes to the original source.";
+        Program.LogRuntime(
+            $"EDITOR_RECOVERY_CONTEXT_APPLIED template={originalTemplate} activeDifficulty={activeCode} " +
+            $"source={_loadedSourcePath ?? _loadedTstsBundlePath ?? "<new-chart>"}");
+    }
+
+    private static string? ResolveRecoveryWorkspaceChartPath(
+        string? workspace,
+        string difficultyCode,
+        string? preferredName,
+        string? previousSourcePath)
+    {
+        if (string.IsNullOrWhiteSpace(workspace) || !Directory.Exists(workspace))
+            return previousSourcePath;
+
+        var chartsDirectory = Path.Combine(workspace, "charts");
+        var preferredFileName = !string.IsNullOrWhiteSpace(preferredName)
+            ? Path.GetFileName(preferredName)
+            : !string.IsNullOrWhiteSpace(previousSourcePath)
+                ? Path.GetFileName(previousSourcePath)
+                : string.Empty;
+        var fallbackFileName = GetTstsBundleChartFileName(difficultyCode);
+        var candidateNames = new[]
+        {
+            preferredFileName,
+            fallbackFileName,
+            "pattern_" + GetEditorDifficultyCode(difficultyCode) + ".ares"
+        }
+        .Where(name => !string.IsNullOrWhiteSpace(name))
+        .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var directory in new[] { chartsDirectory, workspace })
+        {
+            if (!Directory.Exists(directory))
+                continue;
+            foreach (var name in candidateNames)
+            {
+                var candidate = Path.Combine(directory, name!);
+                if (File.Exists(candidate))
+                    return Path.GetFullPath(candidate);
+                if (File.Exists(candidate + ".disabled"))
+                    return Path.GetFullPath(candidate + ".disabled");
+            }
+        }
+
+        // Preserve a planned output path for newly created difficulties. It is
+        // intentionally absent from disk until the user saves the recovery.
+        return Path.GetFullPath(Path.Combine(chartsDirectory, string.IsNullOrWhiteSpace(preferredFileName)
+            ? fallbackFileName
+            : preferredFileName));
     }
 
     private string? GetTstsAssetSourceDirectory()
@@ -6521,13 +7004,15 @@ public sealed partial class Playfield
         };
     }
 
-    private void CommitEditorMetaField()
+    private void CommitEditorMetaField(bool preserveEditingState = false)
     {
         if (string.IsNullOrWhiteSpace(_editorMetaEditingField)) return;
         var field = _editorMetaEditingField;
         var value = _editorMetaInputText.Trim();
         if (IsEditorLanTestAdbTextField(field))
         {
+            if (preserveEditingState)
+                return;
             switch (field)
             {
                 case "adb_pair_address": _editorLanTestAdbPairAddress = value; break;
@@ -6686,12 +7171,15 @@ public sealed partial class Playfield
         SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
         MarkEditorDirty();
-        _editorMetaEditingField = null;
-        _editorMetaInputCaretIndex = 0;
-        _editorMetaInputText = string.Empty;
-        _editorMetaBbCodeStripOpen = false;
-        _editorMetaBbCodeStripField = null;
-        _statusMessage = "Metadata updated.";
+        if (!preserveEditingState)
+        {
+            _editorMetaEditingField = null;
+            _editorMetaInputCaretIndex = 0;
+            _editorMetaInputText = string.Empty;
+            _editorMetaBbCodeStripOpen = false;
+            _editorMetaBbCodeStripField = null;
+            _statusMessage = "Metadata updated.";
+        }
     }
 
     private bool TryGetEditorMetaInputCharacter(KeyboardState keyboard, KeyboardState previousKeyboard,

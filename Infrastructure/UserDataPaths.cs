@@ -63,6 +63,7 @@ public static class UserDataPaths
     public static string KeybindsPath => Path.Combine(GameRootDirectory, "keybinds.json");
     public static string CrashLogPath => Path.Combine(GameRootDirectory, "tsc_crash.log");
     public static string ScoresPath => Path.Combine(RootDirectory, "save", "scores.json");
+    public static string EditorRecoveryPath => Path.Combine(RootDirectory, "EditorRecovery", "editor-recovery.tsts");
 
     /// <summary>Resolve writable user files relative to the install root.</summary>
     public static string GetPath(params string[] segments)
