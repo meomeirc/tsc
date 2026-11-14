@@ -1,5 +1,14 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.56
+
+- added crash recovery
+- changed radar axes to represent more of the pattern difficulty instead of combo
+- recalibrated radar weight
+- added video and glsl shader support for skin
+- reworked renderConfig / editorRenderConfig into a shared playfieldConfig. you can use custom texture names now
+- adjusted default skin
+
 # 0.0.55
 
 - added difficulty radar and combo distribution overlay to song select
