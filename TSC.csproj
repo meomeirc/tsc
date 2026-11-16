@@ -2,6 +2,9 @@
   <PropertyGroup>
     <Configurations>Debug;Release;Publish</Configurations>
     <MonoGamePlatform>DesktopGL</MonoGamePlatform>
+    <!-- This is the DesktopGL project. Keep MGCB discovery explicit so the Android-only
+         Content.Android.mgcb is not auto-added with the same Content/ target paths. -->
+    <EnableMGCBItems>false</EnableMGCBItems>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
