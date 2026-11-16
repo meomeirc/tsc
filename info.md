@@ -1,5 +1,10 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.57
+
+- added level predictor (shows in song select for unset levels and in chart editor level label)
+- fixes and adjustments to the skin
+
 # 0.0.56
 
 - added crash recovery
