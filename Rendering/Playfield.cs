@@ -21,6 +21,7 @@ namespace TSC.Rendering;
 
 public sealed partial class Playfield
 {
+#if DEBUG
     private sealed class LoadTimingScope : IDisposable
     {
         private readonly string _stage;
@@ -39,6 +40,14 @@ public sealed partial class Playfield
                 $"allocatedBytes={allocatedBytes} managedDeltaBytes={managedDeltaBytes}");
         }
     }
+#else
+    // Keep the using sites allocation-free in shipping builds.
+    private readonly struct LoadTimingScope : IDisposable
+    {
+        public LoadTimingScope(string stage) { }
+        public void Dispose() { }
+    }
+#endif
 
     public event Action? OpenFpkRequested;
     public event Action? OpenAresRequested;
@@ -65,6 +74,7 @@ public sealed partial class Playfield
     private static readonly string[] EditorDifficultyNames = { "Easy", "Normal", "Hard", "Expert", "Extra" };
     private static readonly string[] EditorMetaCategories = { "SONG", "MEDIA", "JUDGEMENT", "STATS", "TEST" };
     private readonly Dictionary<string, EditorDifficultyState> _editorDifficultyStates = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<AresChart, int?> _editorLevelEstimateCache = new(ReferenceEqualityComparer.Instance);
     private readonly HashSet<string> _editorDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _editorCommittedDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private bool _editorDifficultySessionActive;
@@ -377,14 +387,20 @@ public sealed partial class Playfield
     private readonly Dictionary<string, (double PerfectPlusMs, double PerfectMs, double GoodMs)> _bundleJudgementWindows = new(StringComparer.OrdinalIgnoreCase);
     private string? _bundleSeries;
     private bool _scoreDebugEnabled = false;
+#if DEBUG
     private bool _showPerformanceDebug;
-    private bool _showAuxTrackDebug;
     private bool _performanceDebugWasVisible;
     private bool _performanceDebugInstrumentFrame;
     private long _performanceDebugNextSampleTimestamp;
     private long _performanceDebugOverlayNextRefreshTimestamp;
     private string _performanceDebugOverlayText = string.Empty;
+#else
+    private const bool _performanceDebugInstrumentFrame = false;
+#endif
+    private bool _showAuxTrackDebug;
+#if DEBUG
     private readonly Process _debugProcess = Process.GetCurrentProcess();
+#endif
     private bool _disableOrbitLaneTransition;
     private bool _disableTransitionFlash;
     private double _debugFrameMs;
@@ -427,11 +443,15 @@ public sealed partial class Playfield
     private long _debugAllocFeedbackHudBytes;
     private double _debugTexturedSubmitMs;
     private long _debugAllocatedBytes;
+#if DEBUG
     private double _debugLastGameplayDtMs;
     private double _debugLastTimingOffsetMs;
     private readonly double[] _debugTimingOffsets = new double[12];
     private int _debugTimingOffsetWriteIndex;
     private int _debugTimingOffsetCount;
+    private double _debugSkinNoteBridgeMs;
+    private long _debugSkinNoteBridgeAllocatedBytes;
+#endif
     private int _debugVisibleGameplayChains;
     private int _debugGameplayLinkSegments;
     private int _debugLinkBodyQuads;
@@ -839,6 +859,7 @@ public sealed partial class Playfield
     private readonly List<TexturedQuadCommand> _headBatchScratch = new();
     private readonly List<Textured3DQuadCommand> _head3DCommands = new();
     private readonly List<Textured3DQuadCommand> _head3DBatchScratch = new();
+    private readonly Dictionary<VertexPositionColorTexture[], SkinPlayfieldGeometryDrawRequest> _skinPlayfieldInPlaceGeometryRequests = new(64);
     private readonly List<SkinPlayfieldGeometrySnapshot> _skinPlayfieldGeometryScratch = new(512);
     private readonly List<SkinPlayfieldSpriteGeometrySnapshot> _skinPlayfieldSpriteGeometryScratch = new(64);
     private readonly List<SkinPlayfieldSpriteGeometrySnapshot> _skinJudgementLineGeometryScratch = new(16);
@@ -975,6 +996,19 @@ public sealed partial class Playfield
         // Give the player time to switch lanes inside a LinkTail's timing window.
         // Releases never judge a tail by themselves.
         public bool AllowUnheldUntilNextTailWindow { get; set; }
+        // A LinkTail press can be released and retried on the same lane. The
+        // deadline starts at the tail's original late timing edge. Every release
+        // inside the original timing window adds one more leniency window; releases
+        // after that original window can still use earned time but cannot extend it.
+        public double? LinkTailRepressDeadlineSeconds { get; set; }
+        // Timestamp of the most recent press or release edge processed for this tail.
+        public double LinkTailLastPressSeconds { get; set; }
+        public bool LinkTailRepressPending { get; set; }
+        // A manual LinkHead/LinkTail press may auto-hit exactly the next LinkTail
+        // when that tail's authored time falls inside the GOOD window of the press.
+        // An auto-hit consumes this allowance and never renews it.
+        public bool CanAutoHitNextLinkTail { get; set; }
+        public double LastManualLinkPressSeconds { get; set; }
         public bool AccuracyCompletionReserved { get; set; }
         public bool AccuracyCompletionResolved { get; set; }
         public double AccuracyCompletionWeight { get; set; }
@@ -1219,6 +1253,123 @@ public sealed partial class Playfield
             "xt" or "extra" or "sc" or "secret" => "xt",
             _ => "ex"
         };
+    }
+
+    private int? GetEditorEstimatedLevel(AresChart chart, string? difficultyCode = null)
+    {
+        ArgumentNullException.ThrowIfNull(chart);
+        if (_editorLevelEstimateCache.TryGetValue(chart, out var cached))
+            return cached;
+
+        int? estimate = null;
+        try
+        {
+            var code = GetEditorDifficultyCode(difficultyCode ?? chart.Difficulty, _sourceName);
+            estimate = ChartLevelEstimator.Estimate(ChartRadarAnalyzer.Analyze(chart), code);
+        }
+        catch (Exception ex)
+        {
+            var logDifficulty = difficultyCode ?? chart.Difficulty ?? "unknown";
+            var logChartName = chart.Name ?? "Untitled";
+            Program.LogRuntime(
+                $"EDITOR_LEVEL_ESTIMATE_FAILED difficulty={logDifficulty} " +
+                $"chart={logChartName} error={ex.GetType().Name}: {ex.Message}");
+        }
+
+        _editorLevelEstimateCache[chart] = estimate;
+        return estimate;
+    }
+
+    private static string GetEditorSongJsonDifficultyKey(string? difficultyCode)
+        => GetEditorDifficultyCode(difficultyCode) switch
+        {
+            "ez" => "easy",
+            "nm" => "normal",
+            "hd" => "hard",
+            "ex" => "expert",
+            "xt" => "sc",
+            _ => string.Empty
+        };
+
+    /// <summary>
+    /// Writes the explicit level, or the estimated fallback, into song.json only.
+    /// The chart passed to TscLoader/AresWriter is never modified, so legacy
+    /// in-chart TSC level metadata is not populated by an estimate.
+    /// </summary>
+    private void ApplyEditorSongJsonLevel(JsonObject root, AresChart chart, string? difficultyCode = null)
+    {
+        ArgumentNullException.ThrowIfNull(root);
+        ArgumentNullException.ThrowIfNull(chart);
+
+        var code = GetEditorDifficultyCode(difficultyCode ?? chart.Difficulty, _sourceName);
+        var key = GetEditorSongJsonDifficultyKey(code);
+        if (key.Length == 0)
+            return;
+
+        JsonObject levels;
+        if (root["difficulty_levels"] is JsonObject currentLevels)
+        {
+            levels = currentLevels;
+        }
+        else if (root["level"] is JsonObject legacyLevels)
+        {
+            levels = (JsonObject)legacyLevels.DeepClone();
+            root.Remove("level");
+            root["difficulty_levels"] = levels;
+        }
+        else
+        {
+            levels = new JsonObject();
+            root["difficulty_levels"] = levels;
+        }
+
+        if (chart.Level.HasValue)
+        {
+            levels[key] = chart.Level.Value;
+            return;
+        }
+
+        if (levels[key] is JsonValue existingLevel && existingLevel.TryGetValue<int>(out _))
+            return;
+
+        var estimate = GetEditorEstimatedLevel(chart, code);
+        if (estimate.HasValue)
+            levels[key] = estimate.Value;
+    }
+
+    private static string? FindExistingEditorSongJson(string chartPath)
+    {
+        var current = Path.GetDirectoryName(Path.GetFullPath(chartPath));
+        for (var depth = 0; current is not null && depth < 10; depth++)
+        {
+            var candidate = Path.Combine(current, "song.json");
+            if (File.Exists(candidate))
+                return candidate;
+            current = Directory.GetParent(current)?.FullName;
+        }
+        return null;
+    }
+
+    private void UpdateExistingEditorSongJsonLevel(string chartPath, AresChart chart, string? difficultyCode = null)
+    {
+        var sidecarPath = FindExistingEditorSongJson(chartPath);
+        if (sidecarPath is null)
+            return;
+
+        JsonObject root;
+        try
+        {
+            root = JsonNode.Parse(File.ReadAllText(sidecarPath)) as JsonObject ?? new JsonObject();
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            Program.LogRuntime($"EDITOR_LEVEL_SONG_JSON_READ_FAILED path={sidecarPath} error={ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+
+        ApplyEditorSongJsonLevel(root, chart, difficultyCode);
+        File.WriteAllText(sidecarPath, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine,
+            new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
     }
 
     public static string GetEditorDifficultyName(string? code)
@@ -1623,6 +1774,7 @@ public sealed partial class Playfield
     {
         _editorMetaStatsCache = null;
         _editorMetaStatsCacheChart = null;
+        _editorLevelEstimateCache.Clear();
         if (_chartEditorMode)
         {
             _editorRecoveryRevision++;
@@ -3935,18 +4087,13 @@ public sealed partial class Playfield
         }
     }
 
-    private static void ApplyExtraDifficultyEnabledMetadata(JsonObject root, AresChart? savedExtraChart, AresChart? activeExtraChart = null)
+    private void ApplyExtraDifficultyEnabledMetadata(JsonObject root, AresChart? savedExtraChart, AresChart? activeExtraChart = null)
     {
         RemoveMissingDifficultyLevels(root);
-        var extraLevel = activeExtraChart?.Level ?? savedExtraChart?.Level;
-        if (extraLevel is not { } level)
+        var extraChart = activeExtraChart ?? savedExtraChart;
+        if (extraChart is null)
             return;
-        if (root["difficulty_levels"] is not JsonObject levels)
-        {
-            levels = new JsonObject();
-            root["difficulty_levels"] = levels;
-        }
-        levels["sc"] = level;
+        ApplyEditorSongJsonLevel(root, extraChart, "xt");
         RemoveMissingDifficultyLevels(root);
     }
 
@@ -4790,6 +4937,7 @@ public sealed partial class Playfield
         InvalidateLaneMeshCache();
         _editorMetaStatsCache = null;
         _editorMetaStatsCacheChart = null;
+        _editorLevelEstimateCache.Clear();
         using (new LoadTimingScope("chart_gear_timeline"))
             _gear = new GearTimeline(_chart);
         _editorPreviewGearState = null;
@@ -4945,6 +5093,8 @@ public sealed partial class Playfield
             if (!adoptOutputAsSource)
                 RestoreEditorChartMediaState(_chart, originalMediaState);
         }
+        if (writeSongJsonSidecar)
+            UpdateExistingEditorSongJsonLevel(fullTarget, _chart, activeDifficultyCode);
         ApplyDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: false);
         UpdateEditorExtraDifficultySongJson(fullTarget, createIfMissing: writeSongJsonSidecar);
         var previewRangeSyncFailures = SynchronizePreviewRangeToSiblingChartFiles(fullTarget, activeDifficultyCode);
@@ -5103,6 +5253,10 @@ public sealed partial class Playfield
             {
                 var json = JsonNode.Parse(File.ReadAllText(songJsonPath)) as JsonObject
                     ?? throw new InvalidDataException("Could not create TSC ZIP song.json metadata.");
+                foreach (var pair in includedStates)
+                    ApplyEditorSongJsonLevel(json, pair.Value.Chart, GetEditorDifficultyCode(pair.Key));
+                if (extraChartOutsideSession is not null)
+                    ApplyEditorSongJsonLevel(json, extraChartOutsideSession, "xt");
                 if (!_editorExtraDifficultyEnabled)
                     ApplyExtraDifficultyDisabledMetadata(json);
                 else
@@ -5348,6 +5502,7 @@ public sealed partial class Playfield
             if (!adoptOutputAsSource)
                 RestoreEditorChartMediaState(_chart, originalMediaState);
         }
+        UpdateExistingEditorSongJsonLevel(fullTarget, _chart, activeDifficultyCode);
         ApplyDifficultyFilePolicyInDirectory(targetDirectory, useAresFileNames: _editorBundleTemplate != ChartBundleTemplate.Tsc);
         UpdateEditorExtraDifficultySongJson(fullTarget, createIfMissing: _editorBundleTemplate != ChartBundleTemplate.Tsc);
         var previewRangeSyncFailures = SynchronizePreviewRangeToSiblingChartFiles(fullTarget, activeDifficultyCode);
@@ -5742,6 +5897,7 @@ public sealed partial class Playfield
                 includeJudgementWindows: IsEditorCustomJudgementWindowsEnabled(GetEditorDifficultyCode(chart.Difficulty, _sourceName)));
             var generated = JsonNode.Parse(File.ReadAllText(Path.Combine(directory, "song.json"))) as JsonObject
                 ?? throw new InvalidDataException("Could not build bundle song.json metadata.");
+            ApplyEditorSongJsonLevel(generated, chart, GetEditorDifficultyCode(chart.Difficulty, _sourceName));
             if (!_editorExtraDifficultyEnabled)
                 ApplyExtraDifficultyDisabledMetadata(generated);
             else
@@ -5787,6 +5943,8 @@ public sealed partial class Playfield
             }
             var generated = JsonNode.Parse(File.ReadAllText(Path.Combine(directory, "song.json"))) as JsonObject
                 ?? throw new InvalidDataException("Could not build bundle song.json metadata.");
+            foreach (var state in states)
+                ApplyEditorSongJsonLevel(generated, state.Chart, GetEditorDifficultyCode(state.Chart.Difficulty, state.SourceName));
             if (!_editorExtraDifficultyEnabled)
                 ApplyExtraDifficultyDisabledMetadata(generated);
             else
@@ -5946,6 +6104,8 @@ public sealed partial class Playfield
             var songJsonPath = Path.Combine(staging, "song.json");
             var songJson = JsonNode.Parse(File.ReadAllText(songJsonPath)) as JsonObject
                 ?? throw new InvalidDataException("Could not create TSTS song.json metadata.");
+            foreach (var pair in exportableStates)
+                ApplyEditorSongJsonLevel(songJson, pair.Value.Chart, pair.Key);
             songJson["schema"] = 3;
             if (!_editorExtraDifficultyEnabled)
                 ApplyExtraDifficultyDisabledMetadata(songJson);
@@ -11516,6 +11676,7 @@ public sealed partial class Playfield
         }
         _editorMetaStatsCache = null;
         _editorMetaStatsCacheChart = null;
+        _editorLevelEstimateCache.Clear();
         _gear = new GearTimeline(_chart);
         _gameplayState = _gear.Initial;
         _skinRuntime.SetPanelTracks(_chart, _tempo);
@@ -12662,6 +12823,11 @@ public sealed partial class Playfield
         // This clock deliberately advances before pause/result early returns. Skin
         // effects and key-release animations must not depend on chart playback time.
         _uiTimeSeconds += Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
+#if TSC_ANDROID
+        UpdateAndroidGameplayTouchActions();
+#else
+        KeybindSettings.UpdateTouchGameplayActions(Array.Empty<string>(), suppressPressEdges: true);
+#endif
 
         // Upload hit-effect textures in small batches while the screen is hidden
         // during startup. The transition readiness check keeps gameplay from
@@ -12883,7 +13049,9 @@ public sealed partial class Playfield
         }
 
         var dt = (float)gameTime.ElapsedGameTime.TotalSeconds;
+#if DEBUG
         _debugLastGameplayDtMs = gameTime.ElapsedGameTime.TotalMilliseconds;
+#endif
         var playbackElapsedSeconds = gameTime.ElapsedGameTime.TotalSeconds;
         if (_pendingAudioRecoveryClockCorrectionSeconds > 0)
         {
@@ -13595,6 +13763,7 @@ public sealed partial class Playfield
         _editorHoverOutlinePoints[EditorHoverOutlineSegments] = _editorHoverOutlinePoints[0];
         DrawPolyline(batch, _editorHoverOutlinePoints, width, color);
     }
+#if DEBUG
     private (double ManagedUsedMb, double GcHeapMb, double GcCommittedMb, double GcFragmentedMb,
         double LohMb, double ProcessCommitMb, double WorkingSetMb, double NonGcCommittedMb) GetMemoryDebug()
     {
@@ -13627,6 +13796,7 @@ public sealed partial class Playfield
             workingSetBytes * bytesToMb,
             nonGcCommittedBytes * bytesToMb);
     }
+#endif
 
     public void Dispose()
     {
@@ -13657,7 +13827,9 @@ public sealed partial class Playfield
         _pauseSkinRuntime.Dispose();
         _resultSkinRuntime.Dispose();
         _chartEditorInterfaceRuntime.Dispose();
+#if DEBUG
         _debugProcess.Dispose();
+#endif
     }
     private static Texture2D CreateCircleTexture(GraphicsDevice device, int size)
     {

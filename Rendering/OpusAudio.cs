@@ -419,18 +419,32 @@ public sealed class OpusAudioPlayer : IDisposable
         // song at the exact moment playback began. On songs whose audio origin is
         // near tick 0, that work could become a visible startup hitch and leave
         // the software chart clock ahead of the audio.
-        _effect = CreateTrackedSoundBuffer(_pcm!);
-        _effectContainsFullSource = true;
-        _instance = CreateTrackedSoundSource(_effect);
-        _instance.IsLooped = _isLooped;
-        _instance.Volume = _volume;
+        var pcm = _pcm!;
+        var pcmBytes = pcm.Length;
+        var bufferCreateStart = Stopwatch.GetTimestamp();
+        var bufferCreateSucceeded = false;
+        try
+        {
+            _effect = CreateTrackedSoundBuffer(pcm);
+            _effectContainsFullSource = true;
+            _instance = CreateTrackedSoundSource(_effect);
+            _instance.IsLooped = _isLooped;
+            _instance.Volume = _volume;
 
-        // The normal menu-play path never seeks. Once the full-song effect is
-        // prepared, keeping the decoded PCM around is just another large copy of
-        // the music. Debug/editor playback retains it because its manual seek
-        // controls still use the PCM slice path.
-        if (!retainPcmForSeeking)
-            _pcm = null;
+            // The normal menu-play path never seeks. Once the full-song effect is
+            // prepared, keeping the decoded PCM around is just another large copy
+            // of the music. Debug/editor playback retains it because its manual
+            // seek controls still use the PCM slice path.
+            if (!retainPcmForSeeking)
+                _pcm = null;
+            bufferCreateSucceeded = true;
+        }
+        finally
+        {
+            TSC.Program.LogRuntime(
+                $"AUDIO_SOUND_BUFFER_CREATE elapsedMs={Stopwatch.GetElapsedTime(bufferCreateStart).TotalMilliseconds:0.00} " +
+                $"pcmBytes={pcmBytes} retainPcm={retainPcmForSeeking} success={bufferCreateSucceeded} thread=game");
+        }
     }
 
     public void SyncToChartTime(double chartSeconds, double audioStartChartSeconds)

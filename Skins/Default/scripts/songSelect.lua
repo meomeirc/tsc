@@ -1,6 +1,10 @@
 -- Song Select skin matching the supplied reference layout.
 
 local UI = import("uiStyle")
+
+-- This screen has no time-driven visual animation. Let SkinRuntime reuse the
+-- previous resolved command list while its state and pointer remain unchanged.
+song_select.static_render_cache = true
 local FONT_REGULAR = UI.fonts.regular
 local FONT_MEDIUM = UI.fonts.medium
 local FONT_BOLD = UI.fonts.bold
@@ -13,6 +17,15 @@ local DARK = UI.colors.background
 local DARK_PANEL = UI.colors.panel
 local MUTED = UI.colors.muted
 local SOFT = UI.colors.muted
+
+-- Constant color tables are shared because draw.* consumes their values
+-- immediately; rebuilding these tables in render() only creates garbage.
+local CARD_INFO_OVERLAY_COLOR = { r = 0, g = 0, b = 0, a = 185 }
+local SELECTED_ART_OVERLAY_COLOR = { r = 0, g = 0, b = 0, a = 120 }
+local FULLSCREEN_ART_OVERLAY_COLOR = { r = 0, g = 0, b = 0, a = 68 }
+local FOOTER_BACKGROUND_COLOR = { r = 0, g = 0, b = 0, a = 184 }
+local SEARCH_FRAME_COLOR = { r = 0, g = 0, b = 0, a = 210 }
+local LOADING_OVERLAY_COLOR = { r = 0, g = 0, b = 0, a = 120 }
 
 local DIFF = {
     { name = "EZ", key = "ez_level", color = "#F3D200" },
@@ -138,14 +151,249 @@ local function px(value, scale)
     return (tonumber(value) or 0) * scale
 end
 
+local UPPERCASE_CACHE = {}
+local RIGHT_CONTROL_LABEL_CACHE = {
+    scroll_speed = { value = nil, label = "" },
+    gauge = { value = nil, label = "" },
+    scroll_mode = { value = nil, label = "" },
+}
+
+local function cached_upper(value)
+    value = tostring(value or "")
+    local upper = UPPERCASE_CACHE[value]
+    if upper == nil then
+        upper = string.upper(value)
+        UPPERCASE_CACHE[value] = upper
+    end
+    return upper
+end
+
+local function cached_right_control_label(key, prefix, value)
+    local cache = RIGHT_CONTROL_LABEL_CACHE[key]
+    value = tostring(value or "")
+    if cache.value ~= value then
+        cache.value = value
+        cache.label = prefix .. cached_upper(value)
+    end
+    return cache.label
+end
+
 local REFERENCE_WIDTH = 1920
 local REFERENCE_HEIGHT = 1080
 
 local pulse = 0
 
+-- The renderer copies option values synchronously. Reuse one scratch table per
+-- command type instead of constructing a fresh Lua table for every draw call.
+-- This is especially important on Android, where MoonSharp table/DynValue
+-- creation was a sizeable part of the Song Select render allocation rate.
+local RECT_OPTIONS = {}
+local TEXT_OPTIONS = {}
+local USER_TEXT_OPTIONS = {}
+local USER_TEXT_MEASURE_OPTIONS = {}
+local BUTTON_OPTIONS = {}
+local INPUT_OPTIONS = {}
+local SLIDER_OPTIONS = {}
+local LAYOUT_BOX_OPTIONS = {}
+local PANEL_OPTIONS = {}
+local RIGHT_BUTTON_OPTIONS = {}
+local FOOTER_CONTROL_LAYOUT = { pack = {}, sort = {}, order = {} }
+local CHART_PANEL_OPTIONS = {
+    id = "selected_chart_panel",
+    mode = "current",
+    layer = 25,
+    clickable = true,
+    hitbox = {
+        id = "selected_chart_panel_toggle",
+        action = "cycle_chart_panel",
+        hit_test_priority = 50,
+    },
+    header = true,
+    background_color = CHART_PANEL_STYLE.background_color,
+    border_color = CHART_PANEL_STYLE.border_color,
+    header_color = CHART_PANEL_STYLE.header_color,
+    divider_color = CHART_PANEL_STYLE.divider_color,
+    radar_fill_color = CHART_PANEL_STYLE.radar_fill_color,
+    radar_line_color = CHART_PANEL_STYLE.radar_line_color,
+    guide_color = CHART_PANEL_STYLE.guide_color,
+    bar_background_color = CHART_PANEL_STYLE.bar_background_color,
+    taps_color = CHART_PANEL_STYLE.taps_color,
+    chords_color = CHART_PANEL_STYLE.chords_color,
+    longs_color = CHART_PANEL_STYLE.longs_color,
+    slides_color = CHART_PANEL_STYLE.slides_color,
+    flicks_color = CHART_PANEL_STYLE.flicks_color,
+    stream_color = CHART_PANEL_STYLE.stream_color,
+    travel_color = CHART_PANEL_STYLE.travel_color,
+    border_width = CHART_PANEL_STYLE.border_width,
+    header_size = CHART_PANEL_STYLE.header_size,
+    background_bleed = CHART_PANEL_STYLE.background_bleed,
+}
+
+local function submit_rect(id, parent, x, y, width, height, color, layer, alpha, anchor, clip)
+    local options = RECT_OPTIONS
+    options.position = nil
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.width = width
+    options.height = height
+    options.color = color
+    options.alpha = alpha == nil and 1 or alpha
+    options.anchor = anchor
+    options.rotation = 0
+    options.blend = nil
+    options.clip = clip
+    options.layer = layer
+    draw.rect(options)
+end
+
+local function submit_text(text, id, parent, x, y, size, color, font, anchor, layer, shadow, alpha, clip)
+    local options = TEXT_OPTIONS
+    options.position = nil
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.size = size
+    options.max_width = nil
+    options.wrap = false
+    options.color = color
+    options.font = font
+    options.anchor = anchor
+    options.layer = layer
+    options.shadow = shadow
+    options.stroke = nil
+    options.alpha = alpha == nil and 1 or alpha
+    options.rotation = 0
+    options.blend = nil
+    options.clip = clip
+    options.scale = nil
+    draw.text(text, options)
+end
+
+local function submit_user_text(text, parent, x, y, size, color, font, anchor, layer, shadow, maxWidth, wrap, clip)
+    local options = USER_TEXT_OPTIONS
+    options.position = nil
+    options.id = nil
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.size = size
+    options.max_width = maxWidth
+    options.wrap = wrap == true
+    options.color = color
+    options.font = font
+    options.anchor = anchor
+    options.layer = layer
+    options.shadow = shadow
+    options.stroke = nil
+    options.alpha = 1
+    options.rotation = 0
+    options.blend = nil
+    options.clip = clip
+    options.scale = nil
+    draw.user_text(text, options)
+end
+
+local function submit_button(id, parent, x, y, width, height, action, value, hitPriority, clip)
+    local options = BUTTON_OPTIONS
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.width = width
+    options.height = height
+    options.action = action
+    options.value = value
+    options.hit_test_priority = hitPriority
+    options.clip = clip
+    ui.button(options)
+end
+
+local function submit_input(id, parent, x, y, width, height, action, clip)
+    local options = INPUT_OPTIONS
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.width = width
+    options.height = height
+    options.action = action
+    options.clip = clip
+    ui.input(options)
+end
+
+local function submit_slider(id, parent, x, y, width, height, minValue, maxValue, step, action, clip)
+    local options = SLIDER_OPTIONS
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.width = width
+    options.height = height
+    options.min = minValue
+    options.max = maxValue
+    options.step = step
+    options.action = action
+    options.clip = clip
+    ui.slider(options)
+end
+
+local function submit_layout_box(id, parent, x, y, width, height)
+    local options = LAYOUT_BOX_OPTIONS
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.width = width
+    options.height = height
+    UI.layout_box(options)
+end
+
+local function submit_panel(id, parent, x, y, width, height, color, layer, alpha)
+    local options = PANEL_OPTIONS
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.width = width
+    options.height = height
+    options.color = color
+    options.layer = layer
+    options.alpha = alpha
+    UI.draw_panel(options)
+end
+
+local function submit_right_button(id, parent, x, y, width, height, label, textSize, action, variant, layer)
+    local options = RIGHT_BUTTON_OPTIONS
+    options.id = id
+    options.parent = parent
+    options.x = x
+    options.y = y
+    options.width = width
+    options.height = height
+    options.label = label
+    options.text_size = textSize
+    options.font = FONT_BOLD
+    options.action = action
+    options.variant = variant
+    options.layer = layer or 58
+    UI.draw_button(options)
+end
+
 -- SkinRuntime builds this blur from the same font raster as the text.
+-- The arguments other than alpha are intentionally presentation-neutral here;
+-- keep one immutable Lua options table for each alpha used by this skin.
+local SOFT_SHADOW_CACHE = {}
 local function soft_shadow(fontPath, x, y, alpha)
-    return { blur = 1.8, expand = 0, x = 0, y = 0, color = BLACK, alpha = alpha or 0.65 }
+    local opacity = alpha or 0.65
+    local cached = SOFT_SHADOW_CACHE[opacity]
+    if cached == nil then
+        cached = { blur = 1.8, expand = 0, x = 0, y = 0, color = BLACK, alpha = opacity }
+        SOFT_SHADOW_CACHE[opacity] = cached
+    end
+    return cached
 end
 
 function init()
@@ -163,12 +411,14 @@ local cached_layout_width = -1
 local cached_layout_height = -1
 local cached_layout_metrics = nil
 
--- On wide displays, keep the Song Select UI inside a centered 16:9 canvas.
+-- Desktop keeps its centered 16:9 composition on ultra-wide windows.
+-- Android's render viewport already follows the physical display aspect, so use
+-- the entire width there instead of leaving unused side margins.
 local function song_select_viewport(width, height)
     width = math.max(1, tonumber(width) or 1)
     height = math.max(1, tonumber(height) or 1)
     local viewport_width = width
-    if width / height > (16 / 9) then
+    if not (screen and screen.is_android == true) and width / height > (16 / 9) then
         viewport_width = height * (16 / 9)
     end
     local viewport_x = (width - viewport_width) * 0.5
@@ -384,13 +634,70 @@ local function fit_text_size(value, baseSize, maxWidth)
     return math.min(baseSize, math.max(0.01, maxWidth / units))
 end
 
+-- Text-fit results are shared by text and layout parameters, not by song index.
+-- The old per-song cache missed whenever the visible-list indices were rebuilt,
+-- causing one native font measurement per visible card label on every render.
+-- Keep a bounded cache so scrolling through a large library cannot grow memory forever.
+local USER_TEXT_FIT_CACHE = {}
+local USER_TEXT_FIT_CACHE_ORDER = {}
+local USER_TEXT_FIT_CACHE_LIMIT = 512
+local USER_TEXT_FIT_CACHE_NEXT = 1
+
+-- The selected panel is redrawn every frame, but its score geometry usually stays
+-- unchanged. Reuse the score's measured width and derived line height.
+local SCORE_LAYOUT_CACHE = {}
+local SCORE_MEASURE_OPTIONS = {}
+
 local function fit_user_text_size(value, baseSize, maxWidth, font)
-    local measured = draw.measure_user_text_width(tostring(value or ""), {
-        font = font or FONT_REGULAR,
-        size = baseSize,
-    })
-    if measured <= 0 or measured <= maxWidth then return baseSize end
-    return math.max(0.01, baseSize * maxWidth / measured)
+    value = tostring(value or "")
+    font = font or FONT_REGULAR
+
+    -- Quarter-pixel buckets avoid cache misses from harmless float noise when
+    -- responsive layout values are recomputed. The returned size is rescaled
+    -- against the current base size, so the visible result remains proportional.
+    local baseKey = math.floor(baseSize * 4 + 0.5)
+    local widthKey = math.floor(maxWidth * 4 + 0.5)
+    local textCache = USER_TEXT_FIT_CACHE[value]
+    if textCache ~= nil then
+        local fontCache = textCache[font]
+        local sizeCache = fontCache ~= nil and fontCache[baseKey] or nil
+        local ratio = sizeCache ~= nil and sizeCache[widthKey] or nil
+        if ratio ~= nil then
+            return math.max(0.01, baseSize * ratio)
+        end
+    else
+        if #USER_TEXT_FIT_CACHE_ORDER < USER_TEXT_FIT_CACHE_LIMIT then
+            USER_TEXT_FIT_CACHE_ORDER[#USER_TEXT_FIT_CACHE_ORDER + 1] = value
+        else
+            local evicted = USER_TEXT_FIT_CACHE_ORDER[USER_TEXT_FIT_CACHE_NEXT]
+            USER_TEXT_FIT_CACHE[evicted] = nil
+            USER_TEXT_FIT_CACHE_ORDER[USER_TEXT_FIT_CACHE_NEXT] = value
+            USER_TEXT_FIT_CACHE_NEXT = USER_TEXT_FIT_CACHE_NEXT % USER_TEXT_FIT_CACHE_LIMIT + 1
+        end
+        textCache = {}
+        USER_TEXT_FIT_CACHE[value] = textCache
+    end
+
+    local fontCache = textCache[font]
+    if fontCache == nil then
+        fontCache = {}
+        textCache[font] = fontCache
+    end
+    local sizeCache = fontCache[baseKey]
+    if sizeCache == nil then
+        sizeCache = {}
+        fontCache[baseKey] = sizeCache
+    end
+
+    local measureOptions = USER_TEXT_MEASURE_OPTIONS
+    measureOptions.font = font
+    measureOptions.size = baseSize
+    local measured = draw.measure_user_text_width(value, measureOptions)
+    local fitted = (measured <= 0 or measured <= maxWidth)
+        and baseSize
+        or math.max(0.01, baseSize * maxWidth / measured)
+    sizeCache[widthKey] = fitted / math.max(0.01, baseSize)
+    return fitted
 end
 
 local function score_text(score)
@@ -416,69 +723,6 @@ local function accuracy_text(value)
     return string.format("%.1f%%", value)
 end
 
-local function chart_difficulty_index(song)
-    local wanted = string.lower(tostring(song.chart_difficulty or "")):gsub("^%s+", ""):gsub("%s+$", "")
-    if wanted == "expert" then wanted = "ex" end
-    if wanted == "extra" then wanted = "xt" end
-    if wanted == "hard" then wanted = "hd" end
-    if wanted == "normal" then wanted = "nm" end
-    if wanted == "easy" then wanted = "ez" end
-
-    if wanted ~= "" then
-        for i = 1, #DIFF do
-            if DIFF[i].name:lower() == wanted or DIFF[i].key:gsub("_level$", "") == wanted then
-                return i
-            end
-        end
-    end
-    return nil
-end
-
-local function active_difficulty_index(song)
-    local wanted = tonumber(song_select.selected_difficulty or 4) or 4
-    if wanted >= 1 and wanted <= 5 and song[DIFF[wanted].key] ~= nil then
-        return wanted
-    end
-
-    for i = 5, 1, -1 do
-        if song[DIFF[i].key] ~= nil then
-            return i
-        end
-    end
-    return wanted
-end
-
-local function active_level(song)
--- In chart-based sorting the C# side gives each card its own concrete chart.
-    if song.chart_level ~= nil and song.chart_difficulty ~= nil and song.chart_difficulty ~= "" then
-        local chart_index = chart_difficulty_index(song)
-        if chart_index ~= nil then
-            return song.chart_level, chart_index
-        end
-    end
-
-    local i = active_difficulty_index(song)
-    return song[DIFF[i].key], i
-end
-
-local function draw_cover(asset, x, y, w, h, alpha, crop, layer, parent)
-    if asset == nil then
-        return false
-    end
-    draw.sprite(asset, {
-        parent = parent,
-        x = x,
-        y = y,
-        width = w,
-        height = h,
-        alpha = alpha or 1,
-        crop = crop and "cover" or nil,
-        anchor = "top-left",
-        layer = layer,
-    })
-    return true
-end
-
 local function clear_short_name(clear_type)
     clear_type = string.upper(clear_type or "")
     if clear_type == "FULL COMBO" then return "FULL COMBO" end
@@ -489,144 +733,309 @@ local function clear_short_name(clear_type)
     return "--"
 end
 
+local CHART_DIFFICULTY_INDEX = {
+    ez = 1, easy = 1,
+    nm = 2, normal = 2,
+    hd = 3, hard = 3,
+    ex = 4, expert = 4,
+    xt = 5, extra = 5,
+}
+
+local function chart_difficulty_index(song)
+    local wanted = string.lower(tostring(song.chart_difficulty or ""))
+    local direct = CHART_DIFFICULTY_INDEX[wanted]
+    if direct ~= nil then
+        return direct
+    end
+
+    -- Preserve the previous whitespace-tolerant behavior for unusual metadata.
+    wanted = string.match(wanted, "^%s*(.-)%s*$") or wanted
+    return CHART_DIFFICULTY_INDEX[wanted]
+end
+
+local SONG_PRESENTATION_CACHE = {}
+local SONG_PRESENTATION_CACHE_ORDER = {}
+local SONG_PRESENTATION_CACHE_LIMIT = 512
+local SONG_PRESENTATION_CACHE_NEXT = 1
+
+local function get_song_presentation(song, fallback_index)
+    local index = tonumber(song.index or fallback_index or 0) or 0
+    local cache = SONG_PRESENTATION_CACHE[index]
+    if cache == nil then
+        if #SONG_PRESENTATION_CACHE_ORDER < SONG_PRESENTATION_CACHE_LIMIT then
+            SONG_PRESENTATION_CACHE_ORDER[#SONG_PRESENTATION_CACHE_ORDER + 1] = index
+        else
+            local evicted = SONG_PRESENTATION_CACHE_ORDER[SONG_PRESENTATION_CACHE_NEXT]
+            SONG_PRESENTATION_CACHE[evicted] = nil
+            SONG_PRESENTATION_CACHE_ORDER[SONG_PRESENTATION_CACHE_NEXT] = index
+            SONG_PRESENTATION_CACHE_NEXT = SONG_PRESENTATION_CACHE_NEXT % SONG_PRESENTATION_CACHE_LIMIT + 1
+        end
+        cache = {
+            card_id = "song_card_frame_" .. tostring(index),
+            button_id = "song_" .. tostring(index),
+        }
+        SONG_PRESENTATION_CACHE[index] = cache
+    end
+
+    local name = song.name or ""
+    local artist = song.artist or ""
+    local series = song.series or ""
+    local chartDifficulty = song.chart_difficulty or ""
+    local chartLevel = song.chart_level
+    local ezLevel = song.ez_level
+    local nmLevel = song.nm_level
+    local hdLevel = song.hd_level
+    local exLevel = song.ex_level
+    local xtLevel = song.xt_level
+    local chartLevelEstimated = song.chart_level_estimated == true
+    local ezLevelEstimated = song.ez_level_estimated == true
+    local nmLevelEstimated = song.nm_level_estimated == true
+    local hdLevelEstimated = song.hd_level_estimated == true
+    local exLevelEstimated = song.ex_level_estimated == true
+    local xtLevelEstimated = song.xt_level_estimated == true
+    local grade = song.grade or ""
+    local bpm = song.bpm or 0
+    local score = song.score or 0
+    local accuracy = song.accuracy or 0
+    local clearType = song.clear_type or ""
+    local selectedDifficulty = tonumber(song_select.selected_difficulty or 4) or 4
+
+    if cache.name_source ~= name or cache.artist_source ~= artist or cache.series_source ~= series or
+        cache.chart_difficulty_source ~= chartDifficulty or cache.chart_level_source ~= chartLevel or
+        cache.ez_level_source ~= ezLevel or cache.nm_level_source ~= nmLevel or
+        cache.hd_level_source ~= hdLevel or cache.ex_level_source ~= exLevel or
+        cache.xt_level_source ~= xtLevel or
+        cache.chart_level_estimated_source ~= chartLevelEstimated or
+        cache.ez_level_estimated_source ~= ezLevelEstimated or
+        cache.nm_level_estimated_source ~= nmLevelEstimated or
+        cache.hd_level_estimated_source ~= hdLevelEstimated or
+        cache.ex_level_estimated_source ~= exLevelEstimated or
+        cache.xt_level_estimated_source ~= xtLevelEstimated or cache.grade_source ~= grade or
+        cache.bpm_source ~= bpm or cache.score_source ~= score or
+        cache.accuracy_source ~= accuracy or cache.clear_type_source ~= clearType or
+        cache.selected_difficulty_source ~= selectedDifficulty then
+
+        cache.name_source = name
+        cache.artist_source = artist
+        cache.series_source = series
+        cache.chart_difficulty_source = chartDifficulty
+        cache.chart_level_source = chartLevel
+        cache.ez_level_source = ezLevel
+        cache.nm_level_source = nmLevel
+        cache.hd_level_source = hdLevel
+        cache.ex_level_source = exLevel
+        cache.xt_level_source = xtLevel
+        cache.chart_level_estimated_source = chartLevelEstimated
+        cache.ez_level_estimated_source = ezLevelEstimated
+        cache.nm_level_estimated_source = nmLevelEstimated
+        cache.hd_level_estimated_source = hdLevelEstimated
+        cache.ex_level_estimated_source = exLevelEstimated
+        cache.xt_level_estimated_source = xtLevelEstimated
+        cache.grade_source = grade
+        cache.bpm_source = bpm
+        cache.score_source = score
+        cache.accuracy_source = accuracy
+        cache.clear_type_source = clearType
+        cache.selected_difficulty_source = selectedDifficulty
+
+        cache.title = tostring(name)
+        cache.artist = tostring(artist)
+        cache.series = display_series(series)
+        cache.grade = tostring(grade)
+        cache.bpm_text = string.format("%.0f", bpm)
+        cache.score_text = score_text(score)
+        cache.accuracy_text = accuracy_text(accuracy)
+        cache.clear_text = clear_short_name(clearType)
+        cache.chart_diff_index = chart_difficulty_index(song)
+        cache.selected_difficulty = selectedDifficulty
+        cache.difficulty_labels = {}
+        cache.difficulty_levels = {}
+        local estimatedFlags = {
+            ezLevelEstimated,
+            nmLevelEstimated,
+            hdLevelEstimated,
+            exLevelEstimated,
+            xtLevelEstimated,
+        }
+        for i = 1, #DIFF do
+            local difficultyLevel = song[DIFF[i].key]
+            cache.difficulty_levels[i] = difficultyLevel
+            local levelText = difficultyLevel and tostring(difficultyLevel) or "--"
+            if difficultyLevel ~= nil and estimatedFlags[i] then
+                levelText = "~" .. levelText
+            end
+            cache.difficulty_labels[i] = DIFF[i].name .. " " .. levelText
+        end
+
+        if chartLevel ~= nil and cache.chart_diff_index ~= nil then
+            cache.level = chartLevel
+            cache.diff_index = cache.chart_diff_index
+        else
+            local difficultyIndex = selectedDifficulty
+            if difficultyIndex < 1 or difficultyIndex > #DIFF or song[DIFF[difficultyIndex].key] == nil then
+                for i = #DIFF, 1, -1 do
+                    if song[DIFF[i].key] ~= nil then
+                        difficultyIndex = i
+                        break
+                    end
+                end
+            end
+            cache.diff_index = difficultyIndex
+            cache.level = DIFF[difficultyIndex] ~= nil and song[DIFF[difficultyIndex].key] or nil
+        end
+        local displayedLevelIsEstimated = cache.diff_index ~= nil and estimatedFlags[cache.diff_index] == true
+        cache.level_text = cache.level ~= nil
+            and (displayedLevelIsEstimated and "~" or "") .. string.format("%d", tonumber(cache.level) or 0)
+            or nil
+    end
+    return cache
+end
+
+-- These option tables are scratch buffers. draw.* consumes them synchronously
+-- and copies the needed values into its command before returning, so the same
+-- table can safely serve the next draw call.
+local COVER_SPRITE_OPTIONS = {}
+local CARD_SHADOW_OPTIONS = {}
+
+local function draw_cover(asset, x, y, w, h, alpha, crop, layer, parent)
+    if asset == nil then
+        return false
+    end
+    local options = COVER_SPRITE_OPTIONS
+    options.geometry = nil
+    options.position = nil
+    options.parent = parent
+    options.id = nil
+    options.x = x
+    options.y = y
+    options.width = w
+    options.height = h
+    options.scale = nil
+    options.alpha = alpha or 1
+    options.crop = crop and "cover" or nil
+    options.nine_slice = nil
+    options.shader = nil
+    options.uniforms = nil
+    options.color = nil
+    options.rotation = 0
+    options.flip_x = false
+    options.flip_y = false
+    options.blend = nil
+    options.fill = 1
+    options.anchor = "top-left"
+    options.layer = layer
+    options.clip = nil
+    draw.sprite(asset, options)
+    return true
+end
+
+local function draw_card_rect(parent, id, x, y, width, height, color, layer, anchor)
+    submit_rect(id, parent, x, y, width, height, color, layer, 1, anchor)
+end
+
+local function draw_card_shadow(x, y, size, scale)
+    local L = LAYOUT.card
+    local options = CARD_SHADOW_OPTIONS
+    options.position = nil
+    options.id = nil
+    options.parent = "song_gallery"
+    options.x = x
+    options.y = y
+    options.width = size
+    options.height = size
+    options.anchor = nil
+    options.offset_x = 0
+    options.offset_y = px(L.shadow_y, scale)
+    options.blur = px(L.shadow_blur, scale)
+    options.spread = 1 * scale
+    options.color = BLACK
+    options.alpha = 0.30
+    options.rotation = 0
+    options.blend = nil
+    options.layer = 0
+    draw.shadow(options)
+end
+
+local function draw_card_label(text, parent, x, y, size, color, font, anchor, layer, shadow, userText)
+    if userText then
+        submit_user_text(text, parent, x, y, size, color, font, anchor, layer, shadow)
+    else
+        submit_text(text, nil, parent, x, y, size, color, font, anchor, layer, shadow)
+    end
+end
+
 local function draw_card(song, x, y, size, scale, absolute_index)
     local L = LAYOUT.card
-    local level, diff_index = active_level(song)
+    local presentation = get_song_presentation(song, absolute_index)
+    local level, diff_index = presentation.level, presentation.diff_index
     local diff = DIFF[diff_index]
     local selected = song.selected == true
-    local card_id = "song_card_frame_" .. tostring(absolute_index or song.index or 0)
+    local card_id = presentation.card_id
 
 -- Card visuals use coordinates local to the gallery card frame.
-    draw.shadow({
-        parent = "song_gallery",
-        x = x, y = y,
-        width = size, height = size,
-        offset_x = 0,
-        offset_y = px(L.shadow_y, scale),
-        blur = px(L.shadow_blur, scale),
-        spread = 1 * scale,
-        color = BLACK,
-        alpha = 0.30,
-        layer = 0,
-    })
-
-    draw.rect({
-        id = card_id,
-        parent = "song_gallery",
-        x = x, y = y,
-        width = size, height = size,
-        color = UI.colors.panel,
-        anchor = "top-left",
-        layer = 0,
-    })
+    draw_card_shadow(x, y, size, scale)
+    draw_card_rect("song_gallery", card_id, x, y, size, size, UI.colors.panel, 0, "top-left")
 
     if song.album ~= nil then
         draw_cover(song.album, 0, 0, size, size, 1, true, nil, card_id)
     end
 
-    draw.rect({
-        parent = card_id,
 -- Overscan slightly to cover fractional-scale seams.
-        x = -px(1, scale), y = size - px(L.info_height, scale),
-        width = size + px(2, scale), height = px(L.info_height, scale),
-        color = { r = 0, g = 0, b = 0, a = 185 },
-        layer = 3,
-    })
+    draw_card_rect(card_id, nil,
+        -px(1, scale), size - px(L.info_height, scale),
+        size + px(2, scale), px(L.info_height, scale), CARD_INFO_OVERLAY_COLOR, 3)
 
-    local titleValue = tostring(song.name or "")
+    local titleValue = presentation.title
     local titleX = px(L.title.x, scale)
     local titleSize = fit_user_text_size(titleValue, px(L.title.size, scale),
         math.max(1, size - titleX - px(14, scale)), FONT_BOLD)
-    draw.user_text(titleValue, {
-        parent = card_id,
-        x = titleX,
-        y = size - px(300 - L.title.y, scale),
-        size = titleSize,
-        color = WHITE,
-        font = FONT_BOLD,
-        anchor = L.title.anchor or "left",
-        layer = 5,
-        shadow = soft_shadow(FONT_BOLD, 1.5 * scale, 1.5 * scale, 0.75),
-    })
+    draw_card_label(titleValue, card_id, titleX, size - px(300 - L.title.y, scale),
+        titleSize, WHITE, FONT_BOLD, L.title.anchor or "left", 5,
+        soft_shadow(FONT_BOLD, 1.5 * scale, 1.5 * scale, 0.75), true)
 
-    local artistValue = tostring(song.artist or "")
+    local artistValue = presentation.artist
     local artistX = px(L.artist.x, scale)
     local artistSize = fit_user_text_size(artistValue, px(L.artist.size, scale),
         math.max(1, size - artistX - px(14, scale)), FONT_REGULAR)
-    draw.user_text(artistValue, {
-        parent = card_id,
-        x = artistX,
-        y = size - px(300 - L.artist.y, scale),
-        size = artistSize,
-        color = SOFT,
-        font = FONT_REGULAR,
-        anchor = L.artist.anchor or "left",
-        layer = 5,
-        shadow = soft_shadow(FONT_REGULAR, 1 * scale, 1 * scale, 0.7),
-    })
+    draw_card_label(artistValue, card_id, artistX, size - px(300 - L.artist.y, scale),
+        artistSize, SOFT, FONT_REGULAR, L.artist.anchor or "left", 5,
+        soft_shadow(FONT_REGULAR, 1 * scale, 1 * scale, 0.7), true)
 
-    local series = display_series(song.series)
+    local series = presentation.series
     if series ~= "" then
         local seriesX = px(L.series.x, scale)
         local seriesSize = fit_user_text_size(series, px(L.series.size, scale),
             math.max(1, size - seriesX - px(14, scale)), FONT_BOLD)
-        draw.user_text(series, {
-            parent = card_id,
-            x = seriesX,
-            y = px(L.series.y, scale),
-            size = seriesSize,
-            color = WHITE,
-            font = FONT_BOLD,
-            anchor = "left",
-            layer = 5,
-            shadow = soft_shadow(FONT_BOLD, 1 * scale, 1 * scale, 0.8),
-        })
+        draw_card_label(series, card_id, seriesX, px(L.series.y, scale),
+            seriesSize, WHITE, FONT_BOLD, "left", 5,
+            soft_shadow(FONT_BOLD, 1 * scale, 1 * scale, 0.8), true)
     end
 
     if level ~= nil then
-        draw.rect({
-            parent = card_id,
-            x = size - px(L.level.right + L.level.size, scale),
-            y = px(L.level.top, scale),
-            width = px(L.level.size, scale),
-            height = px(L.level.size, scale),
-            color = diff.color,
-            layer = 6,
-        })
-        draw.text(string.format("%d", tonumber(level) or 0), {
-            parent = card_id,
-            x = size - px(L.level.text_x_from_right, scale),
-            y = px(L.level.text_y, scale),
-            size = px(L.level.text_size, scale),
-            color = WHITE,
-            font = FONT_BOLD,
-            anchor = "center",
-            layer = 7,
-        })
+        draw_card_rect(card_id, nil,
+            size - px(L.level.right + L.level.size, scale), px(L.level.top, scale),
+            px(L.level.size, scale), px(L.level.size, scale), diff.color, 6)
+        draw_card_label(presentation.level_text, card_id,
+            size - px(L.level.text_x_from_right, scale), px(L.level.text_y, scale),
+            px(L.level.text_size, scale), WHITE, FONT_BOLD, "center", 7, nil, false)
     end
 
-    local grade = song.grade or ""
+    local grade = presentation.grade
     if grade ~= "" then
-        draw.text(grade, {
-            parent = card_id,
-            x = size - px(L.grade.right, scale),
-            y = size - px(300 - L.grade.y, scale),
-            size = px(L.grade.size, scale),
-            color = WHITE,
-            font = FONT_BOLD_ITALIC,
-            anchor = L.grade.anchor or "right",
-            layer = 7,
-            shadow = soft_shadow(FONT_REGULAR, 1 * scale, 1 * scale, 0.7),
-        })
+        draw_card_label(grade, card_id, size - px(L.grade.right, scale),
+            size - px(300 - L.grade.y, scale), px(L.grade.size, scale), WHITE,
+            FONT_BOLD_ITALIC, L.grade.anchor or "right", 7,
+            soft_shadow(FONT_REGULAR, 1 * scale, 1 * scale, 0.7), false)
     end
 
     if selected then
         local border = px(L.selected_border, scale)
-        draw.rect({ parent = card_id, x = -border, y = -border, width = size + border * 2, height = border, color = WHITE, layer = 8 })
-        draw.rect({ parent = card_id, x = -border, y = size, width = size + border * 2, height = border, color = WHITE, layer = 8 })
-        draw.rect({ parent = card_id, x = -border, y = 0, width = border, height = size, color = WHITE, layer = 8 })
-        draw.rect({ parent = card_id, x = size, y = 0, width = border, height = size, color = WHITE, layer = 8 })
+        draw_card_rect(card_id, nil, -border, -border, size + border * 2, border, WHITE, 8)
+        draw_card_rect(card_id, nil, -border, size, size + border * 2, border, WHITE, 8)
+        draw_card_rect(card_id, nil, -border, 0, border, size, WHITE, 8)
+        draw_card_rect(card_id, nil, size, 0, border, size, WHITE, 8)
     end
+    return presentation
 end
 
 local function draw_selected_panel(selected, metrics, scale, w, h)
@@ -639,23 +1048,15 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     local panel_x = 0
     local panel_y = 0
 
-    draw.rect({
-        id = "song_selected_panel",
-        parent = "song_select_viewport",
-        x = panel_offset_x,
-        y = panel_offset_y,
-        width = panel_w,
-        height = panel_h,
-        color = DARK_PANEL,
-        anchor = "top-left",
-        layer = 20,
-    })
+    submit_rect("song_selected_panel", "song_select_viewport", panel_offset_x,
+        panel_offset_y, panel_w, panel_h, DARK_PANEL, 20, 1, "top-left")
 
     if selected == nil then
 -- An empty selection is represented by the gallery itself.
         return
     end
 
+    local presentation = get_song_presentation(selected, selected.index or 0)
     local art = selected.album
     local frame_x = px(P.art_inset, panelScale)
     local frame_y = px(P.art_inset, panelScale)
@@ -664,13 +1065,8 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
 
     if art ~= nil then
         draw_cover(art, frame_x, frame_y, art_size, art_size, 0.58, true, 21, "song_selected_panel")
-        draw.rect({
-            parent = "song_selected_panel",
-            x = frame_x, y = frame_y,
-            width = art_size, height = art_size,
-            color = { r = 0, g = 0, b = 0, a = 120 },
-            layer = 22,
-        })
+        submit_rect(nil, "song_selected_panel", frame_x, frame_y, art_size, art_size,
+            SELECTED_ART_OVERLAY_COLOR, 22)
 
 -- Crop the dimmed backdrop, but preserve the front cover aspect ratio.
         local source_w = math.max(1, tonumber(art.width) or art_size)
@@ -682,81 +1078,52 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
         local fitted_y = frame_y + (art_size - fitted_h) * 0.5
         draw_cover(art, fitted_x, fitted_y, fitted_w, fitted_h, 1, false, 23, "song_selected_panel")
     else
-        draw.rect({
-            parent = "song_selected_panel",
-            x = frame_x, y = frame_y,
-            width = art_size, height = art_size,
-            color = UI.colors.background, layer = 21,
-        })
+        submit_rect(nil, "song_selected_panel", frame_x, frame_y, art_size, art_size,
+            UI.colors.background, 21)
     end
 
     local metadata_y = frame_y + art_size
-    draw.rect({
-        parent = "song_selected_panel",
-        x = frame_x,
-        y = metadata_y,
-        width = art_size,
-        height = px(P.metadata_height, panelScale),
-        color = DARK,
-        layer = 24,
-    })
+    submit_rect(nil, "song_selected_panel", frame_x, metadata_y, art_size,
+        px(P.metadata_height, panelScale), DARK, 24)
 
-    local selected_title = tostring(selected.name or "")
+    local selected_title = presentation.title
     local selected_title_x = px(P.title.x, panelScale)
     local selected_title_size = fit_user_text_size(
         selected_title,
         px(P.title.size, panelScale),
         math.max(1, art_size - selected_title_x - px(16, panelScale)), FONT_BOLD)
-    draw.user_text(selected_title, {
-        parent = "song_selected_panel",
-        x = selected_title_x,
-        y = metadata_y + px(P.title.y, panelScale),
-        size = selected_title_size,
-        color = WHITE, font = FONT_BOLD, anchor = P.title.anchor or "left", layer = 28,
-        shadow = soft_shadow(FONT_BOLD, 2 * panelScale, 2 * panelScale, 0.85),
-    })
-    local series = display_series(selected.series)
+    submit_user_text(selected_title, "song_selected_panel", selected_title_x,
+        metadata_y + px(P.title.y, panelScale), selected_title_size, WHITE, FONT_BOLD,
+        P.title.anchor or "left", 28,
+        soft_shadow(FONT_BOLD, 2 * panelScale, 2 * panelScale, 0.85))
+    local series = presentation.series
     if series ~= "" then
         local seriesX = px(P.series.x, panelScale)
         local seriesSize = fit_user_text_size(series, px(P.artist.size, panelScale),
             math.max(1, art_size - seriesX - px(16, panelScale)), FONT_REGULAR)
-        draw.user_text(series, {
-            parent = "song_selected_panel",
-            x = seriesX,
-            y = metadata_y + px(P.series.y, panelScale),
-            size = seriesSize,
-            color = SOFT, font = FONT_REGULAR, anchor = P.series.anchor or "left", layer = 28,
-            shadow = soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8),
-        })
+        submit_user_text(series, "song_selected_panel", seriesX,
+            metadata_y + px(P.series.y, panelScale), seriesSize, SOFT, FONT_REGULAR,
+            P.series.anchor or "left", 28,
+            soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8))
     end
-    local selected_artist = tostring(selected.artist or "")
+    local selected_artist = presentation.artist
     local selected_artist_x = px(P.artist.x, panelScale)
     local artist_max_width = math.max(1,
         art_size - selected_artist_x - px(P.bpm_label.right + 22, panelScale))
     local selected_artist_size = fit_user_text_size(selected_artist, px(P.artist.size, panelScale),
         artist_max_width, FONT_REGULAR)
-    draw.user_text(selected_artist, {
-        parent = "song_selected_panel",
-        x = selected_artist_x,
-        y = metadata_y + px(P.artist.y, panelScale),
-        size = selected_artist_size,
-        color = WHITE, font = FONT_REGULAR, anchor = P.artist.anchor or "left", layer = 28,
-        shadow = soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8),
-    })
-    draw.text("BPM", {
-        parent = "song_selected_panel",
-        x = panel_w - px(P.bpm_label.right, panelScale),
-        y = metadata_y + px(P.bpm_label.y, panelScale),
-        size = px(P.bpm_label.size, panelScale),
-        color = WHITE, font = FONT_REGULAR, anchor = P.bpm_label.anchor or "left", layer = 28,
-    })
-    draw.text(string.format("%.0f", selected.bpm or 0), {
-        parent = "song_selected_panel",
-        x = panel_w - px(P.bpm_value.right, panelScale),
-        y = metadata_y + px(P.bpm_value.y, panelScale),
-        size = px(P.bpm_value.size, panelScale),
-        color = WHITE, font = FONT_BOLD_ITALIC, anchor = P.bpm_value.anchor or "left", layer = 28,
-    })
+    submit_user_text(selected_artist, "song_selected_panel", selected_artist_x,
+        metadata_y + px(P.artist.y, panelScale), selected_artist_size, WHITE, FONT_REGULAR,
+        P.artist.anchor or "left", 28,
+        soft_shadow(FONT_REGULAR, 1.5 * panelScale, 1.5 * panelScale, 0.8))
+    submit_text("BPM", nil, "song_selected_panel",
+        panel_w - px(P.bpm_label.right, panelScale), metadata_y + px(P.bpm_label.y, panelScale),
+        px(P.bpm_label.size, panelScale), WHITE, FONT_REGULAR,
+        P.bpm_label.anchor or "left", 28)
+    submit_text(presentation.bpm_text, nil, "song_selected_panel",
+        panel_w - px(P.bpm_value.right, panelScale), metadata_y + px(P.bpm_value.y, panelScale),
+        px(P.bpm_value.size, panelScale), WHITE, FONT_BOLD_ITALIC,
+        P.bpm_value.anchor or "left", 28)
 
     local tabs_y = metadata_y + px(P.metadata_height + P.tabs.top_gap, panelScale)
     local tab_w = px(P.tabs.width, panelScale)
@@ -765,40 +1132,28 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     local tab_item_width = tab_w - tab_gap
     for i = 1, #DIFF do
         local diff = DIFF[i]
-        local level = selected[diff.key]
+        local level = presentation.difficulty_levels[i]
         local enabled = level ~= nil
         local bx, tab_row_y = UI.stack_position(
             "song_selected_panel", "horizontal", i,
             tab_item_width, tab_h, tab_gap, "top", 0, tabs_y)
 -- The gaps belong between tabs only.
         local draw_tab_width = tab_item_width + (i == #DIFF and tab_gap or 0)
-        local active = (tonumber(song_select.selected_difficulty or 0) or 0) == i and enabled
+        local active = presentation.selected_difficulty == i and enabled
         if active then
-            draw.rect({
-                parent = "song_selected_panel",
-                x = bx, y = tab_row_y,
-                width = draw_tab_width, height = tab_h,
-                color = diff.color, layer = 30,
-            })
+            submit_rect(nil, "song_selected_panel", bx, tab_row_y,
+                draw_tab_width, tab_h, diff.color, 30)
         end
-        draw.text(diff.name .. " " .. (level and tostring(level) or "--"), {
-            parent = "song_selected_panel",
-            x = bx + draw_tab_width * 0.5,
-            y = tab_row_y + px(P.tabs.label_y, panelScale),
-            size = px(P.tabs.label_size, panelScale),
-            color = active and WHITE or (enabled and diff.color or UI.colors.muted),
-            font = FONT_BOLD, anchor = "center", layer = 32,
-        })
-        ui.button({
-            id = "difficulty_" .. diff.key,
-            parent = "song_selected_panel",
-            x = bx, y = tab_row_y,
-            width = draw_tab_width, height = tab_h,
-            action = "select_difficulty", value = i,
-        })
+        submit_text(presentation.difficulty_labels[i], nil, "song_selected_panel",
+            bx + draw_tab_width * 0.5, tab_row_y + px(P.tabs.label_y, panelScale),
+            px(P.tabs.label_size, panelScale),
+            active and WHITE or (enabled and diff.color or UI.colors.muted),
+            FONT_BOLD, "center", 32)
+        submit_button("difficulty_" .. diff.key, "song_selected_panel", bx, tab_row_y,
+            draw_tab_width, tab_h, "select_difficulty", i)
     end
 
-    local selected_diff_index = chart_difficulty_index(selected)
+    local selected_diff_index = presentation.chart_diff_index
         or tonumber(song_select.selected_difficulty or 4)
         or 4
     selected_diff_index = clamp(selected_diff_index, 1, #DIFF)
@@ -809,21 +1164,40 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     -- This makes a 10,000,000 score leave exactly the configured side padding,
     -- while shorter scores keep the same font size and naturally leave more room.
     local score_base_size = px(P.score.value_size, panelScale)
-    local score_reference_width = draw.measure_user_text_width("10,000,000", {
-        font = FONT_BOLD, size = score_base_size,
-    })
     local score_max_width = math.max(1,
         panel_w - px(P.score.horizontal_padding * 2, panelScale))
-    local score_size = score_base_size
-    if score_reference_width > 0 then
-        score_size = score_base_size * score_max_width / score_reference_width
-    end
-
-    local score_text_height = draw.measure_user_text_height("10,000,000", {
-        font = FONT_BOLD, size = score_size, max_width = score_max_width + 2,
-    })
-    if score_text_height <= 0 then
-        score_text_height = score_size
+    local score_cache = SCORE_LAYOUT_CACHE
+    local score_size, score_text_height
+    if score_cache.valid == true and
+        math.abs(score_cache.panel_w - panel_w) < 0.25 and
+        math.abs(score_cache.base_size - score_base_size) < 0.25 and
+        math.abs(score_cache.max_width - score_max_width) < 0.25 then
+        score_size = score_cache.size
+        score_text_height = score_cache.text_height
+    else
+        SCORE_MEASURE_OPTIONS.font = FONT_BOLD
+        SCORE_MEASURE_OPTIONS.size = score_base_size
+        SCORE_MEASURE_OPTIONS.max_width = nil
+        local score_reference_width = draw.measure_user_text_width("10,000,000", SCORE_MEASURE_OPTIONS)
+        score_size = score_base_size
+        if score_reference_width > 0 then
+            score_size = score_base_size * score_max_width / score_reference_width
+        end
+        -- Measure the line box only when the panel geometry changes. The cached
+        -- result is reused on subsequent frames, preserving the font's true metrics.
+        SCORE_MEASURE_OPTIONS.font = FONT_BOLD
+        SCORE_MEASURE_OPTIONS.size = score_size
+        SCORE_MEASURE_OPTIONS.max_width = score_max_width + 2
+        score_text_height = draw.measure_user_text_height("10,000,000", SCORE_MEASURE_OPTIONS)
+        if score_text_height <= 0 then
+            score_text_height = score_size
+        end
+        score_cache.valid = true
+        score_cache.panel_w = panel_w
+        score_cache.base_size = score_base_size
+        score_cache.max_width = score_max_width
+        score_cache.size = score_size
+        score_cache.text_height = score_text_height
     end
 
     local score_label_size = px(P.score.label_size, panelScale)
@@ -841,69 +1215,39 @@ local function draw_selected_panel(selected, metrics, scale, w, h)
     local score_text_top = score_content_top + score_label_height + score_label_value_gap
     local score_value_y = score_text_top + score_text_height * 0.5
 
-    draw.text("BEST SCORE", {
-        parent = "song_selected_panel",
-        x = px(P.score.label_x or 27, panelScale),
-        y = score_y + score_label_y,
-        size = score_label_size, color = WHITE,
-        font = FONT_BOLD, anchor = "left", layer = 32,
-    })
+    submit_text("BEST SCORE", nil, "song_selected_panel",
+        px(P.score.label_x or 27, panelScale), score_y + score_label_y,
+        score_label_size, WHITE, FONT_BOLD, "left", 32)
 
     -- Keep the colored score panel exactly as tall as the measured content box.
     -- The score height can exceed the design minimum when the reference value
     -- needs more room, so the background must follow that calculated height.
-    draw.rect({
-        parent = "song_selected_panel",
-        x = panel_x, y = score_y,
-        width = panel_w, height = score_box_height,
-        color = best_score_color, layer = 30,
-    })
+    submit_rect(nil, "song_selected_panel", panel_x, score_y, panel_w,
+        score_box_height, best_score_color, 30)
 
-    draw.text(score_text(selected.score), {
-        parent = "song_selected_panel",
-        x = panel_w * 0.5, y = score_y + score_value_y,
-        size = score_size, color = WHITE,
-        font = FONT_BOLD, anchor = "center", layer = 32,
-        shadow = soft_shadow(FONT_BOLD, 2 * panelScale, 3 * panelScale, 0.32),
-    })
+    submit_text(presentation.score_text, nil, "song_selected_panel",
+        panel_w * 0.5, score_y + score_value_y, score_size, WHITE,
+        FONT_BOLD, "center", 32,
+        soft_shadow(FONT_BOLD, 2 * panelScale, 3 * panelScale, 0.32))
 
     local stats_y = score_y + score_box_height
-    draw.rect({
-        parent = "song_selected_panel",
-        x = panel_x, y = stats_y,
-        width = panel_w, height = math.max(1, panel_h - stats_y),
-        color = BLACK, layer = 30,
-    })
-    draw.text("ACC", {
-        parent = "song_selected_panel",
-        x = px(P.stats.acc_x, panelScale), y = stats_y + px(P.stats.label_y, panelScale),
-        size = px(P.stats.label_size, panelScale), color = WHITE,
-        font = FONT_BOLD, anchor = "left", layer = 32,
-    })
-    draw.text(accuracy_text(selected.accuracy), {
-        parent = "song_selected_panel",
-        x = px(P.stats.acc_x, panelScale), y = stats_y + px(P.stats.value_y, panelScale),
-        size = px(P.stats.accuracy_size, panelScale), color = WHITE,
-        font = FONT_REGULAR, anchor = "left", layer = 32,
-    })
-    draw.text("GRADE", {
-        parent = "song_selected_panel",
-        x = px(P.stats.grade_x, panelScale), y = stats_y + px(P.stats.label_y, panelScale),
-        size = px(P.stats.label_size, panelScale), color = WHITE,
-        font = FONT_BOLD, anchor = "left", layer = 32,
-    })
-    draw.text(selected.grade ~= "" and selected.grade or "--", {
-        parent = "song_selected_panel",
-        x = px(P.stats.grade_x, panelScale), y = stats_y + px(P.stats.grade_value_y, panelScale),
-        size = px(P.stats.grade_size, panelScale), color = WHITE,
-        font = FONT_BOLD_ITALIC, anchor = "left", layer = 32,
-    })
-    draw.text(clear_short_name(selected.clear_type), {
-        parent = "song_selected_panel",
-        x = px(P.stats.clear_x, panelScale), y = stats_y + px(P.stats.clear_value_y, panelScale),
-        size = px(P.stats.clear_size, panelScale), color = WHITE,
-        font = FONT_ITALIC, anchor = "left", layer = 32,
-    })
+    submit_rect(nil, "song_selected_panel", panel_x, stats_y, panel_w,
+        math.max(1, panel_h - stats_y), BLACK, 30)
+    submit_text("ACC", nil, "song_selected_panel", px(P.stats.acc_x, panelScale),
+        stats_y + px(P.stats.label_y, panelScale), px(P.stats.label_size, panelScale),
+        WHITE, FONT_BOLD, "left", 32)
+    submit_text(presentation.accuracy_text, nil, "song_selected_panel", px(P.stats.acc_x, panelScale),
+        stats_y + px(P.stats.value_y, panelScale), px(P.stats.accuracy_size, panelScale),
+        WHITE, FONT_REGULAR, "left", 32)
+    submit_text("GRADE", nil, "song_selected_panel", px(P.stats.grade_x, panelScale),
+        stats_y + px(P.stats.label_y, panelScale), px(P.stats.label_size, panelScale),
+        WHITE, FONT_BOLD, "left", 32)
+    submit_text(presentation.grade ~= "" and presentation.grade or "--", nil, "song_selected_panel",
+        px(P.stats.grade_x, panelScale), stats_y + px(P.stats.grade_value_y, panelScale),
+        px(P.stats.grade_size, panelScale), WHITE, FONT_BOLD_ITALIC, "left", 32)
+    submit_text(presentation.clear_text, nil, "song_selected_panel", px(P.stats.clear_x, panelScale),
+        stats_y + px(P.stats.clear_value_y, panelScale), px(P.stats.clear_size, panelScale),
+        WHITE, FONT_ITALIC, "left", 32)
 end
 
 local function draw_gallery(selected, metrics, scale, w, h)
@@ -913,12 +1257,8 @@ local function draw_gallery(selected, metrics, scale, w, h)
     local gallery_y = metrics.gallery_y
     local gallery_w = metrics.gallery_width
     local gallery_h = metrics.gallery_height
-    UI.layout_box({
-        id = "song_gallery",
-        parent = "song_select_viewport",
-        x = gallery_x, y = gallery_y,
-        width = gallery_w, height = gallery_h,
-    })
+    submit_layout_box("song_gallery", "song_select_viewport",
+        gallery_x, gallery_y, gallery_w, gallery_h)
 
     local right_x = metrics.grid_left
     local top_y = metrics.grid_top
@@ -941,17 +1281,12 @@ local function draw_gallery(selected, metrics, scale, w, h)
 -- Draw every card intersecting the full gallery viewport.
             local selected_border = item.selected == true and px(C.selected_border, metrics.card_scale) or 0
             if y + card + selected_border >= 0 and y - selected_border <= gallery_h then
-                draw_card(item, x, y, card, metrics.card_scale, absolute)
+                local presentation = draw_card(item, x, y, card, metrics.card_scale, absolute)
 -- Disable card interaction while a popup is open.
                 if not song_select.pack_expanded and not song_select.sort_expanded and
                     not song_select.scroll_speed_expanded and not song_select.edit_confirm_open then
-                    ui.button({
-                        id = "song_" .. tostring(absolute),
-                        parent = "song_gallery",
-                        x = x, y = y,
-                        width = card, height = card,
-                        action = "select_song", value = absolute,
-                    })
+                    submit_button(presentation.button_id, "song_gallery", x, y,
+                        card, card, "select_song", absolute)
                 end
             end
         end
@@ -966,58 +1301,34 @@ local function draw_bottom_control(label, value, x, width, scale, action, footer
         not song_select.scroll_speed_expanded and
         not song_select.edit_confirm_open
     if control_enabled then
-        ui.button({
-            id = id,
-            parent = "song_footer",
-            x = x, y = 0,
-            width = width, height = footer_height or px(LAYOUT.footer.height, scale),
-            action = action,
-        })
+        submit_button(id, "song_footer", x, 0, width,
+            footer_height or px(LAYOUT.footer.height, scale), action)
     end
 
     local state = control_enabled and ui.state(id) or "normal"
     if state == "hovered" or state == "pressed" then
-        draw.rect({
-            parent = "song_footer",
-            x = x, y = 0, width = width,
-            height = footer_height or px(LAYOUT.footer.height, scale),
-            color = state == "pressed" and UI.colors.pressed or UI.colors.hover,
-            alpha = 0.72, layer = 55,
-        })
+        submit_rect(nil, "song_footer", x, 0, width,
+            footer_height or px(LAYOUT.footer.height, scale),
+            state == "pressed" and UI.colors.pressed or UI.colors.hover, 55, 0.72)
     end
 
-    draw.text(label, {
-        parent = "song_footer",
-        x = x, y = px(LAYOUT.footer.label_y, scale),
-        size = px(LAYOUT.footer.label_size, scale),
-        color = state == "hovered" and UI.colors.accent or UI.colors.muted,
-        font = FONT_BOLD, anchor = "left", layer = 60,
-    })
-    draw.text(value or "", {
-        parent = "song_footer",
-        x = x, y = px(LAYOUT.footer.value_y, scale),
-        size = px(LAYOUT.footer.value_size, scale),
-        color = (state == "hovered" or state == "pressed") and UI.colors.accent or WHITE,
-        font = FONT_BOLD_ITALIC, anchor = "left", layer = 60,
-    })
-    draw.rect({
-        parent = "song_footer",
-        x = x, y = px(LAYOUT.footer.underline_y, scale),
-        width = width, height = px(LAYOUT.footer.underline_height, scale),
-        color = (state == "hovered" or state == "pressed") and UI.colors.accent or UI.colors.accent_dim,
-        layer = 61,
-    })
+    submit_text(label, nil, "song_footer", x, px(LAYOUT.footer.label_y, scale),
+        px(LAYOUT.footer.label_size, scale),
+        state == "hovered" and UI.colors.accent or UI.colors.muted,
+        FONT_BOLD, "left", 60)
+    submit_text(value or "", nil, "song_footer", x, px(LAYOUT.footer.value_y, scale),
+        px(LAYOUT.footer.value_size, scale),
+        (state == "hovered" or state == "pressed") and UI.colors.accent or WHITE,
+        FONT_BOLD_ITALIC, "left", 60)
+    submit_rect(nil, "song_footer", x, px(LAYOUT.footer.underline_y, scale),
+        width, px(LAYOUT.footer.underline_height, scale),
+        (state == "hovered" or state == "pressed") and UI.colors.accent or UI.colors.accent_dim, 61)
 end
 
 local function register_popup_backdrop(width, height)
     -- Register this first; later popup controls then take priority over it.
-    ui.button({
-        id = "popup_backdrop",
-        parent = "song_select_viewport",
-        x = 0, y = 0,
-        width = width, height = height,
-        action = "close_popup",
-    })
+    submit_button("popup_backdrop", "song_select_viewport", 0, 0,
+        width, height, "close_popup")
 end
 
 local function draw_popups(scale, footer_x, footer_top, controls_layout, viewport_width)
@@ -1035,43 +1346,25 @@ local function draw_popups(scale, footer_x, footer_top, controls_layout, viewpor
         local height = (count + C.header_rows) * row_h + px(C.bottom_padding, scale)
         local y = footer_y - height - px(P.footer_gap, scale)
 
-        draw.rect({
-            id = "pack_popup_frame", parent = "song_select_viewport",
-            x = x, y = y, width = width, height = height,
-            color = UI.colors.panel, alpha = 0.98, layer = 80,
-        })
-        draw.rect({
-            parent = "pack_popup_frame",
-            x = 0, y = height - px(P.underline_height, scale), width = width, height = px(P.underline_height, scale),
-            color = UI.colors.accent, layer = 83,
-        })
-        draw.text("PACK", {
-            parent = "pack_popup_frame", x = px(C.title_x, scale), y = px(C.title_y, scale),
-            size = px(C.title_size, scale), color = SOFT, font = FONT_BOLD,
-            anchor = "left", layer = 82,
-        })
+        submit_rect("pack_popup_frame", "song_select_viewport", x, y, width, height,
+            UI.colors.panel, 80, 0.98)
+        submit_rect(nil, "pack_popup_frame", 0, height - px(P.underline_height, scale),
+            width, px(P.underline_height, scale), UI.colors.accent, 83)
+        submit_text("PACK", nil, "pack_popup_frame", px(C.title_x, scale), px(C.title_y, scale),
+            px(C.title_size, scale), SOFT, FONT_BOLD, "left", 82)
         for i = 1, count do
             local _, ry = UI.stack_position(
                 "pack_popup_frame", "vertical", i, width, row_h, 0,
                 "left", px(C.top_padding, scale), 0)
             if i == song_select.pack_index then
-                draw.rect({
-                    parent = "pack_popup_frame",
-                    x = px(P.selection_inset_x, scale), y = ry,
-                    width = width - px(P.selection_inset_width, scale), height = row_h,
-                    color = UI.colors.selected, alpha = 0.96, layer = 81,
-                })
+                submit_rect(nil, "pack_popup_frame", px(P.selection_inset_x, scale), ry,
+                    width - px(P.selection_inset_width, scale), row_h, UI.colors.selected, 81, 0.96)
             end
-            ui.button({
-                id = "pack_" .. tostring(i), parent = "pack_popup_frame",
-                x = 0, y = ry, width = width, height = row_h,
-                action = "select_pack", value = i,
-            })
-            draw.text(song_select.pack_list[i], {
-                parent = "pack_popup_frame", x = px(P.row_text_x, scale), y = ry + px(P.row_text_y, scale),
-                size = px(P.row_text_size, scale), color = WHITE, font = FONT_REGULAR,
-                anchor = "left", layer = 82,
-            })
+            submit_button("pack_" .. tostring(i), "pack_popup_frame", 0, ry,
+                width, row_h, "select_pack", i)
+            submit_text(song_select.pack_list[i], nil, "pack_popup_frame", px(P.row_text_x, scale),
+                ry + px(P.row_text_y, scale), px(P.row_text_size, scale), WHITE,
+                FONT_REGULAR, "left", 82)
         end
     end
 
@@ -1086,38 +1379,23 @@ local function draw_popups(scale, footer_x, footer_top, controls_layout, viewpor
         local height = #names * row_h + px(C.top_padding + C.bottom_padding, scale)
         local y = footer_y - height - px(P.footer_gap, scale)
 
-        draw.rect({
-            id = "sort_popup_frame", parent = "song_select_viewport",
-            x = x, y = y, width = width, height = height,
-            color = UI.colors.panel, alpha = 0.98, layer = 80,
-        })
-        draw.rect({
-            parent = "sort_popup_frame",
-            x = 0, y = height - px(P.underline_height, scale), width = width, height = px(P.underline_height, scale),
-            color = UI.colors.accent, layer = 83,
-        })
+        submit_rect("sort_popup_frame", "song_select_viewport", x, y, width, height,
+            UI.colors.panel, 80, 0.98)
+        submit_rect(nil, "sort_popup_frame", 0, height - px(P.underline_height, scale),
+            width, px(P.underline_height, scale), UI.colors.accent, 83)
         for i = 1, #names do
             local _, ry = UI.stack_position(
                 "sort_popup_frame", "vertical", i, width, row_h, 0,
                 "left", px(C.top_padding, scale), 0)
             if i == song_select.sort_index then
-                draw.rect({
-                    parent = "sort_popup_frame",
-                    x = px(P.selection_inset_x, scale), y = ry,
-                    width = width - px(P.selection_inset_width, scale), height = row_h,
-                    color = UI.colors.selected, alpha = 0.96, layer = 81,
-                })
+                submit_rect(nil, "sort_popup_frame", px(P.selection_inset_x, scale), ry,
+                    width - px(P.selection_inset_width, scale), row_h, UI.colors.selected, 81, 0.96)
             end
-            ui.button({
-                id = "sort_" .. tostring(i), parent = "sort_popup_frame",
-                x = 0, y = ry, width = width, height = row_h,
-                action = "select_sort", value = i,
-            })
-            draw.text(names[i], {
-                parent = "sort_popup_frame", x = px(P.row_text_x, scale), y = ry + px(P.row_text_y, scale),
-                size = px(P.row_text_size, scale), color = WHITE, font = FONT_REGULAR,
-                anchor = "left", layer = 82,
-            })
+            submit_button("sort_" .. tostring(i), "sort_popup_frame", 0, ry,
+                width, row_h, "select_sort", i)
+            submit_text(names[i], nil, "sort_popup_frame", px(P.row_text_x, scale),
+                ry + px(P.row_text_y, scale), px(P.row_text_size, scale), WHITE,
+                FONT_REGULAR, "left", 82)
         end
     end
 end
@@ -1138,11 +1416,14 @@ local function footer_control_layout(footer_width, scale)
     local pack_x = padding
     local sort_x = pack_x + pack_width + gap
     local order_x = sort_x + sort_width + gap
-    return {
-        pack = { x = pack_x, width = pack_width },
-        sort = { x = sort_x, width = sort_width },
-        order = { x = order_x, width = order_width },
-    }
+    local result = FOOTER_CONTROL_LAYOUT
+    result.pack.x = pack_x
+    result.pack.width = pack_width
+    result.sort.x = sort_x
+    result.sort.width = sort_width
+    result.order.x = order_x
+    result.order.width = order_width
+    return result
 end
 
 local function draw_right_controls(metrics, scale, viewport_w, viewport_h)
@@ -1159,95 +1440,53 @@ local function draw_right_controls(metrics, scale, viewport_w, viewport_h)
     local button_text_size = px(R.button_text_size, scale)
 
     -- Match the footer's translucent frame, but stack its controls vertically.
-    UI.draw_panel({
-        id = "song_right_controls",
-        parent = "song_select_viewport",
-        x = x, y = y,
-        width = width, height = height,
-        color = { r = 0, g = 0, b = 0, a = 184 }, layer = 50,
-    })
-    draw.text("CONTROLS", {
-        parent = "song_right_controls",
-        x = padding, y = px(R.header_y, scale),
-        size = px(R.header_size, scale),
-        color = UI.colors.muted, font = FONT_BOLD, anchor = "left", layer = 56,
-    })
-    draw.rect({
-        parent = "song_right_controls",
-        x = 0, y = px(44, scale), width = width, height = px(3, scale),
-        color = UI.colors.accent_dim, layer = 56,
-    })
+    submit_panel("song_right_controls", "song_select_viewport", x, y,
+        width, height, FOOTER_BACKGROUND_COLOR, 50, 1)
+    submit_text("CONTROLS", nil, "song_right_controls", padding, px(R.header_y, scale),
+        px(R.header_size, scale), UI.colors.muted, FONT_BOLD, "left", 56)
+    submit_rect(nil, "song_right_controls", 0, px(44, scale), width, px(3, scale),
+        UI.colors.accent_dim, 56)
 
-    UI.draw_button({
-        id = "scroll_speed_button",
-        parent = "song_right_controls",
-        x = padding, y = content_top + (button_height + button_gap),
-        width = button_width, height = button_height,
-        label = string.format("SCROLL %.2fx", tonumber(song_select.scroll_speed or 1.0) or 1.0),
-        text_size = button_text_size, font = FONT_BOLD,
-        action = "toggle_scroll_speed_popup", variant = "secondary", layer = 58,
-    })
-    UI.draw_button({
-        id = "song_search_button",
-        parent = "song_right_controls",
-        x = padding, y = content_top,
-        width = button_width, height = button_height,
-        label = "SEARCH",
-        text_size = button_text_size, font = FONT_BOLD,
-        action = "toggle_search", variant = "secondary", layer = 58,
-    })
-    UI.draw_button({
-        id = "song_autoplay_button",
-        parent = "song_right_controls",
-        x = padding, y = content_top + (button_height + button_gap) * 3,
-        width = button_width, height = button_height,
-        label = song_select.autoplay and "AUTOPLAY: ON" or "AUTOPLAY: OFF",
-        text_size = button_text_size, font = FONT_BOLD,
-        action = "toggle_autoplay", variant = song_select.autoplay and "primary" or "secondary", layer = 58,
-    })
-    UI.draw_button({
-        id = "song_gauge_button",
-        parent = "song_right_controls",
-        x = padding, y = content_top + (button_height + button_gap) * 4,
-        width = button_width, height = button_height,
-        label = "GAUGE: " .. string.upper(tostring(song_select.gauge or "hard")),
-        text_size = button_text_size, font = FONT_BOLD,
-        action = "toggle_gauge", variant = tostring(song_select.gauge or "hard") == "hard" and "primary" or "secondary", layer = 58,
-    })
+    local scroll_speed = tonumber(song_select.scroll_speed or 1.0) or 1.0
+    local speedLabelCache = RIGHT_CONTROL_LABEL_CACHE.scroll_speed
+    if speedLabelCache.value ~= scroll_speed then
+        speedLabelCache.value = scroll_speed
+        speedLabelCache.label = string.format("SCROLL %.2fx", scroll_speed)
+    end
+    submit_right_button("scroll_speed_button", "song_right_controls", padding,
+        content_top + (button_height + button_gap), button_width, button_height,
+        speedLabelCache.label, button_text_size, "toggle_scroll_speed_popup", "secondary")
+    submit_right_button("song_search_button", "song_right_controls", padding,
+        content_top, button_width, button_height, "SEARCH", button_text_size,
+        "toggle_search", "secondary")
+    submit_right_button("song_autoplay_button", "song_right_controls", padding,
+        content_top + (button_height + button_gap) * 3, button_width, button_height,
+        song_select.autoplay and "AUTOPLAY: ON" or "AUTOPLAY: OFF", button_text_size,
+        "toggle_autoplay", song_select.autoplay and "primary" or "secondary")
+    local gauge = tostring(song_select.gauge or "hard")
+    submit_right_button("song_gauge_button", "song_right_controls", padding,
+        content_top + (button_height + button_gap) * 4, button_width, button_height,
+        cached_right_control_label("gauge", "GAUGE: ", gauge), button_text_size, "toggle_gauge",
+        gauge == "hard" and "primary" or "secondary")
     local scroll_mode = string.lower(tostring(song_select.scroll_mode or "xmod"))
-    UI.draw_button({
-        id = "song_scroll_mode_button",
-        parent = "song_right_controls",
-        x = padding, y = content_top + (button_height + button_gap) * 2,
-        width = button_width, height = button_height,
-        label = "SCROLL: " .. string.upper(scroll_mode),
-        text_size = button_text_size, font = FONT_BOLD,
-        action = "toggle_scroll_mode", variant = scroll_mode == "mmod" and "primary" or "secondary", layer = 58,
-    })
-    UI.draw_button({
-        id = "song_edit_button",
-        parent = "song_right_controls",
-        x = padding, y = content_top + (button_height + button_gap) * 5,
-        width = button_width, height = button_height,
-        label = "EDIT",
-        text_size = button_text_size, font = FONT_BOLD,
-        action = "open_editor_confirm", variant = "secondary", layer = 58,
-    })
+    submit_right_button("song_scroll_mode_button", "song_right_controls", padding,
+        content_top + (button_height + button_gap) * 2, button_width, button_height,
+        cached_right_control_label("scroll_mode", "SCROLL: ", scroll_mode), button_text_size, "toggle_scroll_mode",
+        scroll_mode == "mmod" and "primary" or "secondary")
+if song_select.editor_enabled ~= false then
+    submit_right_button("song_edit_button", "song_right_controls", padding,
+        content_top + (button_height + button_gap) * 5, button_width, button_height,
+        "EDIT", button_text_size, "open_editor_confirm", "secondary")
+end
 
     -- Continue remains the primary action and is anchored to the rail bottom.
     local continue_height = math.min(
         px(R.continue_button.height, scale),
         math.max(1, height - padding * 2))
     local continue_y = height - padding - continue_height
-    UI.draw_button({
-        id = "continue",
-        parent = "song_right_controls",
-        x = padding, y = continue_y,
-        width = button_width, height = continue_height,
-        label = "CONTINUE",
-        text_size = px(R.continue_button.text_size, scale), font = FONT_BOLD,
-        action = "continue", variant = "primary", layer = 62,
-    })
+    submit_right_button("continue", "song_right_controls", padding, continue_y,
+        button_width, continue_height, "CONTINUE", px(R.continue_button.text_size, scale),
+        "continue", "primary", 62)
 
     if song_select.scroll_speed_expanded then
         local slider_width = math.max(button_width, px(R.slider_width, scale))
@@ -1260,37 +1499,19 @@ local function draw_right_controls(metrics, scale, viewport_w, viewport_h)
         slider_x = clamp(slider_x, 0, math.max(0, viewport_w - slider_width))
         local slider_y = y + content_top + button_height * 0.5 - slider_height * 0.5
         slider_y = clamp(slider_y, 0, math.max(0, viewport_h - slider_height))
-        UI.draw_panel({
-            id = "scroll_speed_popup",
-            parent = "song_select_viewport",
-            x = slider_x, y = slider_y,
-            width = slider_width, height = slider_height,
-            color = UI.colors.panel, alpha = 0.98, layer = 70,
-        })
+        submit_panel("scroll_speed_popup", "song_select_viewport", slider_x, slider_y,
+            slider_width, slider_height, UI.colors.panel, 70, 0.98)
         local track_y = slider_height * 0.5
-        draw.rect({
-            parent = "scroll_speed_popup",
-            x = px(14, scale), y = track_y - px(3, scale),
-            width = slider_width - px(28, scale), height = px(6, scale),
-            color = UI.colors.accent_dim, layer = 71,
-        })
-        ui.slider({
-            id = "scroll_speed_slider",
-            parent = "scroll_speed_popup",
-            x = px(14, scale), y = track_y - px(14, scale),
-            width = slider_width - px(28, scale), height = px(28, scale),
-            min = 0.25, max = 9.0, step = 0.05,
-            action = "set_scroll_speed",
-        })
+        submit_rect(nil, "scroll_speed_popup", px(14, scale), track_y - px(3, scale),
+            slider_width - px(28, scale), px(6, scale), UI.colors.accent_dim, 71)
+        submit_slider("scroll_speed_slider", "scroll_speed_popup", px(14, scale),
+            track_y - px(14, scale), slider_width - px(28, scale), px(28, scale),
+            0.25, 9.0, 0.05, "set_scroll_speed")
         local speed = clamp(tonumber(song_select.scroll_speed or 1.0) or 1.0, 0.25, 9.0)
         local t = (speed - 0.25) / 8.75
-        draw.rect({
-            parent = "scroll_speed_popup",
-            x = px(14, scale) + t * (slider_width - px(28, scale)) - px(7, scale),
-            y = track_y - px(8, scale),
-            width = px(16, scale), height = px(16, scale),
-            color = UI.colors.accent, layer = 73,
-        })
+        submit_rect(nil, "scroll_speed_popup",
+            px(14, scale) + t * (slider_width - px(28, scale)) - px(7, scale),
+            track_y - px(8, scale), px(16, scale), px(16, scale), UI.colors.accent, 73)
     end
 end
 
@@ -1326,80 +1547,34 @@ function render()
     local selected = song_select.selected
 
 -- Album-big art is a true full-screen backdrop.
-    draw.rect({
-        x = 0, y = 0, width = w, height = h,
-        color = DARK, layer = -100,
-    })
+    submit_rect(nil, nil, 0, 0, w, h, DARK, -100)
     if selected ~= nil and selected.album_big ~= nil then
         draw_cover(selected.album_big, 0, 0, w, h, 0.92, true, -99, nil)
-        draw.rect({
-            x = 0, y = 0, width = w, height = h,
-            color = { r = 0, g = 0, b = 0, a = 68 }, layer = -98,
-        })
+        submit_rect(nil, nil, 0, 0, w, h, FULLSCREEN_ART_OVERLAY_COLOR, -98)
     end
 
 -- Center the UI at 16:9 on wide displays; fill narrow displays.
-    UI.layout_box({
-        id = "song_select_viewport",
-        x = viewport_x, y = viewport_y,
-        width = viewport_w, height = viewport_h,
-    })
+    submit_layout_box("song_select_viewport", nil, viewport_x, viewport_y, viewport_w, viewport_h)
 
     draw_selected_panel(selected, metrics, scale, viewport_w, viewport_h)
 
     -- The selected chart panel is a single native draw command. Skins can move it,
     -- resize it, restyle it and choose its layer without implementing radar maths.
     if selected ~= nil and type(draw.chart_panel) == "function" then
-        draw.chart_panel({
-            id = "selected_chart_panel",
-            x = metrics.artwork_x,
-            y = metrics.artwork_y,
-            width = metrics.artwork_size,
-            height = metrics.artwork_size,
-            mode = "current",
-            layer = 25,
-            clickable = true,
-            hitbox = {
-                id = "selected_chart_panel_toggle",
-                action = "cycle_chart_panel",
-                hit_test_priority = 50,
-            },
-            header = true,
-            background_color = CHART_PANEL_STYLE.background_color,
-            border_color = CHART_PANEL_STYLE.border_color,
-            header_color = CHART_PANEL_STYLE.header_color,
-            divider_color = CHART_PANEL_STYLE.divider_color,
-            radar_fill_color = CHART_PANEL_STYLE.radar_fill_color,
-            radar_line_color = CHART_PANEL_STYLE.radar_line_color,
-            guide_color = CHART_PANEL_STYLE.guide_color,
-            bar_background_color = CHART_PANEL_STYLE.bar_background_color,
-            taps_color = CHART_PANEL_STYLE.taps_color,
-            chords_color = CHART_PANEL_STYLE.chords_color,
-            longs_color = CHART_PANEL_STYLE.longs_color,
-            slides_color = CHART_PANEL_STYLE.slides_color,
-            flicks_color = CHART_PANEL_STYLE.flicks_color,
-            stream_color = CHART_PANEL_STYLE.stream_color,
-            travel_color = CHART_PANEL_STYLE.travel_color,
-            border_width = CHART_PANEL_STYLE.border_width,
-            header_size = CHART_PANEL_STYLE.header_size,
-            background_bleed = CHART_PANEL_STYLE.background_bleed,
-        })
+        CHART_PANEL_OPTIONS.x = metrics.artwork_x
+        CHART_PANEL_OPTIONS.y = metrics.artwork_y
+        CHART_PANEL_OPTIONS.width = metrics.artwork_size
+        CHART_PANEL_OPTIONS.height = metrics.artwork_size
+        draw.chart_panel(CHART_PANEL_OPTIONS)
     end
-
     draw_gallery(selected, metrics, scale, viewport_w, viewport_h)
     if not song_select.loading and (tonumber(song_select.song_count or 0) or 0) == 0 then
         local search = tostring(song_select.search or "")
         local message = search ~= "" and "SONG NOT FOUND" or "NO SONGS FOUND"
-        draw.text(message, {
-            parent = "song_select_viewport",
-            x = metrics.gallery_x + metrics.gallery_width * 0.5,
-            y = metrics.gallery_y + metrics.gallery_height * 0.5,
-            size = px(UI.sizes.heading, scale),
-            color = UI.colors.muted,
-            font = FONT_BOLD,
-            anchor = "center",
-            layer = 18,
-        })
+        submit_text(message, nil, "song_select_viewport",
+            metrics.gallery_x + metrics.gallery_width * 0.5,
+            metrics.gallery_y + metrics.gallery_height * 0.5,
+            px(UI.sizes.heading, scale), UI.colors.muted, FONT_BOLD, "center", 18)
     end
     draw_right_controls(metrics, scale, viewport_w, viewport_h)
 
@@ -1409,51 +1584,25 @@ function render()
 -- Match the footer width to the card group.
     local footer_width = metrics.gallery_width
     local controls_layout = footer_control_layout(footer_width, scale)
-    UI.layout_box({
-        id = "song_footer",
-        parent = "song_select_viewport",
-        x = footer_x,
-        y = metrics.footer_top_local,
-        width = footer_width,
-        height = footer_height,
-    })
-    draw.rect({
-        id = "song_footer_background",
-        parent = "song_footer",
-        x = 0, y = 0,
-        width = footer_width, height = footer_height,
-        -- Cards remain visible under the footer; controls/text themselves stay opaque.
-        color = { r = 0, g = 0, b = 0, a = 184 },
-        layer = 50,
-    })
+    submit_layout_box("song_footer", "song_select_viewport", footer_x,
+        metrics.footer_top_local, footer_width, footer_height)
+    submit_rect("song_footer_background", "song_footer", 0, 0,
+        footer_width, footer_height, FOOTER_BACKGROUND_COLOR, 50)
 
     draw_bottom_control("PACK", song_select.pack or "ALL", controls_layout.pack.x, controls_layout.pack.width, scale, "open_pack", footer_height)
-    draw_bottom_control("SORT", string.upper(song_select.sort or "TITLE"), controls_layout.sort.x, controls_layout.sort.width, scale, "open_sort", footer_height)
-    draw_bottom_control("ORDER", string.upper(song_select.sort_direction or "ASC"), controls_layout.order.x, controls_layout.order.width, scale, "toggle_order", footer_height)
+    draw_bottom_control("SORT", cached_upper(song_select.sort or "TITLE"), controls_layout.sort.x, controls_layout.sort.width, scale, "open_sort", footer_height)
+    draw_bottom_control("ORDER", cached_upper(song_select.sort_direction or "ASC"), controls_layout.order.x, controls_layout.order.width, scale, "toggle_order", footer_height)
 
     if song_select.search_active then
-        draw.rect({
-            id = "song_search_frame",
-            parent = "song_select_viewport",
-            -- Search is an overlay on the gallery, using its exact outer bounds.
-            x = metrics.gallery_x, y = metrics.gallery_y,
-            width = metrics.gallery_width, height = px(LAYOUT.search.height, scale),
-            color = { r = 0, g = 0, b = 0, a = 210 }, layer = 90,
-        })
+        submit_rect("song_search_frame", "song_select_viewport", metrics.gallery_x,
+            metrics.gallery_y, metrics.gallery_width, px(LAYOUT.search.height, scale),
+            SEARCH_FRAME_COLOR, 90)
 -- Keep search input above the gallery hitboxes.
-        ui.input({
-            id = "song_search_input",
-            parent = "song_search_frame",
-            x = 0, y = 0,
-            width = metrics.gallery_width, height = px(LAYOUT.search.height, scale),
-            action = "focus_search",
-        })
-        draw.text("SEARCH", {
-            parent = "song_search_frame",
-            x = px(LAYOUT.search.title_x, scale), y = px(LAYOUT.search.title_y, scale),
-            size = px(LAYOUT.search.title_size, scale), color = UI.colors.accent,
-            font = FONT_BOLD, anchor = "left", layer = 92,
-        })
+        submit_input("song_search_input", "song_search_frame", 0, 0,
+            metrics.gallery_width, px(LAYOUT.search.height, scale), "focus_search")
+        submit_text("SEARCH", nil, "song_search_frame", px(LAYOUT.search.title_x, scale),
+            px(LAYOUT.search.title_y, scale), px(LAYOUT.search.title_size, scale),
+            UI.colors.accent, FONT_BOLD, "left", 92)
         local full_search_text = song_select.search or ""
         local text_value = song_select.search_display or full_search_text
         local search_has_text = full_search_text ~= ""
@@ -1478,29 +1627,19 @@ function render()
             local text_visual_center_y = text_y - px(5, scale)
             if search_has_text and selection_end > selection_start and selection_width > 0 then
                 local selection_height = text_size * 0.92
-                draw.rect({
-                    parent = "song_search_frame",
-                    x = text_x + selection_offset, y = text_visual_center_y - selection_height * 0.5,
-                    width = selection_width, height = selection_height,
-                    color = UI.colors.accent_dim, layer = 91,
-                })
+                submit_rect(nil, "song_search_frame", text_x + selection_offset,
+                    text_visual_center_y - selection_height * 0.5,
+                    selection_width, selection_height, UI.colors.accent_dim, 91)
             end
-            draw.text(search_text, {
-                parent = "song_search_frame", x = text_x, y = text_y,
-                size = text_size, color = search_has_text and WHITE or MUTED,
-                font = FONT_REGULAR, anchor = "left", layer = 92,
-            })
+            submit_text(search_text, nil, "song_search_frame", text_x, text_y,
+                text_size, search_has_text and WHITE or MUTED, FONT_REGULAR, "left", 92)
             local caret_height = text_size * 0.92
-            draw.rect({ parent = "song_search_frame", x = text_x + caret_offset, y = text_visual_center_y - caret_height * 0.5,
-                width = math.max(1, px(2, scale)), height = caret_height, color = WHITE, layer = 94 })
+            submit_rect(nil, "song_search_frame", text_x + caret_offset,
+                text_visual_center_y - caret_height * 0.5,
+                math.max(1, px(2, scale)), caret_height, WHITE, 94)
         else
-            draw.text(search_text, {
-                parent = "song_search_frame",
-                x = text_x, y = text_y,
-                size = text_size,
-                color = search_has_text and WHITE or MUTED,
-                font = FONT_REGULAR, anchor = "left", layer = 92,
-            })
+            submit_text(search_text, nil, "song_search_frame", text_x, text_y,
+                text_size, search_has_text and WHITE or MUTED, FONT_REGULAR, "left", 92)
         end
     end
 
@@ -1514,21 +1653,10 @@ function render()
     end
 
     if song_select.loading then
-        draw.rect({
-            id = "song_loading_overlay",
-            parent = "song_select_viewport",
-            x = 0, y = 0, width = viewport_w, height = viewport_h,
-            color = { r = 0, g = 0, b = 0, a = 120 }, layer = 100,
-        })
+        submit_rect("song_loading_overlay", "song_select_viewport", 0, 0,
+            viewport_w, viewport_h, LOADING_OVERLAY_COLOR, 100)
         local loading_x, loading_y = UI.point("song_loading_overlay", "center", "center")
-        draw.text("LOADING SONGS...", {
-            parent = "song_loading_overlay",
-            x = loading_x, y = loading_y,
-            size = px(LAYOUT.loading.text_size, scale),
-            color = WHITE,
-            font = FONT_BOLD,
-            anchor = "center",
-            layer = 102,
-        })
+        submit_text("LOADING SONGS...", nil, "song_loading_overlay", loading_x, loading_y,
+            px(LAYOUT.loading.text_size, scale), WHITE, FONT_BOLD, "center", 102)
     end
 end

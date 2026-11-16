@@ -11,8 +11,16 @@ namespace TSC;
 /// </summary>
 internal static class SkinBoxShadowRenderer
 {
+#if TSC_ANDROID
+    // Song Select redraws its visible card shadows while scrolling. Four nested
+    // layers retain the soft edge while keeping the per-frame UI submission cost
+    // low on mobile GPUs/CPUs.
+    private const int MinSteps = 3;
+    private const int MaxSteps = 4;
+#else
     private const int MinSteps = 6;
     private const int MaxSteps = 12;
+#endif
     private const float FalloffExponent = 3f;
 
     public static void Draw(
@@ -20,9 +28,10 @@ internal static class SkinBoxShadowRenderer
         Texture2D pixel,
         SkinDrawCommand command)
     {
-        var shadow = command.BoxShadow;
-        if (shadow is null || pixel is null)
+        var maybeShadow = command.BoxShadow;
+        if (!maybeShadow.HasValue || pixel is null)
             return;
+        var shadow = maybeShadow.Value;
 
         var width = Math.Max(0f, command.Size.X);
         var height = Math.Max(0f, command.Size.Y);

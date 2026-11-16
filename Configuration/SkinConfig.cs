@@ -280,6 +280,10 @@ public sealed class RenderLaneDepthConfig
     public float FarCameraDistance { get; set; } = ChartProjection.DefaultLaneFarCameraDistance;
     public float Length { get; set; } = ChartProjection.DefaultLaneLength;
     public float EndLength { get; set; } = ChartProjection.DefaultLaneEndLength;
+
+    // Optional gameplay-side alias used by playfieldConfig.lua. When present,
+    // this is the distance the visible lane continues past the judge toward the camera.
+    public float? BehindCameraDistance { get; set; }
 }
 
 public sealed class RenderLaneLineWidthConfig

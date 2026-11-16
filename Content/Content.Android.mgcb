@@ -1,0 +1,30 @@
+
+#----------------------------- Global Properties ----------------------------#
+
+/outputDir:bin/$(Platform)/$(Configuration)/Content
+/intermediateDir:obj/$(Platform)/$(Configuration)/Content
+/platform:Android
+
+#-------------------------------- References --------------------------------#
+
+#---------------------------------- Content ---------------------------------#
+
+/build:DefaultFont.spritefont
+
+#begin LaneLine.fx
+/importer:EffectImporter
+/processor:EffectProcessor
+/processorParam:Defines=TSC_ANDROID
+/build:LaneLine.fx
+
+#begin SkinSparkles.fx
+/importer:EffectImporter
+/processor:EffectProcessor
+/processorParam:Defines=TSC_ANDROID
+/build:SkinSparkles.fx
+
+#begin SkinQuad3D.fx
+/importer:EffectImporter
+/processor:EffectProcessor
+/processorParam:Defines=TSC_ANDROID
+/build:SkinQuad3D.fx

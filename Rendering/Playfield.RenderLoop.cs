@@ -67,6 +67,7 @@ public sealed partial class Playfield
 
     public void Draw()
     {
+#if DEBUG
         var frameStartTimestamp = Stopwatch.GetTimestamp();
         if (_debugLastDrawStartTimestamp != 0)
         {
@@ -133,6 +134,7 @@ public sealed partial class Playfield
             _projection.ResetPerformanceDebugCounters();
         }
         _projection.PerformanceDebugEnabled = _performanceDebugInstrumentFrame;
+#endif
 
         var outputViewport = _graphics.Viewport;
         var (virtualWidth, virtualHeight) = GetVirtualResolution(outputViewport.Width, outputViewport.Height);
@@ -150,9 +152,11 @@ public sealed partial class Playfield
         // between the default background and the 3D playfield; non-negative
         // layers are rendered after the normal HUD.
         _skinRuntime.SetCompactMode(_compact);
+#if DEBUG
         _skinRuntime.DebugMeasureApiAllocations = _performanceDebugInstrumentFrame;
         var allocStart = GC.GetAllocatedBytesForCurrentThread();
         var skinBuildStartTimestamp = Stopwatch.GetTimestamp();
+#endif
         _skinDrawCommands = _skinRuntime.BuildDrawCommands(
             virtualWidth,
             virtualHeight,
@@ -160,8 +164,10 @@ public sealed partial class Playfield
             _uiTimeSeconds,
             _playSeconds,
             _chartEditorMode && _topDownViewEnabled ? "editor" : "gameplay");
+#if DEBUG
         _debugSkinBuildMs = ElapsedMilliseconds(skinBuildStartTimestamp);
         _debugAllocSkinBuildBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+#endif
 
         _graphics.Clear(Background);
         WarmFeedbackRenderingIfNeeded();
@@ -174,6 +180,15 @@ public sealed partial class Playfield
         GearState? laneState = _chart is not null && _tempo is not null && _gear is not null
             ? RenderGearState(laneTick)
             : null;
+#if DEBUG
+        if (_showGameplayTouchHitAreasDebug)
+        {
+            if (laneState is { } touchAreaGear)
+                BuildGameplayTouchHitAreas(touchAreaGear);
+            else
+                _gameplayTouchHitAreas.Clear();
+        }
+#endif
 
         BeginEditorMultiSelectionRenderFrame();
         if (editorGroupInactiveBanks && laneState is not null)
@@ -185,12 +200,15 @@ public sealed partial class Playfield
             _graphics.Clear(Background);
         }
 
+#if DEBUG
         allocStart = GC.GetAllocatedBytesForCurrentThread();
         var skinDrawStartTimestamp = Stopwatch.GetTimestamp();
         var backgroundDrawStartTimestamp = _performanceDebugInstrumentFrame
             ? Stopwatch.GetTimestamp()
             : 0L;
+#endif
         DrawSkinScriptUiLayers(_skinDrawCommands, true, _skinRuntime);
+#if DEBUG
         _debugSkinDrawMs = ElapsedMilliseconds(skinDrawStartTimestamp);
         if (_performanceDebugInstrumentFrame)
         {
@@ -206,6 +224,7 @@ public sealed partial class Playfield
             _debugBackgroundDrawCommandCount = backgroundCommandCount;
         }
         _debugAllocSkinDrawBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+#endif
 
         // The editor owns its background dimmer: dim background/skin layers by
         // 50% in top-down 2D, but keep the lanes and notes at full brightness.
@@ -217,22 +236,28 @@ public sealed partial class Playfield
             _spriteBatch.End();
         }
 
+#if DEBUG
         var laneDrawCallsStart = _debugTexturedDrawCalls;
         var laneVerticesStart = _debugTexturedVertices;
+#endif
         // Draw the currently active banks normally. Inactive banks are skipped
         // here and rendered, together with their notes, into a separate layer below.
         _editorActiveBanksOnlyPass = editorGroupInactiveBanks;
+#if DEBUG
         allocStart = GC.GetAllocatedBytesForCurrentThread();
+#endif
         DrawPlayfield();
         DrawLaneHighlights();
         DrawTransitionFlashes();
         _editorActiveBanksOnlyPass = false;
+#if DEBUG
         _debugAllocLaneBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
         if (_performanceDebugInstrumentFrame)
         {
             _debugTexturedLaneDrawCalls = _debugTexturedDrawCalls - laneDrawCallsStart;
             _debugTexturedLaneVertices = _debugTexturedVertices - laneVerticesStart;
         }
+#endif
         if (editorGroupInactiveBanks && laneState is not null)
         {
             var inactiveBankOpacity = Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f);
@@ -252,15 +277,19 @@ public sealed partial class Playfield
         {
             var currentTick = laneTick;
             var currentState = laneState ?? RenderGearState(currentTick);
+#if DEBUG
             var guideDrawCallsStart = _debugTexturedDrawCalls;
             var guideVerticesStart = _debugTexturedVertices;
+#endif
 
             // Beat subdivisions and tempo-change guide lines are editor-only.
             // Do not call their projection/drawing paths during normal gameplay:
             // the judgement line is the only timing line needed while playing.
             if (_chartEditorMode && !_editorPreviewMode)
             {
+#if DEBUG
                 allocStart = GC.GetAllocatedBytesForCurrentThread();
+#endif
                 DrawEditorBankSeparators();
                 // Keep gameplay beat lines visible behind the translucent panel
                 // overlay; the panel tracks also draw their own flat 2D snap grid.
@@ -268,7 +297,9 @@ public sealed partial class Playfield
                 DrawBeatNumbers(currentTick, currentState);
                 DrawTempoChanges(currentTick, currentState);
                 DrawPlayTickMarker(currentTick, currentState);
+#if DEBUG
                 _debugAllocBeatTempoBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+#endif
             }
 
             // Only active-bank judge markers remain in the normal pass. Inactive
@@ -276,21 +307,26 @@ public sealed partial class Playfield
             _editorActiveBanksOnlyPass = editorGroupInactiveBanks;
             DrawJudgementLine(currentTick);
             _editorActiveBanksOnlyPass = false;
+#if DEBUG
             if (_performanceDebugInstrumentFrame)
             {
                 _debugTexturedGuideDrawCalls = _debugTexturedDrawCalls - guideDrawCallsStart;
                 _debugTexturedGuideVertices = _debugTexturedVertices - guideVerticesStart;
             }
+#endif
 
+#if DEBUG
             var noteDrawCallsStart = _debugTexturedDrawCalls;
             var noteVerticesStart = _debugTexturedVertices;
             var drawNotesStartTimestamp = Stopwatch.GetTimestamp();
             allocStart = GC.GetAllocatedBytesForCurrentThread();
+#endif
             _editorActiveBanksOnlyPass = editorGroupInactiveBanks;
             DrawNotes(currentTick, currentState);
             _editorActiveBanksOnlyPass = false;
             if (_chartEditorMode && !_editorPreviewMode)
                 DrawEditorProblemNoteMarkers(currentTick, currentState);
+#if DEBUG
             _debugAllocNotesBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
             _debugDrawNotesMs = ElapsedMilliseconds(drawNotesStartTimestamp);
             if (_performanceDebugInstrumentFrame)
@@ -298,15 +334,18 @@ public sealed partial class Playfield
                 _debugTexturedNoteDrawCalls = _debugTexturedDrawCalls - noteDrawCallsStart;
                 _debugTexturedNoteVertices = _debugTexturedVertices - noteVerticesStart;
             }
+#endif
             // The inactive-bank layer is collected first, but the active-bank
             // note pass runs later in the main target. Draw the brackets only
             // after both passes have contributed their bounds so active notes
             // receive the same edited-instance highlight as inactive notes.
             DrawEditorEditedGroupHighlights();
 
+#if DEBUG
             var feedbackDrawCallsStart = _debugTexturedDrawCalls;
             var feedbackVerticesStart = _debugTexturedVertices;
             allocStart = GC.GetAllocatedBytesForCurrentThread();
+#endif
             DrawHitAnimations();
             DrawSkinScriptUiLayers(_skinDrawCommands, false, _skinRuntime, hitEffectsOnly: true);
             if (_chartEditorMode && !_editorPreviewMode && !_editorPanelsViewEnabled)
@@ -321,19 +360,25 @@ public sealed partial class Playfield
                 DrawHud(currentState, currentTick);
             if (_showAuxTrackDebug && !_chartEditorMode)
                 DrawAuxTrackDebugOverlay(currentTick);
+#if DEBUG
             _debugAllocFeedbackHudBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
             if (_performanceDebugInstrumentFrame)
             {
                 _debugTexturedFeedbackDrawCalls = _debugTexturedDrawCalls - feedbackDrawCallsStart;
                 _debugTexturedFeedbackVertices = _debugTexturedVertices - feedbackVerticesStart;
             }
+#endif
         }
 
+#if DEBUG
         allocStart = GC.GetAllocatedBytesForCurrentThread();
         skinDrawStartTimestamp = Stopwatch.GetTimestamp();
+#endif
         DrawSkinScriptUiLayers(_skinDrawCommands, false, _skinRuntime);
+#if DEBUG
         _debugSkinDrawMs += ElapsedMilliseconds(skinDrawStartTimestamp);
         _debugAllocSkinDrawBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+#endif
         if (_gameplayPaused)
         {
             var pauseSkinDrawn = false;
@@ -425,10 +470,21 @@ public sealed partial class Playfield
             _editorMetaPanelOpen && _editorMetaBbCodeStripOpen)
             DrawEditorMetaBbCodeStripOverlay(virtualWidth, virtualHeight);
 
+#if DEBUG
+        if (_showGameplayTouchHitAreasDebug)
+            DrawGameplayTouchHitAreasDebugOverlay();
         if (_showPerformanceDebug)
             DrawPerformanceDebugOverlay();
+#endif
 
         _graphics.SetRenderTarget(null);
+        var backBufferWidth = Math.Max(1, _graphics.PresentationParameters.BackBufferWidth);
+        var backBufferHeight = Math.Max(1, _graphics.PresentationParameters.BackBufferHeight);
+        var fullBackBufferViewport = new Viewport(0, 0, backBufferWidth, backBufferHeight);
+        _graphics.Viewport = fullBackBufferViewport;
+        _graphics.RasterizerState = RasterizerState.CullNone;
+        _graphics.ScissorRectangle = fullBackBufferViewport.Bounds;
+        _graphics.Clear(Color.Black);
         _graphics.Viewport = outputViewport;
         _graphics.BlendState = BlendState.Opaque;
         _graphics.DepthStencilState = DepthStencilState.None;
@@ -444,6 +500,7 @@ public sealed partial class Playfield
         // Measure after drawing the diagnostics overlay and compositing the render
         // target. The overlay shown above contains the previous completed frame's
         // value, which is preferable to reporting a partial frame time.
+#if DEBUG
         _debugFrameMs = ElapsedMilliseconds(frameStartTimestamp);
         _debugAllocatedBytes = GC.GetAllocatedBytesForCurrentThread() - frameAllocStart;
         _debugGc0Delta = Math.Max(0, GC.CollectionCount(0) - gc0Start);
@@ -461,6 +518,7 @@ public sealed partial class Playfield
             _debugClearGc1 += _debugGc1Delta;
             _debugClearGc2 += _debugGc2Delta;
         }
+#endif
 
         // Count only complete gameplay renders made while the opaque transition
         // is holding the intro. The transition cannot reveal the playfield until
@@ -474,10 +532,15 @@ public sealed partial class Playfield
             _gameplayStartupHiddenDrawFrames = Math.Min(
                 GameplayStartupHiddenDrawFramesRequired,
                 _gameplayStartupHiddenDrawFrames + 1);
+#if DEBUG
             Program.LogRuntime(
                 $"GAMEPLAY_STARTUP_HIDDEN_FRAME frame={_gameplayStartupHiddenDrawFrames}/{GameplayStartupHiddenDrawFramesRequired} " +
                 $"frameMs={_debugFrameMs:0.00} skinBuildMs={_debugSkinBuildMs:0.00} skinDrawMs={_debugSkinDrawMs:0.00} " +
                 $"allocatedBytes={_debugAllocatedBytes} gc0={_debugGc0Delta} gc1={_debugGc1Delta} gc2={_debugGc2Delta}");
+#else
+            Program.LogRuntime(
+                $"GAMEPLAY_STARTUP_HIDDEN_FRAME frame={_gameplayStartupHiddenDrawFrames}/{GameplayStartupHiddenDrawFramesRequired}");
+#endif
         }
     }
 

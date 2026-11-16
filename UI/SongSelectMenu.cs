@@ -38,6 +38,8 @@ namespace TSC;
 public sealed class SongSelectMenu : IDisposable
 {
     private const string ImportedBundleMarkerFileName = ".tsc-bundle-import.sha256";
+    private static readonly StringComparer FileSystemPathComparer =
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
     private const string BundleImportStagingDirectoryName = "bundle-import-staging";
     private static readonly TimeSpan BundleImportStagingRetention = TimeSpan.FromDays(1);
     private static readonly RasterizerState ChartPanelScissorRasterizer = new()
@@ -50,6 +52,9 @@ public sealed class SongSelectMenu : IDisposable
         public required string Path { get; init; }
         public required string Difficulty { get; init; }
         public int? Level { get; init; }
+        public int? EstimatedLevel { get; set; }
+        public int? DisplayLevel => Level ?? EstimatedLevel;
+        public bool LevelIsEstimated => !Level.HasValue && EstimatedLevel.HasValue;
         public string Name { get; init; } = string.Empty;
         public string Artist { get; init; } = string.Empty;
         public double Bpm { get; init; }
@@ -165,7 +170,15 @@ public sealed class SongSelectMenu : IDisposable
     // Null means the slot is the normal one-card-per-song representation.
     private readonly List<ChartEntry?> _visibleChartOverrides = new();
     private readonly List<string> _packs = new();
+#if TSC_ANDROID
+    private readonly List<SkinSongSelectItem> _skinSongSelectItems = new();
+#endif
     private Task<InitialLoadResult>? _initialLoadTask;
+    private Task<InitialLoadResult?>? _songListRefreshTask;
+    private CancellationTokenSource? _songListRefreshCancellation;
+    private Task<ScoreLookupResult>? _scoreLookupTask;
+    private CancellationTokenSource? _scoreLookupCancellation;
+    private int _scoreLookupGeneration;
     private bool _initialLoadInProgress;
     private bool _songListReady;
 
@@ -197,8 +210,16 @@ public sealed class SongSelectMenu : IDisposable
     // WebP can otherwise generate an unbounded stream of load errors when FFmpeg
     // is unavailable. Keep failures cached for this Song Select instance.
     private readonly HashSet<string> _artworkFailed = new(StringComparer.OrdinalIgnoreCase);
+#if TSC_ANDROID
+    // Song cards are rendered at roughly 230-315 logical pixels on phones.
+    // 384px covers retain enough detail while reducing texture upload work by
+    // 44% compared with 512px images when a newly visible row enters the cache.
+    private const int MaxCachedArtwork = 24;
+    private const int MaxArtworkDecodeDimension = 384;
+#else
     private const int MaxCachedArtwork = 32;
     private const int MaxArtworkDecodeDimension = 768;
+#endif
 
     private int _packIndex;
     private int _selectedSongIndex;
@@ -271,14 +292,35 @@ public sealed class SongSelectMenu : IDisposable
     private ChartRadarResult? _chartRadarResult;
     private string? _chartRadarError;
     private readonly Dictionary<string, ChartRadarResult> _chartRadarCache = new(StringComparer.OrdinalIgnoreCase);
+    private string ChartLevelEstimateCachePath => Path.Combine(_songSelectStateDirectory, "chart-level-estimates.json");
+    private const int ChartLevelEstimateCacheVersion = 1;
+    private const long ChartLevelEstimateCacheReadLimitBytes = 8L * 1024L * 1024L;
+    private readonly Dictionary<string, int> _chartLevelEstimateCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _chartLevelEstimateKeysByPath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _chartRadarKeysByPath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Queue<ChartLevelEstimateRequest> _chartLevelEstimateQueue = new();
+    private readonly HashSet<string> _chartLevelEstimateRequestedKeys = new(StringComparer.OrdinalIgnoreCase);
+    private Task? _chartLevelEstimateCacheSaveTask;
+    private bool _chartLevelEstimateCacheDirty;
+    private string? _chartRadarTaskPath;
+    private string? _chartRadarTaskDifficulty;
 
-    // Song previews are debounced so holding a navigation key or moving quickly
-    // through songs does not start every intermediate preview.
+    // Song previews are briefly debounced so holding a navigation key or moving
+    // quickly through songs does not start every intermediate preview. Android
+    // uses a shorter delay; file reading and Opus decoding are asynchronous there.
+#if TSC_ANDROID
+    private const double PreviewSelectionDelaySeconds = 0.14;
+#else
     private const double PreviewSelectionDelaySeconds = 0.38;
+#endif
     private OpusAudioPlayer? _previewAudio;
     private string? _previewSelectionPath;
     private SongEntry? _previewSelectionSong;
     private string? _previewAttemptedPath;
+    private string? _previewLoadingPath;
+    private Task<(SongEntry Song, string? Path)>? _previewResolveTask;
+    private Task<(string Path, byte[] Bytes)>? _previewReadTask;
+    private CancellationTokenSource? _previewReadCancellation;
     private bool _previewSelectionSnapshotInitialized;
     private double _previewStartDelayRemaining;
 
@@ -319,6 +361,7 @@ public sealed class SongSelectMenu : IDisposable
         public List<SongEntry> Songs { get; } = new();
         public List<string> Packs { get; } = new();
         public bool LoadedFromCache { get; set; }
+        public bool NeedsBackgroundRefresh { get; set; }
     }
 
     private sealed class DecodedArtwork
@@ -334,6 +377,63 @@ public sealed class SongSelectMenu : IDisposable
         public List<string> Packs { get; } = new();
         public List<CacheSourceFile> Sources { get; } = new();
     }
+
+    private sealed class SongLibraryInventory
+    {
+        public List<string> TscCharts { get; } = new();
+        public List<string> AresFiles { get; } = new();
+        public List<string> TstsBundles { get; } = new();
+        public List<string> ZipBundles { get; } = new();
+        public List<string> LooseTstsCharts { get; } = new();
+        public Dictionary<string, CacheSourceFile> Files { get; } = new(FileSystemPathComparer);
+        public HashSet<string> SongJsonDirectories { get; } = new(FileSystemPathComparer);
+        public int DirectoriesVisited { get; set; }
+        public int CandidateFilesVisited { get; set; }
+
+        public bool TryGetFile(string path, out CacheSourceFile source)
+        {
+            if (Files.TryGetValue(Path.GetFullPath(path), out var found))
+            {
+                source = found;
+                return true;
+            }
+            source = null!;
+            return false;
+        }
+
+        public bool ContainsFile(string path)
+            => Files.ContainsKey(Path.GetFullPath(path));
+    }
+
+    private sealed class SidecarCacheEntry
+    {
+        public bool IsValid { get; init; }
+        public JsonElement Root { get; init; }
+        public string Error { get; init; } = string.Empty;
+        public bool CoverResolved { get; set; }
+        public string? PreparedCoverPath { get; set; }
+    }
+
+    private sealed class ScoreLookupResult
+    {
+        public int Generation { get; init; }
+        public double ElapsedMilliseconds { get; init; }
+        public Dictionary<string, ScoreSaveStore.ScoreRecord?> Records { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class ChartLevelEstimateCache
+    {
+        public int Version { get; set; } = 1;
+        public List<ChartLevelEstimateCacheEntry> Entries { get; set; } = new();
+    }
+
+    private sealed class ChartLevelEstimateCacheEntry
+    {
+        public string Key { get; set; } = string.Empty;
+        public int Level { get; set; }
+    }
+
+    private readonly record struct ChartLevelEstimateRequest(string Key, string RadarKey, string Path, string Difficulty);
 
     private sealed class SongListCache
     {
@@ -421,10 +521,30 @@ public sealed class SongSelectMenu : IDisposable
     {
         "ez", "nm", "hd", "ex", "xt"
     };
+    private static readonly string[] DifficultyNamesUpper = DifficultyNames
+        .Select(static difficulty => difficulty.ToUpperInvariant())
+        .ToArray();
 
     private GameConfig _gameConfig;
     private readonly Effect? _skinSparklesEffect;
     private readonly Effect? _skinQuad3DEffect;
+#if TSC_ANDROID && DEBUG
+    private long _androidPerfWindowStartTicks;
+    private long _androidPerfStateTicks;
+    private long _androidPerfRenderTicks;
+    private double _androidPerfLuaRenderMilliseconds;
+    private double _androidPerfLayoutMilliseconds;
+    private double _androidPerfSortMilliseconds;
+    private long _androidPerfAllocatedBytes;
+    private long _androidPerfCommandCount;
+    private int _androidPerfFrameCount;
+    private int _androidPerfLastGc0Count;
+    private int _androidPerfGc0Collections;
+    private double _androidPerfMaxArtworkUploadMilliseconds;
+    private int _androidPerfArtworkUploadCount;
+    private int _androidPerfRenderCacheHits;
+    private int _androidPerfRenderCacheMisses;
+#endif
 
     public SongSelectMenu(GraphicsDevice graphics, SpriteFont font, string? skinDirectory = null, GameConfig? gameConfig = null, Effect? skinSparklesEffect = null, Effect? skinQuad3DEffect = null, string? gameConfigPath = null)
     {
@@ -449,6 +569,7 @@ public sealed class SongSelectMenu : IDisposable
         };
         _songsRoot = FindSongsRoot();
         _songSelectStateDirectory = FindSongSelectStateDirectory(_songsRoot);
+        LoadChartLevelEstimateCache();
 #if !TSC_PUBLISH
         // Published builds use AppData directly and do not import legacy cache files from the songs folder.
         MigrateLegacySongSelectStateFiles();
@@ -485,6 +606,23 @@ public sealed class SongSelectMenu : IDisposable
     public void Open()
     {
         Program.LogRuntime("SONG_SELECT_OPEN");
+#if TSC_ANDROID && DEBUG
+        _androidPerfWindowStartTicks = 0;
+        _androidPerfStateTicks = 0;
+        _androidPerfRenderTicks = 0;
+        _androidPerfLuaRenderMilliseconds = 0.0;
+        _androidPerfLayoutMilliseconds = 0.0;
+        _androidPerfSortMilliseconds = 0.0;
+        _androidPerfAllocatedBytes = 0;
+        _androidPerfCommandCount = 0;
+        _androidPerfFrameCount = 0;
+        _androidPerfLastGc0Count = GC.CollectionCount(0);
+        _androidPerfGc0Collections = 0;
+        _androidPerfMaxArtworkUploadMilliseconds = 0.0;
+        _androidPerfArtworkUploadCount = 0;
+        _androidPerfRenderCacheHits = 0;
+        _androidPerfRenderCacheMisses = 0;
+#endif
         _open = true;
         Reload();
     }
@@ -546,6 +684,14 @@ public sealed class SongSelectMenu : IDisposable
         _scanSongsFound = 0;
         _scanLastPath = string.Empty;
         _initialLoadTask = null;
+        _songListRefreshCancellation?.Cancel();
+        _songListRefreshCancellation?.Dispose();
+        _songListRefreshCancellation = null;
+        _songListRefreshTask = null;
+        _scoreLookupCancellation?.Cancel();
+        _scoreLookupCancellation?.Dispose();
+        _scoreLookupCancellation = null;
+        _scoreLookupTask = null;
         _initialLoadInProgress = true;
         _songListReady = false;
         _loadProgressCurrent = 0;
@@ -569,6 +715,8 @@ public sealed class SongSelectMenu : IDisposable
         // interaction while it is running; Song Select only advances its async
         // preparation and initializes the skin once the song list is ready.
         CompleteInitialLoad();
+        CompleteBackgroundSongListRefresh();
+        CompleteScoreLookup();
         if (_initialLoadInProgress)
             return;
 
@@ -585,6 +733,8 @@ public sealed class SongSelectMenu : IDisposable
 
         var wasLoading = _initialLoadInProgress;
         CompleteInitialLoad();
+        CompleteBackgroundSongListRefresh();
+        CompleteScoreLookup();
 
         // Do not initialize the skin, update Lua, or pump artwork on the same
         // frame that the JSON preparation finishes. Give the prepared song list
@@ -596,6 +746,8 @@ public sealed class SongSelectMenu : IDisposable
         if (KeybindSettings.IsPressed("gameplay_toggle_chart_radar"))
             CycleChartPanelMode();
         UpdateChartRadarState();
+        UpdateChartLevelEstimates();
+        PumpChartLevelEstimateCacheSave();
         UpdateChartPanelTransition(Math.Max(0.0, deltaSeconds));
 
         if (Pressed(keyboard, previousKeyboard, XnaKeys.F10))
@@ -660,6 +812,14 @@ public sealed class SongSelectMenu : IDisposable
             }
         }
 
+#if TSC_ANDROID
+        // Capture a gallery drag before the skin's song-card button handler
+        // consumes the initial press. Android touch gestures must keep tracking
+        // even when that first contact lands on a song card.
+        if (!_searchActive)
+            UpdateGalleryScroll(mouse, previousMouse, Math.Max(0.0, deltaSeconds));
+#endif
+
         if (mousePressed && EnsureSkinRuntime() && _skinRuntime!.HandleUiPointerPressed(mouse.Position.X, mouse.Position.Y))
         {
             var action = ConsumeSkinAction();
@@ -668,11 +828,12 @@ public sealed class SongSelectMenu : IDisposable
             return;
         }
 
-        // UI controls (especially opening Search) get first refusal on pointer
-        // input. Only pass the same press to gallery drag/scroll after no control
-        // consumed it, and never while a text field owns pointer focus.
+#if !TSC_ANDROID
+        // Preserve the existing desktop behavior: interactive controls get first
+        // refusal, and only unconsumed presses are passed to gallery scrolling.
         if (!_searchActive)
             UpdateGalleryScroll(mouse, previousMouse, Math.Max(0.0, deltaSeconds));
+#endif
 
         // Keep Lua sliders live while dragging, not only on the initial click.
         if (mouse.LeftButton == XnaButtonState.Pressed &&
@@ -844,15 +1005,118 @@ public sealed class SongSelectMenu : IDisposable
         var selectedSong = SelectedSong;
         if (!_previewSelectionSnapshotInitialized || !ReferenceEquals(_previewSelectionSong, selectedSong))
         {
-            var selectedPath = ResolveSelectedPreviewPath();
+            var selectedChart = SelectedChart;
             _previewSelectionSnapshotInitialized = true;
             _previewSelectionSong = selectedSong;
-            _previewSelectionPath = selectedPath;
+            _previewSelectionPath = null;
             _previewAttemptedPath = null;
-            _previewStartDelayRemaining = string.IsNullOrWhiteSpace(selectedPath)
-                ? 0.0
-                : PreviewSelectionDelaySeconds;
+            _previewStartDelayRemaining = selectedSong is null ? 0.0 : PreviewSelectionDelaySeconds;
             StopPreviewAudioAndRelease();
+
+            // File.Exists / Directory.Exists on shared Android storage can stall
+            // the UI thread. Resolve the preview candidate paths on a worker too.
+            if (selectedSong is not null)
+            {
+                var songSnapshot = selectedSong;
+                var chartSnapshot = selectedChart;
+                _previewResolveTask = Task.Run(() =>
+                {
+                    var resolveStart = Stopwatch.GetTimestamp();
+                    var path = ResolveSelectedPreviewPath(songSnapshot, chartSnapshot);
+                    Program.LogRuntime(
+                        $"SONG_SELECT_PREVIEW_PATH_RESOLVE_DONE ms={Stopwatch.GetElapsedTime(resolveStart).TotalMilliseconds:F2} " +
+                        $"found={!string.IsNullOrWhiteSpace(path)}");
+                    return (Song: songSnapshot, Path: path);
+                });
+            }
+        }
+
+        // Poll the background path resolution without blocking the game thread.
+        if (_previewResolveTask is { IsCompleted: true } resolveTask)
+        {
+            _previewResolveTask = null;
+            try
+            {
+                var resolved = resolveTask.GetAwaiter().GetResult();
+                if (ReferenceEquals(resolved.Song, SelectedSong))
+                    _previewSelectionPath = resolved.Path;
+            }
+            catch (Exception ex)
+            {
+                Program.LogRuntime(
+                    $"SONG_SELECT_PREVIEW_PATH_RESOLVE_FAILED type={ex.GetType().Name} message={ex.Message}");
+            }
+        }
+
+        // Poll the background file read without blocking the game thread. A result
+        // is ignored when the user has already moved to another song.
+        if (_previewReadTask is { IsCompleted: true } readTask)
+        {
+            _previewReadTask = null;
+            _previewReadCancellation?.Dispose();
+            _previewReadCancellation = null;
+            try
+            {
+                var (path, bytes) = readTask.GetAwaiter().GetResult();
+                if (!string.IsNullOrWhiteSpace(_previewSelectionPath) &&
+                    string.Equals(path, _previewSelectionPath, StringComparison.OrdinalIgnoreCase) &&
+                    bytes.Length > 0)
+                {
+                    var player = new OpusAudioPlayer
+                    {
+                        IsLooped = true,
+                        Volume = _gameConfig.MusicVolume
+                    };
+                    try
+                    {
+                        // Concentus decoding runs on OpusAudioPlayer's dedicated
+                        // worker. SoundEffect creation remains on the game thread
+                        // when TryCompletePendingLoad observes the completed decode.
+                        player.BeginLoadOpus(bytes);
+                        _previewAudio = player;
+                        _previewLoadingPath = path;
+                    }
+                    catch
+                    {
+                        player.Dispose();
+                        throw;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // A newer selection canceled this read; this is normal while browsing.
+            }
+            catch (Exception ex)
+            {
+                Program.LogRuntime($"SONG_SELECT_PREVIEW_READ_FAILED path={_previewSelectionPath} error={ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        // Finish decoding and create the native sound buffer only after the worker
+        // has completed. This avoids doing file I/O and the Opus decode on the UI
+        // thread, which previously caused a visible pause after selecting a song.
+        if (_previewAudio is { IsLoading: true } loadingPlayer)
+        {
+            if (loadingPlayer.TryCompletePendingLoad(retainPcmForSeeking: false, out var loadError))
+            {
+                var stillSelected = !string.IsNullOrWhiteSpace(_previewLoadingPath) &&
+                    string.Equals(_previewLoadingPath, _previewSelectionPath, StringComparison.OrdinalIgnoreCase);
+                _previewLoadingPath = null;
+                if (loadError is not null)
+                {
+                    Program.LogRuntime($"SONG_SELECT_PREVIEW_DECODE_FAILED path={_previewSelectionPath} error={loadError.GetBaseException().Message}");
+                    StopPreviewAudioAndRelease();
+                }
+                else if (stillSelected && ReferenceEquals(_previewAudio, loadingPlayer))
+                {
+                    loadingPlayer.Resume();
+                }
+                else if (ReferenceEquals(_previewAudio, loadingPlayer))
+                {
+                    StopPreviewAudioAndRelease();
+                }
+            }
         }
 
         if (string.IsNullOrWhiteSpace(_previewSelectionPath))
@@ -865,36 +1129,40 @@ public sealed class SongSelectMenu : IDisposable
                 return;
         }
 
-        if (string.Equals(_previewAttemptedPath, _previewSelectionPath, StringComparison.OrdinalIgnoreCase))
-            return;
-        _previewAttemptedPath = _previewSelectionPath;
-
-        if (!File.Exists(_previewSelectionPath))
+        if (string.Equals(_previewAttemptedPath, _previewSelectionPath, StringComparison.OrdinalIgnoreCase) ||
+            _previewReadTask is not null || _previewAudio is not null)
             return;
 
-        OpusAudioPlayer? player = null;
-        try
-        {
-            var encoded = File.ReadAllBytes(_previewSelectionPath);
-            if (encoded.Length == 0)
-                return;
+        var pathToRead = _previewSelectionPath;
+        _previewAttemptedPath = pathToRead;
 
-            player = new OpusAudioPlayer { IsLooped = true, Volume = _gameConfig.MusicVolume };
-            player.LoadOpus(encoded);
-            player.PrepareInitialPlayback(retainPcmForSeeking: false);
-            player.Resume();
-            _previewAudio = player;
-        }
-        catch (Exception ex)
+        var cancellation = new CancellationTokenSource();
+        _previewReadCancellation = cancellation;
+        var token = cancellation.Token;
+        Program.LogRuntime($"SONG_SELECT_PREVIEW_READ_BEGIN path={pathToRead}");
+        _previewReadTask = Task.Run(async () =>
         {
-            try { player?.Dispose(); } catch { }
-            Program.LogRuntime($"SONG_SELECT_PREVIEW_FAILED path={_previewSelectionPath} error={ex.GetType().Name}: {ex.Message}");
-        }
+            var readStart = Stopwatch.GetTimestamp();
+            try
+            {
+                var bytes = await File.ReadAllBytesAsync(pathToRead, token).ConfigureAwait(false);
+                token.ThrowIfCancellationRequested();
+                Program.LogRuntime(
+                    $"SONG_SELECT_PREVIEW_READ_DONE ms={Stopwatch.GetElapsedTime(readStart).TotalMilliseconds:F2} bytes={bytes.Length}");
+                return (Path: pathToRead, Bytes: bytes);
+            }
+            catch (Exception ex)
+            {
+                Program.LogRuntime(
+                    $"SONG_SELECT_PREVIEW_READ_WORKER_FAILED ms={Stopwatch.GetElapsedTime(readStart).TotalMilliseconds:F2} " +
+                    $"type={ex.GetType().Name} message={ex.Message}");
+                throw;
+            }
+        }, token);
     }
 
-    private string? ResolveSelectedPreviewPath()
+    private static string? ResolveSelectedPreviewPath(SongEntry? song, ChartEntry? chart)
     {
-        var chart = SelectedChart;
         if (chart is null)
             return null;
 
@@ -914,7 +1182,6 @@ public sealed class SongSelectMenu : IDisposable
         if (explicitPath is not null)
             return explicitPath;
 
-        var song = SelectedSong;
         if (song is not null && Directory.Exists(song.FolderPath))
         {
             var songRootPreview = ExistingPath(Path.Combine(song.FolderPath, "preview.opus"));
@@ -942,6 +1209,14 @@ public sealed class SongSelectMenu : IDisposable
 
     private void StopPreviewAudioAndRelease()
     {
+        _previewResolveTask = null;
+        var cancellation = _previewReadCancellation;
+        _previewReadCancellation = null;
+        try { cancellation?.Cancel(); } catch { }
+        try { cancellation?.Dispose(); } catch { }
+        _previewReadTask = null;
+        _previewLoadingPath = null;
+
         var player = _previewAudio;
         _previewAudio = null;
         try { player?.Stop(); } catch { }
@@ -1298,12 +1573,14 @@ public sealed class SongSelectMenu : IDisposable
                 break;
 
             case "open_editor_confirm":
+#if !TSC_ANDROID
                 _editConfirmOpen = true;
                 _packExpanded = false;
                 _sortExpanded = false;
                 _scrollSpeedPopupExpanded = false;
                 if (_searchActive)
                     CloseSearch(commit: true);
+#endif
                 break;
 
             case "cancel_edit_confirm":
@@ -1311,8 +1588,10 @@ public sealed class SongSelectMenu : IDisposable
                 break;
 
             case "confirm_open_editor":
+#if !TSC_ANDROID
                 _editConfirmOpen = false;
                 _editorRequestPending = true;
+#endif
                 break;
 
             case "close_popup":
@@ -1392,6 +1671,8 @@ public sealed class SongSelectMenu : IDisposable
 
     public void Close()
     {
+        // Preserve estimates before the menu stops receiving Update() calls.
+        FlushChartLevelEstimateCache();
         // Preserve the last filter text before Close clears transient editor state.
         SaveLastSelection();
         _open = false;
@@ -1444,8 +1725,80 @@ public sealed class SongSelectMenu : IDisposable
             {
                 try
                 {
+#if TSC_ANDROID && DEBUG
+                    var perfFrameStart = Stopwatch.GetTimestamp();
+                    var perfAllocatedStart = GC.GetAllocatedBytesForCurrentThread();
+                    if (_androidPerfWindowStartTicks == 0)
+                        _androidPerfWindowStartTicks = perfFrameStart;
+#endif
                     UpdateSkinState();
-                    _skinRuntime.RenderDrawCommands(_spriteBatch, _pixel, _font, width, height);
+#if TSC_ANDROID && DEBUG
+                    var perfAfterState = Stopwatch.GetTimestamp();
+                    // Debug-only Song Select profiling; shipping builds do not collect
+                    // per-frame timers, allocation counts, or command statistics.
+                    _skinRuntime.DebugMeasureApiAllocations = false;
+#endif
+                    _skinRuntime.RenderDrawCommands(
+                        _spriteBatch, _pixel, _font, width, height,
+                        reuseUnchangedCommands: true);
+#if TSC_ANDROID && DEBUG
+                    var perfAfterRender = Stopwatch.GetTimestamp();
+                    _androidPerfStateTicks += perfAfterState - perfFrameStart;
+                    _androidPerfRenderTicks += perfAfterRender - perfAfterState;
+                    _androidPerfLuaRenderMilliseconds += _skinRuntime.DebugLastLuaRenderMilliseconds;
+                    _androidPerfLayoutMilliseconds += _skinRuntime.DebugLastLayoutResolveMilliseconds;
+                    _androidPerfSortMilliseconds += _skinRuntime.DebugLastCommandSortMilliseconds;
+                    _androidPerfAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - perfAllocatedStart;
+                    _androidPerfCommandCount += _skinRuntime.DebugLastDrawCommandCount;
+                    if (_skinRuntime.DebugLastRenderCacheHit)
+                        _androidPerfRenderCacheHits++;
+                    else
+                        _androidPerfRenderCacheMisses++;
+                    var currentGc0 = GC.CollectionCount(0);
+                    _androidPerfGc0Collections += Math.Max(0, currentGc0 - _androidPerfLastGc0Count);
+                    _androidPerfLastGc0Count = currentGc0;
+                    _androidPerfFrameCount++;
+                    var perfWindowTicks = perfAfterRender - _androidPerfWindowStartTicks;
+                    if (perfWindowTicks >= Stopwatch.Frequency * 8L && _androidPerfFrameCount > 0)
+                    {
+                        var frames = _androidPerfFrameCount;
+                        var windowSeconds = perfWindowTicks / (double)Stopwatch.Frequency;
+                        var stateAverageMs = _androidPerfStateTicks * 1000.0 / Stopwatch.Frequency / frames;
+                        var renderAverageMs = _androidPerfRenderTicks * 1000.0 / Stopwatch.Frequency / frames;
+                        var luaAverageMs = _androidPerfLuaRenderMilliseconds / frames;
+                        var layoutAverageMs = _androidPerfLayoutMilliseconds / frames;
+                        var sortAverageMs = _androidPerfSortMilliseconds / frames;
+                        var submitAverageMs = Math.Max(0.0,
+                            renderAverageMs - luaAverageMs - layoutAverageMs - sortAverageMs);
+                        var allocatedAverageKb = _androidPerfAllocatedBytes / 1024.0 / frames;
+                        var commandAverage = _androidPerfCommandCount / (double)frames;
+                        Program.LogRuntime(
+                            $"ANDROID_SONG_SELECT_PERF fps={frames / windowSeconds:F1} " +
+                            $"state_avg_ms={stateAverageMs:F2} skin_render_avg_ms={renderAverageMs:F2} " +
+                            $"lua_avg_ms={luaAverageMs:F2} layout_avg_ms={layoutAverageMs:F2} " +
+                            $"sort_avg_ms={sortAverageMs:F2} draw_submit_avg_ms={submitAverageMs:F2} " +
+                            $"alloc_kb_avg={allocatedAverageKb:F1} commands_avg={commandAverage:F1} " +
+                            $"gc0={_androidPerfGc0Collections} " +
+                            $"render_cache_hits={_androidPerfRenderCacheHits} " +
+                            $"render_cache_misses={_androidPerfRenderCacheMisses} " +
+                            $"artwork_uploads={_androidPerfArtworkUploadCount} " +
+                            $"artwork_upload_max_ms={_androidPerfMaxArtworkUploadMilliseconds:F2}");
+                        _androidPerfWindowStartTicks = perfAfterRender;
+                        _androidPerfStateTicks = 0;
+                        _androidPerfRenderTicks = 0;
+                        _androidPerfLuaRenderMilliseconds = 0.0;
+                        _androidPerfLayoutMilliseconds = 0.0;
+                        _androidPerfSortMilliseconds = 0.0;
+                        _androidPerfAllocatedBytes = 0;
+                        _androidPerfCommandCount = 0;
+                        _androidPerfFrameCount = 0;
+                        _androidPerfGc0Collections = 0;
+                        _androidPerfMaxArtworkUploadMilliseconds = 0.0;
+                        _androidPerfArtworkUploadCount = 0;
+                        _androidPerfRenderCacheHits = 0;
+                        _androidPerfRenderCacheMisses = 0;
+                    }
+#endif
                     if (_skinRuntime.IsLoaded)
                     {
                         DrawSongSelectErrorOverlay(width, height);
@@ -1522,9 +1875,6 @@ public sealed class SongSelectMenu : IDisposable
 
     private void UpdateChartRadarState(bool force = false)
     {
-        if (_chartPanelMode == ChartPanelMode.Hidden && !force)
-            return;
-
         // Finish one worker at a time. If selection changed while it was parsing,
         // discard the stale result and start the currently requested chart next.
         if (_chartRadarTask is { IsCompleted: true } completedTask)
@@ -1534,7 +1884,12 @@ public sealed class SongSelectMenu : IDisposable
             {
                 var result = completedTask.GetAwaiter().GetResult();
                 if (completedKey is not null)
+                {
                     _chartRadarCache[completedKey] = result;
+                    if (_chartRadarTaskPath is not null && _chartRadarTaskDifficulty is not null &&
+                        _chartLevelEstimateKeysByPath.TryGetValue(_chartRadarTaskPath, out var estimateKey))
+                        ApplyChartLevelEstimate(_chartRadarTaskPath, estimateKey, _chartRadarTaskDifficulty, result);
+                }
                 if (string.Equals(completedKey, _chartRadarDesiredKey, StringComparison.OrdinalIgnoreCase))
                 {
                     _chartRadarResult = result;
@@ -1553,7 +1908,12 @@ public sealed class SongSelectMenu : IDisposable
             }
             _chartRadarTask = null;
             _chartRadarTaskKey = null;
+            _chartRadarTaskPath = null;
+            _chartRadarTaskDifficulty = null;
         }
+
+        if (_chartPanelMode == ChartPanelMode.Hidden && !force)
+            return;
 
         var selectedChart = SelectedChart;
         if (selectedChart is null)
@@ -1614,7 +1974,235 @@ public sealed class SongSelectMenu : IDisposable
         {
             var requestedPath = _chartRadarDesiredPath;
             _chartRadarTaskKey = key;
+            _chartRadarTaskPath = requestedPath;
+            _chartRadarTaskDifficulty = selectedChart.Difficulty;
             _chartRadarTask = Task.Run(() => ChartRadarAnalyzer.Analyze(requestedPath));
+        }
+    }
+
+    private void UpdateChartLevelEstimates()
+    {
+        var selectedSong = SelectedSong;
+        if (selectedSong is not null)
+        {
+            // The selected panel can show all five difficulty tabs at once, so
+            // queue each missing estimate rather than only estimating the active tab.
+            foreach (var chart in selectedSong.Charts)
+                EnqueueChartLevelEstimate(chart);
+        }
+
+        var columns = GalleryColumnCount();
+        var visibleRows = GalleryVisibleRowCount();
+        var safePitch = Math.Max(1.0, GalleryPitchPixels());
+        var contentTopRow = Math.Max(0, (int)Math.Floor(_galleryScrollPixels / safePitch));
+        var galleryStart = Math.Max(0, contentTopRow - 1) * columns;
+        var galleryEnd = Math.Min(_visibleSongs.Count, galleryStart + columns * (visibleRows + 3));
+        for (var i = galleryStart; i < galleryEnd; i++)
+        {
+            var song = _visibleSongs[i];
+            var cardChart = GetVisibleChartOverride(i)
+                ?? song.GetChart(DifficultyNames[Math.Clamp(_selectedDifficultyIndex, 0, DifficultyNames.Length - 1)])
+                ?? song.RepresentativeChart;
+            EnqueueChartLevelEstimate(cardChart);
+        }
+
+        if (_chartRadarTask is not null)
+            return;
+
+        while (_chartLevelEstimateQueue.Count > 0)
+        {
+            var request = _chartLevelEstimateQueue.Dequeue();
+            if (_chartRadarCache.TryGetValue(request.RadarKey, out var cached))
+            {
+                ApplyChartLevelEstimate(request.Path, request.Key, request.Difficulty, cached);
+                continue;
+            }
+
+            _chartRadarTaskKey = request.RadarKey;
+            _chartRadarTaskPath = request.Path;
+            _chartRadarTaskDifficulty = request.Difficulty;
+            _chartRadarTask = Task.Run(() => ChartRadarAnalyzer.Analyze(request.Path));
+            break;
+        }
+    }
+
+    private void EnqueueChartLevelEstimate(ChartEntry? chart)
+    {
+        if (chart is null || chart.Level.HasValue || chart.EstimatedLevel.HasValue)
+            return;
+        if (chart.Difficulty is not ("ez" or "nm" or "hd" or "ex" or "xt"))
+            return;
+
+        string path;
+        string key;
+        try
+        {
+            path = Path.GetFullPath(chart.Path);
+            if (!_chartLevelEstimateKeysByPath.TryGetValue(path, out key!))
+            {
+                var info = new FileInfo(path);
+                if (!info.Exists)
+                    return;
+                var radarKey = string.Concat(
+                    path, "|", info.Length.ToString(CultureInfo.InvariantCulture), "|",
+                    info.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture));
+                key = string.Concat(
+                    radarKey, "|", chart.Difficulty, "|",
+                    ChartLevelEstimator.ModelVersion.ToString(CultureInfo.InvariantCulture));
+                _chartLevelEstimateKeysByPath[path] = key;
+                _chartRadarKeysByPath[path] = radarKey;
+            }
+        }
+        catch
+        {
+            return;
+        }
+
+        if (!_chartRadarKeysByPath.TryGetValue(path, out var radarCacheKey))
+            return;
+
+        if (_chartLevelEstimateCache.TryGetValue(key, out var cachedLevel))
+        {
+            chart.EstimatedLevel = cachedLevel;
+            _chartLevelEstimateRequestedKeys.Add(key);
+            return;
+        }
+
+        if (_chartLevelEstimateRequestedKeys.Add(key))
+            _chartLevelEstimateQueue.Enqueue(new ChartLevelEstimateRequest(key, radarCacheKey, path, chart.Difficulty));
+    }
+
+    private void ApplyChartLevelEstimate(string path, string key, string difficulty, ChartRadarResult radar)
+    {
+        if (!_chartLevelEstimateRequestedKeys.Contains(key))
+            return;
+
+        var estimate = ChartLevelEstimator.Estimate(radar, difficulty);
+        if (!estimate.HasValue)
+            return;
+
+        var applied = false;
+        foreach (var song in _songs)
+        {
+            foreach (var chart in song.Charts)
+            {
+                if (chart.Level.HasValue)
+                    continue;
+                var chartPath = Path.IsPathRooted(chart.Path) ? chart.Path : Path.GetFullPath(chart.Path);
+                if (!FileSystemPathComparer.Equals(chartPath, path))
+                    continue;
+                chart.EstimatedLevel = estimate.Value;
+                applied = true;
+            }
+        }
+
+        if (!applied)
+            return;
+
+        _chartLevelEstimateCache[key] = estimate.Value;
+        _chartLevelEstimateCacheDirty = true;
+        Program.LogRuntime(
+            $"SONG_SELECT_LEVEL_ESTIMATE difficulty={difficulty} level={estimate.Value} " +
+            $"chart={Path.GetFileName(path)} radar_notes={radar.Notes.NormalizedValue:F1} " +
+            $"radar_chords={radar.Chords.NormalizedValue:F1} radar_slides={radar.Slides.NormalizedValue:F1} " +
+            $"radar_flicks={radar.Flicks.NormalizedValue:F1} radar_stream={radar.Stream.NormalizedValue:F1} " +
+            $"radar_travel={radar.Travel.NormalizedValue:F1}");
+    }
+
+    private void LoadChartLevelEstimateCache()
+    {
+        try
+        {
+            if (!File.Exists(ChartLevelEstimateCachePath))
+                return;
+
+            var info = new FileInfo(ChartLevelEstimateCachePath);
+            if (info.Length <= 0 || info.Length > ChartLevelEstimateCacheReadLimitBytes)
+                return;
+
+            var cache = JsonSerializer.Deserialize<ChartLevelEstimateCache>(
+                File.ReadAllText(ChartLevelEstimateCachePath, Encoding.UTF8));
+            if (cache is null || cache.Version != ChartLevelEstimateCacheVersion || cache.Entries is null)
+                return;
+
+            foreach (var entry in cache.Entries)
+            {
+                if (string.IsNullOrWhiteSpace(entry.Key) || entry.Level <= 0)
+                    continue;
+                _chartLevelEstimateCache[entry.Key] = entry.Level;
+            }
+            Program.LogRuntime($"SONG_SELECT_LEVEL_ESTIMATE_CACHE_LOADED entries={_chartLevelEstimateCache.Count}");
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"SONG_SELECT_LEVEL_ESTIMATE_CACHE_LOAD_FAILED {ex.GetBaseException().Message}");
+        }
+    }
+
+    private ChartLevelEstimateCache CreateChartLevelEstimateCacheSnapshot()
+        => new()
+        {
+            Version = ChartLevelEstimateCacheVersion,
+            Entries = _chartLevelEstimateCache
+                .Select(pair => new ChartLevelEstimateCacheEntry { Key = pair.Key, Level = pair.Value })
+                .ToList()
+        };
+
+    private static void WriteChartLevelEstimateCache(string cachePath, ChartLevelEstimateCache snapshot)
+    {
+        var json = JsonSerializer.Serialize(snapshot);
+        var tempPath = cachePath + ".tmp";
+        Directory.CreateDirectory(Path.GetDirectoryName(cachePath)!);
+        File.WriteAllText(tempPath, json, new UTF8Encoding(false));
+        File.Move(tempPath, cachePath, true);
+    }
+
+    private void PumpChartLevelEstimateCacheSave()
+    {
+        if (_chartLevelEstimateCacheSaveTask is { IsCompleted: true } completed)
+        {
+            try { completed.GetAwaiter().GetResult(); }
+            catch (Exception ex)
+            {
+                _chartLevelEstimateCacheDirty = true;
+                Program.LogRuntime($"SONG_SELECT_LEVEL_ESTIMATE_CACHE_SAVE_FAILED {ex.GetBaseException().Message}");
+            }
+            _chartLevelEstimateCacheSaveTask = null;
+        }
+
+        if (!_chartLevelEstimateCacheDirty || _chartLevelEstimateCacheSaveTask is not null)
+            return;
+
+        var snapshot = CreateChartLevelEstimateCacheSnapshot();
+        _chartLevelEstimateCacheDirty = false;
+        var cachePath = ChartLevelEstimateCachePath;
+        _chartLevelEstimateCacheSaveTask = Task.Run(() => WriteChartLevelEstimateCache(cachePath, snapshot));
+    }
+
+    private void FlushChartLevelEstimateCache()
+    {
+        if (_chartLevelEstimateCacheSaveTask is { } saveTask)
+        {
+            try { saveTask.GetAwaiter().GetResult(); }
+            catch (Exception ex)
+            {
+                _chartLevelEstimateCacheDirty = true;
+                Program.LogRuntime($"SONG_SELECT_LEVEL_ESTIMATE_CACHE_SAVE_FAILED {ex.GetBaseException().Message}");
+            }
+            _chartLevelEstimateCacheSaveTask = null;
+        }
+
+        if (!_chartLevelEstimateCacheDirty)
+            return;
+
+        try
+        {
+            WriteChartLevelEstimateCache(ChartLevelEstimateCachePath, CreateChartLevelEstimateCacheSnapshot());
+            _chartLevelEstimateCacheDirty = false;
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"SONG_SELECT_LEVEL_ESTIMATE_CACHE_FLUSH_FAILED {ex.GetBaseException().Message}");
         }
     }
 
@@ -2568,6 +3156,152 @@ public sealed class SongSelectMenu : IDisposable
         catch { return false; }
     }
 
+    private SongLibraryInventory ScanSongLibraryFiles(CancellationToken cancellationToken = default)
+    {
+        var inventory = new SongLibraryInventory();
+        var root = Path.GetFullPath(_songsRoot);
+        Directory.CreateDirectory(root);
+
+        // Walk the library once and deliberately skip its generated _cache tree.
+        // SearchOption.AllDirectories cannot prune that tree, so it repeatedly
+        // traverses extracted bundle copies on every validation pass.
+        var pendingDirectories = new Stack<string>();
+        var visitedDirectories = new HashSet<string>(FileSystemPathComparer);
+        pendingDirectories.Push(root);
+
+        while (pendingDirectories.Count > 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var directory = pendingDirectories.Pop();
+            if (!visitedDirectories.Add(directory))
+                continue;
+
+            inventory.DirectoriesVisited++;
+            Volatile.Write(ref _loadProgressCurrent, inventory.DirectoriesVisited);
+            Volatile.Write(ref _loadProgressTotal, Math.Max(1, inventory.DirectoriesVisited + pendingDirectories.Count + 1));
+            _loadCurrentItem = $"Scanning {Path.GetFileName(directory)}...";
+            // FileSystemInfo objects carry the directory-enumeration metadata, so
+            // classification does not need a separate GetAttributes call for every
+            // file in a large pack folder.
+            foreach (var entry in new DirectoryInfo(directory).EnumerateFileSystemInfos())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                FileAttributes attributes;
+                try
+                {
+                    attributes = entry.Attributes;
+                }
+                catch (FileNotFoundException)
+                {
+                    continue;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    continue;
+                }
+
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    if (string.Equals(directory, root, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals(entry.Name, "_cache", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    // Following junctions/symlinks can introduce recursive library
+                    // walks. Normal song folders are ordinary directories.
+                    if ((attributes & FileAttributes.ReparsePoint) == 0)
+                        pendingDirectories.Push(Path.GetFullPath(entry.FullName));
+                    continue;
+                }
+
+                var fileName = entry.Name;
+                var extension = Path.GetExtension(fileName);
+                var isTsc = extension.Equals(".tsc", StringComparison.OrdinalIgnoreCase);
+                var isAres = extension.Equals(".ares", StringComparison.OrdinalIgnoreCase);
+                var isTsts = extension.Equals(".tsts", StringComparison.OrdinalIgnoreCase);
+                var isZip = extension.Equals(".zip", StringComparison.OrdinalIgnoreCase);
+                var isSongJson = fileName.Equals("song.json", StringComparison.OrdinalIgnoreCase);
+                var isTstsAsset = fileName.Equals("song.opus", StringComparison.OrdinalIgnoreCase) ||
+                                  fileName.Equals("preview.opus", StringComparison.OrdinalIgnoreCase) ||
+                                  fileName.Equals("cover.webp", StringComparison.OrdinalIgnoreCase) ||
+                                  fileName.Equals("music.opus", StringComparison.OrdinalIgnoreCase);
+                if (!isTsc && !isAres && !isTsts && !isZip && !isSongJson && !isTstsAsset)
+                    continue;
+
+                if (entry is not FileInfo info)
+                    continue;
+                var fullPath = Path.GetFullPath(info.FullName);
+                var source = new CacheSourceFile
+                {
+                    Path = ToCacheRelativePath(fullPath),
+                    Length = info.Length,
+                    LastWriteUtcTicks = info.LastWriteTimeUtc.Ticks
+                };
+                inventory.Files[fullPath] = source;
+                inventory.CandidateFilesVisited++;
+
+                if (isTsc) inventory.TscCharts.Add(fullPath);
+                if (isAres) inventory.AresFiles.Add(fullPath);
+                if (isTsts && !_importedBundlePaths.Contains(fullPath)) inventory.TstsBundles.Add(fullPath);
+                if (isZip && !_importedBundlePaths.Contains(fullPath)) inventory.ZipBundles.Add(fullPath);
+                if (isSongJson)
+                    inventory.SongJsonDirectories.Add(Path.GetDirectoryName(fullPath) ?? string.Empty);
+            }
+        }
+
+        inventory.TscCharts.Sort(StringComparer.OrdinalIgnoreCase);
+        inventory.AresFiles.Sort(StringComparer.OrdinalIgnoreCase);
+        inventory.TstsBundles.Sort(StringComparer.OrdinalIgnoreCase);
+        inventory.ZipBundles.Sort(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var chartPath in inventory.AresFiles)
+        {
+            if (!IsRecognizedTstsDifficultyChart(chartPath))
+                continue;
+            var chartDirectory = Path.GetDirectoryName(chartPath) ?? string.Empty;
+            var songRoot = FindNearestSongJsonDirectory(chartDirectory, inventory);
+            if (!string.IsNullOrWhiteSpace(songRoot) && IsTstsLayoutChart(chartPath, songRoot, inventory))
+                inventory.LooseTstsCharts.Add(chartPath);
+        }
+        inventory.LooseTstsCharts.Sort(StringComparer.OrdinalIgnoreCase);
+        return inventory;
+    }
+
+    private static string? FindNearestSongJsonDirectory(string chartDirectory, SongLibraryInventory inventory)
+    {
+        string? current = Path.GetFullPath(chartDirectory);
+        for (var depth = 0; current is not null && depth < 10; depth++)
+        {
+            if (inventory.SongJsonDirectories.Contains(current))
+                return current;
+            current = Directory.GetParent(current)?.FullName;
+        }
+        return null;
+    }
+
+    private static bool IsTstsLayoutChart(string chartPath, string songRoot, SongLibraryInventory inventory)
+    {
+        if (!IsRecognizedTstsDifficultyChart(chartPath))
+            return false;
+        try
+        {
+            var fullRoot = Path.GetFullPath(songRoot);
+            var chartDirectory = Path.GetFullPath(Path.GetDirectoryName(chartPath) ?? string.Empty);
+            var relativeDirectory = Path.GetRelativePath(fullRoot, chartDirectory);
+            var isRootChart = relativeDirectory == ".";
+            var isChartsDirectory = relativeDirectory.Equals("charts", StringComparison.OrdinalIgnoreCase);
+            if (!isRootChart && !isChartsDirectory)
+                return false;
+
+            if (isChartsDirectory)
+                return inventory.ContainsFile(Path.Combine(fullRoot, "song.json"));
+
+            return !inventory.ContainsFile(Path.Combine(fullRoot, "music.opus")) &&
+                   (inventory.ContainsFile(Path.Combine(fullRoot, "song.opus")) ||
+                    inventory.ContainsFile(Path.Combine(fullRoot, "cover.webp")));
+        }
+        catch { return false; }
+    }
+
     private IEnumerable<string> EnumerateTstsBundleFiles()
     {
         if (!Directory.Exists(_songsRoot)) return Array.Empty<string>();
@@ -2589,50 +3323,38 @@ public sealed class SongSelectMenu : IDisposable
     /// files from colliding with other songs. Archives are deleted only after a full
     /// extraction and at least one playable chart has been validated.
     /// </summary>
-    private void ImportSongBundles()
+    private bool ImportSongBundles(IEnumerable<string> archivePaths, CancellationToken cancellationToken = default)
     {
-        if (!Directory.Exists(_songsRoot))
-            return;
-
         CleanupInterruptedBundleImportStaging();
-
-        string[] archivePaths;
-        try
+        var changed = false;
+        foreach (var archivePath in archivePaths.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
         {
-            archivePaths = Directory.EnumerateFiles(_songsRoot, "*", SearchOption.AllDirectories)
-                .Where(path => !IsInsideSongCache(path))
-                .Where(path =>
-                {
-                    var extension = Path.GetExtension(path);
-                    return extension.Equals(".tsts", StringComparison.OrdinalIgnoreCase) ||
-                           extension.Equals(".zip", StringComparison.OrdinalIgnoreCase);
-                })
-                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-        }
-        catch (Exception ex)
-        {
-            Program.LogRuntime($"SONG_BUNDLE_IMPORT_ENUM_ERROR {_songsRoot} :: {ex.Message}");
-            return;
-        }
-
-        foreach (var archivePath in archivePaths)
-        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var destination = Path.Combine(
+                Path.GetDirectoryName(Path.GetFullPath(archivePath)) ?? _songsRoot,
+                Path.GetFileNameWithoutExtension(archivePath));
+            var destinationExisted = Directory.Exists(destination);
             try
             {
-                ImportSongBundle(archivePath);
+                changed |= ImportSongBundle(archivePath, cancellationToken);
             }
             catch (Exception ex)
             {
+                // If extraction moved into place but deleting the original archive
+                // failed, the destination still changed the library and requires
+                // one fresh inventory pass.
+                changed |= !destinationExisted && Directory.Exists(destination);
                 // Import is maintenance on the user's library; a bad archive must
                 // remain on disk and must never prevent Song Select from opening.
                 Program.LogRuntime($"SONG_BUNDLE_IMPORT_ERROR {archivePath} :: {ex.Message}");
             }
         }
+        return changed;
     }
 
-    private void ImportSongBundle(string archivePath)
+    private bool ImportSongBundle(string archivePath, CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var fullArchivePath = Path.GetFullPath(archivePath);
         var songsRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_songsRoot));
         var relativeArchivePath = Path.GetRelativePath(songsRoot, fullArchivePath);
@@ -2641,23 +3363,25 @@ public sealed class SongSelectMenu : IDisposable
             relativeArchivePath.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) ||
             relativeArchivePath.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal) ||
             IsInsideSongCache(fullArchivePath))
-            return;
+            return false;
 
         var parent = Path.GetDirectoryName(fullArchivePath) ?? songsRoot;
         var extension = Path.GetExtension(fullArchivePath);
         var archiveBaseName = Path.GetFileNameWithoutExtension(fullArchivePath);
         if (string.IsNullOrWhiteSpace(archiveBaseName))
-            return;
+            return false;
 
         var destination = Path.Combine(parent, archiveBaseName);
-        var identity = GetSongBundleImportIdentity(fullArchivePath);
         var markerPath = Path.Combine(destination, ImportedBundleMarkerFileName);
 
         if (Directory.Exists(destination))
         {
+            // Avoid hashing a potentially large source archive on every startup
+            // when an ordinary imported destination already exists.
+            var identity = File.Exists(markerPath) ? GetSongBundleImportIdentity(fullArchivePath) : string.Empty;
             // Recover the narrow crash case where extraction completed and the
             // archive remained because deleting it failed or the process stopped.
-            if (File.Exists(markerPath) &&
+            if (identity.Length > 0 &&
                 string.Equals(File.ReadAllText(markerPath, Encoding.UTF8), identity, StringComparison.Ordinal) &&
                 IsUsableImportedBundle(fullArchivePath, destination, extension, out _))
             {
@@ -2665,18 +3389,19 @@ public sealed class SongSelectMenu : IDisposable
                 File.Delete(fullArchivePath);
                 TryDeleteImportedBundleMarker(markerPath);
                 Program.LogRuntime($"SONG_BUNDLE_IMPORT_RECOVERED {fullArchivePath} -> {destination}");
-                return;
+                return true;
             }
 
             Program.LogRuntime($"SONG_BUNDLE_IMPORT_SKIPPED_DESTINATION_EXISTS {fullArchivePath} :: {destination}");
-            return;
+            return false;
         }
         if (File.Exists(destination))
         {
             Program.LogRuntime($"SONG_BUNDLE_IMPORT_SKIPPED_DESTINATION_FILE {fullArchivePath} :: {destination}");
-            return;
+            return false;
         }
 
+        var identityForExtraction = GetSongBundleImportIdentity(fullArchivePath);
         var stagingParent = Path.Combine(Path.GetFullPath(_songsRoot), "_cache", BundleImportStagingDirectoryName);
         Directory.CreateDirectory(stagingParent);
         var stagingRoot = Path.Combine(stagingParent, "TSC-bundle-import-" + Guid.NewGuid().ToString("N"));
@@ -2684,9 +3409,10 @@ public sealed class SongSelectMenu : IDisposable
         try
         {
             ChartZipBundleSupport.ExtractToDirectory(fullArchivePath, stagingRoot);
-            if (!string.Equals(identity, GetSongBundleImportIdentity(fullArchivePath), StringComparison.Ordinal))
+            if (!string.Equals(identityForExtraction, GetSongBundleImportIdentity(fullArchivePath), StringComparison.Ordinal))
                 throw new IOException("The bundle changed while it was being extracted; the original archive was kept.");
 
+            cancellationToken.ThrowIfCancellationRequested();
             if (!IsUsableImportedBundle(fullArchivePath, stagingRoot, extension, out var validationError))
                 throw new InvalidDataException(string.IsNullOrWhiteSpace(validationError)
                     ? "The archive does not contain a supported, playable chart bundle."
@@ -2696,10 +3422,11 @@ public sealed class SongSelectMenu : IDisposable
             if (File.Exists(markerInStaging))
                 throw new InvalidDataException($"The bundle uses the reserved import-marker path: {ImportedBundleMarkerFileName}");
 
-            File.WriteAllText(markerInStaging, identity, new UTF8Encoding(false));
+            File.WriteAllText(markerInStaging, identityForExtraction, new UTF8Encoding(false));
             try { File.SetAttributes(markerInStaging, File.GetAttributes(markerInStaging) | FileAttributes.Hidden); }
             catch { }
 
+            cancellationToken.ThrowIfCancellationRequested();
             // Stage under _cache so incomplete imports never appear in the song scan.
             // Directory.Move is same-volume and makes the completed import visible at once.
             Directory.Move(stagingRoot, destination);
@@ -2710,6 +3437,7 @@ public sealed class SongSelectMenu : IDisposable
             File.Delete(fullArchivePath);
             TryDeleteImportedBundleMarker(Path.Combine(destination, ImportedBundleMarkerFileName));
             Program.LogRuntime($"SONG_BUNDLE_IMPORTED {fullArchivePath} -> {destination}");
+            return true;
         }
         catch
         {
@@ -2883,12 +3611,20 @@ public sealed class SongSelectMenu : IDisposable
         catch { return "Unsorted"; }
     }
 
-    private void AddCacheSource(ScanResult result, HashSet<string> recordedSources, string path)
+    private void AddCacheSource(ScanResult result, HashSet<string> recordedSources, string path, SongLibraryInventory? inventory = null)
     {
         try
         {
             var fullPath = Path.GetFullPath(path);
-            if (!File.Exists(fullPath) || !recordedSources.Add(fullPath)) return;
+            if (!recordedSources.Add(fullPath)) return;
+            if (inventory is not null)
+            {
+                if (inventory.TryGetFile(fullPath, out var cachedSource))
+                    result.Sources.Add(cachedSource);
+                return;
+            }
+
+            if (!File.Exists(fullPath)) return;
             var info = new FileInfo(fullPath);
             result.Sources.Add(new CacheSourceFile
             {
@@ -2977,14 +3713,14 @@ public sealed class SongSelectMenu : IDisposable
             .OrderBy(path => NormalizeDifficulty(null, Path.GetFileNameWithoutExtension(path)), StringComparer.OrdinalIgnoreCase);
     }
 
-    private SongEntry? TryLoadTstsBundleSong(string bundlePath, out string error)
+    private SongEntry? TryLoadTstsBundleSong(string bundlePath, out string error, Dictionary<string, SidecarCacheEntry>? sidecarCache = null)
     {
         error = string.Empty;
         try
         {
             var fullBundlePath = Path.GetFullPath(bundlePath);
             var extractionRoot = PrepareTstsBundle(fullBundlePath);
-            return TryLoadTstsSongFromRoot(fullBundlePath, extractionRoot, out error);
+            return TryLoadTstsSongFromRoot(fullBundlePath, extractionRoot, out error, sidecarCache);
         }
         catch (Exception ex)
         {
@@ -2993,7 +3729,7 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
-    private SongEntry? TryLoadTstsSongFromRoot(string sourcePath, string songRoot, out string error)
+    private SongEntry? TryLoadTstsSongFromRoot(string sourcePath, string songRoot, out string error, Dictionary<string, SidecarCacheEntry>? sidecarCache = null)
     {
         error = string.Empty;
         try
@@ -3039,7 +3775,7 @@ public sealed class SongSelectMenu : IDisposable
             };
             foreach (var chartPath in chartPaths)
             {
-                if (!TryReadLightweightMetadata(chartPath, out var meta, out var metadataError))
+                if (!TryReadLightweightMetadata(chartPath, out var meta, out var metadataError, null, sidecarCache))
                 {
                     Program.LogRuntime($"SONG_SELECT_TSTS_CHART_SKIP {chartPath} :: {metadataError}");
                     continue;
@@ -3063,7 +3799,7 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
-    private List<SongEntry> TryLoadZipBundleSongs(string bundlePath, out string error)
+    private List<SongEntry> TryLoadZipBundleSongs(string bundlePath, out string error, Dictionary<string, SidecarCacheEntry>? sidecarCache = null)
     {
         error = string.Empty;
         var songs = new List<SongEntry>();
@@ -3082,7 +3818,7 @@ public sealed class SongSelectMenu : IDisposable
                     .GroupBy(item => Path.GetFullPath(item.Root!), StringComparer.OrdinalIgnoreCase);
                 foreach (var group in tstsGroups)
                 {
-                    var song = TryLoadTstsSongFromRoot(fullBundlePath, group.Key, out var tstsError);
+                    var song = TryLoadTstsSongFromRoot(fullBundlePath, group.Key, out var tstsError, sidecarCache);
                     if (song is null)
                         Program.LogRuntime($"SONG_SELECT_ZIP_TSTS_SKIP {fullBundlePath} :: {tstsError}");
                     else
@@ -3112,7 +3848,7 @@ public sealed class SongSelectMenu : IDisposable
 
                     foreach (var chartPath in group.OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
                     {
-                        if (!TryReadLightweightMetadata(chartPath, out var meta, out var metadataError))
+                        if (!TryReadLightweightMetadata(chartPath, out var meta, out var metadataError, null, sidecarCache))
                         {
                             Program.LogRuntime($"SONG_SELECT_ZIP_TSC_CHART_SKIP {chartPath} :: {metadataError}");
                             continue;
@@ -3338,7 +4074,7 @@ public sealed class SongSelectMenu : IDisposable
         return result;
     }
 
-    private ScanResult BuildSongListCache()
+    private ScanResult BuildSongListCache(SongLibraryInventory inventory, CancellationToken cancellationToken = default)
     {
         var result = new ScanResult();
 
@@ -3368,33 +4104,15 @@ public sealed class SongSelectMenu : IDisposable
 
         Log($"CACHE BUILD START root={_songsRoot}");
 
-        string[] chartFiles;
-        string[] tstsBundleFiles;
-        string[] zipBundleFiles;
-        string[] looseTstsChartFiles;
-        try
-        {
-            chartFiles = Directory.EnumerateFiles(_songsRoot, "*.tsc", SearchOption.AllDirectories)
-                .Where(p => !IsInsideSongCache(p))
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            tstsBundleFiles = EnumerateTstsBundleFiles()
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            zipBundleFiles = EnumerateZipBundleFiles()
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            looseTstsChartFiles = EnumerateLooseTstsChartFiles()
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-        }
-        catch (Exception ex)
-        {
-            Log($"CHART ENUM ERROR :: {ex.Message}");
-            throw;
-        }
+        var chartFiles = inventory.TscCharts;
+        var tstsBundleFiles = inventory.TstsBundles;
+        var zipBundleFiles = inventory.ZipBundles;
+        var looseTstsChartFiles = inventory.LooseTstsCharts;
+        var sidecarCache = new Dictionary<string, SidecarCacheEntry>(StringComparer.OrdinalIgnoreCase);
 
-        var totalCandidates = chartFiles.Length + tstsBundleFiles.Length + zipBundleFiles.Length + looseTstsChartFiles.Length;
+        var totalCandidates = chartFiles.Count + tstsBundleFiles.Count + zipBundleFiles.Count + looseTstsChartFiles.Count;
+        _scanFilesSeen = 0;
+        _scanSongsFound = 0;
         Volatile.Write(ref _loadProgressCurrent, 0);
         Volatile.Write(ref _loadProgressTotal, Math.Max(1, totalCandidates));
         _loadStage = "BUILDING SONG LIST";
@@ -3410,6 +4128,7 @@ public sealed class SongSelectMenu : IDisposable
         {
             foreach (var chartPath in chartFiles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var seen = Interlocked.Increment(ref _scanFilesSeen);
                 _scanLastPath = chartPath;
                 Volatile.Write(ref _loadProgressCurrent, seen);
@@ -3440,12 +4159,15 @@ public sealed class SongSelectMenu : IDisposable
                         continue;
                     }
 
-                    AddCacheSource(result, recordedSources, fullChartPath);
-                    var sidecarPath = Path.Combine(songDir, "song.json");
-                    if (recordedSidecars.Add(sidecarPath) && File.Exists(sidecarPath))
-                        AddCacheSource(result, recordedSources, sidecarPath);
+                    AddCacheSource(result, recordedSources, fullChartPath, inventory);
+                    var sidecarDirectory = FindNearestSongJsonDirectory(songDir, inventory);
+                    var sidecarPath = string.IsNullOrWhiteSpace(sidecarDirectory)
+                        ? string.Empty
+                        : Path.Combine(sidecarDirectory, "song.json");
+                    if (sidecarPath.Length > 0 && recordedSidecars.Add(sidecarPath))
+                        AddCacheSource(result, recordedSources, sidecarPath, inventory);
 
-                    if (!TryReadLightweightMetadata(fullChartPath, out var meta, out var metadataError))
+                    if (!TryReadLightweightMetadata(fullChartPath, out var meta, out var metadataError, inventory, sidecarCache))
                     {
                         Log($"SKIP {fullChartPath} :: {metadataError}");
                         continue;
@@ -3506,6 +4228,7 @@ public sealed class SongSelectMenu : IDisposable
 
             foreach (var chartPath in looseTstsChartFiles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var seen = Interlocked.Increment(ref _scanFilesSeen);
                 _scanLastPath = chartPath;
                 Volatile.Write(ref _loadProgressCurrent, seen);
@@ -3515,24 +4238,24 @@ public sealed class SongSelectMenu : IDisposable
                 {
                     var fullChartPath = Path.GetFullPath(chartPath);
                     var chartDirectory = Path.GetDirectoryName(fullChartPath) ?? string.Empty;
-                    var songRoot = FindNearestSongJsonDirectory(chartDirectory);
-                    if (string.IsNullOrWhiteSpace(songRoot) || !IsTstsLayoutChart(fullChartPath, songRoot))
+                    var songRoot = FindNearestSongJsonDirectory(chartDirectory, inventory);
+                    if (string.IsNullOrWhiteSpace(songRoot) || !IsTstsLayoutChart(fullChartPath, songRoot, inventory))
                         continue;
                     songRoot = Path.GetFullPath(songRoot);
                     var packName = GetPackNameForPath(songRoot);
                     var songNameFallback = Path.GetFileName(songRoot);
 
-                    AddCacheSource(result, recordedSources, fullChartPath);
+                    AddCacheSource(result, recordedSources, fullChartPath, inventory);
                     var sidecarPath = Path.Combine(songRoot, "song.json");
-                    if (recordedSidecars.Add(sidecarPath) && File.Exists(sidecarPath))
-                        AddCacheSource(result, recordedSources, sidecarPath);
+                    if (recordedSidecars.Add(sidecarPath) && inventory.ContainsFile(sidecarPath))
+                        AddCacheSource(result, recordedSources, sidecarPath, inventory);
                     foreach (var assetName in new[] { "song.opus", "preview.opus", "cover.webp" })
                     {
                         var assetPath = Path.Combine(songRoot, assetName);
-                        if (File.Exists(assetPath)) AddCacheSource(result, recordedSources, assetPath);
+                        if (inventory.ContainsFile(assetPath)) AddCacheSource(result, recordedSources, assetPath, inventory);
                     }
 
-                    if (!TryReadLightweightMetadata(fullChartPath, out var meta, out var metadataError))
+                    if (!TryReadLightweightMetadata(fullChartPath, out var meta, out var metadataError, inventory, sidecarCache))
                     {
                         Log($"TSTS CHART SKIP {fullChartPath} :: {metadataError}");
                         continue;
@@ -3568,6 +4291,7 @@ public sealed class SongSelectMenu : IDisposable
 
             foreach (var bundlePath in tstsBundleFiles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var seen = Interlocked.Increment(ref _scanFilesSeen);
                 _scanLastPath = bundlePath;
                 Volatile.Write(ref _loadProgressCurrent, seen);
@@ -3575,8 +4299,8 @@ public sealed class SongSelectMenu : IDisposable
 
                 try
                 {
-                    AddCacheSource(result, recordedSources, bundlePath);
-                    var song = TryLoadTstsBundleSong(bundlePath, out var bundleError);
+                    AddCacheSource(result, recordedSources, bundlePath, inventory);
+                    var song = TryLoadTstsBundleSong(bundlePath, out var bundleError, sidecarCache);
                     if (song is null)
                     {
                         Log($"TSTS BUNDLE SKIP {bundlePath} :: {bundleError}");
@@ -3595,13 +4319,14 @@ public sealed class SongSelectMenu : IDisposable
 
             foreach (var bundlePath in zipBundleFiles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var seen = Interlocked.Increment(ref _scanFilesSeen);
                 _scanLastPath = bundlePath;
                 Volatile.Write(ref _loadProgressCurrent, seen);
                 _loadCurrentItem = $"{seen:N0} / {Math.Max(1, Volatile.Read(ref _loadProgressTotal)):N0}  {Path.GetFileName(bundlePath)}";
 
-                AddCacheSource(result, recordedSources, bundlePath);
-                var zipSongs = TryLoadZipBundleSongs(bundlePath, out var zipError);
+                AddCacheSource(result, recordedSources, bundlePath, inventory);
+                var zipSongs = TryLoadZipBundleSongs(bundlePath, out var zipError, sidecarCache);
                 if (zipSongs.Count == 0)
                 {
                     Log($"ZIP BUNDLE SKIP {bundlePath} :: {zipError}");
@@ -3634,6 +4359,7 @@ public sealed class SongSelectMenu : IDisposable
             Volatile.Write(ref _loadProgressCurrent, Volatile.Read(ref _loadProgressTotal));
             _loadStage = "WRITING SONG LIST";
             _loadCurrentItem = "Writing song list cache...";
+            cancellationToken.ThrowIfCancellationRequested();
             WriteSongListCache(result);
             Program.LogRuntime($"SONG_SELECT_CACHE_WRITE_DONE files={_scanFilesSeen} songs={_scanSongsFound}");
             Log($"CACHE BUILD DONE files={_scanFilesSeen} songs={_scanSongsFound}");
@@ -3645,13 +4371,12 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
-    private void CleanupObsoleteBundleCaches()
+    private void CleanupObsoleteBundleCaches(SongLibraryInventory inventory)
     {
-        // Take a complete snapshot before deleting anything. If enumeration or a
-        // bundle identity read fails, skip cleanup rather than mistaking valid
-        // extractions for obsolete ones.
-        var tstsBundles = EnumerateTstsBundleFiles().Select(Path.GetFullPath).ToArray();
-        var zipBundles = EnumerateZipBundleFiles().Select(Path.GetFullPath).ToArray();
+        // The library inventory is already a complete snapshot, so maintenance
+        // does not need to walk the user's song tree again.
+        var tstsBundles = inventory.TstsBundles.Select(Path.GetFullPath).ToArray();
+        var zipBundles = inventory.ZipBundles.Select(Path.GetFullPath).ToArray();
         var expectedTsts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var expectedZip = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -3672,67 +4397,109 @@ public sealed class SongSelectMenu : IDisposable
 
     private InitialLoadResult PrepareSongListCache()
     {
-        var result = new InitialLoadResult();
-
-        SetLoadProgress("CHECKING SONG LIST", 0, 1, "Checking cached song list...");
+        var started = Stopwatch.GetTimestamp();
+        SetLoadProgress("CHECKING SONG LIST", 0, 1, "Loading cached song list...");
 
         try
         {
             Directory.CreateDirectory(_songsRoot);
-            ImportSongBundles();
+            // The cache is a usable snapshot. Do not synchronously walk the entire
+            // library or stat every chart before showing it; validate in the
+            // background after the cached list is already interactive.
+            if (TryLoadSongListCache(out var cached, validateChartFiles: false))
+            {
+                var result = new InitialLoadResult
+                {
+                    LoadedFromCache = true,
+                    NeedsBackgroundRefresh = true
+                };
+                result.Songs.AddRange(cached.Songs);
+                result.Packs.AddRange(cached.Packs);
+                SetLoadProgress("SONG LIST READY", 1, 1, "Showing cached song list; checking for changes in background");
+                Program.LogRuntime($"SONG_SELECT_CACHE_SHOWN songs={result.Songs.Count} ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
+                return result;
+            }
         }
         catch (Exception ex)
         {
-            // Import is best-effort; keep Song Select available even if the library
-            // contains an unexpected filesystem problem.
-            LogStandalone($"SONG BUNDLE IMPORT PREPARATION FAILED :: {ex.Message}");
+            LogStandalone($"CACHE LOAD ERROR :: {ex.Message}");
         }
 
+        // First launch (or a missing/invalid cache) still needs a complete build.
+        // The same single-pass inventory is used for import, validation and build.
+        var built = RefreshSongListCacheCore(forceBuild: true);
+        if (built is not null)
+            return built;
+
+        var empty = new InitialLoadResult();
+        SetLoadProgress("SONG LIST READY", 1, 1, "Song list ready");
+        return empty;
+    }
+
+    private InitialLoadResult? RefreshSongListCacheCore(bool forceBuild, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var started = Stopwatch.GetTimestamp();
+        Directory.CreateDirectory(_songsRoot);
+        SetLoadProgress("SCANNING SONG LIBRARY", 0, 1, "Reading song folders...");
+
+        var scanStarted = Stopwatch.GetTimestamp();
+        var inventory = ScanSongLibraryFiles(cancellationToken);
+        var scanMilliseconds = Stopwatch.GetElapsedTime(scanStarted).TotalMilliseconds;
+
+        var importStarted = Stopwatch.GetTimestamp();
+        var importedBundles = ImportSongBundles(inventory.TstsBundles.Concat(inventory.ZipBundles), cancellationToken);
+        var importMilliseconds = Stopwatch.GetElapsedTime(importStarted).TotalMilliseconds;
+        if (importedBundles)
+        {
+            // Imports create extracted song folders and remove their source archives.
+            // Refresh the inventory once only when the library was actually changed.
+            scanStarted = Stopwatch.GetTimestamp();
+            inventory = ScanSongLibraryFiles(cancellationToken);
+            scanMilliseconds += Stopwatch.GetElapsedTime(scanStarted).TotalMilliseconds;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        var cleanupStarted = Stopwatch.GetTimestamp();
         try
         {
-            CleanupObsoleteBundleCaches();
+            CleanupObsoleteBundleCaches(inventory);
         }
         catch (Exception ex)
         {
             // Cache cleanup is maintenance only; it must never block Song Select.
             LogStandalone($"OBSOLETE BUNDLE CACHE CLEANUP FAILED :: {ex.Message}");
         }
+        var cleanupMilliseconds = Stopwatch.GetElapsedTime(cleanupStarted).TotalMilliseconds;
 
-        try
+        cancellationToken.ThrowIfCancellationRequested();
+        var validationStarted = Stopwatch.GetTimestamp();
+        var cacheIsCurrent = !forceBuild && IsSongListCacheCurrent(inventory);
+        var validationMilliseconds = Stopwatch.GetElapsedTime(validationStarted).TotalMilliseconds;
+        if (cacheIsCurrent)
         {
-            // An empty library is a valid Song Select state. Ensure the root exists
-            // before validating the cache so a missing songs folder does not turn
-            // into a song-list initialization failure (which forces the C# fallback UI).
-            Directory.CreateDirectory(_songsRoot);
-
-            if (TryLoadSongListCache(out var cached))
-            {
-                SetLoadProgress("CHECKING SONG LIST", 0, Math.Max(1, cached.Songs.Count),
-                    $"Validating {cached.Songs.Count:N0} cached songs...");
-
-                if (IsSongListCacheCurrent())
-                {
-                    result.Songs.AddRange(cached.Songs);
-                    result.Packs.AddRange(cached.Packs);
-                    result.LoadedFromCache = true;
-                    SetLoadProgress("SONG LIST READY", 1, 1, "Using cached song list");
-                    return result;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            LogStandalone($"CACHE CHECK ERROR :: {ex.Message}");
+            Program.LogRuntime(
+                $"SONG_SELECT_BACKGROUND_CHECK_CURRENT dirs={inventory.DirectoriesVisited} files={inventory.CandidateFilesVisited} " +
+                $"scan_ms={scanMilliseconds:F1} import_ms={importMilliseconds:F1} cleanup_ms={cleanupMilliseconds:F1} " +
+                $"validate_ms={validationMilliseconds:F1} total_ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
+            SetLoadProgress("SONG LIST READY", 1, 1, "Song list is up to date");
+            return null;
         }
 
-        // No usable/current cache: build the JSON completely before the Song
-        // Select screen is allowed to initialize anything else.
-        SetLoadProgress("BUILDING SONG LIST", 0, 1, "Scanning song folders...");
-        var rebuilt = BuildSongListCache();
+        SetLoadProgress("BUILDING SONG LIST", 0, 1, "Updating changed songs...");
+        var buildStarted = Stopwatch.GetTimestamp();
+        var rebuilt = BuildSongListCache(inventory, cancellationToken);
+        var buildMilliseconds = Stopwatch.GetElapsedTime(buildStarted).TotalMilliseconds;
+        SetLoadProgress("SONG LIST READY", 1, 1, "Song list updated");
+        Program.LogRuntime(
+            $"SONG_SELECT_LIBRARY_REFRESH songs={rebuilt.Songs.Count} dirs={inventory.DirectoriesVisited} files={inventory.CandidateFilesVisited} " +
+            $"scan_ms={scanMilliseconds:F1} import_ms={importMilliseconds:F1} cleanup_ms={cleanupMilliseconds:F1} " +
+            $"validate_ms={validationMilliseconds:F1} build_ms={buildMilliseconds:F1} " +
+            $"total_ms={Stopwatch.GetElapsedTime(started).TotalMilliseconds:F1}");
+
+        var result = new InitialLoadResult { LoadedFromCache = false };
         result.Songs.AddRange(rebuilt.Songs);
         result.Packs.AddRange(rebuilt.Packs);
-        result.LoadedFromCache = false;
-        SetLoadProgress("SONG LIST READY", 1, 1, "Song list cache written");
         return result;
     }
 
@@ -3752,6 +4519,15 @@ public sealed class SongSelectMenu : IDisposable
             _songListReady = true;
             _errorMessage = string.Empty;
             Program.LogRuntime($"SONG_SELECT_LIBRARY_READY songs={result.Songs.Count} packs={result.Packs.Count} source={(result.LoadedFromCache ? "cache" : "rebuilt")}");
+
+            if (result.NeedsBackgroundRefresh)
+            {
+                _songListRefreshCancellation?.Dispose();
+                _songListRefreshCancellation = new CancellationTokenSource();
+                var refreshToken = _songListRefreshCancellation.Token;
+                _songListRefreshTask = Task.Run(
+                    () => RefreshSongListCacheCore(forceBuild: false, cancellationToken: refreshToken), refreshToken);
+            }
         }
         catch (Exception ex)
         {
@@ -3764,6 +4540,41 @@ public sealed class SongSelectMenu : IDisposable
             _visibleChartOverrides.Clear();
             _packs.Clear();
             _packs.Add("ALL");
+        }
+    }
+
+    private void CompleteBackgroundSongListRefresh()
+    {
+        if (_songListRefreshTask is null || !_songListRefreshTask.IsCompleted)
+            return;
+
+        var task = _songListRefreshTask;
+        _songListRefreshTask = null;
+        try
+        {
+            var result = task.GetAwaiter().GetResult();
+            if (result is null)
+                return;
+
+            // Keep the user's current song/chart, pack, sort and search state when
+            // replacing the cached snapshot with the freshly scanned library.
+            ApplyScanResult(result.Songs, result.Packs, preserveSelection: true);
+            Program.LogRuntime($"SONG_SELECT_BACKGROUND_REFRESH_APPLIED songs={result.Songs.Count} packs={result.Packs.Count}");
+        }
+        catch (OperationCanceledException)
+        {
+            // The menu was closed or a newer load replaced this refresh.
+        }
+        catch (Exception ex)
+        {
+            // The already displayed cache remains usable if background validation
+            // or a library read fails.
+            LogStandalone($"BACKGROUND SONG LIST REFRESH FAILED :: {ex.Message}");
+        }
+        finally
+        {
+            _songListRefreshCancellation?.Dispose();
+            _songListRefreshCancellation = null;
         }
     }
 
@@ -3785,30 +4596,30 @@ public sealed class SongSelectMenu : IDisposable
         catch { }
     }
 
-    private void ApplyScanResult(List<SongEntry> songs, List<string> packs)
+    private void ApplyScanResult(List<SongEntry> songs, List<string> packs, bool preserveSelection = false)
     {
+        var currentPack = preserveSelection && _packs.Count > 0
+            ? _packs[Math.Clamp(_packIndex, 0, _packs.Count - 1)]
+            : null;
         _songs.Clear();
         _songs.AddRange(songs);
 
-        // Score data is intentionally not stored in songlist.json. The current
-        // score format is content-addressed (sha256:<chart bytes>), so load the
-        // persistent records against the live .tsc paths after the song list is
-        // applied. Without this call every ChartEntry remains at its 0/empty
-        // defaults even though ScoreSaveStore successfully loaded save/scores.json.
-        ApplySavedScores();
+        // Score keys are SHA-256 hashes of full chart contents. Resolve them off
+        // the UI thread so a large library can appear before every chart is hashed.
+        ScheduleScoreLookup();
 
         _packs.Clear();
         _packs.Add("ALL");
         foreach (var value in packs.Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x, StringComparer.OrdinalIgnoreCase))
             _packs.Add(value);
 
-        var savedPack = _lastSongSelection?.Pack;
+        var savedPack = preserveSelection ? currentPack : _lastSongSelection?.Pack;
         var savedPackIndex = string.IsNullOrWhiteSpace(savedPack)
             ? -1
             : _packs.FindIndex(p => string.Equals(p, savedPack, StringComparison.OrdinalIgnoreCase));
         _packIndex = savedPackIndex >= 0 ? savedPackIndex : 0;
 
-        RefreshVisibleSongs(resetSelection: true);
+        RefreshVisibleSongs(resetSelection: !preserveSelection);
         // Save the restored/default selection and view state after the library is ready.
         SaveLastSelection();
     }
@@ -3933,7 +4744,7 @@ public sealed class SongSelectMenu : IDisposable
 
 #endif
 
-    private bool TryLoadSongListCache(out CacheLoadResult result)
+    private bool TryLoadSongListCache(out CacheLoadResult result, bool validateChartFiles = true)
     {
         result = new CacheLoadResult();
         try
@@ -3947,15 +4758,14 @@ public sealed class SongSelectMenu : IDisposable
 
             var json = File.ReadAllText(SongListCachePath, Encoding.UTF8);
             var cache = JsonSerializer.Deserialize<SongListCache>(json);
-            if (cache is null || cache.Version != SongListCacheVersion || cache.Songs.Count == 0)
+            if (cache is null || cache.Version != SongListCacheVersion || cache.Songs is null || cache.Sources is null)
                 return false;
 
             foreach (var dtoSong in cache.Songs)
             {
-                if (string.IsNullOrWhiteSpace(dtoSong.Folder))
+                if (string.IsNullOrWhiteSpace(dtoSong.Folder) || !TryResolveCachedPath(dtoSong.Folder, out var folderPath))
                     continue;
 
-                var folderPath = Path.GetFullPath(Path.Combine(_songsRoot, FromCachePath(dtoSong.Folder)));
                 var song = new SongEntry
                 {
                     Pack = string.IsNullOrWhiteSpace(dtoSong.Pack) ? Path.GetFileName(Path.GetDirectoryName(folderPath) ?? string.Empty) : dtoSong.Pack,
@@ -3967,12 +4777,11 @@ public sealed class SongSelectMenu : IDisposable
 
                 foreach (var dtoChart in dtoSong.Charts)
                 {
-                    if (string.IsNullOrWhiteSpace(dtoChart.Path))
+                    if (string.IsNullOrWhiteSpace(dtoChart.Path) || !TryResolveCachedPath(dtoChart.Path, out var chartPath))
                         continue;
-
-                    var chartPath = Path.GetFullPath(Path.Combine(_songsRoot, FromCachePath(dtoChart.Path)));
-                    if (!File.Exists(chartPath))
+                    if (validateChartFiles && !File.Exists(chartPath))
                         return false;
+
                     song.Charts.Add(new ChartEntry
                     {
                         Path = chartPath,
@@ -3996,9 +4805,8 @@ public sealed class SongSelectMenu : IDisposable
                     result.Songs.Add(song);
             }
 
-            if (result.Songs.Count == 0)
-                return false;
-
+            // An empty library is a valid cached state too. This avoids doing a
+            // full recursive scan on every launch when the user has no songs yet.
             foreach (var song in result.Songs)
                 if (!result.Packs.Contains(song.Pack, StringComparer.OrdinalIgnoreCase))
                     result.Packs.Add(song.Pack);
@@ -4012,7 +4820,28 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
-    private bool IsSongListCacheCurrent()
+    private bool TryResolveCachedPath(string relativePath, out string fullPath)
+    {
+        fullPath = string.Empty;
+        try
+        {
+            if (Path.IsPathRooted(relativePath))
+                return false;
+            var root = Path.GetFullPath(_songsRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var candidate = Path.GetFullPath(Path.Combine(root, FromCachePath(relativePath)));
+            var rootPrefix = root + Path.DirectorySeparatorChar;
+            if (!candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+                return false;
+            fullPath = candidate;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool IsSongListCacheCurrent(SongLibraryInventory inventory)
     {
         try
         {
@@ -4025,57 +4854,58 @@ public sealed class SongSelectMenu : IDisposable
 
             var json = File.ReadAllText(SongListCachePath, Encoding.UTF8);
             var cache = JsonSerializer.Deserialize<SongListCache>(json);
-            if (cache is null || cache.Version != SongListCacheVersion)
+            if (cache is null || cache.Version != SongListCacheVersion || cache.Sources is null)
                 return false;
 
             var expected = Math.Max(1, cache.Sources.Count * 2);
             Volatile.Write(ref _loadProgressCurrent, 0);
             Volatile.Write(ref _loadProgressTotal, expected);
             _loadStage = "CHECKING SONG LIST";
-            _loadCurrentItem = $"0 / {cache.Sources.Count:N0} cached chart files";
+            _loadCurrentItem = $"0 / {cache.Sources.Count:N0} cached source files";
 
             var current = new Dictionary<string, CacheSourceFile>(StringComparer.OrdinalIgnoreCase);
-            var progress = 0;
-            foreach (var chartPath in Directory.EnumerateFiles(_songsRoot, "*.tsc", SearchOption.AllDirectories))
+            void AddInventorySource(string path)
             {
-                var relative = Path.GetRelativePath(_songsRoot, chartPath);
-                if (relative.StartsWith("_cache" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-                    continue;
+                if (inventory.TryGetFile(path, out var source))
+                    current[source.Path] = source;
+            }
 
-                var info = new FileInfo(chartPath);
-                var source = new CacheSourceFile
+            var progress = 0;
+            var sidecars = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var chartPath in inventory.TscCharts)
+            {
+                AddInventorySource(chartPath);
+                var sidecarDirectory = FindNearestSongJsonDirectory(
+                    Path.GetDirectoryName(chartPath) ?? string.Empty, inventory);
+                if (!string.IsNullOrWhiteSpace(sidecarDirectory))
                 {
-                    Path = ToCacheRelativePath(chartPath),
-                    Length = info.Length,
-                    LastWriteUtcTicks = info.LastWriteTimeUtc.Ticks
-                };
-                current[source.Path] = source;
+                    var sidecarPath = Path.Combine(sidecarDirectory, "song.json");
+                    if (sidecars.Add(sidecarPath))
+                        AddInventorySource(sidecarPath);
+                }
                 progress++;
                 Volatile.Write(ref _loadProgressCurrent, Math.Min(expected, progress));
                 _loadCurrentItem = $"Checking {progress:N0} / {cache.Sources.Count:N0}  {Path.GetFileName(chartPath)}";
             }
 
-            foreach (var bundlePath in EnumerateTstsBundleFiles())
-                AddCurrentCacheSource(current, bundlePath);
-            foreach (var bundlePath in EnumerateZipBundleFiles())
-                AddCurrentCacheSource(current, bundlePath);
+            foreach (var bundlePath in inventory.TstsBundles)
+                AddInventorySource(bundlePath);
+            foreach (var bundlePath in inventory.ZipBundles)
+                AddInventorySource(bundlePath);
 
             var looseRoots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var chartPath in EnumerateLooseTstsChartFiles())
+            foreach (var chartPath in inventory.LooseTstsCharts)
             {
-                AddCurrentCacheSource(current, chartPath);
-                var root = FindNearestSongJsonDirectory(Path.GetDirectoryName(chartPath) ?? string.Empty);
-                if (!string.IsNullOrWhiteSpace(root)) looseRoots.Add(Path.GetFullPath(root));
+                AddInventorySource(chartPath);
+                var root = FindNearestSongJsonDirectory(Path.GetDirectoryName(chartPath) ?? string.Empty, inventory);
+                if (!string.IsNullOrWhiteSpace(root))
+                    looseRoots.Add(Path.GetFullPath(root));
             }
             foreach (var root in looseRoots)
-                foreach (var assetName in new[] { "song.opus", "preview.opus", "cover.webp" })
-                    AddCurrentCacheSource(current, Path.Combine(root, assetName));
-
-            foreach (var sidecarPath in Directory.EnumerateFiles(_songsRoot, "song.json", SearchOption.AllDirectories))
             {
-                if (IsInsideSongCache(sidecarPath))
-                    continue;
-                AddCurrentCacheSource(current, sidecarPath);
+                AddInventorySource(Path.Combine(root, "song.json"));
+                foreach (var assetName in new[] { "song.opus", "preview.opus", "cover.webp" })
+                    AddInventorySource(Path.Combine(root, assetName));
             }
 
             if (current.Count != cache.Sources.Count)
@@ -4200,20 +5030,60 @@ public sealed class SongSelectMenu : IDisposable
     private static bool TryReadLightweightMetadata(
         string path,
         out LightweightChartMetadata metadata,
-        out string error)
+        out string error,
+        SongLibraryInventory? inventory = null,
+        Dictionary<string, SidecarCacheEntry>? sidecarCache = null)
     {
         metadata = new LightweightChartMetadata();
         error = string.Empty;
 
         var chartDirectory = Path.GetDirectoryName(Path.GetFullPath(path)) ?? string.Empty;
-        var metadataDirectory = FindNearestSongJsonDirectory(chartDirectory);
+        var metadataDirectory = inventory is null
+            ? FindNearestSongJsonDirectory(chartDirectory)
+            : FindNearestSongJsonDirectory(chartDirectory, inventory);
         var sidecarPath = string.IsNullOrWhiteSpace(metadataDirectory) ? string.Empty : Path.Combine(metadataDirectory, "song.json");
-        if (metadataDirectory is not null && sidecarPath.Length > 0 && File.Exists(sidecarPath))
+        var hasSidecar = metadataDirectory is not null && sidecarPath.Length > 0 &&
+                         (inventory is null ? File.Exists(sidecarPath) : inventory.ContainsFile(sidecarPath));
+        if (hasSidecar)
         {
+            JsonDocument? sidecarDocument = null;
             try
             {
-                using var sidecarDocument = JsonDocument.Parse(File.ReadAllText(sidecarPath, Encoding.UTF8));
-                var root = sidecarDocument.RootElement;
+                JsonElement root;
+                SidecarCacheEntry? cachedEntry = null;
+                if (sidecarCache is not null)
+                {
+                    if (!sidecarCache.TryGetValue(sidecarPath, out cachedEntry))
+                    {
+                        try
+                        {
+                            using var parsedDocument = JsonDocument.Parse(File.ReadAllText(sidecarPath, Encoding.UTF8));
+                            cachedEntry = new SidecarCacheEntry
+                            {
+                                IsValid = true,
+                                Root = parsedDocument.RootElement.Clone()
+                            };
+                        }
+                        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+                        {
+                            cachedEntry = new SidecarCacheEntry { IsValid = false, Error = ex.Message };
+                        }
+                        sidecarCache[sidecarPath] = cachedEntry;
+                    }
+
+                    if (!cachedEntry.IsValid)
+                    {
+                        error = $"invalid song.json: {cachedEntry.Error}";
+                        return false;
+                    }
+                    root = cachedEntry.Root;
+                }
+                else
+                {
+                    sidecarDocument = JsonDocument.Parse(File.ReadAllText(sidecarPath, Encoding.UTF8));
+                    root = sidecarDocument.RootElement;
+                }
+
                 if (root.ValueKind != JsonValueKind.Object)
                 {
                     error = "song.json root must be an object";
@@ -4226,14 +5096,33 @@ public sealed class SongSelectMenu : IDisposable
                 metadata.Series = TextField("series") ?? string.Empty;
                 // Bundle templates define media filenames. TSTS charts can live in
                 // charts/ while song.json and shared media remain at the bundle root.
-                var isTsts = IsTstsLayoutChart(path, metadataDirectory);
-                metadata.Music = RelativeAssetPath(path, metadataDirectory, isTsts ? "song.opus" : "music.opus");
-                metadata.Preview = RelativeAssetPath(path, metadataDirectory, "preview.opus");
-                var coverPath = isTsts ? TryPrepareSongSelectCover(Path.Combine(metadataDirectory, "cover.webp")) : null;
+                var isTsts = inventory is null
+                    ? IsTstsLayoutChart(path, metadataDirectory!)
+                    : IsTstsLayoutChart(path, metadataDirectory!, inventory);
+                metadata.Music = RelativeAssetPath(path, metadataDirectory!, isTsts ? "song.opus" : "music.opus");
+                metadata.Preview = RelativeAssetPath(path, metadataDirectory!, "preview.opus");
+
+                string? coverPath = null;
+                if (isTsts)
+                {
+                    if (cachedEntry is not null)
+                    {
+                        if (!cachedEntry.CoverResolved)
+                        {
+                            cachedEntry.PreparedCoverPath = TryPrepareSongSelectCover(Path.Combine(metadataDirectory!, "cover.webp"));
+                            cachedEntry.CoverResolved = true;
+                        }
+                        coverPath = cachedEntry.PreparedCoverPath;
+                    }
+                    else
+                    {
+                        coverPath = TryPrepareSongSelectCover(Path.Combine(metadataDirectory!, "cover.webp"));
+                    }
+                }
                 metadata.Album = isTsts
-                    ? RelativeAssetPath(path, metadataDirectory, coverPath is not null ? Path.GetFileName(coverPath) : "cover.webp")
-                    : RelativeAssetPath(path, metadataDirectory, "album.png");
-                metadata.AlbumBig = isTsts ? null : TextField("album_big") ?? RelativeAssetPath(path, metadataDirectory, "album_big.png");
+                    ? RelativeAssetPath(path, metadataDirectory!, coverPath is not null ? Path.GetFileName(coverPath) : "cover.webp")
+                    : RelativeAssetPath(path, metadataDirectory!, "album.png");
+                metadata.AlbumBig = isTsts ? null : TextField("album_big") ?? RelativeAssetPath(path, metadataDirectory!, "album_big.png");
                 metadata.Difficulty = Path.GetFileNameWithoutExtension(path);
                 if (root.TryGetProperty("bpm", out var bpm) && bpm.ValueKind == JsonValueKind.Number && bpm.TryGetDouble(out var bpmValue) && double.IsFinite(bpmValue) && bpmValue > 0)
                     metadata.Bpm = bpmValue;
@@ -4256,6 +5145,10 @@ public sealed class SongSelectMenu : IDisposable
             {
                 error = $"invalid song.json: {ex.Message}";
                 return false;
+            }
+            finally
+            {
+                sidecarDocument?.Dispose();
             }
         }
 
@@ -4394,25 +5287,82 @@ public sealed class SongSelectMenu : IDisposable
         return value;
     }
 
-    private void ApplySavedScores()
+    private void ScheduleScoreLookup()
     {
-        var matched = 0;
-        var total = 0;
+        _scoreLookupCancellation?.Cancel();
+        _scoreLookupCancellation?.Dispose();
 
-        foreach (var song in _songs)
-        foreach (var chart in song.Charts)
+        var cancellation = new CancellationTokenSource();
+        _scoreLookupCancellation = cancellation;
+        var token = cancellation.Token;
+        var generation = Interlocked.Increment(ref _scoreLookupGeneration);
+        var chartPaths = _songs
+            .SelectMany(song => song.Charts)
+            .Select(chart => chart.Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        _scoreLookupTask = Task.Run(() =>
         {
-            total++;
-            var saved = _scoreSaves.Get(chart.Path);
-            if (saved is not null)
-                matched++;
+            var lookupStarted = Stopwatch.GetTimestamp();
+            var records = new Dictionary<string, ScoreSaveStore.ScoreRecord?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var chartPath in chartPaths)
+            {
+                token.ThrowIfCancellationRequested();
+                records[chartPath] = _scoreSaves.Get(chartPath);
+            }
 
-            chart.Score = saved?.Score ?? 0;
-            chart.Accuracy = saved?.Accuracy ?? 0.0;
-            chart.Grade = saved?.Grade ?? string.Empty;
-            chart.ClearType = saved?.ClearType ?? string.Empty;
+            return new ScoreLookupResult
+            {
+                Generation = generation,
+                ElapsedMilliseconds = Stopwatch.GetElapsedTime(lookupStarted).TotalMilliseconds,
+                Records = records
+            };
+        }, token);
+    }
+
+    private void CompleteScoreLookup()
+    {
+        if (_scoreLookupTask is null || !_scoreLookupTask.IsCompleted)
+            return;
+
+        var task = _scoreLookupTask;
+        _scoreLookupTask = null;
+        try
+        {
+            var result = task.GetAwaiter().GetResult();
+            if (result.Generation != Volatile.Read(ref _scoreLookupGeneration))
+                return;
+
+            foreach (var song in _songs)
+            foreach (var chart in song.Charts)
+            {
+                result.Records.TryGetValue(chart.Path, out var saved);
+                chart.Score = saved?.Score ?? 0;
+                chart.Accuracy = saved?.Accuracy ?? 0.0;
+                chart.Grade = saved?.Grade ?? string.Empty;
+                chart.ClearType = saved?.ClearType ?? string.Empty;
+            }
+
+            // SCORE sorting depends on the asynchronously loaded record values.
+            if (_sortIndex == 3)
+                RefreshVisibleSongs(resetSelection: false);
+
+            Program.LogRuntime($"SONG_SELECT_SCORE_LOOKUP_DONE charts={result.Records.Count} ms={result.ElapsedMilliseconds:F1}");
         }
-
+        catch (OperationCanceledException)
+        {
+            // A newer library snapshot replaced the paths being hashed.
+        }
+        catch (Exception ex)
+        {
+            LogStandalone($"SCORE LOOKUP FAILED :: {ex.Message}");
+        }
+        finally
+        {
+            _scoreLookupCancellation?.Dispose();
+            _scoreLookupCancellation = null;
+        }
     }
 
     private void RefreshVisibleSongs(bool resetSelection)
@@ -5097,7 +6047,14 @@ public sealed class SongSelectMenu : IDisposable
         // One row above and two rows below cover fractional scrolling at every height.
         var bufferRows = visibleRows + 3;
         var galleryEnd = Math.Min(_visibleSongs.Count, galleryStart + columns * bufferRows);
+#if TSC_ANDROID
+        var visibleItems = _skinSongSelectItems;
+        visibleItems.Clear();
+        if (visibleItems.Capacity < galleryEnd - galleryStart)
+            visibleItems.Capacity = galleryEnd - galleryStart;
+#else
         var visibleItems = new List<SkinSongSelectItem>(Math.Max(0, galleryEnd - galleryStart));
+#endif
         var selectedSong = SelectedSong;
         var selectedChart = SelectedChart ?? selectedSong?.RepresentativeChart;
         // The large selected artwork is shown outside the scrolling grid, so
@@ -5117,7 +6074,18 @@ public sealed class SongSelectMenu : IDisposable
                 ? TryGetArtworkHandle(GetArtworkPath(cardChart, preferBig: true))
                 : null;
 
-            int? Level(string diff) => song.GetChart(diff)?.Level;
+            // Avoid a loop-local captured function in this hot per-card path; read
+            // each difficulty level directly instead of capturing the song.
+            var easyChart = song.GetChart("ez");
+            var normalChart = song.GetChart("nm");
+            var hardChart = song.GetChart("hd");
+            var expertChart = song.GetChart("ex");
+            var extraChart = song.GetChart("xt");
+            var easyLevel = easyChart?.DisplayLevel;
+            var normalLevel = normalChart?.DisplayLevel;
+            var hardLevel = hardChart?.DisplayLevel;
+            var expertLevel = expertChart?.DisplayLevel;
+            var extraLevel = extraChart?.DisplayLevel;
 
             visibleItems.Add(new SkinSongSelectItem(
                 i + 1,
@@ -5129,39 +6097,61 @@ public sealed class SongSelectMenu : IDisposable
                 albumBig,
                 cardChart.Bpm,
                 cardChart.Difficulty,
-                cardChart.Level,
-                Level("ez"),
-                Level("nm"),
-                Level("hd"),
-                Level("ex"),
-                Level("xt"),
+                cardChart.DisplayLevel,
+                easyLevel,
+                normalLevel,
+                hardLevel,
+                expertLevel,
+                extraLevel,
                 i == _selectedSongIndex,
                 cardChart.Score,
                 cardChart.Accuracy,
                 cardChart.Grade,
-                cardChart.ClearType));
+                cardChart.ClearType,
+                chartLevelEstimated: cardChart.LevelIsEstimated,
+                easyLevelEstimated: easyChart?.LevelIsEstimated == true,
+                normalLevelEstimated: normalChart?.LevelIsEstimated == true,
+                hardLevelEstimated: hardChart?.LevelIsEstimated == true,
+                expertLevelEstimated: expertChart?.LevelIsEstimated == true,
+                extraLevelEstimated: extraChart?.LevelIsEstimated == true));
         }
 
         // Absolute indices are grid-entry coordinates. In LEVEL/DIFFICULTY sorting
         // one song can therefore occupy several indices, one for each chart.
         var galleryFractionalPixels = _galleryScrollPixels - galleryStartRow * safePitch;
 
-        var searchScale = Math.Max(0.01f, Math.Min(_graphics.Viewport.Width / 1920f, _graphics.Viewport.Height / 1080f));
-        var searchAvailableWidth = 400f * searchScale;
-        if (_skinRuntime!.TryGetUiInputBounds("song_search_input", out var searchBounds) ||
-            _skinRuntime.TryGetUiButtonBounds("song_search_input", out searchBounds))
-            searchAvailableWidth = Math.Max(1f, searchBounds.Width - 144f * searchScale);
-        var searchWindow = GetSearchVisibleWindow(searchAvailableWidth, 24f);
-        var safeSearchCaret = Math.Clamp(_searchEditor.Caret, searchWindow.Start, searchWindow.End);
-        var safeSearchSelectionStart = Math.Clamp(_searchEditor.SelectionStart, searchWindow.Start, searchWindow.End);
-        var safeSearchSelectionEnd = Math.Clamp(_searchEditor.SelectionEnd, searchWindow.Start, searchWindow.End);
-        var searchCaretOffset = MeasureSearchTextWidth(_searchEditor.Text[searchWindow.Start..safeSearchCaret], 24f);
-        var searchSelectionOffset = MeasureSearchTextWidth(_searchEditor.Text[searchWindow.Start..safeSearchSelectionStart], 24f);
-        var searchSelectionWidth = MeasureSearchTextWidth(_searchEditor.Text[safeSearchSelectionStart..safeSearchSelectionEnd], 24f);
+        var searchText = _searchEditor.Text;
+        var searchDisplay = searchText;
+        var searchVisibleStart = 0;
+        var searchVisibleEnd = searchText.Length;
+        var safeSearchCaret = Math.Clamp(_searchEditor.Caret, 0, searchText.Length);
+        var safeSearchSelectionStart = Math.Clamp(_searchEditor.SelectionStart, 0, searchText.Length);
+        var safeSearchSelectionEnd = Math.Clamp(_searchEditor.SelectionEnd, safeSearchSelectionStart, searchText.Length);
+        float searchCaretOffset = 0f;
+        float searchSelectionOffset = 0f;
+        float searchSelectionWidth = 0f;
+        if (_searchActive)
+        {
+            var searchScale = Math.Max(0.01f, Math.Min(_graphics.Viewport.Width / 1920f, _graphics.Viewport.Height / 1080f));
+            var searchAvailableWidth = 400f * searchScale;
+            if (_skinRuntime!.TryGetUiInputBounds("song_search_input", out var searchBounds) ||
+                _skinRuntime.TryGetUiButtonBounds("song_search_input", out searchBounds))
+                searchAvailableWidth = Math.Max(1f, searchBounds.Width - 144f * searchScale);
+            var searchWindow = GetSearchVisibleWindow(searchAvailableWidth, 24f);
+            searchDisplay = searchWindow.Display;
+            searchVisibleStart = searchWindow.Start;
+            searchVisibleEnd = searchWindow.End;
+            safeSearchCaret = Math.Clamp(_searchEditor.Caret, searchVisibleStart, searchVisibleEnd);
+            safeSearchSelectionStart = Math.Clamp(_searchEditor.SelectionStart, searchVisibleStart, searchVisibleEnd);
+            safeSearchSelectionEnd = Math.Clamp(_searchEditor.SelectionEnd, safeSearchSelectionStart, searchVisibleEnd);
+            searchCaretOffset = MeasureSearchTextWidth(searchText[searchVisibleStart..safeSearchCaret], 24f);
+            searchSelectionOffset = MeasureSearchTextWidth(searchText[searchVisibleStart..safeSearchSelectionStart], 24f);
+            searchSelectionWidth = MeasureSearchTextWidth(searchText[safeSearchSelectionStart..safeSearchSelectionEnd], 24f);
+        }
         _skinRuntime!.UpdateSongSelectState(
             _selectedSongIndex + 1,
             _selectedDifficultyIndex + 1,
-            DifficultyNames[Math.Clamp(_selectedDifficultyIndex, 0, DifficultyNames.Length - 1)].ToUpperInvariant(),
+            DifficultyNamesUpper[Math.Clamp(_selectedDifficultyIndex, 0, DifficultyNamesUpper.Length - 1)],
             CurrentPack,
             SortNames[Math.Clamp(_sortIndex, 0, SortNames.Length - 1)],
             _descending,
@@ -5194,26 +6184,32 @@ public sealed class SongSelectMenu : IDisposable
                 TryGetArtworkHandle(GetArtworkPath(selectedChart ?? selectedSong.RepresentativeChart, preferBig: true)),
                 selectedChart?.Bpm ?? selectedSong.RepresentativeChart.Bpm,
                 selectedChart?.Difficulty ?? DifficultyNames[Math.Clamp(_selectedDifficultyIndex, 0, DifficultyNames.Length - 1)],
-                selectedChart?.Level,
-                selectedSong.GetChart("ez")?.Level,
-                selectedSong.GetChart("nm")?.Level,
-                selectedSong.GetChart("hd")?.Level,
-                selectedSong.GetChart("ex")?.Level,
-                selectedSong.GetChart("xt")?.Level,
+                selectedChart?.DisplayLevel,
+                selectedSong.GetChart("ez")?.DisplayLevel,
+                selectedSong.GetChart("nm")?.DisplayLevel,
+                selectedSong.GetChart("hd")?.DisplayLevel,
+                selectedSong.GetChart("ex")?.DisplayLevel,
+                selectedSong.GetChart("xt")?.DisplayLevel,
                 true,
                 selectedChart?.Score ?? 0,
                 selectedChart?.Accuracy ?? 0.0,
                 selectedChart?.Grade ?? string.Empty,
-                selectedChart?.ClearType ?? string.Empty),
+                selectedChart?.ClearType ?? string.Empty,
+                chartLevelEstimated: selectedChart?.LevelIsEstimated == true,
+                easyLevelEstimated: selectedSong.GetChart("ez")?.LevelIsEstimated == true,
+                normalLevelEstimated: selectedSong.GetChart("nm")?.LevelIsEstimated == true,
+                hardLevelEstimated: selectedSong.GetChart("hd")?.LevelIsEstimated == true,
+                expertLevelEstimated: selectedSong.GetChart("ex")?.LevelIsEstimated == true,
+                extraLevelEstimated: selectedSong.GetChart("xt")?.LevelIsEstimated == true),
             visibleItems,
             _packs,
-            DifficultyNames.Select(d => d.ToUpperInvariant()).ToArray(),
+            DifficultyNamesUpper,
             _searchEditor.Caret,
             _searchEditor.SelectionStart,
             _searchEditor.SelectionEnd,
-            searchWindow.Display,
-            searchWindow.Start,
-            searchWindow.End,
+            searchDisplay,
+            searchVisibleStart,
+            searchVisibleEnd,
             searchCaretOffset,
             searchSelectionOffset,
             searchSelectionWidth,
@@ -5312,7 +6308,21 @@ public sealed class SongSelectMenu : IDisposable
                 {
                     var decoded = completedTask.GetAwaiter().GetResult();
                     if (decoded is not null && _artworkWanted.Contains(path) && !_artCache.ContainsKey(path))
+                    {
+#if TSC_ANDROID && DEBUG
+                        var uploadStart = Stopwatch.GetTimestamp();
+#endif
                         UploadArtwork(path, decoded);
+#if TSC_ANDROID && DEBUG
+                        var uploadMilliseconds = Stopwatch.GetElapsedTime(uploadStart).TotalMilliseconds;
+                        _androidPerfMaxArtworkUploadMilliseconds = Math.Max(
+                            _androidPerfMaxArtworkUploadMilliseconds, uploadMilliseconds);
+                        _androidPerfArtworkUploadCount++;
+                        Program.LogRuntime(
+                            $"ANDROID_SONG_SELECT_ARTWORK_UPLOAD ms={uploadMilliseconds:F2} " +
+                            $"size={decoded.Width}x{decoded.Height} bytes={decoded.Pixels.LongLength * 4L}");
+#endif
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -5368,6 +6378,33 @@ public sealed class SongSelectMenu : IDisposable
         }
     }
 
+#if TSC_ANDROID
+    private static DecodedArtwork DecodeArtwork(string path)
+    {
+        using var bitmap = Android.Graphics.BitmapFactory.DecodeFile(path)
+            ?? throw new InvalidDataException($"Android could not decode artwork: {path}");
+        var scale = Math.Min(1.0, MaxArtworkDecodeDimension / (double)Math.Max(bitmap.Width, bitmap.Height));
+        var width = Math.Max(1, (int)Math.Round(bitmap.Width * scale));
+        var height = Math.Max(1, (int)Math.Round(bitmap.Height * scale));
+        using var scaled = (width == bitmap.Width && height == bitmap.Height)
+            ? null
+            : Android.Graphics.Bitmap.CreateScaledBitmap(bitmap, width, height, filter: true);
+        var source = scaled ?? bitmap;
+        var argb = new int[checked(width * height)];
+        source.GetPixels(argb, 0, width, 0, 0, width, height);
+        var pixels = new XnaColor[argb.Length];
+        for (var i = 0; i < argb.Length; i++)
+        {
+            var value = unchecked((uint)argb[i]);
+            pixels[i] = new XnaColor(
+                (byte)((value >> 16) & 0xff),
+                (byte)((value >> 8) & 0xff),
+                (byte)(value & 0xff),
+                (byte)((value >> 24) & 0xff));
+        }
+        return new DecodedArtwork { Width = width, Height = height, Pixels = pixels };
+    }
+#else
     private static DecodedArtwork DecodeArtwork(string path)
     {
         Exception? nativeDecodeException = null;
@@ -5524,6 +6561,7 @@ public sealed class SongSelectMenu : IDisposable
             Pixels = pixels
         };
     }
+#endif
 
     private void DrawBackground(int width, int height)
     {
@@ -5642,10 +6680,10 @@ public sealed class SongSelectMenu : IDisposable
                 selected ? XnaColor.White : new XnaColor(78, 85, 98, enabled ? 160 : 65),
                 selected ? 2f * scale : 1f * scale);
 
-            var level = chart?.Level;
+            var level = chart?.DisplayLevel;
             var label = DifficultyNames[i].ToUpperInvariant();
             if (level.HasValue)
-                label += $"  {level.Value:00}";
+                label += $"  {(chart!.LevelIsEstimated ? "~" : string.Empty)}{level.Value:00}";
 
             DrawText(label,
                 x + i * (buttonWidth + gap) + buttonWidth * 0.5f,
@@ -5684,7 +6722,11 @@ public sealed class SongSelectMenu : IDisposable
             _ => new XnaColor(150, 150, 150)
         };
         DrawRect(x + width - 48f * scale, y + 4f * scale, 44f * scale, 44f * scale, chartColor);
-        DrawText(displayChart.Level?.ToString("00") ?? "--", x + width - 26f * scale, y + 26f * scale, 21f * scale, XnaColor.White, centered: true);
+        var displayLevel = displayChart.DisplayLevel;
+        var displayLevelText = displayLevel.HasValue
+            ? $"{(displayChart.LevelIsEstimated ? "~" : string.Empty)}{displayLevel.Value:00}"
+            : "--";
+        DrawText(displayLevelText, x + width - 26f * scale, y + 26f * scale, 21f * scale, XnaColor.White, centered: true);
 
         DrawUserText(DisplaySeries(song.Series).ToUpperInvariant(), x + 12f * scale, y + 10f * scale,
             12f * scale, new XnaColor(220, 225, 232, 210), width - 24f * scale);
@@ -6081,7 +7123,11 @@ public sealed class SongSelectMenu : IDisposable
 
     private static string FindSongsRoot()
     {
-#if TSC_PUBLISH
+#if TSC_ANDROID
+        // Android's process working directory and APK asset paths are not writable.
+        // AndroidStorage installs the writable game root under shared Internal storage/TSC/.
+        return Path.GetFullPath(Path.Combine(UserDataPaths.GameRootDirectory, "songs"));
+#elif TSC_PUBLISH
         // Songs are user-managed and live beside the root launcher.
         return Path.GetFullPath(Path.Combine(UserDataPaths.GameRootDirectory, "songs"));
 #else
@@ -6180,6 +7226,7 @@ public sealed class SongSelectMenu : IDisposable
 
     public void Dispose()
     {
+        FlushChartLevelEstimateCache();
         StopPreviewAudioAndRelease();
         foreach (var texture in _artCache.Values)
             texture.Dispose();
@@ -6192,6 +7239,14 @@ public sealed class SongSelectMenu : IDisposable
         _artworkWanted.Clear();
         _artworkFailed.Clear();
         _initialLoadTask = null;
+        _songListRefreshCancellation?.Cancel();
+        _songListRefreshCancellation?.Dispose();
+        _songListRefreshCancellation = null;
+        _songListRefreshTask = null;
+        _scoreLookupCancellation?.Cancel();
+        _scoreLookupCancellation?.Dispose();
+        _scoreLookupCancellation = null;
+        _scoreLookupTask = null;
         _initialLoadInProgress = false;
         _songListReady = false;
         _skinRuntime?.Dispose();

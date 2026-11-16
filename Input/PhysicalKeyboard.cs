@@ -19,6 +19,10 @@ internal static class PhysicalKeyboard
     private static byte[] _previous = new byte[ScancodeCount];
     private static bool _nativeAvailable = true;
     private static bool _initialized;
+    private static int _pendingEscapePress;
+
+    /// <summary>Queues one Escape key-down edge from a platform navigation button.</summary>
+    public static void RequestEscapePress() => Interlocked.Exchange(ref _pendingEscapePress, 1);
 
     [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetKeyboardState")]
     private static extern IntPtr SdlGetKeyboardState(out int count);
@@ -38,6 +42,7 @@ internal static class PhysicalKeyboard
                 {
                     Marshal.Copy(pointer, _current, 0, Math.Min(KeyboardScancodeCount, count));
                     ApplyMouseState(mouse);
+                    ApplyPendingEscapePress();
                     return;
                 }
             }
@@ -54,6 +59,13 @@ internal static class PhysicalKeyboard
             if (scan >= 0 && scan < KeyboardScancodeCount) _current[scan] = 1;
         }
         ApplyMouseState(mouse);
+        ApplyPendingEscapePress();
+    }
+
+    private static void ApplyPendingEscapePress()
+    {
+        if (Interlocked.Exchange(ref _pendingEscapePress, 0) != 0)
+            _current[41] = 1; // SDL scancode 41 = Escape.
     }
 
     private static void ApplyMouseState(MouseState mouse)

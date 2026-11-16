@@ -326,7 +326,21 @@ public sealed partial class Playfield
 
             if (_gameplayMode && ev.NoteType is NoteType.SingleLong or NoteType.Vibrato)
             {
-                DrawGameplayRegularHold(ev, currentState, counts, bodyCommands, headCommands, currentTick);
+                // The event cache already contains tempo seconds and scroll units.
+                // Reuse the values resolved above instead of converting this hold
+                // a second time inside its gameplay-specific renderer.
+                DrawGameplayRegularHold(
+                    ev,
+                    currentState,
+                    counts,
+                    bodyCommands,
+                    headCommands,
+                    currentTick,
+                    effectiveEndTick,
+                    _eventSeconds[eventIndex],
+                    _eventEffectiveEndSeconds[eventIndex],
+                    startTravel,
+                    endTravel);
                 continue;
             }
 
@@ -837,8 +851,25 @@ public sealed partial class Playfield
         // Editor-only decorations and interactions (selection, problem markers,
         // placement previews, etc.) are drawn in their separate native passes.
         if (CanUseSkinPlayfieldEffects && _skinRuntime.SupportsPlayfieldNoteRenderer)
-            ApplySkinPlayfieldNoteRenderer(currentTick, superFlicks, headCommands);
+        {
+#if DEBUG
+            if (_performanceDebugInstrumentFrame)
+            {
+                var bridgeStartTimestamp = Stopwatch.GetTimestamp();
+                var bridgeAllocationStart = GC.GetAllocatedBytesForCurrentThread();
+                ApplySkinPlayfieldNoteRenderer(currentTick, superFlicks, headCommands);
+                _debugSkinNoteBridgeMs += ElapsedMilliseconds(bridgeStartTimestamp);
+                _debugSkinNoteBridgeAllocatedBytes +=
+                    GC.GetAllocatedBytesForCurrentThread() - bridgeAllocationStart;
+            }
+            else
+#endif
+            {
+                ApplySkinPlayfieldNoteRenderer(currentTick, superFlicks, headCommands);
+            }
+        }
 
+#if DEBUG
         _debugHeadCommands = headCommands.Count;
         _debug3DHeadCommands = head3DCommands.Count;
         _debugBodyCommands = bodyCommands.Count;
@@ -849,6 +880,7 @@ public sealed partial class Playfield
         _debugVisibleRenderableNotes = renderEventCount;
         _debugVisibleHolds = bodyCommands.Count + _body3DCommands.Count;
         _debugVisible3DPlanes = _body3DCommands.Count + head3DCommands.Count;
+#endif
         if (_performanceDebugInstrumentFrame)
         {
             var bodyDrawStartTimestamp = Stopwatch.GetTimestamp();
@@ -1006,6 +1038,36 @@ public sealed partial class Playfield
         }
     }
 
+    private void AddSkinPlayfieldGeometrySnapshot(
+        List<SkinPlayfieldGeometrySnapshot> geometry,
+        Textured3DQuadCommand command)
+    {
+        if (command.Track < 0 || command.Tick < 0 || command.EventIndex < 0 ||
+            command.Vertices is not { Length: > 0 } || string.IsNullOrEmpty(command.Component))
+            return;
+
+        var geometryTrack = command.GeometryTrack >= 0 ? command.GeometryTrack : command.Track;
+        var position = GearState.Position(geometryTrack);
+        var eventKey = new ChartEventKey(command.Tick, command.Track, command.EventIndex);
+        geometry.Add(new SkinPlayfieldGeometrySnapshot(
+            command.Vertices,
+            command.Depth,
+            command.Layer,
+            command.Track,
+            command.Tick,
+            command.EventIndex,
+            command.Attr,
+            command.DurationTicks,
+            command.NoteType,
+            command.Component,
+            position?.Side ?? string.Empty,
+            position?.Bank ?? string.Empty,
+            _hitEvents.Contains(eventKey),
+            command.SkinMissed || _missedEvents.Contains(eventKey),
+            command.Simultaneous,
+            geometryTrack));
+    }
+
     private void ApplySkinPlayfieldNoteRenderer(
         double currentTick,
         List<(float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family)> superFlicks,
@@ -1016,38 +1078,10 @@ public sealed partial class Playfield
         geometry.Clear();
         spriteGeometry.Clear();
 
-        void AddGeometry(in Textured3DQuadCommand command)
-        {
-            if (command.Track < 0 || command.Tick < 0 || command.EventIndex < 0 ||
-                command.Vertices is not { Length: > 0 } || string.IsNullOrEmpty(command.Component))
-                return;
-
-            var geometryTrack = command.GeometryTrack >= 0 ? command.GeometryTrack : command.Track;
-            var position = GearState.Position(geometryTrack);
-            var eventKey = new ChartEventKey(command.Tick, command.Track, command.EventIndex);
-            geometry.Add(new SkinPlayfieldGeometrySnapshot(
-                command.Vertices,
-                command.Depth,
-                command.Layer,
-                command.Track,
-                command.Tick,
-                command.EventIndex,
-                command.Attr,
-                command.DurationTicks,
-                command.NoteType,
-                command.Component,
-                position?.Side ?? string.Empty,
-                position?.Bank ?? string.Empty,
-                _hitEvents.Contains(eventKey),
-                command.SkinMissed || _missedEvents.Contains(eventKey),
-                command.Simultaneous,
-                geometryTrack));
-        }
-
         for (var i = 0; i < _head3DCommands.Count; i++)
-            AddGeometry(_head3DCommands[i]);
+            AddSkinPlayfieldGeometrySnapshot(geometry, _head3DCommands[i]);
         for (var i = 0; i < _body3DCommands.Count; i++)
-            AddGeometry(_body3DCommands[i]);
+            AddSkinPlayfieldGeometrySnapshot(geometry, _body3DCommands[i]);
 
         for (var i = 0; i < superFlicks.Count; i++)
         {
@@ -1110,6 +1144,30 @@ public sealed partial class Playfield
         customBodies.Clear();
         replacedVertices.Clear();
 
+        // Requests that keep the source geometry unchanged can replace their
+        // source command in place. This is part of the shared skin renderer: it
+        // applies to any Lua skin returning replacement geometry, not a
+        // Default-skin-specific renderer. Transformed/tinted requests still use
+        // the general clone-and-submit path below. First identify unique source
+        // arrays so a skin that deliberately submits the same geometry more than
+        // once retains the old duplicate-command behavior.
+        var inPlaceRequests = _skinPlayfieldInPlaceGeometryRequests;
+        inPlaceRequests.Clear();
+        if (replaceRequested)
+        {
+            for (var i = 0; i < requests.Count; i++)
+            {
+                var source = requests[i].Geometry.Vertices;
+                if (source.Length == 0 || replacedVertices.Contains(source))
+                    continue;
+                if (!inPlaceRequests.TryAdd(source, requests[i]))
+                {
+                    inPlaceRequests.Remove(source);
+                    replacedVertices.Add(source);
+                }
+            }
+        }
+
         for (var i = 0; i < requests.Count; i++)
         {
             var request = requests[i];
@@ -1117,8 +1175,19 @@ public sealed partial class Playfield
             if (source.Length == 0)
                 continue;
 
+            var isIdentity = request.Tint == Color.White &&
+                request.Alpha >= 0.9999f &&
+                MathF.Abs(request.ScaleX - 1f) < 0.0001f &&
+                MathF.Abs(request.ScaleY - 1f) < 0.0001f;
+            if (replaceRequested && isIdentity &&
+                !replacedVertices.Contains(source) && inPlaceRequests.ContainsKey(source))
+                continue;
+
             if (replaceRequested)
+            {
+                inPlaceRequests.Remove(source);
                 replacedVertices.Add(source);
+            }
 
             var vertices = RentBody3DVertices(source.Length);
             for (var vertexIndex = 0; vertexIndex < source.Length; vertexIndex++)
@@ -1138,30 +1207,37 @@ public sealed partial class Playfield
                 vertices, request.ScaleX, request.ScaleY,
                 0f, 0f, 0.5f, 0.5f);
 
-            var handle = request.Geometry;
+            var geometrySnapshot = request.Geometry;
             var command = new Textured3DQuadCommand(
                 request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture,
                 vertices,
-                handle.depth,
+                geometrySnapshot.Depth,
                 false,
                 null,
                 request.Layer,
                 false,
-                handle.track,
-                handle.tick,
-                handle.event_index,
-                handle.attr,
-                handle.duration_ticks,
-                handle.note_type,
-                handle.role,
-                handle.simultaneous);
+                geometrySnapshot.Track,
+                geometrySnapshot.Tick,
+                geometrySnapshot.EventIndex,
+                geometrySnapshot.Attr,
+                geometrySnapshot.DurationTicks,
+                geometrySnapshot.NoteType,
+                geometrySnapshot.Component,
+                geometrySnapshot.Simultaneous);
 
-            if (string.Equals(handle.role, "body", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(handle.role, "connector", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(handle.role, "endpoint", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(geometrySnapshot.Component, "body", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(geometrySnapshot.Component, "connector", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(geometrySnapshot.Component, "endpoint", StringComparison.OrdinalIgnoreCase))
                 customBodies.Add(command);
             else
                 customHeads.Add(command);
+        }
+
+        if (inPlaceRequests.Count > 0)
+        {
+            ApplySkinPlayfieldGeometryRequestsInPlace(_head3DCommands, inPlaceRequests);
+            ApplySkinPlayfieldGeometryRequestsInPlace(_body3DCommands, inPlaceRequests);
+            inPlaceRequests.Clear();
         }
 
         if (replaceRequested && replacedVertices.Count > 0)
@@ -1203,9 +1279,8 @@ public sealed partial class Playfield
         for (var requestIndex = 0; requestIndex < spriteRequests.Count; requestIndex++)
         {
             var request = spriteRequests[requestIndex];
-            var handle = request.Geometry;
-            var spriteSnapshot = handle.Snapshot;
-            if (string.Equals(handle.role, "flick_attachment", StringComparison.OrdinalIgnoreCase) &&
+            var spriteSnapshot = request.Geometry;
+            if (string.Equals(spriteSnapshot.Component, "flick_attachment", StringComparison.OrdinalIgnoreCase) &&
                 spriteSnapshot.HasScreenQuad)
             {
                 var tint = request.Tint;
@@ -1246,13 +1321,13 @@ public sealed partial class Playfield
             {
                 var flick = superFlicks[flickIndex];
                 var ev = flick.Event;
-                if (ev.Track != handle.track || ev.Tick != handle.tick || ev.EventIndex != handle.event_index)
+                if (ev.Track != spriteSnapshot.Track || ev.Tick != spriteSnapshot.Tick || ev.EventIndex != spriteSnapshot.EventIndex)
                     continue;
 
                 AddSkinSuperFlickSpriteCommand(request, flick, currentTick, _headCommands);
                 if (replaceRequested)
                     _skinReplacedSuperFlickComponents.Add(new SkinSuperFlickComponentKey(
-                        ev.Track, ev.Tick, ev.EventIndex, handle.role));
+                        ev.Track, ev.Tick, ev.EventIndex, spriteSnapshot.Component));
                 break;
             }
         }
@@ -1278,6 +1353,40 @@ public sealed partial class Playfield
         replacedVertices.Clear();
         _skinRuntime.ClearPlayfieldGeometryDrawRequests();
         _skinRuntime.ClearPlayfieldSpriteDrawRequests();
+    }
+
+    private void ApplySkinPlayfieldGeometryRequestsInPlace(
+        List<Textured3DQuadCommand> commands,
+        Dictionary<VertexPositionColorTexture[], SkinPlayfieldGeometryDrawRequest> requests)
+    {
+        for (var i = 0; i < commands.Count; i++)
+        {
+            var command = commands[i];
+            if (!requests.TryGetValue(command.Vertices, out var request))
+                continue;
+
+            var geometry = request.Geometry;
+            commands[i] = command with
+            {
+                Texture = request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture,
+                Depth = geometry.Depth,
+                FlipV = false,
+                Tint = null,
+                Layer = request.Layer,
+                FlipU = false,
+                Track = geometry.Track,
+                Tick = geometry.Tick,
+                EventIndex = geometry.EventIndex,
+                Attr = geometry.Attr,
+                DurationTicks = geometry.DurationTicks,
+                NoteType = geometry.NoteType,
+                Component = geometry.Component,
+                Simultaneous = geometry.Simultaneous,
+                GeometryTrack = -1,
+                SkinMissed = false,
+            };
+            requests.Remove(command.Vertices);
+        }
     }
 
     // Filled by the ordinary note render pass in its existing far-to-near order.
@@ -2936,8 +3045,18 @@ public sealed partial class Playfield
             _skinNoteSimultaneousContext);
     }
 
-    private void DrawGameplayRegularHold(ChartEvent ev, GearState currentState, Dictionary<int, int> counts,
-        List<TexturedBodyCommand> bodyCommands, List<TexturedQuadCommand> headCommands, double currentTick)
+    private void DrawGameplayRegularHold(
+        ChartEvent ev,
+        GearState currentState,
+        Dictionary<int, int> counts,
+        List<TexturedBodyCommand> bodyCommands,
+        List<TexturedQuadCommand> headCommands,
+        double currentTick,
+        int cachedEffectiveEndTick,
+        double startSeconds,
+        double cachedEndSeconds,
+        float holdStartTravel,
+        float cachedEndTravel)
     {
         if (_tempo is null)
             return;
@@ -2946,29 +3065,34 @@ public sealed partial class Playfield
         if (runtime.Completed)
             return;
         var missVisual = runtime.StartMissed || runtime.Dropped;
+        var holdEndTick = GetHoldEndTick(ev);
+        var holdEndSeconds = holdEndTick == cachedEffectiveEndTick
+            ? cachedEndSeconds
+            : _tempo.TickToSeconds(holdEndTick);
+        var holdEndTravel = holdEndTick == cachedEffectiveEndTick
+            ? cachedEndTravel
+            : (float)_projection.ScrollPixels(holdEndSeconds, _playSeconds);
 
-        var endTick = GetHoldEndTick(ev);
-        var startSeconds = _tempo.TickToSeconds(ev.Tick);
-        var endSeconds = _tempo.TickToSeconds(endTick);
-        var holdStartTravel = (float)_projection.ScrollPixels(startSeconds, _playSeconds);
-        var holdEndTravel = (float)_projection.ScrollPixels(endSeconds, _playSeconds);
+        // DrawNotes has already resolved these scroll positions from the shared
+        // event cache. Reuse them here rather than repeating tempo conversion,
+        // scroll integration, and projection for every gameplay hold.
         // Gameplay holds are rendered by a separate path, so apply the long-note
-        // lifetime here as well. This is what keeps a long body/tail alive far past
-        // the camera without making ordinary notes use the long-note distance.
+        // lifetime here as well. This keeps a long body/tail alive past the camera
+        // without making ordinary notes use the long-note distance.
         if (!_projection.RenderIntervalIntersects(holdStartTravel, holdEndTravel))
             return;
 
-        var startPoint = _projection.Project(ev.Track, startSeconds, _playSeconds, currentState);
-        var endPoint = _projection.Project(ev.Track, endSeconds, _playSeconds, currentState);
-
-        if (runtime.Started && !runtime.Dropped && _playSeconds >= startSeconds)
+        var startPoint = _projection.ProjectAtTravel(ev.Track, holdStartTravel, currentState);
+        var endPoint = _projection.ProjectAtTravel(ev.Track, holdEndTravel, currentState);
+        var droppedTravel = holdStartTravel;
+        if (runtime.Dropped)
         {
-            var nowPoint = _projection.Project(ev.Track, _playSeconds, _playSeconds, currentState);
-            startPoint = nowPoint;
+            droppedTravel = (float)_projection.ScrollPixels(runtime.DropSeconds, _playSeconds);
+            startPoint = _projection.ProjectAtTravel(ev.Track, droppedTravel, currentState);
         }
-        else if (runtime.Dropped)
+        else if (runtime.Started && _playSeconds >= startSeconds)
         {
-            startPoint = _projection.Project(ev.Track, runtime.DropSeconds, _playSeconds, currentState);
+            startPoint = _projection.ProjectAtTravel(ev.Track, 0f, currentState);
         }
 
         var position = GearState.Position(ev.Track);
@@ -2991,12 +3115,17 @@ public sealed partial class Playfield
             // body is anchored to the judge and follows the normal hold behavior.
             var bodyStarted = runtime.Started && !runtime.Dropped;
             var bodyHasReachedJudge = bodyStarted && _playSeconds >= startSeconds;
-            var bodyStartSeconds = bodyStarted
-                ? (bodyHasReachedJudge ? _playSeconds : startSeconds)
-                : (runtime.Dropped ? runtime.DropSeconds : startSeconds);
-            AddSegmentedLaneBody(bodyCommands, body, position.Value.Side, position.Value.Bank,
-                _projection.LaneNormalizedX(ev.Track), bodyStartSeconds, endSeconds,
-                currentState,
+            var bodyStartTravel = bodyStarted
+                ? (bodyHasReachedJudge ? 0f : holdStartTravel)
+                : (runtime.Dropped ? droppedTravel : holdStartTravel);
+            AddSegmentedLaneBodyFromTravel(
+                bodyCommands,
+                body,
+                position.Value.Side,
+                position.Value.Bank,
+                _projection.LaneNormalizedX(ev.Track),
+                bodyStartTravel,
+                holdEndTravel,
                 ev.NoteType == NoteType.Vibrato
                     ? _projection.VibratoBodyTextureWidth
                     : _projection.BodyTextureWidth,
@@ -3015,7 +3144,7 @@ public sealed partial class Playfield
             {
                 var indicator = _textures.Get(simultaneous ? NoteTextureAsset.IndicatorVibratoMulti : NoteTextureAsset.IndicatorVibrato);
                 AddNoteOverlayCommands(headCommands, startPoint, ev.Track, null, indicator, 0f,
-                    _projection.VibratoIndicatorWidth, currentTick, (float)_projection.ScrollPixels(startSeconds, _playSeconds));
+                    _projection.VibratoIndicatorWidth, currentTick, holdStartTravel);
             }
             else
             {
@@ -3026,7 +3155,7 @@ public sealed partial class Playfield
                     ? _textures.Get(NoteTextureAsset.IndicatorLongMiss)
                     : _textures.Get(simultaneous ? NoteTextureAsset.IndicatorLongMulti : NoteTextureAsset.IndicatorLong);
                 AddNoteOverlayCommands(headCommands, startPoint, ev.Track, baseTexture, indicator, _projection.NoteWidth,
-                    _projection.HoldIndicatorWidth, currentTick, (float)_projection.ScrollPixels(startSeconds, _playSeconds));
+                    _projection.HoldIndicatorWidth, currentTick, holdStartTravel);
             }
         }
 
@@ -3042,7 +3171,7 @@ public sealed partial class Playfield
                 {
                     AddNoteOverlayCommands(headCommands, endPoint, ev.Track, endDim, endLight,
                         _projection.VibratoEndTextureWidth, _projection.VibratoEndTextureWidth, currentTick,
-                        (float)_projection.ScrollPixels(endSeconds, _playSeconds),
+                        holdEndTravel,
                         baseComponent: "end_cap", overlayComponent: "end_indicator");
                 }
             }
@@ -3056,7 +3185,7 @@ public sealed partial class Playfield
                     headCommands,
                     endPoint,
                     ev.Track,
-                    (float)_projection.ScrollPixels(endSeconds, _playSeconds),
+                    holdEndTravel,
                     endTailTexture,
                     _projection.TailTextureWidth,
                     layer: 2);
@@ -3071,7 +3200,7 @@ public sealed partial class Playfield
                     missVisual ? null : light,
                     missVisual ? _projection.TailTextureWidth : _projection.DimTextureWidth,
                     missVisual ? 0f : _projection.LightIndicatorWidth, currentTick,
-                    (float)_projection.ScrollPixels(endSeconds, _playSeconds),
+                    holdEndTravel,
                     baseComponent: "end_cap", overlayComponent: "end_indicator");
             }
         }

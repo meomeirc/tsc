@@ -1,4 +1,9 @@
 #if OPENGL
+#if TSC_ANDROID
+// Keep the Android GLES shader profile's SV_POSITION compatibility mapping
+// isolated from DesktopGL, where the native SV_POSITION semantic is required.
+#define SV_POSITION POSITION
+#endif
 #define VS_SHADERMODEL vs_3_0
 #define PS_SHADERMODEL ps_3_0
 #else
@@ -18,6 +23,9 @@ float ForceWhiteColor;
 float UseBilinearMapping;
 float ClipEnabled;
 float4 ClipRect;
+float ScreenHeight;
+float2 ViewportSize;
+float2 ViewportOrigin;
 texture Texture;
 texture MaskTexture;
 
@@ -51,26 +59,71 @@ struct VSInput
 
 struct VSOutput
 {
-    float4 Position     : SV_POSITION;
-    float4 Color        : COLOR0;
-    float2 TexCoord     : TEXCOORD0;
-    float2 MaskTexCoord : TEXCOORD1;
+    float4 Position       : SV_POSITION;
+    float4 Color          : COLOR0;
+    float2 TexCoord       : TEXCOORD0;
+    float2 MaskTexCoord   : TEXCOORD1;
+    float4 ScreenPosition : TEXCOORD2;
+};
+
+// Keep clip-space position in a normal interpolant. The rasterizer owns the
+// SV_POSITION semantic; attempting to consume it as a ps_3_0 input produces
+// X4502 on OpenGL. Perspective-correct interpolation followed by XY/W gives
+// the actual fragment position in NDC without a VPOS dependency.
+struct PSInput
+{
+    float4 Color          : COLOR0;
+    float2 TexCoord       : TEXCOORD0;
+    float2 MaskTexCoord   : TEXCOORD1;
+    float4 ScreenPosition : TEXCOORD2;
 };
 
 VSOutput MainVS(VSInput input)
 {
     VSOutput output;
     output.Position = mul(input.Position, WorldViewProjection);
+    output.ScreenPosition = output.Position;
     output.Color = input.Color;
     output.TexCoord = input.TexCoord;
     output.MaskTexCoord = input.MaskTexCoord;
     return output;
 }
 
+float2 GetScreenPixelPosition(float4 clipPosition)
+{
+    float safeW = max(abs(clipPosition.w), 0.00001f) *
+                  (clipPosition.w < 0.0f ? -1.0f : 1.0f);
+    float2 ndc = clipPosition.xy / safeW;
+    float2 fragmentPosition = ViewportOrigin + float2(
+        (ndc.x * 0.5f + 0.5f) * ViewportSize.x,
+        (0.5f - ndc.y * 0.5f) * ViewportSize.y);
+#if TSC_ANDROID
+    // Keep screen-space calculations in a small normalized range. MojoShader's
+    // GLES pixel shaders use mediump precision, which cannot safely square or
+    // dot raw 1080p/4K pixel coordinates.
+    return fragmentPosition * rcp(max(ScreenHeight, 1.0f));
+#else
+    return fragmentPosition;
+#endif
+}
+
+float2 GetQuadScreenPosition(float2 screenPosition)
+{
+#if TSC_ANDROID
+    return screenPosition * rcp(max(ScreenHeight, 1.0f));
+#else
+    return screenPosition;
+#endif
+}
+
 float2 BilinearQuadUv(float2 screenPosition)
 {
-    float2 topCenter = (ScreenTopLeft + ScreenTopRight) * 0.5f;
-    float2 bottomCenter = (ScreenBottomLeft + ScreenBottomRight) * 0.5f;
+    float2 topLeft = GetQuadScreenPosition(ScreenTopLeft);
+    float2 topRight = GetQuadScreenPosition(ScreenTopRight);
+    float2 bottomRight = GetQuadScreenPosition(ScreenBottomRight);
+    float2 bottomLeft = GetQuadScreenPosition(ScreenBottomLeft);
+    float2 topCenter = (topLeft + topRight) * 0.5f;
+    float2 bottomCenter = (bottomLeft + bottomRight) * 0.5f;
     float2 down = bottomCenter - topCenter;
     float downLengthSq = dot(down, down);
 
@@ -80,8 +133,8 @@ float2 BilinearQuadUv(float2 screenPosition)
         v = saturate(dot(screenPosition - topCenter, down) / downLengthSq);
     }
 
-    float2 leftEdge = lerp(ScreenTopLeft, ScreenBottomLeft, v);
-    float2 rightEdge = lerp(ScreenTopRight, ScreenBottomRight, v);
+    float2 leftEdge = lerp(topLeft, bottomLeft, v);
+    float2 rightEdge = lerp(topRight, bottomRight, v);
     float2 across = rightEdge - leftEdge;
     float acrossLengthSq = dot(across, across);
 
@@ -94,21 +147,33 @@ float2 BilinearQuadUv(float2 screenPosition)
     return float2(u, v);
 }
 
-float4 MainPS(VSOutput input) : COLOR0
+float4 MainPS(PSInput input) : COLOR0
 {
+    float2 screenPosition = GetScreenPixelPosition(input.ScreenPosition);
+
     // ClipRect is expressed in screen pixels, so the 3D quad keeps its original
     // projected geometry and texture UVs while the visible pixels are wiped.
     if (ClipEnabled > 0.5f)
     {
-        float2 screenPosition = input.Position.xy;
+        // Lua clip bounds are local to the game viewport, while projected
+        // corners above include the physical viewport origin. Remove that
+        // origin only for clipping so wide-screen letterboxing cannot shift it.
+#if TSC_ANDROID
+        float inverseScreenHeight = rcp(max(ScreenHeight, 1.0f));
+        float2 clipPosition = screenPosition - ViewportOrigin * inverseScreenHeight;
+        float4 clipRect = ClipRect * inverseScreenHeight;
+#else
+        float2 clipPosition = screenPosition - ViewportOrigin;
+        float4 clipRect = ClipRect;
+#endif
         float insideDistance = min(
-            min(screenPosition.x - ClipRect.x, ClipRect.z - screenPosition.x),
-            min(screenPosition.y - ClipRect.y, ClipRect.w - screenPosition.y));
+            min(clipPosition.x - clipRect.x, clipRect.z - clipPosition.x),
+            min(clipPosition.y - clipRect.y, clipRect.w - clipPosition.y));
         clip(insideDistance);
     }
 
     float2 uv = UseBilinearMapping > 0.5f
-        ? BilinearQuadUv(input.Position.xy)
+        ? BilinearQuadUv(screenPosition)
         : input.TexCoord;
     float4 texel = tex2D(TextureSampler, uv);
 

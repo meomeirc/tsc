@@ -1,4 +1,9 @@
 #if OPENGL
+#if TSC_ANDROID
+// Keep the Android GLES shader profile's SV_POSITION compatibility mapping
+// isolated from DesktopGL, where the native SV_POSITION semantic is required.
+#define SV_POSITION POSITION
+#endif
 #define VS_SHADERMODEL vs_3_0
 #define PS_SHADERMODEL ps_3_0
 #else
@@ -64,12 +69,32 @@ VSOutput MainVS(VSInput input)
 
 float Hash(float n)
 {
+#if TSC_ANDROID
+    // Avoid the huge sine/multiply hash on GLES mediump implementations.
+    // Keep every intermediate bounded so adjacent cells retain useful
+    // fractional differences even without fragment highp support.
+    float value = frac(n * 0.1031f);
+    return frac((value + 0.37f) * (value + 0.73f) * 3.17f);
+#else
     return frac(sin(n * 12.9898f + 78.233f) * 43758.5453f);
+#endif
 }
 
 float HashCell(float2 cell, float salt)
 {
+#if TSC_ANDROID
+    // The original 127/311 cell multipliers plus large salt values lose
+    // low-order bits on mediump GLES devices. Fold each axis and seed into
+    // the unit interval before mixing, rather than multiplying large values.
+    float seedX = frac(RandomSeed * 0.01313f);
+    float seedY = frac(RandomSeed * 0.01717f);
+    float x = frac(cell.x * 0.754877666f + seedX + frac(salt * 0.0113f));
+    float y = frac(cell.y * 0.569840296f + seedY + frac(salt * 0.0071f));
+    float mixed = frac(x + y * 0.618033989f);
+    return frac((mixed + 0.29f) * (mixed + 0.71f) * 3.37f);
+#else
     return Hash(cell.x * 127.1f + cell.y * 311.7f + salt + RandomSeed * 17.13f);
+#endif
 }
 
 float2 HashCell2(float2 cell, float salt)
@@ -136,14 +161,23 @@ float4 MainPS(VSOutput input) : COLOR0
             float cycleT = frac(Time / cycleLength);
 
             float cycleSeed = cell.x + cell.y * GridSize.x + cycleIndex * 37.17f;
+#if TSC_ANDROID
+            // Keep the random phase independent for each cell and each cycle
+            // without feeding large cycle counters into a low-precision hash.
+            // Fold the cycle into two bounded fractional offsets first.
+            float2 cycleOffset = float2(
+                frac(cycleIndex * 0.754877666f),
+                frac(cycleIndex * 0.569840296f));
+            float flashCenter = HashCell(cell + cycleOffset, 501.0f);
+            float flashWidthRoll = HashCell(cell + cycleOffset, 607.0f);
+            float activeRoll = HashCell(cell + cycleOffset, 719.0f);
+#else
             float flashCenter = Hash(cycleSeed + RandomSeed * 3.7f + 501.0f);
-            float flashWidth = lerp(
-                FlashWidthMin,
-                FlashWidthMax,
-                Hash(cycleSeed + 607.0f));
-            flashWidth = max(0.001f, flashWidth);
-
+            float flashWidthRoll = Hash(cycleSeed + 607.0f);
             float activeRoll = Hash(cycleSeed + 719.0f);
+#endif
+            float flashWidth = lerp(FlashWidthMin, FlashWidthMax, flashWidthRoll);
+            flashWidth = max(0.001f, flashWidth);
             if (activeRoll > BurstChance)
                 continue;
 
@@ -401,14 +435,29 @@ float4 BakeSparklesPS(VSOutput input) : COLOR0
 float2 CrowdResolution;
 float LayerIndex;
 float LayerCount;
-float CrowdSeed;
+float2 CrowdRandomGridSize;
+texture CrowdRandomTextureA;
+texture CrowdRandomTextureB;
 
-float Hash21(float2 p)
+sampler CrowdRandomSamplerA = sampler_state
 {
-    p = frac(p * float2(123.34f, 456.21f));
-    p += dot(p, p + 45.32f);
-    return frac(p.x * p.y);
-}
+    Texture = <CrowdRandomTextureA>;
+    MinFilter = Point;
+    MagFilter = Point;
+    MipFilter = Point;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+sampler CrowdRandomSamplerB = sampler_state
+{
+    Texture = <CrowdRandomTextureB>;
+    MinFilter = Point;
+    MagFilter = Point;
+    MipFilter = Point;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
 
 float3 HexColorCrowd(float3 rgb)
 {
@@ -450,12 +499,21 @@ float4 BakeCrowdLayerPS(VSOutput input) : COLOR0
         for (int x = -1; x <= 1; x++)
         {
             float2 cell = currentCell + float2((float)x, (float)y);
-            float r1 = Hash21(cell + float2(12.3f, 45.6f) + CrowdSeed);
-            float r2 = Hash21(cell + float2(78.9f, 12.3f) + CrowdSeed);
-            float r3 = Hash21(cell + float2(34.5f, 67.8f) + CrowdSeed);
-            float r5 = Hash21(cell + float2(56.7f, 89.1f) + CrowdSeed);
-            float r6 = Hash21(cell + float2(21.4f, 73.2f) + CrowdSeed);
-            float layerRoll = Hash21(cell + float2(31.4f, 92.3f) + CrowdSeed);
+            // Use deterministic CPU-generated random data on every platform.
+            // Keeping the hash out of the fragment shader avoids driver-specific
+            // precision differences and guarantees the same spatial pattern on
+            // DesktopGL and GLES. Point sampling gives each integer cell its own
+            // stable random tuple.
+            float2 randomCell = cell + float2(2.0f, 2.0f);
+            float2 randomUv = (randomCell + 0.5f) / max(CrowdRandomGridSize, float2(1.0f, 1.0f));
+            float4 randomA = tex2D(CrowdRandomSamplerA, randomUv);
+            float4 randomB = tex2D(CrowdRandomSamplerB, randomUv);
+            float r1 = randomA.r;
+            float r2 = randomA.g;
+            float r3 = randomA.b;
+            float r5 = randomA.a;
+            float r6 = randomB.r;
+            float layerRoll = randomB.g;
 
             if (floor(layerRoll * max(1.0f, LayerCount)) != LayerIndex)
                 continue;

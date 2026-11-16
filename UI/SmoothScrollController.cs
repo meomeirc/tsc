@@ -28,6 +28,12 @@ public sealed class SmoothScrollHandler
 
     private bool _draggingScrollbar;
     private double _scrollbarDragOffset;
+    private bool _contentPointerDown;
+    private bool _draggingContent;
+    private double _contentDragStartY;
+    private double _contentDragLastY;
+    private double _contentDragStartPosition;
+    private double _contentDragVelocity;
 
     public double Position { get; private set; }
     public double Target { get; private set; }
@@ -87,7 +93,79 @@ public sealed class SmoothScrollHandler
         Maximum = 0.0;
     }
 
-    public void CancelPointer() => _draggingScrollbar = false;
+    public void CancelPointer()
+    {
+        _draggingScrollbar = false;
+        _contentPointerDown = false;
+        _draggingContent = false;
+        _contentDragVelocity = 0.0;
+    }
+
+    /// <summary>
+    /// Supports direct finger/mouse-content dragging for text or list viewports
+    /// that do not have their own specialised drag controller. A small movement
+    /// threshold preserves ordinary taps; release carries a short inertial tail.
+    /// </summary>
+    public bool HandleContentDrag(
+        bool pointerPressed,
+        bool pointerDown,
+        double pointerX,
+        double pointerY,
+        Rectangle viewport,
+        double deltaSeconds,
+        int dragThreshold = 7)
+    {
+        if (pointerPressed && !_contentPointerDown &&
+            double.IsFinite(pointerX) && double.IsFinite(pointerY) &&
+            viewport.Contains((int)Math.Round(pointerX), (int)Math.Round(pointerY)))
+        {
+            _contentPointerDown = true;
+            _draggingContent = false;
+            _contentDragStartY = pointerY;
+            _contentDragLastY = pointerY;
+            _contentDragStartPosition = Position;
+            _contentDragVelocity = 0.0;
+        }
+
+        if (!_contentPointerDown)
+            return false;
+
+        if (pointerDown)
+        {
+            var totalDelta = pointerY - _contentDragStartY;
+            if (!_draggingContent && Math.Abs(totalDelta) >= Math.Max(1, dragThreshold))
+            {
+                _draggingContent = true;
+                Target = Position;
+            }
+
+            if (!_draggingContent)
+            {
+                _contentDragLastY = pointerY;
+                return false;
+            }
+
+            SetPosition(_contentDragStartPosition - totalDelta);
+            var frameDelta = pointerY - _contentDragLastY;
+            if (deltaSeconds > 0.0001 && double.IsFinite(deltaSeconds) && frameDelta != 0.0)
+            {
+                var measuredVelocity = -frameDelta / Math.Min(deltaSeconds, 0.1);
+                var response = 1.0 - Math.Exp(-20.0 * Math.Min(deltaSeconds, 0.1));
+                _contentDragVelocity += (measuredVelocity - _contentDragVelocity) * response;
+            }
+            _contentDragLastY = pointerY;
+            return true;
+        }
+
+        var wasDragging = _draggingContent;
+        if (wasDragging && Math.Abs(_contentDragVelocity) >= 35.0)
+            SetTarget(Position + _contentDragVelocity * 0.12);
+
+        _contentPointerDown = false;
+        _draggingContent = false;
+        _contentDragVelocity = 0.0;
+        return wasDragging;
+    }
 
     /// <summary>
     /// The single scrollbar input entry point for every menu, whether the input

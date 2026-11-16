@@ -131,7 +131,7 @@ public sealed partial class Playfield
         var surface = _projection.BuildBankSurface(side, bank);
         var textureAspect = texture.Width / (float)Math.Max(1, texture.Height);
 
-        if (string.Equals(request.Geometry.role, "highlight", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(request.Geometry.Component, "highlight", StringComparison.OrdinalIgnoreCase))
         {
             var phase = relativeSeconds * _projection.SuperFlickHighlightSpeed * visualDirectionSign;
             phase -= MathF.Floor(phase);
@@ -164,7 +164,7 @@ public sealed partial class Playfield
             return;
         }
 
-        if (!string.Equals(request.Geometry.role, "strip", StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(request.Geometry.Component, "strip", StringComparison.OrdinalIgnoreCase))
             return;
 
         var leftContext = _projection.BuildStandingNoteTravelContext(surface, bankLeft, side, bank);
@@ -709,7 +709,7 @@ public sealed partial class Playfield
         for (var i = 0; i < requests.Count; i++)
         {
             var request = requests[i];
-            var snapshot = request.Geometry.Snapshot;
+            var snapshot = request.Geometry;
             if (!snapshot.HasScreenQuad)
                 continue;
 

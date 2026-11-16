@@ -1003,6 +1003,56 @@ public sealed partial class Playfield
             closest.Consumed = true;
     }
 
+    private bool TryFindLinkRepressEdge(
+        string action,
+        double afterSeconds,
+        double deadlineSeconds,
+        HashSet<string> consumedPressedKeys,
+        out GameplayLaneInputEdge? edge)
+    {
+        edge = null;
+        var earliestSeconds = double.PositiveInfinity;
+        foreach (var candidate in _gameplayLaneInputEdges)
+        {
+            if (candidate.Consumed || !candidate.IsPress ||
+                !string.Equals(candidate.Action, action, StringComparison.OrdinalIgnoreCase) ||
+                consumedPressedKeys.Contains(candidate.Action) ||
+                candidate.Seconds <= afterSeconds + 1e-9 ||
+                candidate.Seconds > deadlineSeconds + 1e-9 ||
+                candidate.Seconds >= earliestSeconds)
+                continue;
+
+            edge = candidate;
+            earliestSeconds = candidate.Seconds;
+        }
+
+        return edge is not null;
+    }
+
+    private bool TryFindLinkReleaseEdge(
+        string action,
+        double afterSeconds,
+        double deadlineSeconds,
+        out GameplayLaneInputEdge? edge)
+    {
+        edge = null;
+        var earliestReleaseSeconds = double.PositiveInfinity;
+        foreach (var candidate in _gameplayLaneInputEdges)
+        {
+            if (candidate.IsPress ||
+                !string.Equals(candidate.Action, action, StringComparison.OrdinalIgnoreCase) ||
+                candidate.Seconds <= afterSeconds + 1e-9 ||
+                candidate.Seconds > deadlineSeconds + 1e-9 ||
+                candidate.Seconds >= earliestReleaseSeconds)
+                continue;
+
+            edge = candidate;
+            earliestReleaseSeconds = candidate.Seconds;
+        }
+
+        return edge is not null;
+    }
+
     private bool TryConsumeLinkTailInput(
         HoldRuntime runtime,
         ChartEvent currentNode,
@@ -1011,11 +1061,13 @@ public sealed partial class Playfield
         HashSet<string> consumedPressedKeys,
         out int inputTrack,
         out bool usedCorrection,
-        out string inputAction)
+        out string inputAction,
+        out double inputSeconds)
     {
         inputTrack = nextNode.Track;
         usedCorrection = false;
         inputAction = string.Empty;
+        inputSeconds = transitionSeconds;
 
         // First prefer the correctly mapped destination lane. Input history lets
         // Same-tick horizontal connections can use a destination press from the
@@ -1028,6 +1080,7 @@ public sealed partial class Playfield
             expectedEdge.Consumed = true;
             inputTrack = nextNode.Track;
             inputAction = expectedAction;
+            inputSeconds = expectedEdge.Seconds;
             consumedPressedKeys.Add(expectedAction);
             return true;
         }
@@ -1075,6 +1128,7 @@ public sealed partial class Playfield
             bestCorrectionEdge.Consumed = true;
             inputTrack = bestCorrectionTrack;
             usedCorrection = true;
+            inputSeconds = bestCorrectionEdge.Seconds;
             consumedPressedKeys.Add(inputAction);
             return true;
         }
@@ -1083,6 +1137,116 @@ public sealed partial class Playfield
         // switching lanes; UpdateHoldRuntime keeps the chain alive through the
         // LinkTail's timing window and judges it only when a lane press is found.
         return false;
+    }
+
+    private bool UpdateLinkTailRepressGrace(
+        HoldRuntime runtime,
+        double currentSeconds,
+        HashSet<string> consumedPressedKeys)
+    {
+        if (runtime.LinkTailRepressDeadlineSeconds is not double deadline)
+            return true;
+
+        var nodes = runtime.ChainNodes;
+        var nodeIndex = Math.Clamp(runtime.CurrentNodeIndex, 0, nodes.Count - 1);
+        var currentNode = nodes[nodeIndex];
+        if (_tempo is null)
+            return true;
+
+        var transitionSeconds = _tempo.TickToSeconds(currentNode.Tick);
+        if (currentNode.NoteType != NoteType.LinkTail)
+        {
+            runtime.LinkTailRepressDeadlineSeconds = null;
+            runtime.LinkTailRepressPending = false;
+            return true;
+        }
+
+        var trackIsDown = IsTrackKeyDown(currentNode.Track);
+        var action = KeybindSettings.GetActionForTrack(currentNode.Track);
+        if (!string.IsNullOrWhiteSpace(action))
+        {
+            // The overshoot qualification window is fixed to the tail's original
+            // timing window. Each qualifying release adds another full leniency
+            // window to the current deadline; releases in already-earned recovery
+            // time still require a re-press, but cannot earn further time.
+            var originalEarlyEdgeSeconds =
+                transitionSeconds - LinkTailLeniencyWindowSeconds;
+            var originalLateEdgeSeconds =
+                transitionSeconds + LinkTailLeniencyWindowSeconds;
+
+            // Walk buffered input edges in order. A release starts a retry; a new
+            // press satisfies it. Advancing the cursor on both edges lets the same
+            // tail earn another recovery window after each fresh overshoot, without
+            // processing the same release more than once.
+            while (true)
+            {
+                if (!runtime.LinkTailRepressPending)
+                {
+                    if (!TryFindLinkReleaseEdge(
+                            action,
+                            runtime.LinkTailLastPressSeconds,
+                            deadline,
+                            out var releaseEdge) ||
+                        releaseEdge is null)
+                        break;
+
+                    runtime.LinkTailLastPressSeconds = releaseEdge.Seconds;
+                    runtime.LinkTailRepressPending = true;
+                    runtime.AllowUnheldUntilNextTailWindow = true;
+
+                    if (releaseEdge.Seconds >= originalEarlyEdgeSeconds - 1e-9 &&
+                        releaseEdge.Seconds <= originalLateEdgeSeconds + 1e-9)
+                    {
+                        deadline += LinkTailLeniencyWindowSeconds;
+                        runtime.LinkTailRepressDeadlineSeconds = deadline;
+                    }
+                }
+                else
+                {
+                    // Search after the release and use the current (possibly
+                    // extended) deadline. A quick buffered return can therefore
+                    // recover immediately, and another later release can earn time.
+                    if (!TryFindLinkRepressEdge(
+                            action,
+                            runtime.LinkTailLastPressSeconds,
+                            deadline,
+                            consumedPressedKeys,
+                            out var repressEdge) ||
+                        repressEdge is null)
+                        break;
+
+                    repressEdge.Consumed = true;
+                    runtime.LinkTailLastPressSeconds = repressEdge.Seconds;
+                    consumedPressedKeys.Add(action!);
+                    runtime.LinkTailRepressPending = false;
+                    runtime.AllowUnheldUntilNextTailWindow = !trackIsDown;
+                }
+            }
+        }
+
+        if (currentSeconds <= deadline + 1e-9)
+            return true;
+
+        var repressWasMissed = runtime.LinkTailRepressPending;
+        runtime.LinkTailRepressDeadlineSeconds = null;
+        runtime.LinkTailRepressPending = false;
+        if (repressWasMissed)
+        {
+            if (runtime.CurrentNodeIndex + 1 >= nodes.Count)
+            {
+                // A terminal tail has no later tail window to switch into. It
+                // must be re-pressed before its original or earned recovery deadline.
+                DropHold(runtime);
+                return false;
+            }
+
+            // A non-terminal chain may still move to its next authored tail.
+            // Keep the existing lane-switch grace, but do not allow a late retry
+            // of this already-expired tail.
+            runtime.AllowUnheldUntilNextTailWindow = true;
+        }
+
+        return true;
     }
 
     private void ProcessGameplayHits()
@@ -1162,13 +1326,23 @@ public sealed partial class Playfield
                     continue;
 
                 var holdAction = KeybindSettings.GetActionForTrack(ev.Track);
+#if TSC_ANDROID
+                var holdTouchInputConsumed = IsAndroidTouchTrackInputConsumed(ev.Track, consumedPressedKeys) &&
+                                             !IsTrackKeyboardKeyPressed(ev.Track);
+#else
+                var holdTouchInputConsumed = false;
+#endif
                 if (Math.Abs(deltaSeconds) <= GameplayHitWindowSeconds &&
                     holdAction is not null &&
                     !consumedPressedKeys.Contains(holdAction) &&
+                    !holdTouchInputConsumed &&
                     IsTrackKeyPressed(ev.Track))
                 {
                     consumedPressedKeys.Add(holdAction);
                     ConsumeCurrentGameplayLanePressEdge(holdAction, currentSeconds);
+#if TSC_ANDROID
+                    ConsumeAndroidTouchTrackInput(ev.Track, currentSeconds, consumedPressedKeys);
+#endif
                     StartHold(runtime, deltaSeconds);
                     if (ev.NoteType == NoteType.LinkHead)
                         newlyStartedLinkRuntimes.Add(runtime);
@@ -1196,8 +1370,13 @@ public sealed partial class Playfield
                 if (_superFlickResolvedThisFrame.Contains(superFlickKey) || _resolvedSuperFlicks.Contains(superFlickKey) || IsHit(ev) || _missedEvents.Contains(KeyOf(ev)))
                     continue;
 
-                if (Math.Abs(deltaSeconds) <= GameplayHitWindowSeconds && IsSuperFlickInputPressed(ev))
+                if (Math.Abs(deltaSeconds) <= GameplayHitWindowSeconds &&
+                    IsSuperFlickInputPressed(ev, out var androidSuperFlickTouchId, out var androidSuperFlickTrack))
                 {
+#if TSC_ANDROID
+                    if (androidSuperFlickTouchId >= 0 && androidSuperFlickTrack >= 0)
+                        DisarmAndroidGameplayTouchFlickTrack(androidSuperFlickTouchId, androidSuperFlickTrack);
+#endif
                     if (_superFlickDebugEnabled)
                     {
                         var dbgKeys = GameplayKeybinds.GetSuperFlickKeys(ev);
@@ -1250,13 +1429,31 @@ public sealed partial class Playfield
                 continue;
 
             var tapAction = KeybindSettings.GetActionForTrack(ev.Track);
+            var androidFlickTouchId = -1;
+            var trackInputPressed = ev.IsFlick
+                ? IsFlickInputPressed(ev, out androidFlickTouchId)
+                : IsTrackKeyPressed(ev.Track);
+#if TSC_ANDROID
+            var touchTrackInputConsumed = IsAndroidTouchTrackInputConsumed(ev.Track, consumedPressedKeys) &&
+                                          !IsTrackKeyboardKeyPressed(ev.Track);
+#else
+            var touchTrackInputConsumed = false;
+#endif
             if (Math.Abs(deltaSeconds) <= GameplayHitWindowSeconds &&
                 tapAction is not null &&
                 !consumedPressedKeys.Contains(tapAction) &&
-                IsTrackKeyPressed(ev.Track))
+                !touchTrackInputConsumed &&
+                trackInputPressed)
             {
+#if TSC_ANDROID
+                if (ev.IsFlick && androidFlickTouchId >= 0)
+                    DisarmAndroidGameplayTouchFlickTrack(androidFlickTouchId, ev.Track);
+#endif
                 consumedPressedKeys.Add(tapAction);
                 ConsumeCurrentGameplayLanePressEdge(tapAction, currentSeconds);
+#if TSC_ANDROID
+                ConsumeAndroidTouchTrackInput(ev.Track, currentSeconds, consumedPressedKeys);
+#endif
                 _hitEvents.Add(KeyOf(ev));
                 RegisterHit(deltaSeconds * 1000.0, ev);
                 PlayHitSound(ev);
@@ -1427,6 +1624,9 @@ public sealed partial class Playfield
             }
         }
 
+        if (!UpdateLinkTailRepressGrace(runtime, currentSeconds, consumedPressedKeys))
+            return;
+
         var comboStep = Math.Max(1.0, _tempo.TicksPerBeat / 4.0);
         var totalEndTick = GetHoldEndTick(runtime.Root);
 
@@ -1446,8 +1646,9 @@ public sealed partial class Playfield
 
             var currentInputTrack = ResolveHoldInputTrack(runtime, currentNode);
 
-            // Allow the player to release and switch lanes across the wider LinkTail
-            // window, but never judge a tail from a release alone.
+            // Before the destination tail enters its leniency window, the current
+            // body must still be held. Once the destination tail is actually hit,
+            // the transition below confirms this body and advances the chain.
             if (deltaToTransition < -LinkTailLeniencyWindowSeconds - 1e-9)
             {
                 if (!runtime.AllowUnheldUntilNextTailWindow && !IsTrackKeyDown(currentInputTrack))
@@ -1457,9 +1658,17 @@ public sealed partial class Playfield
 
             if (TryConsumeLinkTailInput(
                     runtime, currentNode, nextNode, transitionSeconds, consumedPressedKeys,
-                    out var acceptedInputTrack, out var usedCorrection, out var acceptedInputAction))
+                    out var acceptedInputTrack, out var usedCorrection, out var acceptedInputAction,
+                    out var acceptedInputSeconds))
             {
                 runtime.CurrentNodeIndex++;
+                // Only an actual press on the authored destination lane grants a
+                // one-tail auto-hit allowance. A temporary wrong-lane correction
+                // is not a manual hit on the LinkTail itself.
+                runtime.CanAutoHitNextLinkTail = !usedCorrection;
+                if (!usedCorrection)
+                    runtime.LastManualLinkPressSeconds = acceptedInputSeconds;
+
                 if (usedCorrection)
                 {
                     // Keep the incorrect lane only as a temporary signal that the
@@ -1470,12 +1679,41 @@ public sealed partial class Playfield
                         : null;
                     runtime.InputCorrectionDeadlineSeconds = transitionSeconds + LinkTailLeniencyWindowSeconds;
                     runtime.AllowUnheldUntilNextTailWindow = true;
+                    runtime.LinkTailRepressDeadlineSeconds = null;
+                    runtime.LinkTailRepressPending = false;
                 }
                 else
                 {
                     runtime.CurrentInputTrackOverride = null;
                     runtime.InputCorrectionDeadlineSeconds = null;
-                    runtime.AllowUnheldUntilNextTailWindow = !IsTrackKeyDown(nextNode.Track);
+                    // An early destination press completes the preceding body.
+                    // For another link segment (or a point tail), don't require
+                    // the destination lane to remain down merely to bridge the
+                    // early hit to its authored time. The next tail still has to
+                    // be hit in its own window, and explicit releases continue to
+                    // use this tail's re-press grace below. A terminal duration
+                    // body remains a real hold and still requires its lane.
+                    runtime.AllowUnheldUntilNextTailWindow =
+                        acceptedInputSeconds < transitionSeconds - 1e-9 &&
+                        (runtime.CurrentNodeIndex + 1 < nodes.Count || nextNode.Duration <= 6);
+                    // Re-press grace protects an active LinkTail body, not a
+                    // terminal point tail. A point tail has no lane hold after
+                    // its authored tick, so leaving the lane after its early hit
+                    // must not create a delayed chain-drop miss.
+                    var hasFollowingTail = runtime.CurrentNodeIndex + 1 < nodes.Count;
+                    var hasTerminalBody = !hasFollowingTail && nextNode.Duration > 6;
+                    if (hasFollowingTail || hasTerminalBody)
+                    {
+                        runtime.LinkTailRepressDeadlineSeconds = transitionSeconds + LinkTailLeniencyWindowSeconds;
+                        runtime.LinkTailLastPressSeconds = acceptedInputSeconds;
+                        runtime.LinkTailRepressPending = false;
+                    }
+                    else
+                    {
+                        runtime.LinkTailRepressDeadlineSeconds = null;
+                        runtime.LinkTailLastPressSeconds = acceptedInputSeconds;
+                        runtime.LinkTailRepressPending = false;
+                    }
                 }
                 if (!string.IsNullOrWhiteSpace(acceptedInputAction))
                     consumedPressedKeys.Add(acceptedInputAction);
@@ -1490,6 +1728,30 @@ public sealed partial class Playfield
                 continue;
             }
 
+            // A manual hit can also cover exactly one immediately-following tail
+            // when the manual input timestamp lies inside that tail's GOOD window.
+            // The allowance is consumed here and is deliberately not renewed by
+            // this automatic transition, so L1 -> L2 -> L3 only auto-hits L2 unless
+            // the player manually hits L2 first.
+            if (runtime.CanAutoHitNextLinkTail &&
+                Math.Abs(transitionSeconds - runtime.LastManualLinkPressSeconds) <=
+                    GameplayHitWindowSeconds + 1e-9)
+            {
+                runtime.CurrentNodeIndex++;
+                runtime.CanAutoHitNextLinkTail = false;
+                runtime.CurrentInputTrackOverride = null;
+                runtime.InputCorrectionDeadlineSeconds = null;
+                runtime.AllowUnheldUntilNextTailWindow = true;
+                runtime.LinkTailRepressDeadlineSeconds = null;
+                runtime.LinkTailRepressPending = false;
+
+                _hitEvents.Add(KeyOf(nextNode));
+                ShowJudgement(runtime.StartJudgement, nextNode);
+                PlayHitSound(nextNode);
+                runtime.NextTailSoundIndex = Math.Max(runtime.NextTailSoundIndex, runtime.CurrentNodeIndex + 1);
+                continue;
+            }
+
             if (deltaToTransition > LinkTailLeniencyWindowSeconds)
             {
                 DropHold(runtime);
@@ -1498,6 +1760,12 @@ public sealed partial class Playfield
         }
 
         if (runtime.Dropped || runtime.Completed)
+            return;
+
+        // The tail may have been accepted in the transition loop above. Give
+        // that newly active tail the same-frame chance to observe a release or
+        // a second press from the buffered input history.
+        if (!UpdateLinkTailRepressGrace(runtime, currentSeconds, consumedPressedKeys))
             return;
 
         var currentNodeAfterTransition = nodes[Math.Min(runtime.CurrentNodeIndex, nodes.Count - 1)];
@@ -1509,6 +1777,13 @@ public sealed partial class Playfield
 
         if (runtime.CurrentNodeIndex == nodes.Count - 1)
         {
+            // If the player released immediately after an early LinkTail press,
+            // wait for a fresh press on that lane until the tail's late timing
+            // boundary. Do not auto-complete the terminal hold while that retry
+            // is still pending.
+            if (runtime.LinkTailRepressPending && runtime.LinkTailRepressDeadlineSeconds.HasValue)
+                return;
+
             // Once the end enters the GOOD window, releasing is safe, but the
             // hold does not visually/physically complete until the actual end tick.
             // This keeps the body clipped at judgement while it continues scrolling.
@@ -1526,7 +1801,9 @@ public sealed partial class Playfield
             return;
         }
 
-        // A link chain may briefly have no key held before its next checkpoint.
+        // A link chain may briefly have no key held before its next checkpoint,
+        // but only after the preceding tail has been accepted early. Otherwise the
+        // current segment still has to be held until the next tail window opens.
         var nextTransitionSeconds = _tempo.TickToSeconds(nodes[runtime.CurrentNodeIndex + 1].Tick);
         var currentInputTrackAfterTransition = ResolveHoldInputTrack(runtime, currentNodeAfterTransition);
         if (currentSeconds < nextTransitionSeconds - LinkTailLeniencyWindowSeconds - 1e-9 &&
@@ -1596,11 +1873,20 @@ public sealed partial class Playfield
                 var candidate = ordered[i];
                 if (!IsActiveEvent(candidate, frameGameplayState) || IsHit(candidate))
                     continue;
+                // A plain Android lane touch must not create an early-miss edge for
+                // a Flick. Physical keyboard controls retain their previous behavior.
+                if (candidate.IsFlick && !KeybindSettings.IsPhysicalPressed(action))
+                    continue;
                 var candidateKey = KeyOf(candidate);
                 if (_missedEvents.Contains(candidateKey) || _gameplayIgnoredEvents.Contains(candidateKey) ||
                     candidate.IsSuperFlick || candidate.NoteType is NoteType.End or NoteType.LinkTail)
                     continue;
-                if (!string.Equals(KeybindSettings.GetActionForTrack(candidate.Track), action, StringComparison.OrdinalIgnoreCase))
+                var candidateAction = KeybindSettings.GetActionForTrack(candidate.Track);
+                var matchesAction = string.Equals(candidateAction, action, StringComparison.OrdinalIgnoreCase);
+#if TSC_ANDROID
+                matchesAction |= IsAndroidTouchActionForTrack(candidate.Track, action);
+#endif
+                if (!matchesAction)
                     continue;
                 ev = candidate;
                 break;
@@ -1709,6 +1995,11 @@ public sealed partial class Playfield
         runtime.CurrentInputTrackOverride = null;
         runtime.InputCorrectionDeadlineSeconds = null;
         runtime.AllowUnheldUntilNextTailWindow = false;
+        runtime.LinkTailRepressDeadlineSeconds = null;
+        runtime.LinkTailLastPressSeconds = 0.0;
+        runtime.LinkTailRepressPending = false;
+        runtime.CanAutoHitNextLinkTail = true;
+        runtime.LastManualLinkPressSeconds = runtime.StartSeconds;
         runtime.StartJudgement = RegisterHit(runtime.StartOffsetMs, runtime.Root);
         // Reserve the terminal hold-tick checkpoint. Until the hold completes or
         // drops, it is treated as an unresolved 100% result by GetAccuracyPercent().

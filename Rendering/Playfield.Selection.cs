@@ -2996,7 +2996,9 @@ public sealed partial class Playfield
         var panel = GetEditorMetaPanelBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
         var padding = (int)MathF.Round(12f * unit);
-        var contentTop = panel.Y + (int)MathF.Round(156f * unit);
+        // Match chartEditorInterface.lua: leave a larger gap below the top
+        // difficulty/category buttons while preserving the existing bottom edge.
+        var contentTop = panel.Y + (int)MathF.Round(168f * unit);
         var contentBottom = string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase)
             ? panel.Bottom - padding
             : GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight).Y - padding;

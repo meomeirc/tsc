@@ -22,6 +22,9 @@ internal static class KeybindSettings
     private static readonly Dictionary<string, double> RepeatRemaining = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> RepeatHeld = new(StringComparer.OrdinalIgnoreCase);
     private static readonly HashSet<string> RepeatPulses = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> TouchGameplayCurrent = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> TouchGameplayPrevious = new(StringComparer.OrdinalIgnoreCase);
+    private static bool SuppressNextTouchGameplayPressEdges;
     private const double RepeatDelaySeconds = 0.32;
     private const double RepeatIntervalSeconds = 0.095;
     private static string _path = UserDataPaths.KeybindsPath;
@@ -195,6 +198,9 @@ internal static class KeybindSettings
         RepeatRemaining.Clear();
         RepeatHeld.Clear();
         RepeatPulses.Clear();
+        TouchGameplayCurrent.Clear();
+        TouchGameplayPrevious.Clear();
+        SuppressNextTouchGameplayPressEdges = true;
         foreach (var item in Defaults)
         {
             Bindings[item.Id] = new KeybindDefinition
@@ -466,10 +472,53 @@ internal static class KeybindSettings
         return false;
     }
 
+    /// <summary>
+    /// Replaces the gameplay actions currently held by Android touch lanes. Called
+    /// once per gameplay frame; preserving the previous set gives touch the same
+    /// press/release edges as physical keys.
+    /// </summary>
+    public static void UpdateTouchGameplayActions(IEnumerable<string> actions, bool suppressPressEdges = false)
+    {
+        if (suppressPressEdges || SuppressNextTouchGameplayPressEdges)
+        {
+            SuppressNextTouchGameplayPressEdges = suppressPressEdges;
+            TouchGameplayCurrent.Clear();
+            foreach (var action in actions)
+            {
+                if (Bindings.ContainsKey(action))
+                    TouchGameplayCurrent.Add(action);
+            }
+            TouchGameplayPrevious.Clear();
+            TouchGameplayPrevious.UnionWith(TouchGameplayCurrent);
+            return;
+        }
+
+        TouchGameplayPrevious.Clear();
+        TouchGameplayPrevious.UnionWith(TouchGameplayCurrent);
+        TouchGameplayCurrent.Clear();
+        foreach (var action in actions)
+        {
+            if (Bindings.ContainsKey(action))
+                TouchGameplayCurrent.Add(action);
+        }
+    }
+
+    public static bool IsTouchDown(string action)
+        => !IsTemporarilyDisabled(action) && Bindings.ContainsKey(action) &&
+           TouchGameplayCurrent.Contains(action);
+
+    public static bool IsTouchPressed(string action)
+        => !IsTemporarilyDisabled(action) && Bindings.ContainsKey(action) &&
+           TouchGameplayCurrent.Contains(action) && !TouchGameplayPrevious.Contains(action);
+
     public static bool IsDown(string action, bool previous = false)
     {
         if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;
-        return PhysicalKeyboard.IsChordDown(binding.Primary.Scancodes, previous) ||
+        var touchDown = previous
+            ? TouchGameplayPrevious.Contains(action)
+            : TouchGameplayCurrent.Contains(action);
+        return touchDown ||
+               PhysicalKeyboard.IsChordDown(binding.Primary.Scancodes, previous) ||
                PhysicalKeyboard.IsChordDown(binding.Secondary.Scancodes, previous);
     }
 
@@ -608,11 +657,11 @@ internal static class KeybindSettings
     public static bool IsTextFieldCommitPressed()
         => IsPressed("editor_field_commit") || PhysicalKeyboard.IsPressed(PhysicalKeyboard.NumpadEnterScancode);
 
-    public static bool IsPressed(string action)
+    public static bool IsPhysicalPressed(string action)
     {
-        if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;
-        if (IsRepeatableMenuAction(action))
-            return RepeatPulses.Contains(action);
+        if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding) ||
+            IsRepeatableMenuAction(action))
+            return false;
 
         static bool ChordPressed(IReadOnlyList<int>? chord)
         {
@@ -627,7 +676,32 @@ internal static class KeybindSettings
             return PhysicalKeyboard.IsChordDown(chord) &&
                    !PhysicalKeyboard.IsChordDown(chord, previous: true);
         }
-        return ChordPressed(binding.Primary.Scancodes) || ChordPressed(binding.Secondary.Scancodes);
+
+        var physicalPressed = ChordPressed(binding.Primary.Scancodes) ||
+                              ChordPressed(binding.Secondary.Scancodes);
+        // Preserve the old merged-input behavior: a physical key press does not
+        // create a second edge while the same touch action was already held.
+        return physicalPressed && !TouchGameplayPrevious.Contains(action);
+    }
+
+    public static bool IsPressed(string action)
+    {
+        if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding)) return false;
+        if (IsRepeatableMenuAction(action))
+            return RepeatPulses.Contains(action);
+
+        var physicalPressed = IsPhysicalPressed(action);
+        var touchDown = TouchGameplayCurrent.Contains(action);
+        var touchWasDown = TouchGameplayPrevious.Contains(action);
+        if (!touchDown && !touchWasDown)
+            return physicalPressed;
+
+        var physicalWasDown = PhysicalKeyboard.IsChordDown(binding.Primary.Scancodes, previous: true) ||
+                              PhysicalKeyboard.IsChordDown(binding.Secondary.Scancodes, previous: true);
+        // Merge touch and keyboard into one logical held state. Starting a touch
+        // while the key is already held (or vice versa) must not make a second edge.
+        return (touchDown && !touchWasDown && !physicalWasDown) ||
+               (physicalPressed && !touchWasDown);
     }
 
     public static string? GetActionForTrack(int track)

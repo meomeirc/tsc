@@ -68,6 +68,7 @@ public sealed partial class Playfield
     private static double ElapsedMilliseconds(long startTimestamp)
         => (Stopwatch.GetTimestamp() - startTimestamp) * 1000.0 / Stopwatch.Frequency;
 
+#if DEBUG
     private void ResetPerformanceDebugFrame()
     {
         // _debugFrameMs is completed only at the end of Draw(), after the overlay
@@ -80,6 +81,8 @@ public sealed partial class Playfield
         _debugTexturedDrawMs = 0;
         _debugTexturedSortMs = 0;
         _debugTexturedSubmitMs = 0;
+        _debugSkinNoteBridgeMs = 0;
+        _debugSkinNoteBridgeAllocatedBytes = 0;
         _debugAllocSkinBuildBytes = 0;
         _debugAllocSkinDrawBytes = 0;
         _debugAllocLaneBytes = 0;
@@ -128,6 +131,8 @@ public sealed partial class Playfield
         _debugBackgroundDrawCommandCount = 0;
     }
 
+#endif
+
     private static float ScreenTriangleArea(Vector2 a, Vector2 b, Vector2 c)
         => MathF.Abs((b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X)) * 0.5f;
 
@@ -146,6 +151,7 @@ public sealed partial class Playfield
         return area;
     }
 
+#if DEBUG
     private void DrawPerformanceDebugOverlay()
     {
         const int left = 12;
@@ -179,9 +185,9 @@ public sealed partial class Playfield
 
     private string BuildPerformanceDebugOverlayText()
     {
-        // Keep F8 focused on the values useful for investigating memory
-        // retention and frame pacing. Detailed skin, geometry, and link
-        // instrumentation remains in the runtime diagnostics/logging paths.
+        // Keep F8 focused on memory/frame pacing, while exposing the already
+        // sampled playfield build/draw/sort/submit timings needed to separate
+        // skin command generation from native note rendering.
         var cpuBoundFps = _debugFrameMs > 0.001 ? 1000.0 / _debugFrameMs : 0.0;
         var instantCadenceFps = _debugDrawIntervalMs > 0.001 ? 1000.0 / _debugDrawIntervalMs : 0.0;
         var averageCadenceFps = _debugDrawFpsAverage > 0.001
@@ -199,6 +205,7 @@ public sealed partial class Playfield
         var backgroundLuaRenderKb = _skinRuntime.GetDebugSkinSectionAllocatedBytes(1) / 1024.0;
         var spriteApiCalls = _skinRuntime.DebugLastSpriteApiCalls;
         var spriteApiKb = _skinRuntime.DebugLastSpriteApiAllocatedBytes / 1024.0;
+        var spriteApiMs = _skinRuntime.DebugLastSpriteApiMilliseconds;
         const double bytesToMb = 1.0 / (1024.0 * 1024.0);
         var lines = new[]
         {
@@ -210,7 +217,14 @@ public sealed partial class Playfield
             $"AUDIO   Buffers {native.AudioBufferCount} / {native.AudioBufferBytes * bytesToMb:0.0} MB   music {native.MusicBufferBytes * bytesToMb:0.0}   SFX {native.SoundEffectBufferBytes * bytesToMb:0.0}   instances {native.AudioInstanceCount} (music {native.MusicInstanceCount} / SFX {native.SoundEffectInstanceCount})",
             $"PERF    FPS {instantCadenceFps:0.0} now / {averageCadenceFps:0.0} avg   CPU-only {cpuBoundFps:0} FPS   draw {_debugFrameMs:0.00} ms   max gap {maxInterval:0.00} ms   late {lateIntervals}",
             $"BG      Lua render {backgroundLuaRenderMs:0.000} ms / {backgroundLuaRenderKb:0.0} KB   draw {_debugBackgroundDrawMs:0.000} ms   cmds {_debugBackgroundDrawCommandCount}",
-            $"SKIN    build {_debugSkinBuildMs:0.00} ms   draw {_debugSkinDrawMs:0.00} ms   sprite API {spriteApiCalls} calls / {spriteApiKb:0.0} KB",
+            $"SKIN    build {_debugSkinBuildMs:0.00} ms   Lua {_skinRuntime.DebugLastRenderCallMilliseconds:0.00}   layout {_skinRuntime.DebugLastResolveLayoutMilliseconds:0.00}   sort {_skinRuntime.DebugLastRenderSortMilliseconds:0.00}   draw {_debugSkinDrawMs:0.00} ms",
+            $"SKIN API sprite {spriteApiCalls} / {spriteApiMs:0.000} ms / {spriteApiKb:0.0} KB   text {_skinRuntime.DebugLastTextApiMilliseconds:0.000} ms   rect {_skinRuntime.DebugLastRectApiMilliseconds:0.000} ms   shadow {_skinRuntime.DebugLastShadowApiMilliseconds:0.000} ms",
+            $"SKIN PARTS bg {backgroundLuaRenderMs:0.000}   panels {_skinRuntime.GetDebugSkinSectionMilliseconds(2):0.000}   stage {_skinRuntime.GetDebugSkinSectionMilliseconds(3):0.000}   rank {_skinRuntime.GetDebugSkinSectionMilliseconds(4):0.000}   clear {_skinRuntime.GetDebugSkinSectionMilliseconds(5):0.000}   score/gauge {_skinRuntime.GetDebugSkinSectionMilliseconds(6):0.000}   combo {_skinRuntime.GetDebugSkinSectionMilliseconds(7):0.000}",
+            $"SKIN FX  timing {_skinRuntime.GetDebugSkinSectionMilliseconds(8):0.000}   timing text {_skinRuntime.GetDebugSkinSectionMilliseconds(13):0.000}   hit bar {_skinRuntime.GetDebugSkinSectionMilliseconds(14):0.000}   panel events {_skinRuntime.GetDebugSkinSectionMilliseconds(9):0.000}   panel queue {_skinRuntime.GetDebugSkinSectionMilliseconds(12):0.000}   lights {_skinRuntime.GetDebugSkinSectionMilliseconds(10):0.000}   characters {_skinRuntime.GetDebugSkinSectionMilliseconds(11):0.000}   panel submit {_skinRuntime.GetDebugSkinSectionMilliseconds(15):0.000}",
+            $"PLAYFIELD notes {_debugDrawNotesMs:0.00} ms / {_debugAllocNotesBytes / 1024.0:0.0} KB   textured draw {_debugTexturedDrawMs:0.00} ms   sort {_debugTexturedSortMs:0.00} ms   submit {_debugTexturedSubmitMs:0.00} ms",
+            $"PLAYFIELD skin bridge {_debugSkinNoteBridgeMs:0.00} ms / {_debugSkinNoteBridgeAllocatedBytes / 1024.0:0.0} KB",
+            $"GEOMETRY cmds {_debugTexturedCommands}   note draw calls {_debugTexturedNoteDrawCalls}   vertices {_debugTexturedNoteVertices}   visible notes {_debugVisibleRenderableNotes}   holds {_debugVisibleHolds}",
+            $"LINKS    build {_debugGameplayLinkBuildMs:0.00} ms   chains {_debugVisibleGameplayChains}   segments {_debugGameplayLinkSegments}   body quads {_debugLinkBodyQuads}   connector quads {_debugLinkConnectorQuads}",
             "*GPU/audio are TSC-owned estimates; GPU uses width×height×4, audio uses PCM bytes; internal driver allocations are excluded.",
             "*Managed used is an estimate; GC heap/fragmentation/LOH are last-GC snapshots.",
             "Ctrl+Shift+F8 copy   Ctrl+F8 compacting full GC   F8 hide",
@@ -218,6 +232,8 @@ public sealed partial class Playfield
 
         return string.Join("\n", lines);
     }
+
+#endif
 
 #if DEBUG
     private void CopyPerformanceDebugOverlayToClipboard()

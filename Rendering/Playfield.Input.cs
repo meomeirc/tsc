@@ -66,6 +66,18 @@ public sealed partial class Playfield
 
             var controlDown = keyboard.IsKeyDown(Keys.LeftControl) || keyboard.IsKeyDown(Keys.RightControl);
             var shiftDown = keyboard.IsKeyDown(Keys.LeftShift) || keyboard.IsKeyDown(Keys.RightShift);
+
+            // Ctrl+F12 is a shared desktop/Android Debug-build toggle for the
+            // projected gameplay touch hit regions. The geometry is built on all
+            // platforms so Windows can inspect the very same areas as Android.
+            if (Pressed(keyboard, Keys.F12) && controlDown)
+            {
+                _showGameplayTouchHitAreasDebug = !_showGameplayTouchHitAreasDebug;
+                _statusMessage = _showGameplayTouchHitAreasDebug
+                    ? "Touch hit-area overlay enabled (Ctrl+F12 to hide)"
+                    : "Touch hit-area overlay disabled";
+            }
+
             if (Pressed(keyboard, Keys.F8) && controlDown && shiftDown)
             {
                 CopyPerformanceDebugOverlayToClipboard();
@@ -211,7 +223,9 @@ public sealed partial class Playfield
         if (_lockMenuPlayMode)
         {
 #if DEBUG
-            if (Pressed(keyboard, Keys.F12))
+            if (Pressed(keyboard, Keys.F12) &&
+                !keyboard.IsKeyDown(Keys.LeftControl) &&
+                !keyboard.IsKeyDown(Keys.RightControl))
                 OpenGameplayResult(manualTrigger: true);
             if (Pressed(keyboard, Keys.F5))
             {
@@ -874,11 +888,67 @@ public sealed partial class Playfield
         _statusMessage = _gameplayMode ? "GAMEPLAY ON" : "GAMEPLAY OFF";
     }
 
-    private bool IsTrackKeyDown(int track) => !_editorTextInputOwnsKeyboardThisFrame && KeybindSettings.IsTrackDown(track);
+    private bool IsTrackKeyDown(int track)
+    {
+        if (_editorTextInputOwnsKeyboardThisFrame)
+            return false;
+        if (KeybindSettings.IsTrackDown(track))
+            return true;
+#if TSC_ANDROID
+        return IsAndroidTouchTrackDown(track);
+#else
+        return false;
+#endif
+    }
 
-    private bool IsTrackKeyPressed(int track) => !_editorTextInputOwnsKeyboardThisFrame && KeybindSettings.IsTrackPressed(track);
+    private bool IsTrackKeyPressed(int track)
+    {
+        if (_editorTextInputOwnsKeyboardThisFrame)
+            return false;
+        if (KeybindSettings.IsTrackPressed(track))
+            return true;
+#if TSC_ANDROID
+        return IsAndroidTouchTrackPressed(track);
+#else
+        return false;
+#endif
+    }
 
-    private bool IsSuperFlickInputPressed(ChartEvent ev) => !_editorTextInputOwnsKeyboardThisFrame && KeybindSettings.IsSuperFlickPressed(ev);
+    private bool IsTrackKeyboardKeyPressed(int track)
+    {
+        if (_editorTextInputOwnsKeyboardThisFrame || KeybindSettings.GetActionForTrack(track) is not { } action)
+            return false;
+        return KeybindSettings.IsPhysicalPressed(action);
+    }
+
+    private bool IsFlickInputPressed(ChartEvent ev, out int androidTouchId)
+    {
+        androidTouchId = -1;
+        if (_editorTextInputOwnsKeyboardThisFrame)
+            return false;
+        if (IsTrackKeyboardKeyPressed(ev.Track))
+            return true;
+#if TSC_ANDROID
+        return IsAndroidTouchFlickSwipePressed(ev, out androidTouchId);
+#else
+        return false;
+#endif
+    }
+
+    private bool IsSuperFlickInputPressed(ChartEvent ev, out int androidTouchId, out int androidTouchedTrack)
+    {
+        androidTouchId = -1;
+        androidTouchedTrack = -1;
+        if (_editorTextInputOwnsKeyboardThisFrame)
+            return false;
+        if (KeybindSettings.IsSuperFlickPressed(ev))
+            return true;
+#if TSC_ANDROID
+        return IsAndroidTouchSuperFlickSwipePressed(ev, out androidTouchId, out androidTouchedTrack);
+#else
+        return false;
+#endif
+    }
 
     private SuperFlickVisualKey SuperFlickKeyOf(ChartEvent ev)
     {

@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-android36.0</TargetFramework>
+    <RootNamespace>TSC</RootNamespace>
+    <AssemblyName>TSC</AssemblyName>
+    <ApplicationId>com.tsc.rhythmgame</ApplicationId>
+    <ApplicationTitle>TSC</ApplicationTitle>
+    <ApplicationVersion>1</ApplicationVersion>
+    <ApplicationDisplayVersion>0.0.1</ApplicationDisplayVersion>
+    <SupportedOSPlatformVersion>23.0</SupportedOSPlatformVersion>
+    <AndroidMinSdkVersion>23</AndroidMinSdkVersion>
+    <AndroidTargetSdkVersion>36</AndroidTargetSdkVersion>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <AndroidManifest>Properties/AndroidManifest.xml</AndroidManifest>
+    <MonoGamePlatform>Android</MonoGamePlatform>
+    <DefineConstants>$(DefineConstants);TSC_ANDROID</DefineConstants>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SharpCompress" Version="0.50.4" />
+    <PackageReference Include="Moonsharp" Version="2.0.0" />
+    <PackageReference Include="MonoGame.Framework.Android" Version="3.8.5.1" />
+    <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.5.1" />
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
+    <PackageReference Include="Concentus.Oggfile" Version="1.0.7" />
+    <PackageReference Include="System.Drawing.Common" Version="10.0.0" />
+    <!-- System.Drawing.Common 10.0.0 bundles System.Private.Windows.Core, whose AOT reference closure requires this package. -->
+    <PackageReference Include="System.Formats.Nrbf" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="MainActivity.cs" />
+    <Compile Include="AndroidStorage.cs" />
+    <Compile Include="Program.Android.cs" />
+    <Compile Include="FfmpegDownloadPrompt.Android.cs" />
+    <Compile Include="UnicodeTextRenderer.Android.cs" />
+    <Compile Include="WindowsFormsStubs.cs" />
+    <Compile Include="..\**\*.cs"
+             Exclude="..\Android\**\*.cs;..\bin\**\*.cs;..\obj\**\*.cs;..\Launcher\**\*.cs;..\Updater\Program.cs;..\Updater\obj\**\*.cs;..\Updater\bin\**\*.cs;..\Program.cs;..\Rendering\UnicodeTextRenderer.cs;..\Dependencies\FfmpegDownloadPrompt.cs;..\Skins\SkinDebugConsole.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(Configuration)' != 'Debug'">
+    <Compile Remove="..\Rendering\FrameLoopDiagnostics.cs" />
+    <Compile Remove="..\Rendering\Playfield.ChartDrawPacingDiagnostics.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <MonoGameContentReference Include="..\Content\Content.Android.mgcb" />
+    <EmbeddedResource Include="..\info.md" LogicalName="TSC.info.md" />
+    <EmbeddedResource Include="..\version.txt" LogicalName="TSC.version.txt" />
+
+    <AndroidAsset Include="..\gameConfig.json" Link="TSC\gameConfig.json" />
+    <AndroidAsset Include="..\keybinds.json" Link="TSC\keybinds.json" />
+    <AndroidAsset Include="..\Skins\Default\**\*" Link="TSC\Skins\Default\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

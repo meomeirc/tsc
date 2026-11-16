@@ -1381,7 +1381,10 @@ local function drawMeta(state, w, h, layer)
     local difficultyToggleH = 34 * scale
     local difficultyToggleY = exportToggleY - 6 * scale - difficultyToggleH
     local contentBottom = state.meta_category == "TEST" and (y + panelH - padding) or (difficultyToggleY - padding)
-    local contentTop = y + 156 * scale
+    -- Keep a wider gap below the difficulty/category buttons so the scroll
+    -- viewport cannot overlap their hit areas at compact viewport scales.
+    -- The bottom edge is intentionally unchanged; only the top inset grows.
+    local contentTop = y + 168 * scale
     local rowLabelH = 20 * scale
     local rowLabelGap = 5 * scale
     local baseFieldH = 46 * scale

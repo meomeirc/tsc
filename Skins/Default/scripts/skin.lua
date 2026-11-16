@@ -1,4 +1,11 @@
 -- Default gameplay skin and HUD.
+-- Optional shared API format: per-frame numeric geometry tokens avoid allocating
+-- one MoonSharp userdata wrapper per visible note component. render_notes still
+-- selects textures and submits through draw.quad3d_batch/draw.sprite. Custom skins
+-- may opt in with the same global; legacy userdata handles remain the default.
+-- With numeric-v1, note.geometry contains tokens and note.geometry_roles is a
+-- parallel role-name array. Layer defaults come directly from the C# snapshot.
+TSC_PLAYFIELD_GEOMETRY_HANDLE_FORMAT = "numeric-v1"
 
 local helpers = import("helpers")
 local background_panels = import("backgroundPanels")
@@ -53,19 +60,22 @@ local function fade_draw_options(options)
     return copy
 end
 
-function hud_draw.text(text, options)
+-- These wrappers are installed only during the short HUD fade-in. In normal
+-- gameplay hud_draw points straight at the native API, avoiding a Lua wrapper,
+-- alpha check, table copy, and pairs() traversal for every HUD draw command.
+hud_draw._text_faded = function(text, options)
     return native_draw.text(text, fade_draw_options(options))
 end
-function hud_draw.rect(options)
+hud_draw._rect_faded = function(options)
     return native_draw.rect(fade_draw_options(options))
 end
-function hud_draw.sprite(texture, options)
+hud_draw._sprite_faded = function(texture, options)
     return native_draw.sprite(texture, fade_draw_options(options))
 end
-function hud_draw.line(options)
+hud_draw._line_faded = function(options)
     return native_draw.line(fade_draw_options(options))
 end
-function hud_draw.text_batch(items, count)
+hud_draw._text_batch_faded = function(items, count)
     local faded = {}
     for index = 1, count do
         local item = items[index]
@@ -84,7 +94,7 @@ function hud_draw.text_batch(items, count)
     end
     return native_draw.text_batch(faded, count)
 end
-function hud_draw.line_batch_fast(items, count, start_index)
+hud_draw._line_batch_fast_faded = function(items, count, start_index)
     local faded = {}
     for index = 1, count do
         local item = items[index]
@@ -99,6 +109,28 @@ function hud_draw.line_batch_fast(items, count, start_index)
     end
     return native_draw.line_batch_fast(faded, count, start_index)
 end
+
+hud_draw.set_fade_active = function(active)
+    if hud_draw._fade_active == active then return end
+    hud_draw._fade_active = active
+    if active then
+        hud_draw.text = hud_draw._text_faded
+        hud_draw.rect = hud_draw._rect_faded
+        hud_draw.sprite = hud_draw._sprite_faded
+        hud_draw.line = hud_draw._line_faded
+        hud_draw.text_batch = hud_draw._text_batch_faded
+        hud_draw.line_batch_fast = hud_draw._line_batch_fast_faded
+    else
+        hud_draw.text = native_draw.text
+        hud_draw.rect = native_draw.rect
+        hud_draw.sprite = native_draw.sprite
+        hud_draw.line = native_draw.line
+        hud_draw.text_batch = native_draw.text_batch
+        hud_draw.line_batch_fast = native_draw.line_batch_fast
+    end
+end
+
+hud_draw.set_fade_active(false)
 
 local display = {
     background = true,          -- Master switch for background.lua visuals
@@ -150,6 +182,10 @@ end
 
 local function refresh_display_config()
     local use_editor_display = is_editor_mode()
+    if hud_draw._editor_mode == use_editor_display then
+        return resolved_display
+    end
+    hud_draw._editor_mode = use_editor_display
     for key, normal_value in pairs(display) do
         local value = normal_value
         if use_editor_display and editorDisplay[key] ~= nil then
@@ -183,8 +219,13 @@ local playfield_note_textures = {
     attach_flick_frames = {},
     attach_flick_multi_frames = {},
 }
+local playfield_note_role_assets = {}
+local EMPTY_PLAYFIELD_NOTE_ROLE_ASSETS = {}
 local playfield_note_draw_items = {}
 local playfield_note_previous_draw_count = 0
+-- draw.sprite reads this table synchronously, so reuse it for playfield sprite
+-- geometry rather than allocating one options table for each attachment.
+playfield_note_draw_items._sprite_options = { geometry_token = nil, layer = 0 }
 local lane_highlight_draw_items = {}
 local transition_flash_draw_items = {}
 
@@ -204,6 +245,7 @@ local light_top_texture = nil
 local rank_gradient_texture = nil
 
 local combo_texture = {}
+combo_texture._digit_values = {}
 
 local clear_font = nil
 local clear_shadow = nil
@@ -386,11 +428,12 @@ local GAUGE_SHADOW_Y = 2
 local GAUGE_SHADOW_ALPHA = 0.75
 
 local function current_gauge_value()
-    if game.gauge == nil then
+    local gauge = game.gauge
+    if gauge == nil then
         return 0
     end
 
-    return math.max(0, math.min(100, game.gauge.value or game.gauge.easy or 0))
+    return math.max(0, math.min(100, gauge.value or gauge.easy or 0))
 end
 
 -- Score formatting
@@ -734,6 +777,90 @@ function gameplay_intro_warmup_ready()
         (background_panels.are_assets_loaded() and background_panels.is_prewarm_render_complete())
 end
 
+local function build_playfield_note_role_assets()
+    local t = playfield_note_textures
+    local maps = {
+        tap = {},
+        flick = {},
+        hold = {},
+        vibrato = {},
+        link = {},
+        super_flick = {},
+    }
+
+    local function set_state(note_type, missed, simultaneous, roles)
+        local by_missed = maps[note_type]
+        local by_simultaneous = by_missed[missed]
+        if by_simultaneous == nil then
+            by_simultaneous = {}
+            by_missed[missed] = by_simultaneous
+        end
+        by_simultaneous[simultaneous] = roles
+    end
+
+    set_state("tap", true, false, { head = t.note_miss })
+    set_state("tap", true, true, { head = t.note_miss })
+    set_state("tap", false, false, { head = t.note_regular, indicator = t.light_regular })
+    set_state("tap", false, true, { head = t.note_multi or t.note_regular, indicator = t.light_multi or t.light_regular })
+
+    set_state("flick", false, false, { head = t.note_flick, indicator = t.indicator_flick })
+    set_state("flick", false, true, { head = t.note_flick_multi or t.note_flick, indicator = t.indicator_flick_multi or t.indicator_flick })
+    set_state("flick", true, false, { head = t.note_flick, indicator = t.indicator_flick })
+    set_state("flick", true, true, { head = t.note_flick_multi or t.note_flick, indicator = t.indicator_flick_multi or t.indicator_flick })
+
+    for _, simultaneous in ipairs({ false, true }) do
+        local body = simultaneous and t.body_multi or t.body
+        local head = simultaneous and t.note_multi or t.note_long
+        local indicator = simultaneous and t.indicator_long_multi or t.indicator_long
+        local endpoint = simultaneous and t.tail_multi or t.tail
+        local end_cap = simultaneous and t.dim_multi or t.dim
+        local end_indicator = simultaneous and t.light_multi or t.light_long
+        set_state("hold", false, simultaneous, {
+            body = body, head = head, indicator = indicator,
+            endpoint = endpoint, end_cap = end_cap, end_indicator = end_indicator,
+        })
+        set_state("link", false, simultaneous, {
+            body = body, head = head, indicator = indicator,
+            endpoint = endpoint, connector = body,
+            end_cap = simultaneous and t.dim_multi or t.dim,
+            end_indicator = end_indicator,
+        })
+
+        local vibrato = simultaneous and t.vibrato_multi or t.vibrato
+        set_state("vibrato", false, simultaneous, {
+            body = vibrato, indicator = simultaneous and t.indicator_vibrato_multi or t.indicator_vibrato,
+            end_cap = simultaneous and t.dim_multi or t.dim_vibrato,
+            end_indicator = simultaneous and t.light_multi or t.light_vibrato,
+        })
+        set_state("vibrato", true, simultaneous, {
+            body = t.vibrato_miss or vibrato,
+            indicator = simultaneous and t.indicator_vibrato_multi or t.indicator_vibrato,
+        })
+
+        set_state("hold", true, simultaneous, {
+            body = t.body_miss, head = t.note_miss,
+            indicator = t.indicator_long_miss, endpoint = t.tail_miss,
+            end_cap = t.tail_miss,
+        })
+        set_state("link", true, simultaneous, {
+            body = t.body_miss, head = t.note_miss,
+            indicator = t.indicator_long_miss, endpoint = t.tail_miss,
+            connector = t.body_miss,
+            end_cap = simultaneous and t.dim_multi or t.dim,
+        })
+    end
+
+    maps.super_flick[false] = {
+        inner = { strip = t.super_flick_inner, highlight = t.light_inner },
+        outer = { strip = t.super_flick_outer, highlight = t.light_outer },
+    }
+    maps.super_flick[true] = {
+        inner = { strip = t.note_miss, highlight = t.light_inner },
+        outer = { strip = t.note_miss, highlight = t.light_outer },
+    }
+    return maps
+end
+
 local function start_rank_up(new_grade)
     rank_up_grade = tostring(new_grade or "")
     if rank_up_grade ~= "" then
@@ -821,6 +948,8 @@ function init()
     playfield_note_textures.super_flick_outer = assets.load("super-flick-outer.png")
     playfield_note_textures.light_inner = assets.load("light-inner.png")
     playfield_note_textures.light_outer = assets.load("light-outer.png")
+    playfield_note_role_assets = build_playfield_note_role_assets()
+
     reset_state()
     print("[skin] scripted UI loaded")
 end
@@ -839,26 +968,26 @@ local function beat_pulse(beat)
     return 1 - smooth
 end
 
-local function append_playfield_note_draw(asset, geometry, count, pulse)
+-- Geometry tokens refer to the current C# snapshot. The batch callback reads
+-- the snapshot's layer directly, so no second per-component layer table is needed.
+local function append_playfield_note_draw(asset, geometry_token, count, pulse)
     if asset == nil then return count end
     count = count + 1
     local item = playfield_note_draw_items[count]
     if item == nil then
-        item = { options = {} }
+        item = {}
         playfield_note_draw_items[count] = item
     end
     item.asset = asset
-    item.options.geometry = geometry
-    item.options.layer = geometry.layer
+    item.geometry_handle = geometry_token
+    item.layer = nil
     if pulse ~= nil then
-        item.options.alpha = 0.65 + 0.35 * pulse
-        item.options.scale_x = 1 + 0.1 * pulse
+        item.alpha = 0.65 + 0.35 * pulse
+        item.scale_x = 1 + 0.1 * pulse
     else
-        item.options.alpha = nil
-        item.options.scale_x = nil
+        item.alpha = nil
+        item.scale_x = nil
     end
-    item.options.scale_y = nil
-    item.options.color = nil
     return count
 end
 
@@ -1056,12 +1185,14 @@ end
 function render_notes(frame)
     for index = 1, playfield_note_previous_draw_count do
         local item = playfield_note_draw_items[index]
-        if item ~= nil then item.options.geometry = nil end
+        if item ~= nil then item.geometry_handle = nil end
     end
     playfield_note_previous_draw_count = 0
 
     local draw_count = 0
     local textures = playfield_note_textures
+    local sprite_options = playfield_note_draw_items._sprite_options
+    sprite_options.geometry_token = nil
     local pulse_value = beat_pulse(frame.beat)
     -- Use the same monotonic real/UI clock as hit animations. Unlike frame.time,
     -- frame.real_time continues advancing while the chart/editor preview is paused.
@@ -1070,174 +1201,72 @@ function render_notes(frame)
 
     for note_index = 1, frame.note_count do
         local note = frame.notes[note_index]
-        if note.type == "super_flick" then
-            for geometry_index = 1, #note.geometry do
-                local geometry = note.geometry[geometry_index]
-                local asset = nil
-                if geometry.role == "strip" then
-                    if note.missed then
-                        asset = textures.note_miss
-                    elseif note.family == "inner" then
-                        asset = textures.super_flick_inner
-                    else
-                        asset = textures.super_flick_outer
-                    end
-                elseif geometry.role == "highlight" then
-                    if note.family == "inner" then
-                        asset = textures.light_inner
-                    else
-                        asset = textures.light_outer
-                    end
-                end
+        local note_type = note.type
+        local missed = note.missed
+        local simultaneous = note.simultaneous
+        local note_geometry = note.geometry
+        local geometry_roles = note.geometry_roles
+
+        -- Texture-role combinations are built once during init. The hot render
+        -- loop only performs a couple of direct lookups instead of clearing and
+        -- repopulating ten hash-table entries for every visible note.
+        local role_assets
+        if note_type == "super_flick" then
+            local by_missed = playfield_note_role_assets.super_flick[missed]
+            role_assets = by_missed and (by_missed[note.family] or by_missed.outer) or nil
+        else
+            local by_type = playfield_note_role_assets[note_type]
+            local by_missed = by_type and by_type[missed] or nil
+            role_assets = by_missed and by_missed[simultaneous] or nil
+        end
+        if role_assets == nil then role_assets = EMPTY_PLAYFIELD_NOTE_ROLE_ASSETS end
+
+        local flick_attachment_asset = nil
+        if note_type == "flick" then
+            local frames = simultaneous and textures.attach_flick_multi_frames or textures.attach_flick_frames
+            flick_attachment_asset = type(frames) == "table" and frames[flick_frame_index] or nil
+            if flick_attachment_asset == nil then
+                flick_attachment_asset = simultaneous and textures.attach_flick_multi or textures.attach_flick
+            end
+        end
+
+        if note_type == "super_flick" then
+            for geometry_index = 1, #note_geometry do
+                local geometry_token = note_geometry[geometry_index]
+                local role = geometry_roles[geometry_index]
+                local asset = role_assets[role]
                 if asset ~= nil then
-                    local layer = geometry.role == "strip" and 1 or 0
-                    draw.sprite(asset, { geometry = geometry, layer = layer })
+                    sprite_options.geometry_token = geometry_token
+                    sprite_options.layer = role == "strip" and 1 or 0
+                    draw.sprite(asset, sprite_options)
+                    sprite_options.geometry_token = nil
                 end
             end
-        elseif note.type == "tap" or note.type == "flick" or note.type == "hold" or note.type == "vibrato" or note.type == "link" then
-            for geometry_index = 1, #note.geometry do
-                local geometry = note.geometry[geometry_index]
-                local role = geometry.role
-                local asset = nil
-
-                if note.type == "tap" then
-                    if role == "head" then
-                        if note.missed then
-                            asset = textures.note_miss
-                        elseif note.simultaneous then
-                            asset = textures.note_multi
-                        else
-                            asset = textures.note_regular
-                        end
-                    elseif role == "indicator" and not note.missed then
-                        asset = note.simultaneous and textures.light_multi or textures.light_regular
-                    end
-                elseif note.type == "flick" then
-                    if role == "head" then
-                        asset = note.simultaneous and textures.note_flick_multi or textures.note_flick
-                    elseif role == "indicator" then
-                        asset = note.simultaneous and textures.indicator_flick_multi or textures.indicator_flick
-                    elseif role == "flick_attachment" then
-                        if note.simultaneous then
-                            local frames = textures.attach_flick_multi_frames
-                            asset = type(frames) == "table" and frames[flick_frame_index] or nil
-                            if asset == nil then asset = textures.attach_flick_multi end
-                        else
-                            local frames = textures.attach_flick_frames
-                            asset = type(frames) == "table" and frames[flick_frame_index] or nil
-                            if asset == nil then asset = textures.attach_flick end
-                        end
-                    end
-                elseif note.type == "hold" then
-                    if role == "body" then
-                        if note.missed then
-                            asset = textures.body_miss
-                        elseif note.simultaneous then
-                            asset = textures.body_multi
-                        else
-                            asset = textures.body
-                        end
-                    elseif role == "head" then
-                        if note.missed then
-                            asset = textures.note_miss
-                        elseif note.simultaneous then
-                            asset = textures.note_multi
-                        else
-                            asset = textures.note_long
-                        end
-                    elseif role == "indicator" then
-                        if note.missed then
-                            asset = textures.indicator_long_miss
-                        elseif note.simultaneous then
-                            asset = textures.indicator_long_multi
-                        else
-                            asset = textures.indicator_long
-                        end
-                    elseif role == "endpoint" then
-                        if note.missed then
-                            asset = textures.tail_miss
-                        elseif note.simultaneous then
-                            asset = textures.tail_multi
-                        else
-                            asset = textures.tail
-                        end
-                    elseif role == "end_cap" then
-                        if note.missed then
-                            asset = textures.tail_miss
-                        elseif note.simultaneous then
-                            asset = textures.dim_multi
-                        else
-                            asset = textures.dim
-                        end
-                    elseif role == "end_indicator" and not note.missed then
-                        asset = note.simultaneous and textures.light_multi or textures.light_long
-                    end
-                elseif note.type == "vibrato" then
-                    if role == "body" then
-                        if note.missed then
-                            asset = textures.vibrato_miss
-                            if asset == nil then
-                                asset = note.simultaneous and textures.vibrato_multi or textures.vibrato
-                            end
-                        else
-                            asset = note.simultaneous and textures.vibrato_multi or textures.vibrato
-                        end
-                    elseif role == "indicator" then
-                        asset = note.simultaneous and textures.indicator_vibrato_multi or textures.indicator_vibrato
-                    elseif role == "end_cap" and not note.missed then
-                        asset = note.simultaneous and textures.dim_multi or textures.dim_vibrato
-                    elseif role == "end_indicator" and not note.missed then
-                        asset = note.simultaneous and textures.light_multi or textures.light_vibrato
-                    end
-                elseif note.type == "link" then
-                    if role == "body" or role == "connector" then
-                        if note.missed then
-                            asset = textures.body_miss
-                        elseif note.simultaneous then
-                            asset = textures.body_multi
-                        else
-                            asset = textures.body
-                        end
-                    elseif role == "head" then
-                        if note.missed then
-                            asset = textures.note_miss
-                        elseif note.simultaneous then
-                            asset = textures.note_multi
-                        else
-                            asset = textures.note_long
-                        end
-                    elseif role == "indicator" then
-                        if note.missed then
-                            asset = textures.indicator_long_miss
-                        elseif note.simultaneous then
-                            asset = textures.indicator_long_multi
-                        else
-                            asset = textures.indicator_long
-                        end
-                    elseif role == "endpoint" then
-                        if note.missed then
-                            asset = textures.tail_miss
-                        elseif note.simultaneous then
-                            asset = textures.tail_multi
-                        else
-                            asset = textures.tail
-                        end
-                    elseif role == "end_cap" then
-                        asset = note.simultaneous and textures.dim_multi or textures.dim
-                    elseif role == "end_indicator" and not note.missed then
-                        asset = note.simultaneous and textures.light_multi or textures.light_long
-                    end
+        else
+            for geometry_index = 1, #note_geometry do
+                local geometry_token = note_geometry[geometry_index]
+                local role = geometry_roles[geometry_index]
+                local asset
+                if note_type == "flick" and role == "flick_attachment" then
+                    asset = flick_attachment_asset
+                else
+                    asset = role_assets[role]
                 end
 
-                if note.type == "flick" and role == "flick_attachment" and asset ~= nil then
-                    draw.sprite(asset, { geometry = geometry, layer = geometry.layer })
+                if note_type == "flick" and role == "flick_attachment" then
+                    if asset ~= nil then
+                        sprite_options.geometry_token = geometry_token
+                        sprite_options.layer = nil
+                        draw.sprite(asset, sprite_options)
+                        sprite_options.geometry_token = nil
+                    end
                 else
                     local pulse = nil
-                    if not note.missed and
-                        ((note.type == "tap" and role == "indicator") or role == "end_indicator") then
+                    if not missed and
+                        ((note_type == "tap" and role == "indicator") or role == "end_indicator") then
                         pulse = pulse_value
                     end
-                    draw_count = append_playfield_note_draw(asset, geometry, draw_count, pulse)
+                    draw_count = append_playfield_note_draw(asset, geometry_token, draw_count, pulse)
                 end
             end
         end
@@ -1247,7 +1276,7 @@ function render_notes(frame)
         playfield_note_previous_draw_count = draw_count
         draw.quad3d_batch(playfield_note_draw_items, draw_count)
         for index = 1, draw_count do
-            playfield_note_draw_items[index].options.geometry = nil
+            playfield_note_draw_items[index].geometry_handle = nil
         end
         playfield_note_previous_draw_count = 0
     end
@@ -1263,6 +1292,7 @@ function on_gameplay_preparing()
     stage_elapsed = 0
     hud_fade_elapsed = 0
     hud_fade_alpha = 0
+    hud_draw.set_fade_active(true)
     background_panels.wait_for_intro(true)
 end
 
@@ -1274,6 +1304,7 @@ function prepare_gameplay_intro_frame()
     stage_elapsed = 0
     hud_fade_elapsed = 0
     hud_fade_alpha = 0
+    hud_draw.set_fade_active(true)
     if background_panels.prepare_intro_frame ~= nil then
         background_panels.prepare_intro_frame()
     else
@@ -1295,6 +1326,7 @@ function on_intro_start()
     reset_state()
     hud_fade_elapsed = 0
     hud_fade_alpha = 0
+    hud_draw.set_fade_active(true)
     stage_elapsed = 0
     stage_active = true
     background_panels.start_intro()
@@ -1309,6 +1341,7 @@ function on_gameplay_retry()
     reset_state()
     hud_fade_elapsed = 0
     hud_fade_alpha = 0
+    hud_draw.set_fade_active(true)
     last_grade = tostring(game.grade or "")
     rank_grade_initialized = true
     stage_active = false
@@ -1435,10 +1468,14 @@ function update(dt)
 -- Panels are hidden during the gameplay handoff.
         hud_fade_elapsed = 0
         hud_fade_alpha = 0
+        hud_draw.set_fade_active(true)
     elseif hud_fade_alpha < 1 then
         hud_fade_elapsed = math.min(HUD_FADE_IN_DURATION, hud_fade_elapsed + fade_dt)
         local t = HUD_FADE_IN_DURATION > 0 and (hud_fade_elapsed / HUD_FADE_IN_DURATION) or 1
         hud_fade_alpha = t * t * (3 - 2 * t)
+        if hud_fade_alpha >= 1 then
+            hud_draw.set_fade_active(false)
+        end
     end
     refresh_display_config()
     if resolved_display.background ~= false and resolved_display.background_tiles ~= false then
@@ -1756,6 +1793,9 @@ local function refresh_combo_cache(combo)
     combo_cached_value = combo
     combo_text = tostring(combo or 0)
     combo_digits = #combo_text
+    for index = 1, combo_digits do
+        combo_texture._digit_values[index] = tonumber(string.sub(combo_text, index, index)) or 0
+    end
 end
 
 -- Render
@@ -1804,6 +1844,7 @@ function render()
 
     local ref = screen.ref_scale
     local center_x = screen.width * 0.5
+    local score_value = game.score or 0
 
     if measure_skin then skinperf.begin(4) end
     -- Editor dimming is handled by the C# editor renderer so 2D/3D view
@@ -2032,7 +2073,7 @@ function render()
 
     if measure_skin then skinperf.begin(6) end
     if resolved_display.grade ~= false then
-        local score = math.max(0, tonumber(game.score) or 0)
+        local score = math.max(0, tonumber(score_value) or 0)
         local grade_thresholds = game.grade_thresholds
         local max_score = grade_thresholds ~= nil and (tonumber(grade_thresholds.max_score) or 0) or 0
         if max_score <= 0 then max_score = 11000000 end
@@ -2060,7 +2101,8 @@ function render()
             hud_draw.line(GRADE_UI.fill)
         end
 
-        for _, item in ipairs(GRADE_UI.steps) do
+        for step_index = 1, #GRADE_UI.steps do
+            local item = GRADE_UI.steps[step_index]
             local threshold = grade_thresholds ~= nil and tonumber(grade_thresholds[item.key]) or nil
             if threshold == nil then
                 threshold = item.fallback
@@ -2081,7 +2123,8 @@ function render()
 
         refresh_cached_text(j)
         local counter_y = screen.height - 64 * ref
-        for index, item in ipairs(JUDGEMENT_COUNT_UI) do
+        for index = 1, #JUDGEMENT_COUNT_UI do
+            local item = JUDGEMENT_COUNT_UI[index]
             local slot_x = center_x + item.center_offset * ref
             item.label_options.x = slot_x - 8 * ref
             item.label_options.y = counter_y
@@ -2102,7 +2145,7 @@ function render()
     -- Score / Accuracy
 
     if resolved_display.score ~= false then
-        local score = math.floor((game.score or 0) + 0.5)
+        local score = math.floor(score_value + 0.5)
 
         if score ~= cached_score_value then
             cached_score_value = score
@@ -2234,7 +2277,7 @@ function render()
         local left = center_x - group_width * 0.5
 
         for index = 1, digit_count do
-            local digit = tonumber(string.sub(combo_text, index, index))
+            local digit = combo_texture._digit_values[index]
 
             local texture = combo_texture[digit]
 

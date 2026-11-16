@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Android 11+ gates shared-root file access behind the All files access setting. -->
+  <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+  <!-- Legacy shared-storage permissions are used only on Android 10 and below. -->
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+  <application
+      android:label="TSC"
+      android:allowBackup="false"
+      android:usesCleartextTraffic="false"
+      android:requestLegacyExternalStorage="true"
+      android:enableOnBackInvokedCallback="true" />
+</manifest>

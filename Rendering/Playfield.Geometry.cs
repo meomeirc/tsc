@@ -1510,7 +1510,7 @@ public sealed partial class Playfield
             }
         }
 
-        var measureSubmit = _projection.PerformanceDebugEnabled;
+        var measureSubmit = _performanceDebugInstrumentFrame;
         var submitStartTimestamp = measureSubmit ? Stopwatch.GetTimestamp() : 0L;
         foreach (var pass in _textureEffect.CurrentTechnique.Passes)
         {
@@ -1691,7 +1691,7 @@ public sealed partial class Playfield
                 }
             }
 
-            var measureSubmit = _projection.PerformanceDebugEnabled;
+            var measureSubmit = _performanceDebugInstrumentFrame;
             var submitStartTimestamp = measureSubmit ? Stopwatch.GetTimestamp() : 0L;
             if (commands[commandIndex].IsLine)
             {
@@ -1703,6 +1703,10 @@ public sealed partial class Playfield
                 _laneLineEffect.Parameters["WorldViewProjection"]?.SetValue(
                     _textureEffect.World * _textureEffect.View * _textureEffect.Projection);
                 _laneLineEffect.Parameters["Texture"]?.SetValue(texture);
+                var laneViewport = _graphics.Viewport;
+                _laneLineEffect.Parameters["ScreenHeight"]?.SetValue((float)laneViewport.Height);
+                _laneLineEffect.Parameters["ViewportSize"]?.SetValue(
+                    new Vector2(laneViewport.Width, laneViewport.Height));
 
                 // Give the shader the exact four projected quad corners. It uses
                 // those edges directly for the line texture's U coordinate, so
@@ -2016,13 +2020,13 @@ public sealed partial class Playfield
 
         if (!alreadySorted && commands.Count > 1 && !IsDepthLayerSorted(commands))
         {
-            var sortStartTimestamp = _projection.PerformanceDebugEnabled ? Stopwatch.GetTimestamp() : 0L;
+            var sortStartTimestamp = _performanceDebugInstrumentFrame ? Stopwatch.GetTimestamp() : 0L;
             commands.Sort((a, b) =>
             {
                 var depth = b.Depth.CompareTo(a.Depth);
                 return depth != 0 ? depth : a.Layer.CompareTo(b.Layer);
             });
-            if (_projection.PerformanceDebugEnabled)
+            if (_performanceDebugInstrumentFrame)
                 _debugTexturedSortMs += ElapsedMilliseconds(sortStartTimestamp);
         }
 
@@ -2036,7 +2040,7 @@ public sealed partial class Playfield
             0, _graphics.Viewport.Width,
             _graphics.Viewport.Height, 0, -1, 1);
 
-        var measureSubmit = _projection.PerformanceDebugEnabled;
+        var measureSubmit = _performanceDebugInstrumentFrame;
         var runStart = 0;
         while (runStart < commands.Count)
         {
@@ -2100,13 +2104,13 @@ public sealed partial class Playfield
 
         if (!alreadySorted && commands.Count > 1 && !IsDepthLayerSorted(commands))
         {
-            var sortStartTimestamp = _projection.PerformanceDebugEnabled ? Stopwatch.GetTimestamp() : 0L;
+            var sortStartTimestamp = _performanceDebugInstrumentFrame ? Stopwatch.GetTimestamp() : 0L;
             commands.Sort((a, b) =>
             {
                 var depth = b.Depth.CompareTo(a.Depth);
                 return depth != 0 ? depth : a.Layer.CompareTo(b.Layer);
             });
-            if (_projection.PerformanceDebugEnabled)
+            if (_performanceDebugInstrumentFrame)
                 _debugTexturedSortMs += ElapsedMilliseconds(sortStartTimestamp);
         }
 
@@ -2135,7 +2139,7 @@ public sealed partial class Playfield
             1f,
             Math.Max(maxCameraDistance, _projection.StandingNoteRenderFarClip()));
 
-        var measureSubmit = _projection.PerformanceDebugEnabled;
+        var measureSubmit = _performanceDebugInstrumentFrame;
         var runStart = 0;
         while (runStart < commands.Count)
         {
@@ -2198,13 +2202,13 @@ public sealed partial class Playfield
         // a note overlay (hold/light icon) is always drawn after its base note.
         if (!alreadySorted && commands.Count > 1 && !IsDepthLayerSorted(commands))
         {
-            var sortStartTimestamp = _projection.PerformanceDebugEnabled ? Stopwatch.GetTimestamp() : 0L;
+            var sortStartTimestamp = _performanceDebugInstrumentFrame ? Stopwatch.GetTimestamp() : 0L;
             commands.Sort((a, b) =>
             {
                 var depth = b.Depth.CompareTo(a.Depth);
                 return depth != 0 ? depth : a.Layer.CompareTo(b.Layer);
             });
-            if (_projection.PerformanceDebugEnabled)
+            if (_performanceDebugInstrumentFrame)
                 _debugTexturedSortMs += ElapsedMilliseconds(sortStartTimestamp);
         }
 
@@ -2216,7 +2220,7 @@ public sealed partial class Playfield
         _textureEffect.View = Matrix.Identity;
         _textureEffect.Projection = Matrix.CreateOrthographicOffCenter(0, _graphics.Viewport.Width, _graphics.Viewport.Height, 0, -1, 1);
 
-        var measureSubmit = _projection.PerformanceDebugEnabled;
+        var measureSubmit = _performanceDebugInstrumentFrame;
         var runStart = 0;
         while (runStart < commands.Count)
         {

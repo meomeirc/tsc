@@ -18,7 +18,17 @@ function render()
     local page_padding = tonumber(style.page_padding or 48) or 48
     local button_height = tonumber(style.button_height or UI.spacing.button_height) or UI.spacing.button_height
     local button_gap = tonumber(style.button_gap or UI.spacing.button_gap) or UI.spacing.button_gap
-    local buttons_count = 5
+    local selected = math.max(0, math.floor(tonumber(menu.selected or 0) or 0))
+    local buttons = {
+        { id = "play", label = "PLAY", action = "play" },
+    }
+    if menu.chart_editor_enabled ~= false then
+        table.insert(buttons, { id = "chart_editor", label = "CHART EDITOR", action = "chart_editor" })
+    end
+    table.insert(buttons, { id = "settings", label = "SETTINGS", action = "settings" })
+    table.insert(buttons, { id = "info", label = "INFO", action = "info" })
+    table.insert(buttons, { id = "exit", label = "EXIT", action = "exit" })
+    local buttons_count = #buttons
     local button_width = math.min(
         tonumber(style.button_width or UI.spacing.button_width) or UI.spacing.button_width,
         math.max(1, (width - page_padding * 2 - button_gap * (buttons_count - 1)) / buttons_count))
@@ -55,15 +65,6 @@ function render()
             layer = 1,
         })
     end
-
-    local selected = math.max(0, math.floor(tonumber(menu.selected or 0) or 0))
-    local buttons = {
-        { id = "play", label = "PLAY", action = "play" },
-        { id = "chart_editor", label = "CHART EDITOR", action = "chart_editor" },
-        { id = "settings", label = "SETTINGS", action = "settings" },
-        { id = "info", label = "INFO", action = "info" },
-        { id = "exit", label = "EXIT", action = "exit" },
-    }
 
     for index, button in ipairs(buttons) do
         UI.draw_button({

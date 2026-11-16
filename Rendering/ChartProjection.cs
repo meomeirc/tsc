@@ -154,6 +154,7 @@ public readonly record struct BankSurface(
 
 public sealed class ChartProjection
 {
+#if DEBUG
     public bool PerformanceDebugEnabled { get; set; }
     public int DebugProjectCalls { get; private set; }
     public int DebugProjectAtTicksCalls { get; private set; }
@@ -173,6 +174,9 @@ public sealed class ChartProjection
         DebugScrollPixelsCalls = 0;
         DebugScrollPixelsAtTicksCalls = 0;
     }
+#else
+    public const bool PerformanceDebugEnabled = false;
+#endif
 
     public const float DefaultFocalDistance = 350f;
     // The camera/focal frame uses a fixed scale so neutral 3D projection remains stable.
@@ -618,7 +622,11 @@ public sealed class ChartProjection
         JudgeBlend = NormalizeBlendName(config.Judge.Blend, "normal");
 
         LaneLength = Math.Max(0f, config.Lane.Depth.Length);
-        LaneEndLength = Math.Max(0f, config.Lane.Depth.EndLength);
+        // Gameplay skins can specify the post-judge extension directly as
+        // behindCameraDistance. Keep endLength as the fallback for older skins
+        // and for editor configs that do not define the gameplay-specific value.
+        LaneEndLength = Math.Max(0f,
+            config.Lane.Depth.BehindCameraDistance ?? config.Lane.Depth.EndLength);
 
         NoteWidth = config.Note.Width;
         NoteStandAngleDegrees = Math.Clamp(config.Note.StandAngle, -90f, 90f);
@@ -703,7 +711,9 @@ public sealed class ChartProjection
 
     public ProjectedPoint Project(int track, double noteSeconds, double nowSeconds, GearState nowState)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugProjectCalls++;
+#endif
         var position = GearState.Position(track);
         var normalizedX = LaneNormalizedX(track);
         var travelPixels = ScrollPixels(noteSeconds, nowSeconds);
@@ -931,7 +941,8 @@ public sealed class ChartProjection
         float normalizedX,
         float travelPixels,
         string side,
-        string? bank = null)
+        string? bank = null,
+        bool allowOutsideBank = false)
     {
         bank ??= InferBankForNormalizedX(normalizedX, side);
         var laneTravel = Math.Max(1f, LaneTravelDistanceForNormalizedX(normalizedX, side, bank));
@@ -945,7 +956,9 @@ public sealed class ChartProjection
 
         var edges = LaneBankEdgesNormalized(side, bank);
         var span = Math.Max(0.0001f, edges.Right - edges.Left);
-        var fraction = Math.Clamp((normalizedX - edges.Left) / span, 0f, 1f);
+        var fraction = (normalizedX - edges.Left) / span;
+        if (!allowOutsideBank)
+            fraction = Math.Clamp(fraction, 0f, 1f);
         var sideFraction = side == "left" ? 1f - fraction : fraction;
         var near = Vector3.Lerp(surface.NearInner, surface.NearOuter, sideFraction);
         var far = Vector3.Lerp(surface.FarInner, surface.FarOuter, sideFraction);
@@ -1078,14 +1091,22 @@ public sealed class ChartProjection
             screen, 1f, Math.Max(0f, -cameraPoint.Z), 1f, 1f, 1f, cameraPoint.Z);
     }
 
-    private ProjectedPoint ProjectTravel(float normalizedX, float travelPixels, string side, string? bank = null)
+    private ProjectedPoint ProjectTravel(
+        float normalizedX,
+        float travelPixels,
+        string side,
+        string? bank = null,
+        bool allowOutsideBank = false)
     {
         bank ??= InferBankForNormalizedX(normalizedX, side);
         var surface = BuildBankSurface(side, bank);
         var edges = LaneBankEdgesNormalized(side, bank);
-        var surfaceT = SurfaceTravelT(surface, normalizedX, travelPixels, side, bank);
+        var surfaceT = SurfaceTravelT(
+            surface, normalizedX, travelPixels, side, bank, allowOutsideBank);
         var span = Math.Max(0.0001f, edges.Right - edges.Left);
-        var fraction = Math.Clamp((normalizedX - edges.Left) / span, 0f, 1f);
+        var fraction = (normalizedX - edges.Left) / span;
+        if (!allowOutsideBank)
+            fraction = Math.Clamp(fraction, 0f, 1f);
         var sideFraction = side == "left" ? 1f - fraction : fraction;
         var near = Vector3.Lerp(surface.NearInner, surface.NearOuter, sideFraction);
         var far = Vector3.Lerp(surface.FarInner, surface.FarOuter, sideFraction);
@@ -1093,6 +1114,16 @@ public sealed class ChartProjection
         var screen = ScreenPositionFromCameraSpace(cameraPoint);
         return new ProjectedPoint(screen, 1f, Math.Max(0f, -cameraPoint.Z), 1f, 1f, 1f, cameraPoint.Z);
     }
+
+    /// <summary>
+    /// Projects a point on the same bank surface while allowing its horizontal
+    /// position to extend beyond the visible bank edges. This is used for touch
+    /// hit areas: unlike visual lane geometry, a touch target may intentionally
+    /// occupy the empty space outside the tracks.
+    /// </summary>
+    public ProjectedPoint ProjectSideTravelExtended(
+        float normalizedX, float travelPixels, string side, string? bank = null)
+        => ProjectTravel(normalizedX, travelPixels, side, bank, allowOutsideBank: true);
 
     private ProjectedPoint InvalidTrackPoint()
         => new(new Vector2(JudgeX, JudgeY), 1f, 0f, 1f, 1f, 1f, 0f);
@@ -1348,13 +1379,17 @@ public sealed class ChartProjection
 
     public ProjectedPoint ProjectSideTravel(float normalizedX, float travelPixels, string side, string? bank = null)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugProjectSideTravelCalls++;
+#endif
         return ProjectTravel(normalizedX, travelPixels, side, bank);
     }
 
     public ProjectedLanePoint ProjectSideTravelFrame(float normalizedX, float travelPixels, string side, string? bank = null)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugProjectSideTravelFrameCalls++;
+#endif
         var point = ProjectTravel(normalizedX, travelPixels, side, bank);
         var surface = BuildBankSurface(side, bank);
         var basis = BuildStandingNoteBasis(surface, normalizedX, travelPixels, side, bank);
@@ -1951,7 +1986,9 @@ public sealed class ChartProjection
 
     public float ScrollPixels(double noteSeconds, double nowSeconds)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugScrollPixelsCalls++;
+#endif
         if (_tempo is null || ConstantScroll)
             return (float)((noteSeconds - nowSeconds) * BaseScrollSpeed * _resolutionScale * ScrollSpeedScale);
 
@@ -1974,7 +2011,9 @@ public sealed class ChartProjection
 
     public float ScrollPixelsAtTicks(double noteTick, double nowTick)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugScrollPixelsAtTicksCalls++;
+#endif
         if (_tempo is null)
         {
             var pixelsPerTick = BaseScrollSpeed * _resolutionScale * 60.0 / 120.0 / 48.0;
@@ -2009,7 +2048,9 @@ public sealed class ChartProjection
 
     public ProjectedPoint ProjectAtTicks(int track, double noteTick, double nowTick, GearState nowState)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugProjectAtTicksCalls++;
+#endif
         var travelPixels = ScrollPixelsAtTicks(noteTick, nowTick);
         return ProjectAtTravel(track, travelPixels, nowState);
     }
@@ -2027,7 +2068,9 @@ public sealed class ChartProjection
     // the tempo-map/scroll calculation when they already have that travel value.
     public ProjectedPoint ProjectAtTravel(int track, float travelPixels, GearState nowState)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugProjectAtTravelCalls++;
+#endif
         var position = GearState.Position(track);
         var normalizedX = LaneNormalizedX(track);
         if (position is null)
@@ -2044,7 +2087,9 @@ public sealed class ChartProjection
     // the orbital transform so callers can reuse it for body/connector geometry.
     public ProjectedLanePoint ProjectAtTravelFrame(int track, float travelPixels, GearState nowState)
     {
+#if DEBUG
         if (PerformanceDebugEnabled) DebugProjectAtTravelCalls++;
+#endif
         var position = GearState.Position(track);
         var normalizedX = LaneNormalizedX(track);
         if (position is null)

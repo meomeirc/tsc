@@ -195,7 +195,7 @@ public sealed partial class Playfield
             ? "EDITOR: Ctrl+S TSC  Ctrl+Shift+S ARES  Ctrl+Alt+S FPK. Select a tool and tap a lane to place notes."
 #endif
 #if DEBUG
-            : "Click note/beat = inspect tick   Right-click = clear   Space Play/Pause   F4 Gameplay   F6 Orbit   F7 Flash   F8 Performance   F9 SuperFlick   F11 Aux Tracks   B Beat Lines   F2 FPK   F3 ARES   R Restart   F1 Settings";
+            : "Click note/beat = inspect tick   Right-click = clear   Space Play/Pause   F4 Gameplay   F6 Orbit   F7 Flash   F8 Performance   F9 SuperFlick   F11 Aux Tracks   Ctrl+F12 Touch Areas   B Beat Lines   F2 FPK   F3 ARES   R Restart   F1 Settings";
 #else
             : "Click note/beat = inspect tick   Right-click = clear   Space Play/Pause   F4 Gameplay   B Beat Lines   F2 FPK   F3 ARES   R Restart   F1 Settings";
 #endif
@@ -2256,6 +2256,10 @@ public sealed partial class Playfield
         var seriesValue = _editorBundleTemplate == ChartBundleTemplate.Tsts ? "Unsupported by TSTS" : Show(_chart.Series);
         var judgementPrefix = _editorCustomJudgementWindowsEnabled;
         var difficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+        var levelLabel = string.Equals(_editorMetaCategory, "SONG", StringComparison.OrdinalIgnoreCase) &&
+                         GetEditorEstimatedLevel(_chart, difficultyCode) is { } estimatedLevel
+            ? $"LEVEL (ESTIMATED ~{estimatedLevel})"
+            : "LEVEL";
 
         var rows = _editorMetaCategory switch
         {
@@ -2269,7 +2273,7 @@ public sealed partial class Playfield
                 ("DESCRIPTION", Show(_chart.Description)),
                 ("ELEMENT", Show(_chart.Element)),
                 ("SERIES", seriesValue),
-                ("LEVEL", _chart.Level?.ToString(CultureInfo.InvariantCulture) ?? "Not set"),
+                (levelLabel, _chart.Level?.ToString(CultureInfo.InvariantCulture) ?? "Not set"),
                 ("BPM", _chart.MetadataBpm.ToString("0.###", CultureInfo.InvariantCulture)),
                 ("INITIAL CHART BPM", GetEditorInitialChartBpm().ToString("0.###", CultureInfo.InvariantCulture)),
                 ("START GEAR", $"{initialMode} (attr {_chart.InitialGearAttr})"),
@@ -2772,6 +2776,7 @@ public sealed partial class Playfield
         "SC PASSCODE" => "sc_passcode",
         "SERIES" when _editorBundleTemplate != ChartBundleTemplate.Tsts => "series",
         "LEVEL" => "level",
+        _ when label.StartsWith("LEVEL (ESTIMATED ", StringComparison.OrdinalIgnoreCase) => "level",
         "BPM" => "metadata_bpm",
         "PERFECT+ MS" when _editorCustomJudgementWindowsEnabled => "judgment_perfect_plus_ms",
         "PERFECT MS" when _editorCustomJudgementWindowsEnabled => "judgment_perfect_ms",

@@ -20,6 +20,10 @@
   <ItemGroup Condition="'$(Configuration)' == 'Publish'">
     <Compile Remove="Skins\SkinDebugConsole.cs" />
   </ItemGroup>
+  <ItemGroup Condition="'$(Configuration)' != 'Debug'">
+    <Compile Remove="Rendering\FrameLoopDiagnostics.cs" />
+    <Compile Remove="Rendering\Playfield.ChartDrawPacingDiagnostics.cs" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="SharpCompress" Version="0.50.4" />
     <PackageReference Include="Moonsharp" Version="2.0.0" />
@@ -31,7 +35,7 @@
   <ItemGroup>
     <!-- The updater UI and update engine are part of TSC.exe now. Exclude only stale
          nested build artifacts left by older versions of the separate updater project. -->
-    <Compile Remove="obj\**\*.cs;bin\**\*.cs;Updater\obj\**\*.cs;Updater\bin\**\*.cs;Launcher\**\*.cs" />
+    <Compile Remove="obj\**\*.cs;bin\**\*.cs;Updater\obj\**\*.cs;Updater\bin\**\*.cs;Launcher\**\*.cs;Android\**\*.cs" />
     <!-- State contains generated song-list/cache data and updater bookkeeping, not project assets.
          Never allow a developer's State files to flow into build or publish outputs. -->
     <Compile Remove="State\**\*.cs" />

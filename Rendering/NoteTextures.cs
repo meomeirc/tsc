@@ -50,11 +50,13 @@ public sealed class NoteTextures : IDisposable
     private readonly string? _fallbackTextureDirectory;
     private readonly Queue<(string Variant, int FrameNumber, string Key)> _pendingHitFrames = new();
     private readonly HashSet<string> _pendingHitFrameKeys = new(StringComparer.OrdinalIgnoreCase);
+#if DEBUG
     private long _hitPreloadStartedTimestamp;
     private double _hitPreloadProcessingMilliseconds;
     private long _hitPreloadAllocatedBytes;
     private int _hitPreloadRequestedFrames;
     private int _hitPreloadCompletedFrames;
+#endif
 
     private static readonly (string Key, string RelativePath)[] TextureFiles =
     {
@@ -209,6 +211,7 @@ public sealed class NoteTextures : IDisposable
                 if (_textures.ContainsKey(key) || !_pendingHitFrameKeys.Add(key))
                     continue;
 
+#if DEBUG
                 if (_pendingHitFrames.Count == 0 && _hitPreloadStartedTimestamp == 0)
                 {
                     _hitPreloadProcessingMilliseconds = 0;
@@ -216,9 +219,12 @@ public sealed class NoteTextures : IDisposable
                     _hitPreloadRequestedFrames = 0;
                     _hitPreloadCompletedFrames = 0;
                 }
+#endif
 
                 _pendingHitFrames.Enqueue((variant, frame, key));
+#if DEBUG
                 _hitPreloadRequestedFrames++;
+#endif
             }
         }
     }
@@ -234,9 +240,11 @@ public sealed class NoteTextures : IDisposable
             return 0;
 
         var started = Stopwatch.GetTimestamp();
+#if DEBUG
         if (_hitPreloadStartedTimestamp == 0)
             _hitPreloadStartedTimestamp = started;
         var allocatedAtStart = GC.GetAllocatedBytesForCurrentThread();
+#endif
         var processed = 0;
         while (_pendingHitFrames.Count > 0 && processed < maxFrames)
         {
@@ -251,6 +259,7 @@ public sealed class NoteTextures : IDisposable
                 break;
         }
 
+#if DEBUG
         _hitPreloadCompletedFrames += processed;
         _hitPreloadProcessingMilliseconds += Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         _hitPreloadAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocatedAtStart;
@@ -268,6 +277,7 @@ public sealed class NoteTextures : IDisposable
             _hitPreloadRequestedFrames = 0;
             _hitPreloadCompletedFrames = 0;
         }
+#endif
 
         return processed;
     }
@@ -355,10 +365,12 @@ public sealed class NoteTextures : IDisposable
         _textures.Clear();
         _pendingHitFrames.Clear();
         _pendingHitFrameKeys.Clear();
+#if DEBUG
         _hitPreloadStartedTimestamp = 0;
         _hitPreloadProcessingMilliseconds = 0;
         _hitPreloadAllocatedBytes = 0;
         _hitPreloadRequestedFrames = 0;
         _hitPreloadCompletedFrames = 0;
+#endif
     }
 }

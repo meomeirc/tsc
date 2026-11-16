@@ -2,41 +2,44 @@
 local UI = ui_style
 if type(UI) ~= "table" then error("ui_style is not available") end
 
+local LAYOUT_BOX_DRAW_OPTIONS = {}
+local PANEL_DRAW_OPTIONS = {}
+
 local function is_center(value)
     return value == nil or value == "center" or value == "middle"
 end
 
 -- A transparent node provides a named coordinate frame for children.
 function UI.layout_box(options)
-    draw.rect({
-        id = options.id,
-        parent = options.parent,
-        x = options.x or 0,
-        y = options.y or 0,
-        width = math.max(1, options.width or 1),
-        height = math.max(1, options.height or 1),
-        anchor = options.anchor or "top-left",
-        color = options.color or UI.colors.transparent,
-        alpha = options.alpha == nil and 0 or options.alpha,
-        layer = options.layer or -10000,
-    })
+    local drawOptions = LAYOUT_BOX_DRAW_OPTIONS
+    drawOptions.id = options.id
+    drawOptions.parent = options.parent
+    drawOptions.x = options.x or 0
+    drawOptions.y = options.y or 0
+    drawOptions.width = math.max(1, options.width or 1)
+    drawOptions.height = math.max(1, options.height or 1)
+    drawOptions.anchor = options.anchor or "top-left"
+    drawOptions.color = options.color or UI.colors.transparent
+    drawOptions.alpha = options.alpha == nil and 0 or options.alpha
+    drawOptions.layer = options.layer or -10000
+    draw.rect(drawOptions)
 end
 
 -- A visible frame which also acts as a parent for its contents.
 function UI.draw_panel(options)
-    draw.rect({
-        id = options.id,
-        parent = options.parent,
-        x = options.x or 0,
-        y = options.y or 0,
-        width = math.max(1, options.width or 1),
-        height = math.max(1, options.height or 1),
-        anchor = options.anchor or "top-left",
-        color = options.color or UI.colors.panel,
-        alpha = options.alpha == nil and 1 or options.alpha,
-        clip = options.clip,
-        layer = options.layer or 0,
-    })
+    local drawOptions = PANEL_DRAW_OPTIONS
+    drawOptions.id = options.id
+    drawOptions.parent = options.parent
+    drawOptions.x = options.x or 0
+    drawOptions.y = options.y or 0
+    drawOptions.width = math.max(1, options.width or 1)
+    drawOptions.height = math.max(1, options.height or 1)
+    drawOptions.anchor = options.anchor or "top-left"
+    drawOptions.color = options.color or UI.colors.panel
+    drawOptions.alpha = options.alpha == nil and 1 or options.alpha
+    drawOptions.clip = options.clip
+    drawOptions.layer = options.layer or 0
+    draw.rect(drawOptions)
 end
 
 -- Returns the requested anchor point within a parent's local coordinate space.

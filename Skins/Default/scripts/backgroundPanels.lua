@@ -101,8 +101,10 @@ local CHARACTER_PATHS = PANEL_THEME.assets.characters or FALLBACK_THEME.assets.c
 local LIGHT_PATH = PANEL_THEME.assets.light or FALLBACK_THEME.assets.light
 local PANEL_COLOR_BY_ELEMENT = PANEL_THEME.colors.by_element or FALLBACK_THEME.colors.by_element
 local function current_panel_color()
+    -- SkinRuntime normalizes this enum to DANCER/VOCAL/SESSION before exposing it.
+    -- Avoid tostring()+upper() string work in the per-frame panel renderer.
     local element = game ~= nil and game.element or "DANCER"
-    return PANEL_COLOR_BY_ELEMENT[tostring(element):upper()] or PANEL_COLOR_BY_ELEMENT.DANCER or "#784649"
+    return PANEL_COLOR_BY_ELEMENT[element] or PANEL_COLOR_BY_ELEMENT.DANCER or "#784649"
 end
 
 local PANEL_LAYER = tonumber(PANEL_THEME.geometry.panel_layer) or -100
@@ -139,6 +141,7 @@ local character_quad_options = {}
 local light_quad_options = {}
 local character_flash_quad_options = {}
 local character_mask_uv = {}
+local character_mask_uv_is_full = { [17] = true, [18] = true, [19] = true, [20] = true }
 local quad3d_batch_items = {}
 local quad3d_batch_count = 0
 for index = 1, 24 do
@@ -203,6 +206,11 @@ local character_base_uv_cache = {
     [3] = { left = 0, top = 0, right = 1, bottom = 1 },
     [4] = { left = 0, top = 0, right = 1, bottom = 1 },
 }
+local neutral_light_cfg = ANIMATION_CONFIG.light.neutral
+local neutral_light_same_swing =
+    neutral_light_cfg.swingLeftFrom == neutral_light_cfg.swingRightFrom
+    and neutral_light_cfg.swingLeftTo == neutral_light_cfg.swingRightTo
+
 local neutral_light_frame_cache = {
     left = {},
     right = {},
@@ -213,13 +221,25 @@ local light_effect_cache = {
     [19] = { left = {}, right = {} },
     [20] = { left = {}, right = {} },
 }
+-- Neutral light dimensions/colors do not change during normal idle gameplay.
+-- Track when an event/presentation overrides them so idle values are restored
+-- only on a mode transition instead of rewriting six option fields per panel.
+local light_style_mode = {}
 
-local panel_geometry = {}
+local panel_layout_cache = {
+    screen_width = -1,
+    screen_height = -1,
+    ref = -1,
+    asset_width = -1,
+    asset_height = -1,
+    width = 0,
+    base_height = 0,
+    panel_y = 0,
+    panels = {},
+}
 for index = 1, 4 do
-    panel_geometry[index] = {
+    panel_layout_cache.panels[index] = {
         center_x = 0,
-        width = 0,
-        height = 0,
         depth = 0,
         yaw = PANEL_YAWS[index],
     }
@@ -393,24 +413,34 @@ local function window_from_position(base_uv, position_x, position_y, scale, padd
 
     local base_width = base_uv.right - base_uv.left
     local base_height = base_uv.bottom - base_uv.top
-    scale = clamp(tonumber(scale) or 1.0, 0.001, 1.0)
-    padding = type(padding) == "table" and padding or {}
+    if not (type(padding) == "table" and padding._tsc_normalized) then
+        scale = clamp(tonumber(scale) or 1.0, 0.001, 1.0)
+        padding = type(padding) == "table" and padding or {}
+    end
 
     local width = base_width * scale
     local height = base_height * scale
 
     -- Padding is a 0..1 fraction of the maximum safe inset for that side.
-    -- A value of 1.0 therefore reaches the midpoint, rather than being cut off
-    -- by the old 0.45 limit or pushing the crop window outside the panel.
+    -- Runtime-normalized values are prepared once per animation config, avoiding
+    -- repeated type checks and tonumber conversions for every animated panel.
     local available_x = math.max(0, 1.0 - width)
     local available_y = math.max(0, 1.0 - height)
     local max_horizontal_padding = available_x * 0.5
     local max_vertical_padding = available_y * 0.5
 
-    local left_padding = clamp(tonumber(padding.left) or 0, 0, 1) * max_horizontal_padding
-    local right_padding = clamp(tonumber(padding.right) or 0, 0, 1) * max_horizontal_padding
-    local top_padding = clamp(tonumber(padding.top) or 0, 0, 1) * max_vertical_padding
-    local bottom_padding = clamp(tonumber(padding.bottom) or 0, 0, 1) * max_vertical_padding
+    local left_padding, right_padding, top_padding, bottom_padding
+    if padding._tsc_normalized then
+        left_padding = padding.left * max_horizontal_padding
+        right_padding = padding.right * max_horizontal_padding
+        top_padding = padding.top * max_vertical_padding
+        bottom_padding = padding.bottom * max_vertical_padding
+    else
+        left_padding = clamp(tonumber(padding.left) or 0, 0, 1) * max_horizontal_padding
+        right_padding = clamp(tonumber(padding.right) or 0, 0, 1) * max_horizontal_padding
+        top_padding = clamp(tonumber(padding.top) or 0, 0, 1) * max_vertical_padding
+        bottom_padding = clamp(tonumber(padding.bottom) or 0, 0, 1) * max_vertical_padding
+    end
 
     -- Keep the original 0..1 travel limits used before padding was added.
     -- Zero padding therefore still reaches the literal UV edges, including
@@ -448,16 +478,7 @@ local function window_from_center(base_uv, center_x, center_y, scale, output)
     return output
 end
 
-local function corner_loop_position(name)
-    if name == "topLeft" then
-        return 0, 0
-    elseif name == "topRight" then
-        return 1, 0
-    elseif name == "bottomLeft" then
-        return 0, 1
-    end
-    return 1, 1
-end
+local CHARACTER_RUNTIME = {}
 
 local function prepare_special_indices()
     if panel_tracks == nil then
@@ -602,8 +623,9 @@ local function get_swing_angle(time_seconds, cfg, side, loop)
 
     if loop then
         local phase = (time_seconds or 0) / duration
-        local segment = math.floor(phase) % 2
-        local t = phase - math.floor(phase)
+        local whole_phase = math.floor(phase)
+        local segment = whole_phase % 2
+        local t = phase - whole_phase
         if side == "left" then
             if segment == 0 then
                 return lerp(cfg.swingLeftFrom, cfg.swingLeftTo, smoothstep(t))
@@ -637,10 +659,8 @@ local function get_neutral_light(time_seconds, side, output)
 end
 
 local function get_neutral_lights(time_seconds, left_output, right_output)
-    local cfg = ANIMATION_CONFIG.light.neutral
-    local same_swing = cfg.swingLeftFrom == cfg.swingRightFrom
-        and cfg.swingLeftTo == cfg.swingRightTo
-    if same_swing then
+    local cfg = neutral_light_cfg
+    if neutral_light_same_swing then
         local angle = math.rad(get_swing_angle(time_seconds, cfg, "left", true))
         left_output.angle = angle
         right_output.angle = angle
@@ -746,7 +766,7 @@ local function get_light_effect(track, side, event, current_time)
     return get_neutral_light(current_time, side, output)
 end
 
-local function draw_stage_lights(track, event, neutral_left, neutral_right, current_time, ref)
+local function draw_stage_lights(track, event, neutral_left, neutral_right, current_time, ref, current_mode)
     if stage_light == nil then
         return
     end
@@ -768,7 +788,12 @@ local function draw_stage_lights(track, event, neutral_left, neutral_right, curr
         right_options.width = right_effect.width * ref
         right_options.color = right_effect.color
         right_options.alpha = right_effect.alpha
-    else
+        light_style_mode[track] = "event"
+    elseif current_mode == "intro" or current_mode == "prewarm" or current_mode == "outro" then
+        -- The presentation animator writes width/color/alpha after this call.
+        light_style_mode[track] = "presentation"
+    elseif light_style_mode[track] ~= "neutral" then
+        -- Return to the neutral values once when an event/presentation ends.
         local neutral = ANIMATION_CONFIG.light.neutral
         left_options.width = neutral.width * ref
         left_options.color = neutral.color or neutral.leftColor
@@ -776,6 +801,7 @@ local function draw_stage_lights(track, event, neutral_left, neutral_right, curr
         right_options.width = neutral.width * ref
         right_options.color = neutral.color or neutral.rightColor
         right_options.alpha = neutral.opacity
+        light_style_mode[track] = "neutral"
     end
 
     left_options.rotation_z = left_effect.angle
@@ -791,7 +817,7 @@ local function draw_stage_lights(track, event, neutral_left, neutral_right, curr
     right_item.options = right_options
 end
 
-local function get_character_view(track, base_uv, event, current_time)
+local function get_character_view(track, base_uv, event, current_time, cfg)
     local output_uv = character_uv_cache[track]
     if event == nil then
         return base_uv, 1, 0
@@ -799,68 +825,121 @@ local function get_character_view(track, base_uv, event, current_time)
 
     local elapsed = math.max(0, current_time - (event.start_time or 0))
     local attr = event.attr
-    local cfg = ANIMATION_CONFIG.character[attr]
+    cfg = cfg or ANIMATION_CONFIG.character[attr]
+
+    -- Panel themes are immutable after script load. Normalize the values used by
+    -- the animation hot path once, then keep using the same configuration table.
+    -- This avoids repeated tonumber(), math.max(), nested table and string-path
+    -- lookups on every frame while preserving the user-authored theme values.
+    local runtime = CHARACTER_RUNTIME[attr]
+    if runtime == nil then
+        runtime = {}
+        if attr == 101 or attr == 102 then
+            runtime.duration = cfg.duration
+            runtime.from_x, runtime.from_y = cfg.from[1], cfg.from[2]
+            runtime.to_x, runtime.to_y = cfg.to[1], cfg.to[2]
+            runtime.visual_scale = get_character_visual_scale(cfg.zoom)
+            runtime.flash_duration = math.max(0.001,
+                tonumber(cfg.flashFadeDuration) or tonumber(ANIMATION_CONFIG.character.flashDuration) or 1.0)
+            runtime.flash_opacity = get_flash_opacity()
+            runtime.fade_out_duration = cfg.fadeOutDuration
+        elseif attr == 103 or attr == 104 then
+            runtime.segment_length = math.max(0.001, tonumber(cfg.secondsPerCorner) or 2.0)
+            runtime.path_count = #cfg.path
+            runtime.path_x, runtime.path_y = {}, {}
+            for index = 1, runtime.path_count do
+                local name = cfg.path[index]
+                if name == "topLeft" then
+                    runtime.path_x[index], runtime.path_y[index] = 0, 0
+                elseif name == "topRight" then
+                    runtime.path_x[index], runtime.path_y[index] = 1, 0
+                elseif name == "bottomLeft" then
+                    runtime.path_x[index], runtime.path_y[index] = 0, 1
+                else
+                    runtime.path_x[index], runtime.path_y[index] = 1, 1
+                end
+            end
+            runtime.window_scale = clamp(
+                tonumber(cfg.scale) or tonumber(ANIMATION_CONFIG.character.windowScale) or 0.72,
+                0.001, 1.0)
+            local padding = cfg.padding
+            if type(padding) == "table" then
+                runtime.padding = {
+                    _tsc_normalized = true,
+                    left = clamp(tonumber(padding.left) or 0, 0, 1),
+                    right = clamp(tonumber(padding.right) or 0, 0, 1),
+                    top = clamp(tonumber(padding.top) or 0, 0, 1),
+                    bottom = clamp(tonumber(padding.bottom) or 0, 0, 1),
+                }
+            else
+                runtime.padding = { _tsc_normalized = true, left = 0, right = 0, top = 0, bottom = 0 }
+            end
+        elseif attr == 105 or attr == 106 then
+            runtime.duration = math.max(0.001, tonumber(cfg.duration) or 5.0)
+            runtime.from_x, runtime.from_y = cfg.from[1], cfg.from[2]
+            runtime.to_x, runtime.to_y = cfg.to[1], cfg.to[2]
+            runtime.window_scale = tonumber(cfg.windowScale) or tonumber(cfg.scale)
+                or ANIMATION_CONFIG.character.windowScale
+            runtime.fade_out_duration = math.max(0, tonumber(cfg.fadeOutDuration) or 0)
+            local padding = cfg.padding
+            if type(padding) == "table" then
+                runtime.padding = {
+                    _tsc_normalized = true,
+                    left = clamp(tonumber(padding.left) or 0, 0, 1),
+                    right = clamp(tonumber(padding.right) or 0, 0, 1),
+                    top = clamp(tonumber(padding.top) or 0, 0, 1),
+                    bottom = clamp(tonumber(padding.bottom) or 0, 0, 1),
+                }
+            else
+                runtime.padding = { _tsc_normalized = true, left = 0, right = 0, top = 0, bottom = 0 }
+            end
+        elseif attr == 107 then
+            runtime.flash_duration = get_flash_duration(cfg)
+            runtime.flash_opacity = get_flash_opacity(cfg)
+        elseif attr == 108 then
+            runtime.movement_duration = cfg.movementDuration
+            runtime.pivot_y = cfg.pivotY
+            runtime.cycle_scales = cfg.cycleScales
+            runtime.flash_duration = get_flash_duration(cfg)
+            runtime.flash_opacity = get_flash_opacity(cfg)
+        end
+        CHARACTER_RUNTIME[attr] = runtime
+    end
 
     if attr == 101 or attr == 102 then
-        local t = animation_t(elapsed, cfg.duration)
-        local from_x, from_y = cfg.from[1], cfg.from[2]
-        local to_x, to_y = cfg.to[1], cfg.to[2]
-        local position_x = lerp(from_x, to_x, t)
-        local position_y = lerp(from_y, to_y, t)
-        local visual_scale = get_character_visual_scale(cfg.zoom)
-        local flash_duration = math.max(0.001,
-            tonumber(cfg.flashFadeDuration) or ANIMATION_CONFIG.character.flashDuration or 1.0)
-        local flash_alpha = get_flash_opacity() *
-            (1.0 - smoothstep(animation_t(elapsed, flash_duration)))
-        return base_uv, fade_out_alpha(elapsed, cfg.duration, cfg.fadeOutDuration), flash_alpha,
-            position_x, position_y, visual_scale
+        local t = animation_t(elapsed, runtime.duration)
+        local position_x = lerp(runtime.from_x, runtime.to_x, t)
+        local position_y = lerp(runtime.from_y, runtime.to_y, t)
+        local flash_alpha = runtime.flash_opacity *
+            (1.0 - smoothstep(animation_t(elapsed, runtime.flash_duration)))
+        return base_uv, fade_out_alpha(elapsed, runtime.duration, runtime.fade_out_duration), flash_alpha,
+            position_x, position_y, runtime.visual_scale
     end
 
     if attr == 103 or attr == 104 then
-        local segment_length = math.max(0.001, tonumber(cfg.secondsPerCorner) or 2.0)
-        local phase = math.max(0, elapsed) / segment_length
-        local segment = math.floor(phase) % #cfg.path
-        local segment_t = clamp((math.max(0, elapsed) % segment_length) / segment_length, 0, 1)
-        local from_name = cfg.path[segment + 1]
-        local to_name = cfg.path[(segment + 1) % #cfg.path + 1]
+        local segment_position = elapsed / runtime.segment_length
+        local segment = math.floor(segment_position) % runtime.path_count
+        local segment_t = (elapsed % runtime.segment_length) / runtime.segment_length
+        local from_x, from_y = runtime.path_x[segment + 1], runtime.path_y[segment + 1]
+        local to_index = (segment + 1) % runtime.path_count + 1
+        local position_x = lerp(from_x, runtime.path_x[to_index], segment_t)
+        local position_y = lerp(from_y, runtime.path_y[to_index], segment_t)
 
-        local from_x, from_y = corner_loop_position(from_name)
-        local to_x, to_y = corner_loop_position(to_name)
-        local position_x = lerp(from_x, to_x, segment_t)
-        local position_y = lerp(from_y, to_y, segment_t)
-
-        local corner_loop_scale = clamp(
-            tonumber(cfg.scale) or tonumber(ANIMATION_CONFIG.character.windowScale) or 0.72,
-            0.001,
-            1.0
-        )
         window_from_position(
             base_uv, position_x, position_y,
-            corner_loop_scale, cfg.padding, output_uv)
+            runtime.window_scale, runtime.padding, output_uv)
         return output_uv, 1, 0
     end
 
     if attr == 105 or attr == 106 then
-        -- from/to are normalized positions along the available crop-window
-        -- travel. 1 and 0 therefore land exactly on the far and near edges,
-        -- just like CornerLoop, without waiting for a clamped center to enter
-        -- its valid range.
-        local duration = math.max(0.001, tonumber(cfg.duration) or 5.0)
-        local t = clamp(elapsed / duration, 0, 1)
-        local from_x, from_y = cfg.from[1], cfg.from[2]
-        local to_x, to_y = cfg.to[1], cfg.to[2]
-        local position_x = lerp(from_x, to_x, t)
-        local position_y = lerp(from_y, to_y, t)
-        local window_scale = tonumber(cfg.windowScale) or tonumber(cfg.scale)
-            or ANIMATION_CONFIG.character.windowScale
-
+        local t = clamp(elapsed / runtime.duration, 0, 1)
+        local position_x = lerp(runtime.from_x, runtime.to_x, t)
+        local position_y = lerp(runtime.from_y, runtime.to_y, t)
         window_from_position(base_uv, position_x, position_y,
-            window_scale, cfg.padding, output_uv)
+            runtime.window_scale, runtime.padding, output_uv)
 
-        -- Fade during the final fadeOutDuration seconds of the movement.
-        local fade_duration = math.max(0, tonumber(cfg.fadeOutDuration) or 0)
-        local alpha = fade_duration > 0
-            and fade_out_alpha(elapsed, duration, fade_duration)
+        local alpha = runtime.fade_out_duration > 0
+            and fade_out_alpha(elapsed, runtime.duration, runtime.fade_out_duration)
             or 1
         return output_uv, alpha, 0
     end
@@ -874,19 +953,18 @@ local function get_character_view(track, base_uv, event, current_time)
             ANIMATION_CONFIG.character.windowScale,
             output_uv
         )
-        local flash_t = animation_t(elapsed, get_flash_duration(cfg))
-        local flash_alpha = get_flash_opacity(cfg) * (1.0 - smoothstep(flash_t))
+        local flash_alpha = runtime.flash_opacity *
+            (1.0 - smoothstep(animation_t(elapsed, runtime.flash_duration)))
         return output_uv, 1, flash_alpha
     end
 
     if attr == 108 then
-        local cycle = get_special_cycle(event)
-        local scale_pair = cfg.cycleScales[event.special_index or 1] or cfg.cycleScales[1]
-        local zoom_t = animation_t(elapsed, cfg.movementDuration)
+        local scale_pair = runtime.cycle_scales[event.special_index or 1] or runtime.cycle_scales[1]
+        local zoom_t = animation_t(elapsed, runtime.movement_duration)
         local scale = lerp(scale_pair[1], scale_pair[2], smoothstep(zoom_t))
-        window_from_center(base_uv, 0.5, cfg.pivotY, scale, output_uv)
-        local flash_t = animation_t(elapsed, get_flash_duration(cfg))
-        local flash_alpha = get_flash_opacity(cfg) * (1.0 - smoothstep(flash_t))
+        window_from_center(base_uv, 0.5, runtime.pivot_y, scale, output_uv)
+        local flash_alpha = runtime.flash_opacity *
+            (1.0 - smoothstep(animation_t(elapsed, runtime.flash_duration)))
         return output_uv, 1, flash_alpha
     end
 
@@ -1147,94 +1225,108 @@ local function render(display)
         presentation_clip = presentation_clip_rect
     end
 
-    local width = PANEL_WIDTH * ref
-    local gap = PANEL_GAP * ref
-    local group_width = 4 * width + 3 * gap
-    local start_x = (screen_width - group_width) * 0.5
-    local base_height = width * (panel_base.height / panel_base.width)
-    local panel_y = screen_height * 0.6
     local light_cfg = ANIMATION_CONFIG.light
-    local neutral = light_cfg.neutral
-    -- The 3D skin camera uses a 60-degree vertical field of view. Keep each
-    -- beam's top slightly offscreen, but end its lower edge exactly at the
-    -- corresponding panel's lower edge. Calculate per-side depth because the
-    -- panel yaw shifts the left and right lights along the depth axis.
-    local camera_distance = screen_height / (2.0 * math.tan(math.rad(30.0)))
-    local camera_center_y = screen_height * 0.5
-    local light_top_screen_y = (tonumber(light_cfg.topY) or -100) * ref
-    local light_front_offset = 0.5 * ref
-    local light_bottom_overhang = clamp(tonumber(light_cfg.bottomOverhang) or 0.20, 0.0, 1.0)
-
-    for index = 1, 4 do
-        local x = start_x + (index - 1) * (width + gap)
-        local center_x = x + width * 0.5
-        local yaw = PANEL_YAWS[index]
-        local track = 16 + index
-        local depth = PANEL_DEPTHS[index] * ref
-        local geometry = panel_geometry[index]
-        geometry.center_x, geometry.width, geometry.height = center_x, width, base_height
-        geometry.depth, geometry.yaw = depth, yaw
-
-        local panel_options = panel_quad_options[track]
-        panel_options.x, panel_options.y, panel_options.z = center_x, panel_y, depth
-        panel_options.width, panel_options.rotation_y = width, yaw
-        panel_options.color, panel_options.clip = panel_color, presentation_clip
-        -- Prewarm still submits the real 3D panel commands so the renderer caches
-        -- their styles and GPU pipeline, but must never reveal the panels through
-        -- a partially transparent loading transition.
-        panel_options.alpha = is_hidden_prewarm and 0.0 or 1.0
-
-        -- Place each light on its own panel plane. The x offset is panel-local,
-        -- so rotate it into world space just like the panel and character. Keep
-        -- the beam just in front of the panel to avoid it appearing detached.
+    local layout_cache = panel_layout_cache
+    local layout_changed = layout_cache.screen_width ~= screen_width
+        or layout_cache.screen_height ~= screen_height
+        or layout_cache.ref ~= ref
+        or layout_cache.asset_width ~= panel_base.width
+        or layout_cache.asset_height ~= panel_base.height
+    if layout_changed then
+        local width = PANEL_WIDTH * ref
+        local gap = PANEL_GAP * ref
+        local group_width = 4 * width + 3 * gap
+        local start_x = (screen_width - group_width) * 0.5
+        local base_height = width * (panel_base.height / panel_base.width)
+        local panel_y = screen_height * 0.6
+        local camera_distance = screen_height / (2.0 * math.tan(math.rad(30.0)))
+        local camera_center_y = screen_height * 0.5
+        local light_top_screen_y = (tonumber(light_cfg.topY) or -100) * ref
+        local light_front_offset = 0.5 * ref
+        local light_bottom_overhang = clamp(tonumber(light_cfg.bottomOverhang) or 0.20, 0.0, 1.0)
         local light_local_offset = width * light_cfg.xOffset
-        local light_cos_yaw = PANEL_COS_YAWS[index]
-        local light_sin_yaw = PANEL_SIN_YAWS[index]
 
-        local left_options = light_quad_options[track].left
-        local left_local_x = -light_local_offset
-        set_light_geometry(
-            left_options, center_x, left_local_x, depth, panel_y, base_height, yaw,
-            light_cos_yaw, light_sin_yaw, camera_center_y, camera_distance,
-            light_top_screen_y, light_front_offset, light_bottom_overhang
-        )
-        left_options.width = neutral.width * ref
-        left_options.color, left_options.alpha = neutral.color or neutral.leftColor, neutral.opacity
+        layout_cache.width = width
+        layout_cache.base_height = base_height
+        layout_cache.panel_y = panel_y
 
-        local right_options = light_quad_options[track].right
-        local right_local_x = light_local_offset
-        set_light_geometry(
-            right_options, center_x, right_local_x, depth, panel_y, base_height, yaw,
-            light_cos_yaw, light_sin_yaw, camera_center_y, camera_distance,
-            light_top_screen_y, light_front_offset, light_bottom_overhang
-        )
-        right_options.width = neutral.width * ref
-        right_options.color, right_options.alpha = neutral.color or neutral.rightColor, neutral.opacity
+        for index = 1, 4 do
+            local x = start_x + (index - 1) * (width + gap)
+            local center_x = x + width * 0.5
+            local yaw = PANEL_YAWS[index]
+            local track = 16 + index
+            local depth = PANEL_DEPTHS[index] * ref
+            local panel = layout_cache.panels[index]
+            panel.center_x, panel.depth, panel.yaw = center_x, depth, yaw
 
-        local character_asset = character_assets[index]
-        if character_asset ~= nil then
-            local base_uv = character_base_uv_cache[index]
-            get_cover_uv(character_asset, width, base_height, base_uv)
-            local mask_uv = character_mask_uv[track]
-            mask_uv.left, mask_uv.top, mask_uv.right, mask_uv.bottom = 0, 0, 1, 1
+            local panel_options = panel_quad_options[track]
+            panel_options.x, panel_options.y, panel_options.z = center_x, panel_y, depth
+            panel_options.width, panel_options.rotation_y = width, yaw
 
-            local options = character_quad_options[track]
-            options.x, options.y, options.z = center_x, panel_y, depth - (0.01 * ref)
-            options.width, options.height = width, base_height
-            options.rotation_y, options.uv = yaw, base_uv
-            options.alpha, options.mask, options.mask_uv = presentation_character_alpha, panel_base, mask_uv
-            options.clip = presentation_clip
+            local light_cos_yaw = PANEL_COS_YAWS[index]
+            local light_sin_yaw = PANEL_SIN_YAWS[index]
+            local left_options = light_quad_options[track].left
+            light_style_mode[track] = nil
+            set_light_geometry(
+                left_options, center_x, -light_local_offset, depth, panel_y, base_height, yaw,
+                light_cos_yaw, light_sin_yaw, camera_center_y, camera_distance,
+                light_top_screen_y, light_front_offset, light_bottom_overhang
+            )
+            local right_options = light_quad_options[track].right
+            set_light_geometry(
+                right_options, center_x, light_local_offset, depth, panel_y, base_height, yaw,
+                light_cos_yaw, light_sin_yaw, camera_center_y, camera_distance,
+                light_top_screen_y, light_front_offset, light_bottom_overhang
+            )
+
+            local character_asset = character_assets[index]
+            if character_asset ~= nil then
+                get_cover_uv(character_asset, width, base_height, character_base_uv_cache[index])
+            end
         end
+
+        layout_cache.screen_width = screen_width
+        layout_cache.screen_height = screen_height
+        layout_cache.ref = ref
+        layout_cache.asset_width = panel_base.width
+        layout_cache.asset_height = panel_base.height
     end
 
+    local width = layout_cache.width
+    local base_height = layout_cache.base_height
+    local panel_y = layout_cache.panel_y
+    local neutral_breathing_zoom = 1.0
+    if show_character_panels and presentation_mode == "idle" then
+        local breathing_cfg = ANIMATION_CONFIG.character.neutralBreathing or {}
+        local zoom_in = math.max(0.001, tonumber(breathing_cfg.zoomInDuration) or 3.0)
+        local zoom_out = math.max(0.001, tonumber(breathing_cfg.zoomOutDuration) or 3.0)
+        local min_zoom = math.max(1.0, tonumber(breathing_cfg.minZoom) or 1.0)
+        local max_zoom = math.max(min_zoom, tonumber(breathing_cfg.maxZoom) or 1.05)
+        local cycle_duration = zoom_in + zoom_out
+        local cycle_time = neutral_breath_elapsed % cycle_duration
+        local breath_t
+        if cycle_time < zoom_in then
+            breath_t = smoothstep(cycle_time / zoom_in)
+        else
+            breath_t = smoothstep(1.0 - ((cycle_time - zoom_in) / zoom_out))
+        end
+        neutral_breathing_zoom = min_zoom + (max_zoom - min_zoom) * breath_t
+    end
     local special_indices_ready = false
 
     for index = 1, 4 do
-        local geometry = panel_geometry[index]
-        local center_x = geometry.center_x
-        local current_width = geometry.width
-        local yaw = geometry.yaw
+        local panel = layout_cache.panels[index]
+        local center_x = panel.center_x
+        local yaw = panel.yaw
         local track = 16 + index
+        local depth = panel.depth
+        local current_width = width
+        local current_height = base_height
+        local panel_options = panel_quad_options[track]
+        panel_options.color, panel_options.clip = panel_color, presentation_clip
+        -- Prewarm submits invisible 3D commands to exercise the render path.
+        panel_options.alpha = is_hidden_prewarm and 0.0 or 1.0
+        character_quad_options[track].clip = presentation_clip
         local event = nil
         if show_stage_lights or show_character_panels then
             if profile then skinperf.begin(9) end
@@ -1259,7 +1351,8 @@ local function render(display)
         if show_stage_lights then
             if profile then skinperf.begin(10) end
             draw_stage_lights(track, event,
-                neutral_light_frame_cache.left, neutral_light_frame_cache.right, current_time, ref)
+                neutral_light_frame_cache.left, neutral_light_frame_cache.right,
+                current_time, ref, presentation_mode)
             apply_presentation_light_animation(
                 track,
                 neutral_light_frame_cache.left,
@@ -1283,13 +1376,13 @@ local function render(display)
             if character_asset ~= nil then
                 local base_uv = character_base_uv_cache[index]
                 local character_options = character_quad_options[track]
-                local character_animation = event ~= nil and ANIMATION_CONFIG.character[event.attr] ~= nil
+                local character_animation_cfg = event ~= nil and ANIMATION_CONFIG.character[event.attr] or nil
                 local flash_alpha = 0
                 local flash_uv = base_uv
 
-                if character_animation then
+                if character_animation_cfg ~= nil then
                     local uv, alpha, panel_flash_alpha, position_x, position_y, visual_scale =
-                        get_character_view(track, base_uv, event, current_time)
+                        get_character_view(track, base_uv, event, current_time, character_animation_cfg)
                     flash_uv = uv
                     flash_alpha = panel_flash_alpha or 0
                     if position_x == nil then
@@ -1298,72 +1391,75 @@ local function render(display)
                         visual_scale = 1.0
                     end
 
-                    local character_x, character_y, character_z, character_width, character_height, local_x, local_y = position_character(
-                        current_width,
-                        geometry.height,
-                        center_x,
-                        panel_y,
-                        geometry.depth,
-                        PANEL_COS_YAWS[index],
-                        PANEL_SIN_YAWS[index],
-                        position_x,
-                        position_y,
-                        visual_scale
-                    )
-                    local mask_uv = character_mask_uv[track]
-                    update_character_mask_uv(
-                        mask_uv,
-                        local_x,
-                        local_y,
-                        character_width,
-                        character_height,
-                        current_width,
-                        geometry.height
-                    )
-
-                    character_options.x = character_x
-                    character_options.y = character_y
-                    character_options.z = character_z - (0.01 * ref)
-                    character_options.width = character_width
-                    character_options.height = character_height
-                    character_options.rotation_y = yaw
                     character_options.uv = uv
                     character_options.alpha = alpha * presentation_character_alpha
                     character_options.mask = panel_base
-                    character_options.mask_uv = mask_uv
+
+                    if position_x == nil then
+                        -- Corner-loop and special zoom/snap animations only crop
+                        -- the character UVs. They leave the panel quad untouched,
+                        -- so skip the full position transform and mask calculation.
+                        character_options.x, character_options.y = center_x, panel_y
+                        character_options.z = depth - (0.01 * ref)
+                        character_options.width, character_options.height = current_width, current_height
+                        character_options.rotation_y = yaw
+                        local mask_uv = character_mask_uv[track]
+                        if not character_mask_uv_is_full[track] then
+                            mask_uv.left, mask_uv.top, mask_uv.right, mask_uv.bottom = 0, 0, 1, 1
+                            character_mask_uv_is_full[track] = true
+                        end
+                        character_options.mask_uv = mask_uv
+                    else
+                        local character_x, character_y, character_z, character_width, character_height, local_x, local_y = position_character(
+                            current_width,
+                            current_height,
+                            center_x,
+                            panel_y,
+                            depth,
+                            PANEL_COS_YAWS[index],
+                            PANEL_SIN_YAWS[index],
+                            position_x,
+                            position_y,
+                            visual_scale
+                        )
+                        local mask_uv = character_mask_uv[track]
+                        update_character_mask_uv(
+                            mask_uv,
+                            local_x,
+                            local_y,
+                            character_width,
+                            character_height,
+                            current_width,
+                            current_height
+                        )
+                        character_mask_uv_is_full[track] = false
+
+                        character_options.x = character_x
+                        character_options.y = character_y
+                        character_options.z = character_z - (0.01 * ref)
+                        character_options.width = character_width
+                        character_options.height = character_height
+                        character_options.rotation_y = yaw
+                        character_options.mask_uv = mask_uv
+                    end
                 else
                     character_options.x, character_options.y = center_x, panel_y
-                    character_options.z = geometry.depth - (0.01 * ref)
-                    character_options.width, character_options.height = current_width, geometry.height
+                    character_options.z = depth - (0.01 * ref)
+                    character_options.width, character_options.height = current_width, current_height
                     character_options.rotation_y = yaw
 
-                    local breathing_cfg = ANIMATION_CONFIG.character.neutralBreathing or {}
-                    local breathing_zoom = 1.0
-                    if presentation_mode == "idle" then
-                        local zoom_in = math.max(0.001, tonumber(breathing_cfg.zoomInDuration) or 3.0)
-                        local zoom_out = math.max(0.001, tonumber(breathing_cfg.zoomOutDuration) or 3.0)
-                        local min_zoom = math.max(1.0, tonumber(breathing_cfg.minZoom) or 1.0)
-                        local max_zoom = math.max(min_zoom, tonumber(breathing_cfg.maxZoom) or 1.05)
-                        local cycle_duration = zoom_in + zoom_out
-                        local cycle_time = neutral_breath_elapsed % cycle_duration
-                        local breath_t
-                        if cycle_time < zoom_in then
-                            breath_t = smoothstep(cycle_time / zoom_in)
-                        else
-                            breath_t = smoothstep(1.0 - ((cycle_time - zoom_in) / zoom_out))
-                        end
-                        breathing_zoom = min_zoom + (max_zoom - min_zoom) * breath_t
-                    end
-
-                    if breathing_zoom > 1.00001 then
+                    if neutral_breathing_zoom > 1.00001 then
                         character_options.uv = window_from_center(
-                            base_uv, 0.5, 0.5, 1.0 / breathing_zoom, character_uv_cache[track])
+                            base_uv, 0.5, 0.5, 1.0 / neutral_breathing_zoom, character_uv_cache[track])
                     else
                         character_options.uv = base_uv
                     end
                     character_options.alpha, character_options.mask = presentation_character_alpha, panel_base
                     local mask_uv = character_mask_uv[track]
-                    mask_uv.left, mask_uv.top, mask_uv.right, mask_uv.bottom = 0, 0, 1, 1
+                    if not character_mask_uv_is_full[track] then
+                        mask_uv.left, mask_uv.top, mask_uv.right, mask_uv.bottom = 0, 0, 1, 1
+                        character_mask_uv_is_full[track] = true
+                    end
                     character_options.mask_uv = mask_uv
                 end
 

@@ -68,6 +68,17 @@ public sealed class Game1 : Game
     private SkinRuntime? _editorMenuRuntime;
     private SkinRuntime? _settingsMenuRuntime;
     private int _mainMenuSelectedIndex;
+#if TSC_ANDROID
+    private const int MainMenuItemCount = 4;
+    private const int MainMenuSettingsIndex = 1;
+    private const int MainMenuInfoIndex = 2;
+    private const int MainMenuExitIndex = 3;
+#else
+    private const int MainMenuItemCount = 5;
+    private const int MainMenuSettingsIndex = 2;
+    private const int MainMenuInfoIndex = 3;
+    private const int MainMenuExitIndex = 4;
+#endif
     private bool _updatePromptShown;
     private int _updateAvailableFrames;
     private bool _ffmpegStartupPromptChecked;
@@ -233,8 +244,15 @@ public sealed class Game1 : Game
         _ = chartArgument;
         _graphics = new GraphicsDeviceManager(this)
         {
+#if !TSC_ANDROID
+            // Desktop starts from the project's 16:9 reference window. Android
+            // must keep GraphicsDeviceManager's platform default, which is based
+            // on Window.ClientBounds (the actual device display dimensions). A
+            // fixed 1920x1080 backbuffer leaves a 20:9 phone's extra width unused
+            // and anchors all rendered UI to the left of the physical screen.
             PreferredBackBufferWidth = _windowedWidth,
             PreferredBackBufferHeight = _windowedHeight,
+#endif
             SynchronizeWithVerticalRetrace = true,
             IsFullScreen = false
         };
@@ -244,20 +262,28 @@ public sealed class Game1 : Game
         Content.RootDirectory = "Content";
 #endif
         IsMouseVisible = true;
+#if !TSC_ANDROID
         Window.AllowUserResizing = true;
         Window.Title = "TSC";
+#endif
         UserDataPaths.Initialize();
         KeybindSettings.Initialize(UserDataPaths.KeybindsPath);
 
+#if !TSC_ANDROID
         // Monitor for Windows audio endpoint loss. Recovery recreates MonoGame's
         // entire OpenAL device/context on the game thread after earphone hot-plugging.
         OpenALAudioDeviceRecovery.Start();
+#endif
     }
 
     protected override void Initialize()
     {
         base.Initialize();
+#if TSC_ANDROID
+        ResetDisplayViewport();
+#endif
 
+#if !TSC_ANDROID
         // Windowed mode starts at 80% of the current display in both dimensions.
         // The user can still resize it freely, and the aspect ratio is preserved.
         var initialDisplayBounds = GetCurrentDisplayBounds();
@@ -268,6 +294,11 @@ public sealed class Game1 : Game
         _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
         ApplyDisplayMode(_skin.GameConfig.DisplayMode, persistConfiguration: false);
         EnsureWindowCloseHook();
+#else
+        _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
+        _appliedDisplayMode = "borderless";
+        _skin.GameConfig.DisplayMode = "borderless";
+#endif
         // Only published installations offer updates. The updater runs from the same
         // TSC.exe, using a temporary copy so the installed executable can be replaced.
 #if TSC_PUBLISH
@@ -290,7 +321,11 @@ public sealed class Game1 : Game
         _startupSpriteBatch = new SpriteBatch(GraphicsDevice);
         _startupPixel = NativeResourceDiagnostics.TrackTexture(new Texture2D(GraphicsDevice, 1, 1), NativeResourceCategory.Core);
         _startupPixel.SetData(new[] { Color.White });
+#if !TSC_ANDROID
+        // MonoGame's Android GameWindow does not expose the desktop TextInput event.
+        // Native soft-keyboard editing will be added after the menu-only milestone.
         Window.TextInput += HandleTextInput;
+#endif
 
         // Transition skins are otherwise initialized lazily by the first screen
         // handoff. Initialize and render the reveal path now, before the first
@@ -307,7 +342,9 @@ public sealed class Game1 : Game
 
     protected override void Update(GameTime gameTime)
     {
+#if DEBUG
         FrameLoopDiagnostics.BeginUpdate(gameTime);
+#endif
         var updateCompleted = false;
         try
         {
@@ -330,12 +367,18 @@ public sealed class Game1 : Game
             {
                 Program.LogRuntime($"EDITOR_RECOVERY_UPDATE_HOOK_FAILED error={ex}");
             }
+#if DEBUG
             FrameLoopDiagnostics.EndUpdate();
+#endif
         }
     }
 
     private void TryBeginEditorRecoveryOnStartup()
     {
+#if TSC_ANDROID
+        // The first Android build is menu-only. Do not restore an interrupted desktop editor session.
+        return;
+#else
         var recoveryPath = EditorRecoveryStorage.RecoveryPath;
         if (EditorRecoveryStorage.IsDisarmed)
         {
@@ -371,6 +414,7 @@ public sealed class Game1 : Game
             $"EDITOR_RECOVERY_STARTUP_FOUND activeDifficulty={manifest.ActiveDifficultyCode} " +
             $"source={manifest.SourcePath ?? manifest.BundlePath ?? "<new-chart>"}");
         BeginChartEditorLoadingTransition(StartupScreen.Gameplay, "INTERRUPTED EDITOR SESSION");
+#endif
     }
 
     private void UpdateEditorRecoveryCheckpoint()
@@ -570,25 +614,60 @@ public sealed class Game1 : Game
         }
     }
 
+    /// <summary>
+    /// Restores the full output viewport after a surface reset or a temporary
+    /// render-target pass. Android uses the entire landscape display; the virtual
+    /// render resolution derives its width from the actual viewport aspect ratio.
+    /// Desktop continues to use its normal full-window viewport.
+    /// </summary>
+    private void ResetDisplayViewport()
+    {
+        var presentation = GraphicsDevice.PresentationParameters;
+        var backBufferWidth = Math.Max(1, presentation.BackBufferWidth);
+        var backBufferHeight = Math.Max(1, presentation.BackBufferHeight);
+        var desiredViewport = new Viewport(0, 0, backBufferWidth, backBufferHeight);
+        var currentViewport = GraphicsDevice.Viewport;
+        if (currentViewport.X != desiredViewport.X || currentViewport.Y != desiredViewport.Y ||
+            currentViewport.Width != desiredViewport.Width || currentViewport.Height != desiredViewport.Height)
+        {
+            GraphicsDevice.Viewport = desiredViewport;
+        }
+    }
+
     private void UpdateFrameCore(GameTime gameTime)
     {
         ApplyMaxFrameRateConfig();
         ProcessPendingNativeWindowCloseRequest();
+#if TSC_ANDROID
+        ResetDisplayViewport();
+#endif
 
         // Device loss is detected by the background monitor, but all SoundEffect
         // disposal/recreation and MonoGame audio-context lifecycle work must run
         // on the game thread. Process it before gameplay/UI can play another sound.
         var recoveryPlayfield = _playfield;
+#if !TSC_ANDROID
         Func<bool>? prepareSongAudio = recoveryPlayfield is null ? null : recoveryPlayfield.PrepareAudioForDeviceReset;
         Action? suspendSongAudio = recoveryPlayfield is null ? null : recoveryPlayfield.SuspendAudioForDeviceReset;
         Action? restoreSongAudio = recoveryPlayfield is null ? null : recoveryPlayfield.RestoreAudioAfterDeviceReset;
         OpenALAudioDeviceRecovery.ProcessPendingRecovery(prepareSongAudio, suspendSongAudio, restoreSongAudio);
+#endif
 
         var keyboard = Keyboard.GetState();
         var inputActive = IsWindowInputActive();
+#if TSC_ANDROID
+        GlobalInput.UpdateTouch(Microsoft.Xna.Framework.Input.Touch.TouchPanel.GetState(), inputActive,
+            GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height,
+            GraphicsDevice.Viewport.X, GraphicsDevice.Viewport.Y,
+            GraphicsDevice.PresentationParameters.BackBufferWidth,
+            GraphicsDevice.PresentationParameters.BackBufferHeight);
+#else
         UpdateBorderlessTopmost(inputActive);
         GlobalInput.UpdateMouse(Mouse.GetState(), inputActive);
+#endif
         PhysicalKeyboard.Update(keyboard, GlobalInput.Mouse);
+        if (_startupScreen != StartupScreen.Gameplay || _transitionPhase != TransitionPhase.None)
+            KeybindSettings.UpdateTouchGameplayActions(Array.Empty<string>(), suppressPressEdges: true);
         KeybindSettings.UpdateRepeat(gameTime.ElapsedGameTime.TotalSeconds);
 
         if (_transitionPhase != TransitionPhase.None)
@@ -849,7 +928,9 @@ public sealed class Game1 : Game
         IsFixedTimeStep = true;
         var targetFrameRate = requestedFrameRate > 0 ? requestedFrameRate : 60;
         TargetElapsedTime = TimeSpan.FromSeconds(1.0 / targetFrameRate);
+#if DEBUG
         FrameLoopDiagnostics.SetTargetFrameRate(targetFrameRate);
+#endif
 
         // Frame limiting and VSync are separate controls. Never infer VSync from
         // a 60 FPS cap; enable it only when gameConfig explicitly requests it.
@@ -865,19 +946,26 @@ public sealed class Game1 : Game
 
     protected override void Draw(GameTime gameTime)
     {
+#if DEBUG
         FrameLoopDiagnostics.BeginDraw(gameTime);
+#endif
         try
         {
             DrawFrameCore(gameTime);
         }
         finally
         {
+#if DEBUG
             FrameLoopDiagnostics.EndDraw();
+#endif
         }
     }
 
     private void DrawFrameCore(GameTime gameTime)
     {
+#if TSC_ANDROID
+        ResetDisplayViewport();
+#endif
         if (_transitionPhase != TransitionPhase.None)
         {
             DrawTransitionFrame(gameTime);
@@ -905,7 +993,7 @@ public sealed class Game1 : Game
 
             case StartupScreen.SongSelect:
                 GraphicsDevice.SetRenderTarget(null);
-                GraphicsDevice.Viewport = new Viewport(0, 0, GraphicsDevice.PresentationParameters.BackBufferWidth, GraphicsDevice.PresentationParameters.BackBufferHeight);
+                ResetDisplayViewport();
                 _songSelect?.Draw();
                 return;
 
@@ -922,9 +1010,9 @@ public sealed class Game1 : Game
             return;
 
         GraphicsDevice.SetRenderTarget(null);
-        var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
-        var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
-        GraphicsDevice.Viewport = new Viewport(0, 0, width, height);
+        ResetDisplayViewport();
+        var width = GraphicsDevice.Viewport.Width;
+        var height = GraphicsDevice.Viewport.Height;
 
         _editorMenuRuntime.UpdateEditorExitConfirmation(true, _closeApplicationAfterEditorExitConfirmation);
         _editorMenuRuntime.UpdateScreen(width, height);
@@ -957,8 +1045,8 @@ public sealed class Game1 : Game
         if (!EnsureEditorMenuRuntime() || _editorMenuRuntime is null)
             return;
 
-        var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
-        var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
+        var width = GraphicsDevice.Viewport.Width;
+        var height = GraphicsDevice.Viewport.Height;
         _editorMenuRuntime.UpdateEditorExitConfirmation(true, _closeApplicationAfterEditorExitConfirmation);
         _editorMenuRuntime.UpdateScreen(width, height);
         var mouse = GlobalInput.Mouse;
@@ -1043,6 +1131,9 @@ public sealed class Game1 : Game
 
     private void EnsureWindowCloseHook()
     {
+#if TSC_ANDROID
+        return;
+#else
         if (!OperatingSystem.IsWindows())
             return;
 
@@ -1055,6 +1146,7 @@ public sealed class Game1 : Game
         {
             Program.LogRuntime($"WINDOW_CLOSE_HOOK_INSTALL_FAILED {ex}");
         }
+#endif
     }
 
     private void RemoveWindowCloseHook()
@@ -1227,7 +1319,7 @@ public sealed class Game1 : Game
     private void DrawStartupScreen(StartupScreen screen)
     {
         GraphicsDevice.SetRenderTarget(null);
-        GraphicsDevice.Viewport = new Viewport(0, 0, GraphicsDevice.PresentationParameters.BackBufferWidth, GraphicsDevice.PresentationParameters.BackBufferHeight);
+        ResetDisplayViewport();
         GraphicsDevice.Clear(new Color(9, 12, 18));
 
         if (screen == StartupScreen.Menu)
@@ -1303,7 +1395,7 @@ public sealed class Game1 : Game
     private void DrawStartupFallback()
     {
         GraphicsDevice.SetRenderTarget(null);
-        GraphicsDevice.Viewport = new Viewport(0, 0, GraphicsDevice.PresentationParameters.BackBufferWidth, GraphicsDevice.PresentationParameters.BackBufferHeight);
+        ResetDisplayViewport();
         GraphicsDevice.Clear(new Color(9, 12, 18));
     }
 
@@ -1331,7 +1423,7 @@ public sealed class Game1 : Game
             else
             {
                 GraphicsDevice.SetRenderTarget(null);
-                GraphicsDevice.Viewport = new Viewport(0, 0, GraphicsDevice.PresentationParameters.BackBufferWidth, GraphicsDevice.PresentationParameters.BackBufferHeight);
+                ResetDisplayViewport();
                 GraphicsDevice.Clear(Color.Black);
             }
         }
@@ -1339,8 +1431,9 @@ public sealed class Game1 : Game
         var transitionRendered = false;
         if (_transitionRuntime is { IsLoaded: true })
         {
-            var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
-            var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
+            var width = GraphicsDevice.Viewport.Width;
+            var height = GraphicsDevice.Viewport.Height;
+            _transitionRuntime.UpdateScreen(width, height);
             transitionRendered = _transitionRuntime.RenderDrawCommands(
                 _startupSpriteBatch!, _startupPixel!, _font!, width, height);
         }
@@ -1725,7 +1818,9 @@ public sealed class Game1 : Game
             _mainMenuRuntime?.Dispose();
             _editorMenuRuntime?.Dispose();
             _settingsMenuRuntime?.Dispose();
+#if !TSC_ANDROID
             Window.TextInput -= HandleTextInput;
+#endif
             if (_font is not null)
                 UnicodeTextRenderer.Dispose(GraphicsDevice);
             _startupPixel?.Dispose();
@@ -1800,6 +1895,15 @@ public sealed class Game1 : Game
         var mousePressed = mouseDown && previousMouse.LeftButton != Microsoft.Xna.Framework.Input.ButtonState.Pressed;
         _infoScroll.HandleScrollbar(mousePressed, mouseDown, mouse.Position.X, mouse.Position.Y,
             interactionTrack, totalContentHeight, contentHeight, minimumThumbSize: 22);
+#if TSC_ANDROID
+        var infoContentBounds = new Rectangle(
+            (int)MathF.Round(infoMargin),
+            (int)contentTop,
+            Math.Max(1, viewportWidth - (int)MathF.Round(infoMargin * 2f) - 24),
+            Math.Max(1, (int)Math.Round(contentHeight)));
+        _infoScroll.HandleContentDrag(mousePressed, mouseDown, mouse.Position.X, mouse.Position.Y,
+            infoContentBounds, gameTime.ElapsedGameTime.TotalSeconds);
+#endif
 
         var wheelDelta = GlobalInput.Mouse.ScrollWheelValue - GlobalInput.PreviousMouse.ScrollWheelValue;
         if (wheelDelta != 0)
@@ -1901,7 +2005,8 @@ public sealed class Game1 : Game
         };
         var previousScissor = GraphicsDevice.ScissorRectangle;
         GraphicsDevice.ScissorRectangle = new Rectangle(
-            (int)MathF.Floor(contentLeft), (int)MathF.Floor(contentTop),
+            viewport.X + (int)MathF.Floor(contentLeft),
+            viewport.Y + (int)MathF.Floor(contentTop),
             Math.Max(1, (int)MathF.Ceiling(contentWidth)),
             Math.Max(1, (int)MathF.Ceiling(contentBottom - contentTop)));
         _startupSpriteBatch.Begin(samplerState: SamplerState.LinearClamp,
@@ -2127,13 +2232,13 @@ public sealed class Game1 : Game
         // usable with arrow keys even when the menu layout is being customized.
         if (KeybindSettings.IsPressed("menu_left") || KeybindSettings.IsPressed("menu_up"))
         {
-            _mainMenuSelectedIndex = (_mainMenuSelectedIndex + 4) % 5;
+            _mainMenuSelectedIndex = (_mainMenuSelectedIndex + MainMenuItemCount - 1) % MainMenuItemCount;
             _mainMenuRuntime?.UpdateMainMenuState(_errorMessage, _mainMenuSelectedIndex);
             return;
         }
         if (KeybindSettings.IsPressed("menu_right") || KeybindSettings.IsPressed("menu_down"))
         {
-            _mainMenuSelectedIndex = (_mainMenuSelectedIndex + 1) % 5;
+            _mainMenuSelectedIndex = (_mainMenuSelectedIndex + 1) % MainMenuItemCount;
             _mainMenuRuntime?.UpdateMainMenuState(_errorMessage, _mainMenuSelectedIndex);
             return;
         }
@@ -2148,7 +2253,11 @@ public sealed class Game1 : Game
         if (_mainMenuRuntime is null || !_mainMenuRuntime.IsLoaded)
         {
             var activatePlay = mousePressed && PlayButtonBounds().Contains(mouse.Position);
+#if TSC_ANDROID
+            var activateOpen = false;
+#else
             var activateOpen = mousePressed && ChartEditorButtonBounds().Contains(mouse.Position);
+#endif
             var activateSettings = mousePressed && SettingsButtonBounds().Contains(mouse.Position);
             var activateInfo = mousePressed && InfoButtonBounds().Contains(mouse.Position);
             var activateExit = mousePressed && ExitButtonBounds().Contains(mouse.Position);
@@ -2167,14 +2276,14 @@ public sealed class Game1 : Game
 
             if (activateSettings)
             {
-                _mainMenuSelectedIndex = 2;
+                _mainMenuSelectedIndex = MainMenuSettingsIndex;
                 _startupScreen = StartupScreen.SettingsMenu;
                 return;
             }
 
             if (activateInfo)
             {
-                _mainMenuSelectedIndex = 3;
+                _mainMenuSelectedIndex = MainMenuInfoIndex;
                 _startupScreen = StartupScreen.Info;
                 _infoScroll.Reset();
                 _infoScrollOffset = 0;
@@ -2267,17 +2376,19 @@ public sealed class Game1 : Game
                 break;
             case "chart_editor":
             case "open_fpk": // Backward compatibility with older menu scripts.
+#if !TSC_ANDROID
                 _mainMenuSelectedIndex = 1;
                 _mainMenuRuntime?.UpdateMainMenuState(_errorMessage, _mainMenuSelectedIndex);
                 OpenChartEditorSourcePicker();
+#endif
                 break;
             case "settings":
-                _mainMenuSelectedIndex = 2;
+                _mainMenuSelectedIndex = MainMenuSettingsIndex;
                 _mainMenuRuntime?.UpdateMainMenuState(_errorMessage, _mainMenuSelectedIndex);
                 _startupScreen = StartupScreen.SettingsMenu;
                 break;
             case "info":
-                _mainMenuSelectedIndex = 3;
+                _mainMenuSelectedIndex = MainMenuInfoIndex;
                 _mainMenuRuntime?.UpdateMainMenuState(_errorMessage, _mainMenuSelectedIndex);
                 _infoScroll.Reset();
                 _infoScrollOffset = 0;
@@ -2291,28 +2402,40 @@ public sealed class Game1 : Game
 
     private void ActivateMainMenuItem(int index)
     {
-        switch (Math.Clamp(index, 0, 4))
+#if TSC_ANDROID
+        switch (Math.Clamp(index, 0, MainMenuItemCount - 1))
         {
-            case 0:
-                BeginMainMenuPlayTransition();
-                break;
-            case 1:
-                OpenChartEditorSourcePicker();
-                break;
-            case 2:
-                _mainMenuSelectedIndex = 2;
+            case 0: BeginMainMenuPlayTransition(); break;
+            case MainMenuSettingsIndex:
+                _mainMenuSelectedIndex = MainMenuSettingsIndex;
                 _startupScreen = StartupScreen.SettingsMenu;
                 break;
-            case 3:
-                _mainMenuSelectedIndex = 3;
+            case MainMenuInfoIndex:
+                _mainMenuSelectedIndex = MainMenuInfoIndex;
                 _infoScroll.Reset();
                 _infoScrollOffset = 0;
                 _startupScreen = StartupScreen.Info;
                 break;
-            case 4:
-                Exit();
-                break;
+            case MainMenuExitIndex: Exit(); break;
         }
+#else
+        switch (Math.Clamp(index, 0, MainMenuItemCount - 1))
+        {
+            case 0: BeginMainMenuPlayTransition(); break;
+            case 1: OpenChartEditorSourcePicker(); break;
+            case MainMenuSettingsIndex:
+                _mainMenuSelectedIndex = MainMenuSettingsIndex;
+                _startupScreen = StartupScreen.SettingsMenu;
+                break;
+            case MainMenuInfoIndex:
+                _mainMenuSelectedIndex = MainMenuInfoIndex;
+                _infoScroll.Reset();
+                _infoScrollOffset = 0;
+                _startupScreen = StartupScreen.Info;
+                break;
+            case MainMenuExitIndex: Exit(); break;
+        }
+#endif
     }
 
     private bool EnsureMainMenuRuntime()
@@ -3157,7 +3280,7 @@ public sealed class Game1 : Game
         _keybindScroll = 0;
         _startupScreen = _returnToEditorFromSettings ? StartupScreen.Gameplay : StartupScreen.Menu;
         _returnToEditorFromSettings = false;
-        _mainMenuSelectedIndex = 2;
+        _mainMenuSelectedIndex = MainMenuSettingsIndex;
         _errorMessage = null;
     }
 
@@ -3677,14 +3800,15 @@ public sealed class Game1 : Game
     {
         try
         {
+            ResetDisplayViewport();
             EnsureTransitionRuntime();
             var runtime = _transitionRuntime;
             if (runtime is null || !runtime.IsLoaded || _startupSpriteBatch is null ||
                 _startupPixel is null || _font is null)
                 return;
 
-            var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
-            var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
+            var width = GraphicsDevice.Viewport.Width;
+            var height = GraphicsDevice.Viewport.Height;
             if (width <= 0 || height <= 0)
                 return;
 
@@ -3706,7 +3830,7 @@ public sealed class Game1 : Game
             try
             {
                 GraphicsDevice.SetRenderTarget(null);
-                GraphicsDevice.Viewport = new Viewport(0, 0, width, height);
+                ResetDisplayViewport();
                 GraphicsDevice.Clear(Color.Black);
                 var rendered = runtime.RenderDrawCommands(
                     _startupSpriteBatch, _startupPixel, _font, width, height);
@@ -4072,8 +4196,8 @@ public sealed class Game1 : Game
         if (_font is null || _startupPixel is null || _startupSpriteBatch is null)
             return;
 
-        var width = GraphicsDevice.PresentationParameters.BackBufferWidth;
-        var height = GraphicsDevice.PresentationParameters.BackBufferHeight;
+        var width = GraphicsDevice.Viewport.Width;
+        var height = GraphicsDevice.Viewport.Height;
         var progress = (float)Math.Clamp(_transitionProgress, 0.0, 1.0);
         var alpha = _transitionPhase switch
         {
@@ -4568,7 +4692,10 @@ public sealed class Game1 : Game
         if (_songSelect is not null && Directory.Exists(_songSelect.SongsRoot))
             return Path.GetFullPath(_songSelect.SongsRoot);
 
-#if TSC_PUBLISH
+#if TSC_ANDROID
+        // Keep Android cache paths aligned with the shared Internal storage/TSC/songs folder.
+        return Path.GetFullPath(Path.Combine(UserDataPaths.GameRootDirectory, "songs"));
+#elif TSC_PUBLISH
         // Songs are user-managed and live beside the root launcher, not in data/.
         return Path.GetFullPath(Path.Combine(UserDataPaths.GameRootDirectory, "songs"));
 #else
@@ -6316,10 +6443,12 @@ public sealed class Game1 : Game
 
         var mouse = GlobalInput.Mouse;
         DrawFallbackMainMenuButton(PlayButtonBounds(), "PLAY", 0, mouse.Position);
+#if !TSC_ANDROID
         DrawFallbackMainMenuButton(ChartEditorButtonBounds(), "CHART EDITOR", 1, mouse.Position);
-        DrawFallbackMainMenuButton(SettingsButtonBounds(), "SETTINGS", 2, mouse.Position);
-        DrawFallbackMainMenuButton(InfoButtonBounds(), "INFO", 3, mouse.Position);
-        DrawFallbackMainMenuButton(ExitButtonBounds(), "EXIT", 4, mouse.Position);
+#endif
+        DrawFallbackMainMenuButton(SettingsButtonBounds(), "SETTINGS", MainMenuSettingsIndex, mouse.Position);
+        DrawFallbackMainMenuButton(InfoButtonBounds(), "INFO", MainMenuInfoIndex, mouse.Position);
+        DrawFallbackMainMenuButton(ExitButtonBounds(), "EXIT", MainMenuExitIndex, mouse.Position);
 
         if (!string.IsNullOrWhiteSpace(_errorMessage))
         {
@@ -6404,7 +6533,7 @@ public sealed class Game1 : Game
         const int buttonHeight = 76;
         const int gap = 22;
         const int padding = 48;
-        const int count = 5;
+        const int count = MainMenuItemCount;
         var buttonWidth = Math.Min(requestedButtonWidth,
             Math.Max(1, (viewport.Width - padding * 2 - gap * (count - 1)) / count));
         var rowWidth = buttonWidth * count + gap * (count - 1);
@@ -6417,11 +6546,11 @@ public sealed class Game1 : Game
 
     private Rectangle ChartEditorButtonBounds() => MainMenuButtonBounds(1);
 
-    private Rectangle SettingsButtonBounds() => MainMenuButtonBounds(2);
+    private Rectangle SettingsButtonBounds() => MainMenuButtonBounds(MainMenuSettingsIndex);
 
-    private Rectangle InfoButtonBounds() => MainMenuButtonBounds(3);
+    private Rectangle InfoButtonBounds() => MainMenuButtonBounds(MainMenuInfoIndex);
 
-    private Rectangle ExitButtonBounds() => MainMenuButtonBounds(4);
+    private Rectangle ExitButtonBounds() => MainMenuButtonBounds(MainMenuExitIndex);
 
     private void ToggleWindowMode()
     {
@@ -6435,6 +6564,15 @@ public sealed class Game1 : Game
 
     private void ApplyDisplayMode(string requestedMode, bool persistConfiguration)
     {
+#if TSC_ANDROID
+        _ = requestedMode;
+        _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
+        _appliedDisplayMode = "borderless";
+        _skin.GameConfig.DisplayMode = "borderless";
+        if (persistConfiguration)
+            SkinConfigStore.SaveGameConfig(UserDataPaths.GameConfigPath, _skin.GameConfig);
+        return;
+#else
         var mode = GameConfig.NormalizeDisplayMode(requestedMode);
         _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
         var previousMode = _appliedDisplayMode.Length == 0 ? "" : _appliedDisplayMode;
@@ -6583,6 +6721,7 @@ public sealed class Game1 : Game
         {
             EnsureWindowCloseHook();
         }
+#endif
     }
 
     private void CaptureWindowedSize()

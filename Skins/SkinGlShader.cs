@@ -4,6 +4,7 @@ using MoonSharp.Interpreter;
 using XnaColor = Microsoft.Xna.Framework.Color;
 using XnaMatrix = Microsoft.Xna.Framework.Matrix;
 using System.Reflection;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -53,7 +54,23 @@ internal sealed class SkinShaderStore : IDisposable
 
         var vertexSource = File.ReadAllText(vertexFullPath, Encoding.UTF8);
         var fragmentSource = File.ReadAllText(fragmentFullPath, Encoding.UTF8);
-        var program = SkinGlShaderProgram.Compile(vertexFullPath, fragmentFullPath, vertexSource, fragmentSource);
+        SkinGlShaderProgram program;
+        try
+        {
+            program = SkinGlShaderProgram.Compile(vertexFullPath, fragmentFullPath, vertexSource, fragmentSource);
+#if TSC_ANDROID
+            Program.LogRuntime(
+                $"SKIN_GLSL_LOAD_OK vertex=\"{Path.GetFileName(vertexFullPath)}\" " +
+                $"fragment=\"{Path.GetFileName(fragmentFullPath)}\" api=OpenGL_ES_2_0");
+#endif
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime(
+                $"SKIN_GLSL_LOAD_FAILED vertex=\"{Path.GetFileName(vertexFullPath)}\" " +
+                $"fragment=\"{Path.GetFileName(fragmentFullPath)}\" error={ex.GetBaseException().Message}");
+            throw;
+        }
         var handle = new SkinShaderHandle(program);
         _cache[key] = handle;
         return handle;
@@ -73,10 +90,16 @@ internal sealed class SkinShaderStore : IDisposable
             throw new InvalidOperationException($"Shader path '{requestedPath}' must use the {requiredExtension} extension.");
 
         var candidate = CombineUnderRoot(_skinDirectory, normalized);
+#if TSC_ANDROID
+        candidate = SkinAssetPathUtilities.ResolveCaseInsensitiveFile(_skinDirectory, normalized) ?? candidate;
+#endif
         if (File.Exists(candidate))
             return candidate;
 
         var fallback = CombineUnderRoot(_defaultSkinDirectory, normalized);
+#if TSC_ANDROID
+        fallback = SkinAssetPathUtilities.ResolveCaseInsensitiveFile(_defaultSkinDirectory, normalized) ?? fallback;
+#endif
         if (File.Exists(fallback))
             return fallback;
 
@@ -132,6 +155,10 @@ internal sealed class SkinGlShaderProgram : IDisposable
         string vertexSource,
         string fragmentSource)
     {
+#if TSC_ANDROID
+        vertexSource = NormalizeOpenGlesSource(vertexSource, fragmentShader: false, vertexPath);
+        fragmentSource = NormalizeOpenGlesSource(fragmentSource, fragmentShader: true, fragmentPath);
+#endif
         SkinOpenGl.EnsureLoaded();
         var vertex = CompileStage(SkinOpenGl.VertexShader, vertexSource, vertexPath);
         uint fragment = 0;
@@ -174,6 +201,69 @@ internal sealed class SkinGlShaderProgram : IDisposable
                 SkinOpenGl.DeleteShader(fragment);
         }
     }
+
+#if TSC_ANDROID
+    private static string NormalizeOpenGlesSource(string source, bool fragmentShader, string path)
+    {
+        source = source.TrimStart('\uFEFF');
+        var lines = source.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n').ToList();
+        var versionIndex = lines.FindIndex(line => line.TrimStart().StartsWith("#version", StringComparison.Ordinal));
+        if (versionIndex < 0)
+        {
+            lines.Insert(0, "#version 100");
+            versionIndex = 0;
+        }
+        else
+        {
+            var versionLine = lines[versionIndex].Trim();
+            if (string.Equals(versionLine, "#version 110", StringComparison.Ordinal))
+                lines[versionIndex] = "#version 100";
+            else if (!string.Equals(versionLine, "#version 100", StringComparison.Ordinal))
+                throw new NotSupportedException(
+                    $"Android native skin shaders require GLSL ES 1.00 (#version 100). " +
+                    $"'{Path.GetFileName(path)}' declares '{versionLine}'.");
+        }
+
+        if (fragmentShader && !lines.Any(line => line.TrimStart().StartsWith("precision ", StringComparison.Ordinal)))
+        {
+            // Mobile fragment shaders must declare a default float precision.
+            // Keep any #extension directives directly after #version, since GLSL
+            // requires extension directives to precede ordinary shader statements.
+            var precisionIndex = versionIndex + 1;
+            while (precisionIndex < lines.Count)
+            {
+                var directive = lines[precisionIndex].TrimStart();
+                if (directive.Length == 0 || directive.StartsWith("#extension", StringComparison.Ordinal) ||
+                    directive.StartsWith("#define", StringComparison.Ordinal) ||
+                    directive.StartsWith("#ifdef", StringComparison.Ordinal) ||
+                    directive.StartsWith("#ifndef", StringComparison.Ordinal) ||
+                    directive.StartsWith("#if", StringComparison.Ordinal) ||
+                    directive.StartsWith("#elif", StringComparison.Ordinal) ||
+                    directive.StartsWith("#else", StringComparison.Ordinal) ||
+                    directive.StartsWith("#endif", StringComparison.Ordinal))
+                {
+                    precisionIndex++;
+                    continue;
+                }
+                break;
+            }
+
+            // High precision keeps the same coordinate/math range as DesktopGL
+            // on current Android GPUs, rather than inheriting an implementation's
+            // lower mediump default.
+            lines.InsertRange(precisionIndex, new[]
+            {
+                "#ifdef GL_FRAGMENT_PRECISION_HIGH",
+                "precision highp float;",
+                "#else",
+                "precision mediump float;",
+                "#endif"
+            });
+        }
+
+        return string.Join("\n", lines);
+    }
+#endif
 
     private static uint CompileStage(uint type, string source, string path)
     {
@@ -347,6 +437,9 @@ internal static class SkinOpenGl
 
     private static bool _loaded;
     private static readonly object LoadLock = new();
+#if TSC_ANDROID
+    private static IntPtr _androidGlesLibrary;
+#endif
 
     internal static void EnsureLoaded()
     {
@@ -357,6 +450,18 @@ internal static class SkinOpenGl
             if (_loaded)
                 return;
 
+#if TSC_ANDROID
+            // MonoGame's Android backend uses EGL/OpenGL ES, not SDL. Resolve the
+            // GLES 2.0 entry points from the system GLES library instead of asking
+            // the DesktopGL backend for SDL_GL_GetProcAddress.
+            if (!NativeLibrary.TryLoad("libGLESv2.so", out _androidGlesLibrary) || _androidGlesLibrary == IntPtr.Zero)
+                throw new PlatformNotSupportedException("Android could not load libGLESv2.so for native skin shaders.");
+
+            IntPtr GetProc(string name)
+                => NativeLibrary.TryGetExport(_androidGlesLibrary, name, out var pointer)
+                    ? pointer
+                    : IntPtr.Zero;
+#else
             var assembly = typeof(GraphicsDevice).Assembly;
             const BindingFlags staticMembers = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
             var sdlType = assembly.GetType("Sdl", throwOnError: false) ??
@@ -388,6 +493,7 @@ internal static class SkinOpenGl
                 var result = getProcAddress.DynamicInvoke(name);
                 return result is IntPtr pointer ? pointer : IntPtr.Zero;
             }
+#endif
 
             T Load<T>(string name) where T : Delegate
             {

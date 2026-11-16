@@ -33,6 +33,7 @@ public sealed partial class Playfield
 
     private JudgementTier RegisterHit(double offsetMs, ChartEvent? eventForScore = null)
     {
+#if DEBUG
         if (_performanceDebugInstrumentFrame)
         {
             _debugLastTimingOffsetMs = offsetMs;
@@ -40,6 +41,7 @@ public sealed partial class Playfield
             _debugTimingOffsetWriteIndex = (_debugTimingOffsetWriteIndex + 1) % _debugTimingOffsets.Length;
             _debugTimingOffsetCount = Math.Min(_debugTimingOffsetCount + 1, _debugTimingOffsets.Length);
         }
+#endif
 
         var tier = GetJudgementTier(offsetMs);
         ApplyJudgement(tier, offsetMs, eventForScore);

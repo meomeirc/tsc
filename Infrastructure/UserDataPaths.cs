@@ -6,16 +6,34 @@ using System.Linq;
 namespace TSC;
 
 /// <summary>
-/// Per-user saves and runtime state live in AppData for both developer and published builds.
-/// Editable config files and the crash log remain beside the game launcher for easy access.
+/// Per-user saves and runtime state live in AppData on desktop and app-private storage on Android.
+/// User-managed content (songs and skins) resolves through GameRootDirectory.
 /// </summary>
 public static class UserDataPaths
 {
     private static readonly object Sync = new();
+#if TSC_ANDROID
+    private static string? _androidGameRoot;
+    private static string? _androidUserDataRoot;
+
+    public static void SetAndroidGameRoot(string root, string? userDataRoot = null)
+    {
+        if (string.IsNullOrWhiteSpace(root))
+            throw new ArgumentException("Android game root cannot be empty.", nameof(root));
+        _androidGameRoot = Path.GetFullPath(root);
+        _androidUserDataRoot = string.IsNullOrWhiteSpace(userDataRoot)
+            ? Path.Combine(_androidGameRoot, "userdata")
+            : Path.GetFullPath(userDataRoot);
+    }
+#endif
     public static string RootDirectory
     {
         get
         {
+#if TSC_ANDROID
+            return _androidUserDataRoot ?? Path.Combine(
+                _androidGameRoot ?? Path.Combine(AppContext.BaseDirectory, "TSC"), "userdata");
+#else
             var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             if (!string.IsNullOrWhiteSpace(local))
                 return Path.Combine(local, "TSC");
@@ -28,6 +46,7 @@ public static class UserDataPaths
             return !string.IsNullOrWhiteSpace(profile)
                 ? Path.Combine(profile, ".local", "share", "TSC")
                 : Path.Combine(AppContext.BaseDirectory, "TSC-UserData");
+#endif
         }
     }
 
@@ -36,6 +55,9 @@ public static class UserDataPaths
     {
         get
         {
+#if TSC_ANDROID
+            return Path.GetFullPath(_androidGameRoot ?? AppContext.BaseDirectory);
+#else
             var configuredRoot = Environment.GetEnvironmentVariable("TSC_INSTALL_ROOT");
             if (!string.IsNullOrWhiteSpace(configuredRoot) && Path.IsPathRooted(configuredRoot))
                 return Path.GetFullPath(configuredRoot);
@@ -52,6 +74,7 @@ public static class UserDataPaths
             return SkinScriptPathResolver.FindDeveloperRootDirectory(
                 Environment.CurrentDirectory,
                 AppContext.BaseDirectory);
+#endif
 #endif
         }
     }
@@ -82,7 +105,7 @@ public static class UserDataPaths
             Directory.CreateDirectory(RootDirectory);
             Directory.CreateDirectory(Path.GetDirectoryName(ScoresPath)!);
 
-#if !TSC_PUBLISH
+#if !TSC_PUBLISH && !TSC_ANDROID
             // Preserve developer-build compatibility for editable files that older debug builds
             // temporarily stored in AppData. The live config and logs remain in the game root.
             MigrateUserFileToGameRootIfNewer("gameConfig.json");
@@ -108,7 +131,7 @@ public static class UserDataPaths
         }
     }
 
-#if !TSC_PUBLISH
+#if !TSC_PUBLISH && !TSC_ANDROID
     private static void MigrateUserFileToGameRootIfNewer(string fileName)
         => MigrateUserFileToGameRootIfNewer(fileName, fileName);
 

@@ -344,6 +344,11 @@ public sealed class SkinScreenView
     public double aspect => _height <= 0.0 ? 1.0 : _width / _height;
     public double aspect_ratio => aspect;
     public double ref_scale => _refScale;
+#if TSC_ANDROID
+    public bool is_android => true;
+#else
+    public bool is_android => false;
+#endif
 
     internal void Update(int width, int height)
     {
@@ -441,7 +446,8 @@ internal readonly record struct SkinPlayfieldGeometrySnapshot(
 
 public sealed class SkinPlayfieldGeometryHandle
 {
-    private SkinPlayfieldGeometrySnapshot _snapshot;
+    private readonly SkinPlayfieldGeometrySnapshot _snapshot;
+    internal SkinPlayfieldGeometrySnapshot Snapshot => _snapshot;
     internal long FrameId { get; }
     internal VertexPositionColorTexture[] Vertices => _snapshot.Vertices;
     public float depth => _snapshot.Depth;
@@ -470,7 +476,7 @@ public sealed class SkinPlayfieldGeometryHandle
 
 internal readonly record struct SkinPlayfieldGeometryDrawRequest(
     SkinAssetHandle? Asset,
-    SkinPlayfieldGeometryHandle Geometry,
+    SkinPlayfieldGeometrySnapshot Geometry,
     XnaColor Tint,
     float Alpha,
     int Layer,
@@ -534,7 +540,7 @@ public sealed class SkinPlayfieldSpriteGeometryHandle
 
 internal readonly record struct SkinPlayfieldSpriteDrawRequest(
     SkinAssetHandle Asset,
-    SkinPlayfieldSpriteGeometryHandle Geometry,
+    SkinPlayfieldSpriteGeometrySnapshot Geometry,
     XnaColor Tint,
     float Alpha,
     int Layer,
@@ -1124,6 +1130,73 @@ internal sealed class SkinShadowFontHandle
     }
 }
 
+internal static class SkinAssetPathUtilities
+{
+    /// <summary>
+    /// Resolves a relative asset path using Windows-style case-insensitive matching.
+    /// Android's filesystem is case-sensitive, but skins are commonly authored and
+    /// tested on Windows. Resolve each component so folder casing is handled too.
+    /// </summary>
+    public static string? ResolveCaseInsensitiveFile(string rootDirectory, string relativePath)
+        => ResolveCaseInsensitivePath(rootDirectory, relativePath, requireDirectory: false);
+
+    public static string? ResolveCaseInsensitiveDirectory(string rootDirectory, string relativePath)
+        => ResolveCaseInsensitivePath(rootDirectory, relativePath, requireDirectory: true);
+
+    private static string? ResolveCaseInsensitivePath(
+        string rootDirectory, string relativePath, bool requireDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath))
+            return null;
+
+        var segments = relativePath.Split(
+            new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+            StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0 || segments.Any(static segment =>
+                segment is "." or ".." || segment.IndexOf(':') >= 0))
+            return null;
+
+        var current = Path.GetFullPath(rootDirectory);
+        foreach (var segment in segments)
+        {
+            var exact = Path.Combine(current, segment);
+            if (File.Exists(exact) || Directory.Exists(exact))
+            {
+                current = exact;
+                continue;
+            }
+
+            if (!Directory.Exists(current))
+                return null;
+
+            string? match = null;
+            try
+            {
+                foreach (var entry in Directory.EnumerateFileSystemEntries(current))
+                {
+                    if (string.Equals(Path.GetFileName(entry), segment, StringComparison.OrdinalIgnoreCase))
+                    {
+                        match = entry;
+                        break;
+                    }
+                }
+            }
+            catch
+            {
+                return null;
+            }
+
+            if (match is null)
+                return null;
+            current = match;
+        }
+
+        return (requireDirectory ? Directory.Exists(current) : File.Exists(current))
+            ? Path.GetFullPath(current)
+            : null;
+    }
+}
+
 internal sealed class SkinFontStore : IDisposable
 {
     private readonly GraphicsDevice _graphics;
@@ -1151,7 +1224,13 @@ internal sealed class SkinFontStore : IDisposable
     public SkinFontStore(GraphicsDevice graphics, string skinDirectory, string? fallbackSkinDirectory = null)
     {
         _graphics = graphics;
-        _fontsDirectory = Path.Combine(Path.GetFullPath(skinDirectory), "fonts");
+        var skinRoot = Path.GetFullPath(skinDirectory);
+#if TSC_ANDROID
+        _fontsDirectory = SkinAssetPathUtilities.ResolveCaseInsensitiveDirectory(skinRoot, "fonts")
+            ?? Path.Combine(skinRoot, "fonts");
+#else
+        _fontsDirectory = Path.Combine(skinRoot, "fonts");
+#endif
         if (string.IsNullOrWhiteSpace(fallbackSkinDirectory))
         {
             _fallbackFontsDirectory = null;
@@ -1160,9 +1239,19 @@ internal sealed class SkinFontStore : IDisposable
         {
             var fallbackRoot = Path.GetFullPath(fallbackSkinDirectory);
             var primaryRoot = Path.GetFullPath(skinDirectory);
-            _fallbackFontsDirectory = string.Equals(fallbackRoot, primaryRoot, StringComparison.OrdinalIgnoreCase)
-                ? null
-                : Path.Combine(fallbackRoot, "fonts");
+            if (string.Equals(fallbackRoot, primaryRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                _fallbackFontsDirectory = null;
+            }
+            else
+            {
+#if TSC_ANDROID
+                _fallbackFontsDirectory = SkinAssetPathUtilities.ResolveCaseInsensitiveDirectory(fallbackRoot, "fonts")
+                    ?? Path.Combine(fallbackRoot, "fonts");
+#else
+                _fallbackFontsDirectory = Path.Combine(fallbackRoot, "fonts");
+#endif
+            }
         }
     }
 
@@ -1226,18 +1315,38 @@ internal sealed class SkinFontStore : IDisposable
 
             var root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
                        + Path.DirectorySeparatorChar;
-            if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(fullPath))
+            if (!fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase))
                 continue;
+#if TSC_ANDROID
+            fullPath = SkinAssetPathUtilities.ResolveCaseInsensitiveFile(directory, normalized) ?? string.Empty;
+            if (string.IsNullOrEmpty(fullPath))
+                continue;
+#else
+            if (!File.Exists(fullPath))
+                continue;
+#endif
 
             try
             {
+#if TSC_ANDROID
+                var handle = BuildFontAndroid(fullPath, pathKey, rasterSize, characters);
+                Program.LogRuntime(
+                    $"SKIN_FONT_LOAD_OK path=\"{pathKey}\" raster={rasterSize} " +
+                    $"atlas={handle.Texture.Width}x{handle.Texture.Height}");
+#else
                 var handle = BuildFont(fullPath, pathKey, rasterSize, characters);
+#endif
                 _fonts[key] = handle;
                 _fontRequestCache[requestKey] = handle;
                 return handle;
             }
             catch (Exception ex)
             {
+#if TSC_ANDROID
+                Program.LogRuntime(
+                    $"SKIN_FONT_LOAD_FAILED path=\"{pathKey}\" fullPath=\"{fullPath}\" " +
+                    $"raster={rasterSize} error={ex.GetBaseException().Message}");
+#endif
                 Console.WriteLine(
                     $"[skin] fonts.raster FAILED: path=\"{pathKey}\", " +
                     $"fullPath=\"{fullPath}\", rasterSize={rasterSize}, " +
@@ -1247,6 +1356,11 @@ internal sealed class SkinFontStore : IDisposable
             }
         }
 
+#if TSC_ANDROID
+        Program.LogRuntime(
+            $"SKIN_FONT_NOT_FOUND path=\"{pathKey}\" raster={rasterSize} " +
+            $"primary=\"{_fontsDirectory}\" fallback=\"{_fallbackFontsDirectory ?? string.Empty}\"");
+#endif
         Console.WriteLine(
             $"[skin] fonts.raster failed: font file not found or readable. " +
             $"path=\"{pathKey}\", rasterSize={rasterSize}, chars=\"{characters}\"");
@@ -1257,6 +1371,12 @@ internal sealed class SkinFontStore : IDisposable
 
     public SkinShadowFontHandle? LoadShadow(SkinFontHandle baseFont, float blurRadius, float expand = 0f)
     {
+#if TSC_ANDROID
+        _ = baseFont;
+        _ = blurRadius;
+        _ = expand;
+        return null;
+#else
         if (baseFont is null)
             return null;
 
@@ -1287,7 +1407,155 @@ internal sealed class SkinFontStore : IDisposable
             _shadowFonts[key] = null;
             return null;
         }
+#endif
     }
+
+#if TSC_ANDROID
+    private SkinFontHandle BuildFontAndroid(
+        string fullPath,
+        string relativePath,
+        int rasterFontSize,
+        string rasterCharacters)
+    {
+        using var typeface = Android.Graphics.Typeface.CreateFromFile(fullPath)
+            ?? throw new InvalidOperationException("Android could not open the font file.");
+        using var paint = new Android.Graphics.Paint(
+            Android.Graphics.PaintFlags.AntiAlias | Android.Graphics.PaintFlags.SubpixelText);
+        paint.SetTypeface(typeface);
+        paint.TextSize = rasterFontSize;
+        paint.Color = Android.Graphics.Color.White;
+        paint.TextAlign = Android.Graphics.Paint.Align.Left;
+
+        var metrics = paint.GetFontMetrics();
+        var widths = new List<float>(rasterCharacters.Length);
+        var maxWidth = 1;
+        foreach (var character in rasterCharacters)
+        {
+            var measured = paint.MeasureText(character.ToString());
+            var width = Math.Max(1, (int)MathF.Ceiling(measured));
+            if (character == ' ')
+                width = Math.Max(width, (int)MathF.Ceiling(rasterFontSize * 0.278f));
+            widths.Add(measured);
+            maxWidth = Math.Max(maxWidth, width);
+        }
+
+        var fontHeight = Math.Max(rasterFontSize, (int)MathF.Ceiling(metrics.Descent - metrics.Ascent));
+        var cellHeight = checked(fontHeight + Padding * 2);
+        // Android's Paint metrics provide the real baseline. The horizontal
+        // overhang margin matches the desktop rasterizer so italic outlines
+        // remain inside the glyph source rectangles.
+        var overhangPadding = Math.Max(8, (int)MathF.Ceiling(rasterFontSize * 0.12f));
+        var cellWidth = checked(maxWidth + Padding * 2 + overhangPadding * 2);
+        var layout = CalculateFontLayout(cellWidth, cellHeight, rasterCharacters.Length);
+
+        using var bitmap = Android.Graphics.Bitmap.CreateBitmap(
+            layout.AtlasWidth,
+            layout.AtlasHeight,
+            Android.Graphics.Bitmap.Config.Argb8888);
+        using var canvas = new Android.Graphics.Canvas(bitmap);
+
+        var glyphBounds = new List<XnaRectangle>(rasterCharacters.Length);
+        var cropping = new List<XnaRectangle>(rasterCharacters.Length);
+        var kerning = new List<Vector3>(rasterCharacters.Length);
+        var characters = new List<char>(rasterCharacters.Length);
+        var glyphWidth = checked(maxWidth + overhangPadding * 2);
+        var baselineOffset = Padding - metrics.Ascent;
+
+        for (var i = 0; i < rasterCharacters.Length; i++)
+        {
+            var character = rasterCharacters[i];
+            var column = i % layout.GlyphsPerRow;
+            var row = i / layout.GlyphsPerRow;
+            var cellX = column * cellWidth;
+            var cellY = row * cellHeight;
+            var drawX = cellX + Padding + overhangPadding;
+            var drawY = cellY + baselineOffset;
+            canvas.DrawText(character.ToString(), drawX, drawY, paint);
+
+            glyphBounds.Add(new XnaRectangle(
+                cellX + Padding,
+                cellY,
+                glyphWidth,
+                cellHeight));
+            cropping.Add(new XnaRectangle(
+                -overhangPadding,
+                0,
+                glyphWidth,
+                cellHeight));
+            kerning.Add(new Vector3(0f, 0f, widths[i]));
+            characters.Add(character);
+        }
+
+        var texture = CreateTextureAndroid(bitmap);
+        try
+        {
+            var spriteFont = new SpriteFont(
+                texture,
+                glyphBounds,
+                cropping,
+                characters,
+                cellHeight,
+                0f,
+                kerning,
+                '?');
+            UnicodeTextRenderer.RegisterFont(
+                spriteFont,
+                Path.GetFileNameWithoutExtension(fullPath),
+                rasterFontSize,
+                fullPath);
+            return new SkinFontHandle(
+                spriteFont,
+                texture,
+                fullPath,
+                relativePath,
+                rasterFontSize,
+                rasterCharacters);
+        }
+        catch
+        {
+            texture.Dispose();
+            throw;
+        }
+    }
+
+    private Texture2D CreateTextureAndroid(Android.Graphics.Bitmap bitmap)
+    {
+        var argbPixels = new int[checked(bitmap.Width * bitmap.Height)];
+        bitmap.GetPixels(
+            argbPixels,
+            0,
+            bitmap.Width,
+            0,
+            0,
+            bitmap.Width,
+            bitmap.Height);
+
+        var pixels = new XnaColor[argbPixels.Length];
+        for (var i = 0; i < argbPixels.Length; i++)
+        {
+            var argb = unchecked((uint)argbPixels[i]);
+            pixels[i] = new XnaColor(
+                (byte)(argb >> 16),
+                (byte)(argb >> 8),
+                (byte)argb,
+                (byte)(argb >> 24));
+        }
+
+        var texture = NativeResourceDiagnostics.TrackTexture(
+            new Texture2D(_graphics, bitmap.Width, bitmap.Height, false, SurfaceFormat.Color),
+            NativeResourceCategory.Font);
+        try
+        {
+            texture.SetData(pixels);
+            return texture;
+        }
+        catch
+        {
+            texture.Dispose();
+            throw;
+        }
+    }
+#endif
 
     private SkinFontHandle BuildFont(
         string fullPath,
@@ -1879,13 +2147,22 @@ public struct SkinTextShadow
 /// from the existing 1x1 UI pixel as a small stack of expanded rectangles, so it
 /// needs no per-size textures or render targets.
 /// </summary>
-public sealed class SkinBoxShadow
+public struct SkinBoxShadow
 {
     public Vector2 Offset { get; init; }
-    public float Blur { get; init; } = 12f;
+    public float Blur { get; init; }
     public float Spread { get; init; }
-    public XnaColor Color { get; init; } = XnaColor.Black;
-    public float Alpha { get; init; } = 0.35f;
+    public XnaColor Color { get; init; }
+    public float Alpha { get; init; }
+
+    public SkinBoxShadow()
+    {
+        Offset = Vector2.Zero;
+        Blur = 12f;
+        Spread = 0f;
+        Color = XnaColor.Black;
+        Alpha = 0.35f;
+    }
 }
 
 public struct SkinTextStroke
@@ -2262,6 +2539,12 @@ public sealed class SkinSongSelectItem
     public int? hd_level { get; }
     public int? ex_level { get; }
     public int? xt_level { get; }
+    public bool chart_level_estimated { get; }
+    public bool ez_level_estimated { get; }
+    public bool nm_level_estimated { get; }
+    public bool hd_level_estimated { get; }
+    public bool ex_level_estimated { get; }
+    public bool xt_level_estimated { get; }
     public bool selected { get; }
     public int score { get; }
     public double accuracy { get; }
@@ -2288,7 +2571,13 @@ public sealed class SkinSongSelectItem
         int score,
         double accuracy,
         string grade,
-        string clearType)
+        string clearType,
+        bool chartLevelEstimated = false,
+        bool easyLevelEstimated = false,
+        bool normalLevelEstimated = false,
+        bool hardLevelEstimated = false,
+        bool expertLevelEstimated = false,
+        bool extraLevelEstimated = false)
     {
         this.index = index;
         this.name = name;
@@ -2305,6 +2594,12 @@ public sealed class SkinSongSelectItem
         hd_level = hdLevel;
         ex_level = exLevel;
         xt_level = xtLevel;
+        chart_level_estimated = chartLevelEstimated;
+        ez_level_estimated = easyLevelEstimated;
+        nm_level_estimated = normalLevelEstimated;
+        hd_level_estimated = hardLevelEstimated;
+        ex_level_estimated = expertLevelEstimated;
+        xt_level_estimated = extraLevelEstimated;
         this.selected = selected;
         this.score = score;
         this.accuracy = accuracy;
@@ -2430,6 +2725,34 @@ public sealed class SkinRuntime : IDisposable
     private bool _hasEditorMediaArtwork;
     private readonly SkinScreenView _screen = new();
     private Table? _songSelect;
+    // The Default Song Select skin opts into command reuse because its render()
+    // output is a pure function of the published song-select state, screen size,
+    // and pointer position. Reusing the resolved command list removes the full
+    // MoonSharp render pass from idle frames without changing the visual output.
+    private bool _songSelectRenderDirty = true;
+    private bool _songSelectRenderCacheBuilt;
+    private int _songSelectRenderStateHash;
+    private bool _hasSongSelectRenderStateHash;
+    private int _songSelectRenderCacheWidth = -1;
+    private int _songSelectRenderCacheHeight = -1;
+    private SpriteFont? _songSelectRenderCacheFallbackFont;
+#if TSC_ANDROID && DEBUG
+    public bool DebugLastRenderCacheHit { get; private set; }
+#endif
+#if TSC_ANDROID
+    // Song Select publishes this state every draw. Keep its Lua tables and row
+    // objects alive between frames so scrolling does not allocate a fresh graph
+    // of MoonSharp tables (and trigger avoidable GC pauses) each frame.
+    private Table? _songSelectSongsTable;
+    private Table? _songSelectPackTable;
+    private Table? _songSelectDifficultiesTable;
+    private Table? _songSelectSelectedTable;
+    private readonly List<Table> _songSelectSongRows = new();
+    private readonly List<DynValue> _songSelectStaleKeys = new();
+    private int _songSelectPublishedItemCount;
+    private int _songSelectPublishedPackCount;
+    private int _songSelectPublishedDifficultyCount;
+#endif
     private Table? _chartEditor;
     // Waveform arrays remain native C# buffers. They are intentionally not
     // expanded into tens of thousands of MoonSharp table entries every load.
@@ -2437,17 +2760,28 @@ public sealed class SkinRuntime : IDisposable
     private float[]? _chartEditorWaveformRmsPrefixSource;
     private Table? _mainMenu;
     private Table? _transition;
+#if DEBUG
     private Table? _skinPerfApi;
+#endif
+#if DEBUG
     private readonly SkinLuaProfileSection[] _skinLuaProfileSections =
     {
         new(), new(), new(), new(), new(), new(), new(), new(),
         new(), new(), new(), new(), new(), new(), new()
     };
+#else
+    private readonly SkinLuaProfileSection[] _skinLuaProfileSections = Array.Empty<SkinLuaProfileSection>();
+#endif
     // Actual CPU submission time spent rendering categorized gameplay background
     // quads. Index 0 is unused; categories 1-4 are card base, stage light,
     // character image, and character flash.
+#if DEBUG
     private readonly double[] _debugQuad3DGroupMilliseconds = new double[5];
     private readonly int[] _debugQuad3DGroupQuadCount = new int[5];
+#else
+    private readonly double[] _debugQuad3DGroupMilliseconds = Array.Empty<double>();
+    private readonly int[] _debugQuad3DGroupQuadCount = Array.Empty<int>();
+#endif
     public int DebugLastQuad3DBatchedRuns { get; private set; }
     public int DebugLastQuad3DBatchedQuads { get; private set; }
     public int DebugLastQuad3DDrawCallsSaved { get; private set; }
@@ -2478,11 +2812,55 @@ public sealed class SkinRuntime : IDisposable
     private readonly Dictionary<(int Track, int Tick, int EventIndex), int> _playfieldNoteIndices = new();
     private readonly List<Table> _playfieldNoteTables = new();
     private readonly List<Table> _playfieldNoteGeometryTables = new();
+    private readonly List<Table?> _playfieldNoteGeometryRoleTables = new();
+    private readonly Dictionary<string, DynValue> _playfieldGeometryRoleValues = new(StringComparer.Ordinal);
+    private readonly List<DynValue> _playfieldNoteTableValues = new();
+    private readonly List<DynValue> _playfieldNoteGeometryTableValues = new();
+    private readonly List<DynValue> _playfieldNoteGeometryRoleTableValues = new();
+    private bool _playfieldNoteUsesNumericGeometryHandles;
+    private List<SkinPlayfieldGeometrySnapshot>? _activePlayfieldNoteGeometry;
+    private List<SkinPlayfieldSpriteGeometrySnapshot>? _activePlayfieldNoteSpriteGeometry;
+    private const int PlayfieldGeometryTokenIndexBits = 13;
+    private const long PlayfieldGeometryTokenIndexMask = (1L << PlayfieldGeometryTokenIndexBits) - 1;
+    private const long PlayfieldGeometryTokenFrameMask = (1L << (53 - PlayfieldGeometryTokenIndexBits)) - 1;
     private readonly List<int> _playfieldNoteGeometryCounts = new();
     private readonly List<int> _playfieldNotePreviousGeometryCounts = new();
+    private readonly List<PlayfieldNoteTableCache> _playfieldNoteTableCaches = new();
     private Table? _playfieldNoteFrameTable;
     private Table? _playfieldNotesTable;
+    private DynValue _playfieldNoteFrameValue = DynValue.Nil;
+    private DynValue _playfieldNotesValue = DynValue.Nil;
+    private DynValue _playfieldNoteVersionValue = DynValue.Nil;
     private Script? _playfieldTableOwner;
+
+    private struct PlayfieldNoteTableCache
+    {
+        public bool Initialized;
+        public long LastFrameId;
+        public int Track;
+        public int Tick;
+        public int EventIndex;
+        public int Attr;
+        public int DurationTicks;
+        public string? NoteType;
+        public string? Side;
+        public string? Bank;
+        public string? Family;
+        public bool Hit;
+        public bool Missed;
+        public bool Simultaneous;
+        public DynValue? NoteTypeValue;
+        public DynValue? TrackValue;
+        public DynValue? TickValue;
+        public DynValue? AttrValue;
+        public DynValue? DurationTicksValue;
+        public DynValue? SideValue;
+        public DynValue? BankValue;
+        public DynValue? FamilyValue;
+        public DynValue? HitValue;
+        public DynValue? MissedValue;
+        public DynValue? SimultaneousValue;
+    }
     private int _playfieldPreviousNoteCount;
     private long _playfieldGeometryFrameId;
     private bool _insidePlayfieldNoteRenderer;
@@ -2514,6 +2892,10 @@ public sealed class SkinRuntime : IDisposable
     private readonly List<DynValue>[] _chartEditorStateStaleKeyScratch =
         Enumerable.Range(0, 16).Select(_ => new List<DynValue>(8)).ToArray();
     private readonly Dictionary<string, SkinLayoutNode> _layoutNodes = new(StringComparer.OrdinalIgnoreCase);
+    // Most gameplay frames contain only absolute-positioned draw commands. Avoid
+    // walking every command through the hierarchy resolver when no command or UI
+    // control declares an ID/parent relationship.
+    private bool _drawCommandsNeedLayoutResolve;
     private static readonly Comparison<SkinDrawCommand> DrawCommandComparison = static (a, b) =>
     {
         var layer = a.Layer.CompareTo(b.Layer);
@@ -2826,10 +3208,22 @@ public sealed class SkinRuntime : IDisposable
     // allocations or history themselves.
     public int DebugDrawCommandPoolCount => _drawCommandPool.Count + _quad3DCachedBatchEntries.Count;
     public long DebugLastRenderCallAllocatedBytes { get; private set; }
+    public double DebugLastRenderCallMilliseconds { get; private set; }
     public long DebugLastRenderSortAllocatedBytes { get; private set; }
+    public double DebugLastRenderSortMilliseconds { get; private set; }
     public long DebugLastResolveLayoutAllocatedBytes { get; private set; }
     public double DebugLastResolveLayoutMilliseconds { get; private set; }
+#if TSC_ANDROID && DEBUG
+    public double DebugLastLuaRenderMilliseconds { get; private set; }
+    public double DebugLastLayoutResolveMilliseconds { get; private set; }
+    public double DebugLastCommandSortMilliseconds { get; private set; }
+    public int DebugLastDrawCommandCount { get; private set; }
+#endif
+#if DEBUG
     public bool DebugMeasureApiAllocations { get; set; }
+#else
+    private const bool DebugMeasureApiAllocations = false;
+#endif
 
     public long GetDebugSkinSectionAllocatedBytes(int sectionId)
         => sectionId >= 1 && sectionId <= _skinLuaProfileSections.Length
@@ -2852,13 +3246,34 @@ public sealed class SkinRuntime : IDisposable
             : 0;
 
     public long DebugLastSpriteApiAllocatedBytes { get; private set; }
+    public double DebugLastSpriteApiMilliseconds { get; private set; }
     public long DebugLastQuad3DApiAllocatedBytes { get; private set; }
     public double DebugLastQuad3DApiMilliseconds { get; private set; }
     public long DebugLastSparkleApiAllocatedBytes { get; private set; }
     public long DebugLastTextApiAllocatedBytes { get; private set; }
+    public double DebugLastTextApiMilliseconds { get; private set; }
+    public long DebugLastMeasureTextApiAllocatedBytes { get; private set; }
+    public double DebugLastMeasureTextApiMilliseconds { get; private set; }
+    public int DebugLastMeasureTextApiCalls { get; private set; }
+    public long DebugLastMeasureUserTextWidthApiAllocatedBytes { get; private set; }
+    public double DebugLastMeasureUserTextWidthApiMilliseconds { get; private set; }
+    public int DebugLastMeasureUserTextWidthApiCalls { get; private set; }
+    public long DebugLastMeasureUserTextHeightApiAllocatedBytes { get; private set; }
+    public double DebugLastMeasureUserTextHeightApiMilliseconds { get; private set; }
+    public int DebugLastMeasureUserTextHeightApiCalls { get; private set; }
+    public int DebugLastSkinPerfBeginCalls { get; private set; }
+    public int DebugLastSkinPerfStopCalls { get; private set; }
     public long DebugLastRectApiAllocatedBytes { get; private set; }
+    public double DebugLastRectApiMilliseconds { get; private set; }
     public long DebugLastLineApiAllocatedBytes { get; private set; }
     public long DebugLastShadowApiAllocatedBytes { get; private set; }
+    public double DebugLastShadowApiMilliseconds { get; private set; }
+    public long DebugLastUiControlApiAllocatedBytes { get; private set; }
+    public double DebugLastUiControlApiMilliseconds { get; private set; }
+    public int DebugLastUiControlApiCalls { get; private set; }
+    public long DebugLastChartPanelApiAllocatedBytes { get; private set; }
+    public double DebugLastChartPanelApiMilliseconds { get; private set; }
+    public int DebugLastChartPanelApiCalls { get; private set; }
     public int DebugLastSpriteApiCalls { get; private set; }
     public int DebugLastQuad3DApiCalls { get; private set; }
     public int DebugLastSparkleApiCalls { get; private set; }
@@ -2945,6 +3360,20 @@ public sealed class SkinRuntime : IDisposable
     internal bool IsInitialLoadDeferred => _initialLoadDeferred;
     public string ScriptPath => _scriptPath;
     internal string? ActiveScriptPath => _script is not null ? _activeScriptPath : null;
+    public string DebugActiveScriptName
+    {
+        get
+        {
+            var activePath = _activeScriptPath ?? _scriptPath;
+            var scriptDirectory = Path.GetDirectoryName(activePath);
+            var directoryName = Path.GetFileName(scriptDirectory);
+            var skinName = string.Equals(directoryName, "scripts", StringComparison.OrdinalIgnoreCase)
+                ? Path.GetFileName(Path.GetDirectoryName(scriptDirectory))
+                : directoryName;
+            var fileName = Path.GetFileName(activePath);
+            return string.IsNullOrWhiteSpace(skinName) ? fileName : $"{skinName}/{fileName}";
+        }
+    }
     public string? LastError { get; private set; }
     public string LastCallback { get; private set; } = "none";
     public long CallbackCount { get; private set; }
@@ -3204,6 +3633,7 @@ public sealed class SkinRuntime : IDisposable
         _drawCommands.Clear();
         _drawCommandPoolIndex = 0;
         _layoutNodes.Clear();
+        _drawCommandsNeedLayoutResolve = false;
         _drawOrder = 0;
         _uiButtons.Clear();
         _uiSliders.Clear();
@@ -3216,10 +3646,29 @@ public sealed class SkinRuntime : IDisposable
         _failedImports.Clear();
         _activeImportPath = null;
         _songSelect = null;
+        _songSelectRenderDirty = true;
+        _songSelectRenderCacheBuilt = false;
+        _hasSongSelectRenderStateHash = false;
+        _songSelectRenderCacheWidth = -1;
+        _songSelectRenderCacheHeight = -1;
+        _songSelectRenderCacheFallbackFont = null;
+#if TSC_ANDROID
+        _songSelectSongsTable = null;
+        _songSelectPackTable = null;
+        _songSelectDifficultiesTable = null;
+        _songSelectSelectedTable = null;
+        _songSelectSongRows.Clear();
+        _songSelectStaleKeys.Clear();
+        _songSelectPublishedItemCount = 0;
+        _songSelectPublishedPackCount = 0;
+        _songSelectPublishedDifficultyCount = 0;
+#endif
         _chartEditor = null;
         _mainMenu = null;
         _transition = null;
+#if DEBUG
         _skinPerfApi = null;
+#endif
         DisposeSkin3DBackgroundTextures();
         DisposeSkinSparkleAnimations();
         _sparkleAssetSets.Clear();
@@ -3248,6 +3697,12 @@ public sealed class SkinRuntime : IDisposable
             script.Globals["game"] = _game;
             script.Globals["screen"] = _screen;
             _songSelect = new Table(script);
+            _songSelectRenderDirty = true;
+            _songSelectRenderCacheBuilt = false;
+            _hasSongSelectRenderStateHash = false;
+            _songSelectRenderCacheWidth = -1;
+            _songSelectRenderCacheHeight = -1;
+            _songSelectRenderCacheFallbackFont = null;
             script.Globals["song_select"] = _songSelect;
             _chartEditor = new Table(script);
             script.Globals["chart_editor"] = _chartEditor;
@@ -3259,8 +3714,14 @@ public sealed class SkinRuntime : IDisposable
             script.Globals["fonts"] = CreateFontsApi(script);
             script.Globals["shaders"] = CreateShadersApi(script);
             script.Globals["draw"] = CreateDrawApi(script);
+#if DEBUG
             _skinPerfApi = CreateSkinPerfApi(script);
             script.Globals["skinperf"] = _skinPerfApi;
+#else
+            var skinPerfDisabled = new Table(script);
+            skinPerfDisabled.Set("enabled", DynValue.NewBoolean(false));
+            script.Globals["skinperf"] = skinPerfDisabled;
+#endif
             script.Globals["sound"] = CreateSoundApi(script);
             script.Globals["ui"] = CreateUiApi(script);
             script.Globals["panel_tracks"] = CreatePanelTracksTable(script);
@@ -3352,6 +3813,11 @@ public sealed class SkinRuntime : IDisposable
 
     public void UpdateMainMenuState(string? error, int selectedIndex = 0)
     {
+#if TSC_ANDROID
+        _mainMenu?.Set("chart_editor_enabled", DynValue.NewBoolean(false));
+#else
+        _mainMenu?.Set("chart_editor_enabled", DynValue.NewBoolean(true));
+#endif
         _mainMenu?.Set("error", string.IsNullOrWhiteSpace(error) ? DynValue.Nil : DynValue.NewString(error));
         _mainMenu?.Set("selected", DynValue.NewNumber(Math.Max(0, selectedIndex)));
         _mainMenu?.Set("version", DynValue.NewString(GameVersion.Current));
@@ -3970,7 +4436,8 @@ public sealed class SkinRuntime : IDisposable
         SpriteFont? fallbackFont = null,
         double realTime = 0.0,
         double chartTime = 0.0,
-        string view = "gameplay")
+        string view = "gameplay",
+        bool reuseUnchangedCommands = false)
     {
         // Video assets expose a live Texture2D through the same assets.load()/draw.sprite()
         // path as still images. Upload the newest decoded frame on the graphics thread.
@@ -3982,24 +4449,59 @@ public sealed class SkinRuntime : IDisposable
         if (fallbackFont is not null)
             _defaultFallbackFont = fallbackFont;
 
-        // The command pool is reused every frame. Reset its cursor here, not only
-        // on skin reload; otherwise each draw command allocates a new pooled
-        // object on every frame and the pool grows for the entire song/retry run.
-        _drawCommandPoolIndex = 0;
         _screen.Update(width, height);
+#if TSC_ANDROID && DEBUG
+        DebugLastRenderCacheHit = false;
+#endif
+
+        // Only scripts that explicitly opt in may reuse a previously resolved
+        // command list. The Default Song Select skin is static between state/pointer
+        // changes; animated/custom skins keep the normal per-frame Lua render path.
+        var canReuseUnchangedCommands = reuseUnchangedCommands &&
+            _songSelect is not null &&
+            _songSelect.Get("static_render_cache").Type == DataType.Boolean &&
+            _songSelect.Get("static_render_cache").Boolean &&
+            !SupportsHitEffectRenderer;
+        if (canReuseUnchangedCommands && _songSelectRenderCacheBuilt &&
+            !_songSelectRenderDirty &&
+            _songSelectRenderCacheWidth == width &&
+            _songSelectRenderCacheHeight == height &&
+            ReferenceEquals(_songSelectRenderCacheFallbackFont, _defaultFallbackFont))
+        {
+#if TSC_ANDROID && DEBUG
+            DebugLastRenderCacheHit = true;
+#endif
+#if TSC_ANDROID && DEBUG
+            DebugLastLuaRenderMilliseconds = 0.0;
+            DebugLastLayoutResolveMilliseconds = 0.0;
+            DebugLastCommandSortMilliseconds = 0.0;
+            DebugLastDrawCommandCount = _drawCommands.Count;
+#endif
+            return _drawCommands;
+        }
+
+        // The command pool is reused every frame. Reset its cursor only when a
+        // real Lua rebuild is needed; cache-hit frames keep both the commands and
+        // the hit-test/layout registries intact.
+        _drawCommandPoolIndex = 0;
         _drawCommands.Clear();
         _layoutNodes.Clear();
+        _drawCommandsNeedLayoutResolve = false;
         _drawOrder = 0;
         _uiButtons.Clear();
         _uiSliders.Clear();
 
+#if DEBUG
         if (_skinPerfApi is not null)
             _skinPerfApi.Set("enabled", DynValue.NewBoolean(DebugMeasureApiAllocations));
+#endif
 
         if (DebugMeasureApiAllocations)
         {
             DebugLastRenderCallAllocatedBytes = 0;
+            DebugLastRenderCallMilliseconds = 0.0;
             DebugLastRenderSortAllocatedBytes = 0;
+            DebugLastRenderSortMilliseconds = 0.0;
             DebugLastResolveLayoutAllocatedBytes = 0;
             DebugLastResolveLayoutMilliseconds = 0.0;
             for (var i = 0; i < _skinLuaProfileSections.Length; i++)
@@ -4015,13 +4517,34 @@ public sealed class SkinRuntime : IDisposable
             DebugLastQuad3DBatchedQuads = 0;
             DebugLastQuad3DDrawCallsSaved = 0;
             DebugLastSpriteApiAllocatedBytes = 0;
+            DebugLastSpriteApiMilliseconds = 0.0;
             DebugLastQuad3DApiAllocatedBytes = 0;
             DebugLastQuad3DApiMilliseconds = 0.0;
             DebugLastSparkleApiAllocatedBytes = 0;
             DebugLastTextApiAllocatedBytes = 0;
+            DebugLastTextApiMilliseconds = 0.0;
+            DebugLastMeasureTextApiAllocatedBytes = 0;
+            DebugLastMeasureTextApiMilliseconds = 0.0;
+            DebugLastMeasureTextApiCalls = 0;
+            DebugLastMeasureUserTextWidthApiAllocatedBytes = 0;
+            DebugLastMeasureUserTextWidthApiMilliseconds = 0.0;
+            DebugLastMeasureUserTextWidthApiCalls = 0;
+            DebugLastMeasureUserTextHeightApiAllocatedBytes = 0;
+            DebugLastMeasureUserTextHeightApiMilliseconds = 0.0;
+            DebugLastMeasureUserTextHeightApiCalls = 0;
+            DebugLastSkinPerfBeginCalls = 0;
+            DebugLastSkinPerfStopCalls = 0;
             DebugLastRectApiAllocatedBytes = 0;
+            DebugLastRectApiMilliseconds = 0.0;
             DebugLastLineApiAllocatedBytes = 0;
             DebugLastShadowApiAllocatedBytes = 0;
+            DebugLastShadowApiMilliseconds = 0.0;
+            DebugLastUiControlApiAllocatedBytes = 0;
+            DebugLastUiControlApiMilliseconds = 0.0;
+            DebugLastUiControlApiCalls = 0;
+            DebugLastChartPanelApiAllocatedBytes = 0;
+            DebugLastChartPanelApiMilliseconds = 0.0;
+            DebugLastChartPanelApiCalls = 0;
             DebugLastSpriteApiCalls = 0;
             DebugLastQuad3DApiCalls = 0;
             DebugLastSparkleApiCalls = 0;
@@ -4037,7 +4560,16 @@ public sealed class SkinRuntime : IDisposable
         InvokeHitEffectRenderer(realTime, chartTime, width, height, view);
 
         var renderAllocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var renderTimestampStart = DebugMeasureApiAllocations ? Stopwatch.GetTimestamp() : 0L;
+#if TSC_ANDROID && DEBUG
+        var luaRenderStart = Stopwatch.GetTimestamp();
+#endif
         InvokeOptional("render", false);
+        if (DebugMeasureApiAllocations)
+            DebugLastRenderCallMilliseconds = (Stopwatch.GetTimestamp() - renderTimestampStart) * 1000.0 / Stopwatch.Frequency;
+#if TSC_ANDROID && DEBUG
+        DebugLastLuaRenderMilliseconds = Stopwatch.GetElapsedTime(luaRenderStart).TotalMilliseconds;
+#endif
         if (DebugMeasureApiAllocations)
             DebugLastRenderCallAllocatedBytes = GC.GetAllocatedBytesForCurrentThread() - renderAllocStart;
 
@@ -4045,22 +4577,74 @@ public sealed class SkinRuntime : IDisposable
         // frame. Interactive hitboxes use the same layout tree as draw commands.
         var layoutAllocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
         var layoutTimestampStart = DebugMeasureApiAllocations ? Stopwatch.GetTimestamp() : 0L;
-        var layoutResolved = ResolveDrawHierarchy();
+#if TSC_ANDROID && DEBUG
+        var layoutPerfStart = Stopwatch.GetTimestamp();
+#endif
+        var layoutResolved = !_drawCommandsNeedLayoutResolve || ResolveDrawHierarchy();
+#if TSC_ANDROID && DEBUG
+        DebugLastLayoutResolveMilliseconds = Stopwatch.GetElapsedTime(layoutPerfStart).TotalMilliseconds;
+#endif
         if (DebugMeasureApiAllocations)
         {
             DebugLastResolveLayoutAllocatedBytes = GC.GetAllocatedBytesForCurrentThread() - layoutAllocStart;
             DebugLastResolveLayoutMilliseconds = (Stopwatch.GetTimestamp() - layoutTimestampStart) * 1000.0 / Stopwatch.Frequency;
         }
         if (!layoutResolved)
+        {
+            _songSelectRenderCacheBuilt = false;
+            _songSelectRenderDirty = true;
+#if TSC_ANDROID && DEBUG
+            DebugLastDrawCommandCount = 0;
+            DebugLastCommandSortMilliseconds = 0.0;
+#endif
             return Array.Empty<SkinDrawCommand>();
+        }
 
         if (_drawCommands.Count == 0)
+        {
+            if (canReuseUnchangedCommands)
+            {
+                _songSelectRenderCacheBuilt = true;
+                _songSelectRenderDirty = false;
+                _songSelectRenderCacheWidth = width;
+                _songSelectRenderCacheHeight = height;
+                _songSelectRenderCacheFallbackFont = _defaultFallbackFont;
+            }
+#if TSC_ANDROID && DEBUG
+            DebugLastDrawCommandCount = 0;
+            DebugLastCommandSortMilliseconds = 0.0;
+#endif
             return Array.Empty<SkinDrawCommand>();
+        }
 
         var sortAllocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var sortTimestampStart = DebugMeasureApiAllocations ? Stopwatch.GetTimestamp() : 0L;
+#if TSC_ANDROID && DEBUG
+        var sortPerfStart = Stopwatch.GetTimestamp();
+#endif
         _drawCommands.Sort(DrawCommandComparison);
         if (DebugMeasureApiAllocations)
+            DebugLastRenderSortMilliseconds = (Stopwatch.GetTimestamp() - sortTimestampStart) * 1000.0 / Stopwatch.Frequency;
+#if TSC_ANDROID && DEBUG
+        DebugLastCommandSortMilliseconds = Stopwatch.GetElapsedTime(sortPerfStart).TotalMilliseconds;
+        DebugLastDrawCommandCount = _drawCommands.Count;
+#endif
+        if (DebugMeasureApiAllocations)
             DebugLastRenderSortAllocatedBytes = GC.GetAllocatedBytesForCurrentThread() - sortAllocStart;
+
+        if (canReuseUnchangedCommands)
+        {
+            _songSelectRenderCacheBuilt = true;
+            _songSelectRenderDirty = false;
+            _songSelectRenderCacheWidth = width;
+            _songSelectRenderCacheHeight = height;
+            _songSelectRenderCacheFallbackFont = _defaultFallbackFont;
+        }
+        else
+        {
+            _songSelectRenderCacheBuilt = false;
+            _songSelectRenderDirty = true;
+        }
         return _drawCommands;
     }
 
@@ -4287,6 +4871,253 @@ public sealed class SkinRuntime : IDisposable
         };
     }
 
+    private static void SetSongSelectString(Table table, string key, string? value)
+    {
+        value ??= string.Empty;
+        var current = table.Get(key);
+        if (current.Type == DataType.String && string.Equals(current.String, value, StringComparison.Ordinal))
+            return;
+        table.Set(key, DynValue.NewString(value));
+    }
+
+    private static void SetSongSelectNumber(Table table, string key, double value)
+    {
+        var current = table.Get(key);
+        if (current.Type == DataType.Number && current.Number.Equals(value))
+            return;
+        table.Set(key, DynValue.NewNumber(value));
+    }
+
+    private static void SetSongSelectBoolean(Table table, string key, bool value)
+    {
+        var current = table.Get(key);
+        if (current.Type == DataType.Boolean && current.Boolean == value)
+            return;
+        table.Set(key, DynValue.NewBoolean(value));
+    }
+
+    private static void SetSongSelectNullableNumber(Table table, string key, int? value)
+    {
+        var current = table.Get(key);
+        if (!value.HasValue)
+        {
+            if (current.Type != DataType.Nil)
+                table.Set(key, DynValue.Nil);
+            return;
+        }
+
+        if (current.Type == DataType.Number && current.Number.Equals(value.Value))
+            return;
+        table.Set(key, DynValue.NewNumber(value.Value));
+    }
+
+    private static void SetSongSelectAsset(Table table, string key, SkinAssetHandle? value)
+    {
+        var current = table.Get(key);
+        if (value is null)
+        {
+            if (current.Type != DataType.Nil)
+                table.Set(key, DynValue.Nil);
+            return;
+        }
+
+        if (current.Type == DataType.UserData && ReferenceEquals(current.UserData?.Object, value))
+            return;
+        table.Set(key, UserData.Create(value));
+    }
+
+    private static void SetSongSelectTable(Table parent, string key, Table value)
+    {
+        var current = parent.Get(key);
+        if (current.Type == DataType.Table && ReferenceEquals(current.Table, value))
+            return;
+        parent.Set(key, DynValue.NewTable(value));
+    }
+
+    private static void SetSongSelectString(Table table, int index, string? value)
+    {
+        value ??= string.Empty;
+        var current = table.Get(index);
+        if (current.Type == DataType.String && string.Equals(current.String, value, StringComparison.Ordinal))
+            return;
+        table.Set(index, DynValue.NewString(value));
+    }
+
+    private static void UpdateSongSelectStringArray(Table table, IReadOnlyList<string> values, ref int previousCount)
+    {
+        for (var i = 0; i < values.Count; i++)
+            SetSongSelectString(table, i + 1, values[i]);
+
+        for (var i = values.Count; i < previousCount; i++)
+            table.Set(i + 1, DynValue.Nil);
+
+        previousCount = values.Count;
+    }
+
+    private static void UpdateSongSelectItemTable(Table table, SkinSongSelectItem item, bool includeSelectedFlag, bool clampScoreAndAccuracy)
+    {
+        SetSongSelectNumber(table, "index", item.index);
+        SetSongSelectString(table, "name", item.name);
+        SetSongSelectString(table, "artist", item.artist);
+        SetSongSelectString(table, "pack", item.pack);
+        SetSongSelectString(table, "series", item.series);
+        SetSongSelectAsset(table, "album", item.album);
+        SetSongSelectAsset(table, "album_big", item.album_big);
+        SetSongSelectNumber(table, "bpm", item.bpm);
+        SetSongSelectString(table, "chart_difficulty", item.chart_difficulty);
+        SetSongSelectNullableNumber(table, "chart_level", item.chart_level);
+        SetSongSelectNullableNumber(table, "ez_level", item.ez_level);
+        SetSongSelectNullableNumber(table, "nm_level", item.nm_level);
+        SetSongSelectNullableNumber(table, "hd_level", item.hd_level);
+        SetSongSelectNullableNumber(table, "ex_level", item.ex_level);
+        SetSongSelectNullableNumber(table, "xt_level", item.xt_level);
+        SetSongSelectBoolean(table, "chart_level_estimated", item.chart_level_estimated);
+        SetSongSelectBoolean(table, "ez_level_estimated", item.ez_level_estimated);
+        SetSongSelectBoolean(table, "nm_level_estimated", item.nm_level_estimated);
+        SetSongSelectBoolean(table, "hd_level_estimated", item.hd_level_estimated);
+        SetSongSelectBoolean(table, "ex_level_estimated", item.ex_level_estimated);
+        SetSongSelectBoolean(table, "xt_level_estimated", item.xt_level_estimated);
+        if (includeSelectedFlag)
+            SetSongSelectBoolean(table, "selected", item.selected);
+        SetSongSelectNumber(table, "score", clampScoreAndAccuracy ? Math.Max(0, item.score) : item.score);
+        SetSongSelectNumber(table, "accuracy", clampScoreAndAccuracy ? Math.Clamp(item.accuracy, 0.0, 100.0) : item.accuracy);
+        SetSongSelectString(table, "grade", item.grade);
+        SetSongSelectString(table, "clear_type", item.clear_type);
+    }
+
+    private static void AddSongSelectItemToHash(ref HashCode hash, SkinSongSelectItem? item)
+    {
+        if (item is null)
+        {
+            hash.Add(0);
+            return;
+        }
+
+        hash.Add(1);
+        hash.Add(item.index);
+        hash.Add(item.name);
+        hash.Add(item.artist);
+        hash.Add(item.pack);
+        hash.Add(item.series);
+        hash.Add(item.album is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(item.album));
+        hash.Add(item.album_big is null ? 0 : System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(item.album_big));
+        hash.Add(item.bpm);
+        hash.Add(item.chart_difficulty);
+        hash.Add(item.chart_level);
+        hash.Add(item.ez_level);
+        hash.Add(item.nm_level);
+        hash.Add(item.hd_level);
+        hash.Add(item.ex_level);
+        hash.Add(item.xt_level);
+        hash.Add(item.chart_level_estimated);
+        hash.Add(item.ez_level_estimated);
+        hash.Add(item.nm_level_estimated);
+        hash.Add(item.hd_level_estimated);
+        hash.Add(item.ex_level_estimated);
+        hash.Add(item.xt_level_estimated);
+        hash.Add(item.selected);
+        hash.Add(item.score);
+        hash.Add(item.accuracy);
+        hash.Add(item.grade);
+        hash.Add(item.clear_type);
+    }
+
+    private static int ComputeSongSelectRenderStateHash(
+        int selectedSong,
+        int selectedDifficulty,
+        string selectedDifficultyName,
+        string pack,
+        string sort,
+        bool descending,
+        bool packExpanded,
+        bool sortExpanded,
+        bool searchActive,
+        string searchQuery,
+        double scrollSpeed,
+        bool scrollSpeedExpanded,
+        bool editConfirmOpen,
+        string error,
+        bool loading,
+        int songCount,
+        int page,
+        int pageCount,
+        int packIndex,
+        int sortIndex,
+        double galleryScroll,
+        double galleryScrollMax,
+        double galleryScrollPixels,
+        int galleryBufferStartRow,
+        double galleryFractionalPixels,
+        SkinSongSelectItem? selectedItem,
+        IReadOnlyList<SkinSongSelectItem> items,
+        IReadOnlyList<string> packItems,
+        IReadOnlyList<string> difficulties,
+        int searchCaret,
+        int searchSelectionStart,
+        int searchSelectionEnd,
+        string? searchDisplay,
+        int searchVisibleStart,
+        int searchVisibleEnd,
+        float searchCaretOffset,
+        float searchSelectionOffset,
+        float searchSelectionWidth,
+        bool autoplay,
+        string gauge,
+        string scrollMode,
+        string chartPanelMode)
+    {
+        var hash = new HashCode();
+        hash.Add(selectedSong);
+        hash.Add(selectedDifficulty);
+        hash.Add(selectedDifficultyName);
+        hash.Add(pack);
+        hash.Add(sort);
+        hash.Add(descending);
+        hash.Add(packExpanded);
+        hash.Add(sortExpanded);
+        hash.Add(searchActive);
+        hash.Add(searchQuery);
+        hash.Add(scrollSpeed);
+        hash.Add(scrollSpeedExpanded);
+        hash.Add(editConfirmOpen);
+        hash.Add(error);
+        hash.Add(loading);
+        hash.Add(songCount);
+        hash.Add(page);
+        hash.Add(pageCount);
+        hash.Add(packIndex);
+        hash.Add(sortIndex);
+        hash.Add(galleryScroll);
+        hash.Add(galleryScrollMax);
+        hash.Add(galleryScrollPixels);
+        hash.Add(galleryBufferStartRow);
+        hash.Add(galleryFractionalPixels);
+        hash.Add(searchCaret);
+        hash.Add(searchSelectionStart);
+        hash.Add(searchSelectionEnd);
+        hash.Add(searchDisplay);
+        hash.Add(searchVisibleStart);
+        hash.Add(searchVisibleEnd);
+        hash.Add(searchCaretOffset);
+        hash.Add(searchSelectionOffset);
+        hash.Add(searchSelectionWidth);
+        hash.Add(autoplay);
+        hash.Add(gauge);
+        hash.Add(scrollMode);
+        hash.Add(chartPanelMode);
+        AddSongSelectItemToHash(ref hash, selectedItem);
+        hash.Add(items.Count);
+        for (var i = 0; i < items.Count; i++)
+            AddSongSelectItemToHash(ref hash, items[i]);
+        hash.Add(packItems.Count);
+        for (var i = 0; i < packItems.Count; i++)
+            hash.Add(packItems[i]);
+        hash.Add(difficulties.Count);
+        for (var i = 0; i < difficulties.Count; i++)
+            hash.Add(difficulties[i]);
+        return hash.ToHashCode();
+    }
+
     public void UpdateSongSelectState(
         int selectedSong,
         int selectedDifficulty,
@@ -4334,121 +5165,158 @@ public sealed class SkinRuntime : IDisposable
         if (_songSelect is null || _script is null)
             return;
 
+        var stateHash = ComputeSongSelectRenderStateHash(
+            selectedSong, selectedDifficulty, selectedDifficultyName, pack, sort,
+            descending, packExpanded, sortExpanded, searchActive, searchQuery,
+            scrollSpeed, scrollSpeedExpanded, editConfirmOpen, error, loading,
+            songCount, page, pageCount, packIndex, sortIndex, galleryScroll,
+            galleryScrollMax, galleryScrollPixels, galleryBufferStartRow,
+            galleryFractionalPixels, selectedItem, items, packItems, difficulties,
+            searchCaret, searchSelectionStart, searchSelectionEnd, searchDisplay,
+            searchVisibleStart, searchVisibleEnd, searchCaretOffset,
+            searchSelectionOffset, searchSelectionWidth, autoplay, gauge,
+            scrollMode, chartPanelMode);
+        if (!_hasSongSelectRenderStateHash || stateHash != _songSelectRenderStateHash)
+        {
+            _songSelectRenderStateHash = stateHash;
+            _hasSongSelectRenderStateHash = true;
+            _songSelectRenderDirty = true;
+        }
+
+#if TSC_ANDROID
+        SetSongSelectBoolean(_songSelect, "editor_enabled", false);
+        var songs = _songSelectSongsTable ??= new Table(_script);
+        SetSongSelectTable(_songSelect, "songs", songs);
+        for (var i = 0; i < items.Count; i++)
+        {
+            while (_songSelectSongRows.Count <= i)
+                _songSelectSongRows.Add(new Table(_script));
+
+            var row = _songSelectSongRows[i];
+            UpdateSongSelectItemTable(row, items[i], includeSelectedFlag: true, clampScoreAndAccuracy: false);
+            var currentRow = songs.Get(i + 1);
+            if (currentRow.Type != DataType.Table || !ReferenceEquals(currentRow.Table, row))
+                songs.Set(i + 1, DynValue.NewTable(row));
+        }
+
+        for (var i = items.Count; i < _songSelectPublishedItemCount; i++)
+        {
+            songs.Set(i + 1, DynValue.Nil);
+            ClearSongSelectTable(_songSelectSongRows[i]);
+        }
+        _songSelectPublishedItemCount = items.Count;
+
+        var packTable = _songSelectPackTable ??= new Table(_script);
+        SetSongSelectTable(_songSelect, "pack_list", packTable);
+        UpdateSongSelectStringArray(packTable, packItems, ref _songSelectPublishedPackCount);
+
+        var difficultiesTable = _songSelectDifficultiesTable ??= new Table(_script);
+        SetSongSelectTable(_songSelect, "difficulties", difficultiesTable);
+        UpdateSongSelectStringArray(difficultiesTable, difficulties, ref _songSelectPublishedDifficultyCount);
+#else
+        SetSongSelectBoolean(_songSelect, "editor_enabled", true);
         var songs = new Table(_script);
         for (var i = 0; i < items.Count; i++)
         {
-            var item = items[i];
             var row = new Table(_script);
-            row.Set("index", DynValue.NewNumber(item.index));
-            row.Set("name", DynValue.NewString(item.name));
-            row.Set("artist", DynValue.NewString(item.artist));
-            row.Set("pack", DynValue.NewString(item.pack));
-            row.Set("series", DynValue.NewString(item.series));
-            row.Set("album", item.album is null ? DynValue.Nil : UserData.Create(item.album));
-            row.Set("album_big", item.album_big is null ? DynValue.Nil : UserData.Create(item.album_big));
-            row.Set("bpm", DynValue.NewNumber(item.bpm));
-            row.Set("chart_difficulty", DynValue.NewString(item.chart_difficulty ?? string.Empty));
-            row.Set("chart_level", item.chart_level.HasValue ? DynValue.NewNumber(item.chart_level.Value) : DynValue.Nil);
-            row.Set("ez_level", item.ez_level.HasValue ? DynValue.NewNumber(item.ez_level.Value) : DynValue.Nil);
-            row.Set("nm_level", item.nm_level.HasValue ? DynValue.NewNumber(item.nm_level.Value) : DynValue.Nil);
-            row.Set("hd_level", item.hd_level.HasValue ? DynValue.NewNumber(item.hd_level.Value) : DynValue.Nil);
-            row.Set("ex_level", item.ex_level.HasValue ? DynValue.NewNumber(item.ex_level.Value) : DynValue.Nil);
-            row.Set("xt_level", item.xt_level.HasValue ? DynValue.NewNumber(item.xt_level.Value) : DynValue.Nil);
-            row.Set("selected", DynValue.NewBoolean(item.selected));
-            row.Set("score", DynValue.NewNumber(item.score));
-            row.Set("accuracy", DynValue.NewNumber(item.accuracy));
-            row.Set("grade", DynValue.NewString(item.grade ?? string.Empty));
-            row.Set("clear_type", DynValue.NewString(item.clear_type ?? string.Empty));
+            UpdateSongSelectItemTable(row, items[i], includeSelectedFlag: true, clampScoreAndAccuracy: false);
             songs.Set(i + 1, DynValue.NewTable(row));
         }
 
         var packTable = new Table(_script);
         for (var i = 0; i < packItems.Count; i++)
-            packTable.Set(i + 1, DynValue.NewString(packItems[i]));
+            SetSongSelectString(packTable, i + 1, packItems[i]);
 
         var difficultiesTable = new Table(_script);
         for (var i = 0; i < difficulties.Count; i++)
-            difficultiesTable.Set(i + 1, DynValue.NewString(difficulties[i]));
+            SetSongSelectString(difficultiesTable, i + 1, difficulties[i]);
 
-        _songSelect.Set("selected_song", DynValue.NewNumber(Math.Max(0, selectedSong)));
-        _songSelect.Set("selected_difficulty", DynValue.NewNumber(Math.Max(0, selectedDifficulty)));
-        _songSelect.Set("selected_difficulty_name", DynValue.NewString(selectedDifficultyName ?? string.Empty));
-        _songSelect.Set("pack", DynValue.NewString(pack ?? string.Empty));
-        _songSelect.Set("sort", DynValue.NewString(sort ?? string.Empty));
-        _songSelect.Set("descending", DynValue.NewBoolean(descending));
-        _songSelect.Set("sort_direction", DynValue.NewString(descending ? "DESC" : "ASC"));
-        _songSelect.Set("pack_expanded", DynValue.NewBoolean(packExpanded));
-        _songSelect.Set("sort_expanded", DynValue.NewBoolean(sortExpanded));
-        _songSelect.Set("search_active", DynValue.NewBoolean(searchActive));
-        _songSelect.Set("search", DynValue.NewString(searchQuery ?? string.Empty));
-        _songSelect.Set("search_caret", DynValue.NewNumber(Math.Clamp(searchCaret, 0, (searchQuery ?? string.Empty).Length)));
-        _songSelect.Set("search_selection_start", DynValue.NewNumber(Math.Clamp(searchSelectionStart, 0, (searchQuery ?? string.Empty).Length)));
-        _songSelect.Set("search_selection_end", DynValue.NewNumber(Math.Clamp(searchSelectionEnd, 0, (searchQuery ?? string.Empty).Length)));
-        var safeSearchLength = (searchQuery ?? string.Empty).Length;
+        SetSongSelectTable(_songSelect, "songs", songs);
+        SetSongSelectTable(_songSelect, "pack_list", packTable);
+        SetSongSelectTable(_songSelect, "difficulties", difficultiesTable);
+#endif
+
+        var safeSearch = searchQuery ?? string.Empty;
+        var safeSearchLength = safeSearch.Length;
         var safeVisibleStart = Math.Clamp(searchVisibleStart, 0, safeSearchLength);
         var safeVisibleEnd = Math.Clamp(searchVisibleEnd, safeVisibleStart, safeSearchLength);
-        _songSelect.Set("search_display", DynValue.NewString(searchDisplay ?? searchQuery ?? string.Empty));
-        _songSelect.Set("search_visible_start", DynValue.NewNumber(safeVisibleStart));
-        _songSelect.Set("search_visible_end", DynValue.NewNumber(safeVisibleEnd));
-        _songSelect.Set("search_caret_offset", DynValue.NewNumber(Math.Max(0f, searchCaretOffset)));
-        _songSelect.Set("search_selection_offset", DynValue.NewNumber(Math.Max(0f, searchSelectionOffset)));
-        _songSelect.Set("search_selection_width", DynValue.NewNumber(Math.Max(0f, searchSelectionWidth)));
-        _songSelect.Set("scroll_speed", DynValue.NewNumber(Math.Clamp(scrollSpeed, 0.25, 9.0)));
-        _songSelect.Set("scroll_speed_expanded", DynValue.NewBoolean(scrollSpeedExpanded));
-        _songSelect.Set("autoplay", DynValue.NewBoolean(autoplay));
-        _songSelect.Set("gauge", DynValue.NewString(GameConfig.NormalizeGaugeType(gauge)));
-        _songSelect.Set("scroll_mode", DynValue.NewString(GameConfig.NormalizeScrollMode(scrollMode)));
-        _songSelect.Set("chart_panel_mode", DynValue.NewString(chartPanelMode ?? "hidden"));
-        _songSelect.Set("edit_confirm_open", DynValue.NewBoolean(editConfirmOpen));
-        _songSelect.Set("error", DynValue.NewString(error ?? string.Empty));
-        _songSelect.Set("loading", DynValue.NewBoolean(loading));
-        _songSelect.Set("song_count", DynValue.NewNumber(Math.Max(0, songCount)));
-        _songSelect.Set("page", DynValue.NewNumber(Math.Max(1, page)));
-        _songSelect.Set("page_count", DynValue.NewNumber(Math.Max(1, pageCount)));
-        _songSelect.Set("pack_index", DynValue.NewNumber(Math.Max(0, packIndex)));
-        _songSelect.Set("sort_index", DynValue.NewNumber(Math.Max(0, sortIndex)));
-        _songSelect.Set("gallery_scroll", DynValue.NewNumber(Math.Max(0.0, galleryScroll)));
-        _songSelect.Set("gallery_scroll_max", DynValue.NewNumber(Math.Max(0.0, galleryScrollMax)));
-        _songSelect.Set("gallery_scroll_pixels", DynValue.NewNumber(Math.Max(0.0, galleryScrollPixels)));
+
+        SetSongSelectNumber(_songSelect, "selected_song", Math.Max(0, selectedSong));
+        SetSongSelectNumber(_songSelect, "selected_difficulty", Math.Max(0, selectedDifficulty));
+        SetSongSelectString(_songSelect, "selected_difficulty_name", selectedDifficultyName);
+        SetSongSelectString(_songSelect, "pack", pack);
+        SetSongSelectString(_songSelect, "sort", sort);
+        SetSongSelectBoolean(_songSelect, "descending", descending);
+        SetSongSelectString(_songSelect, "sort_direction", descending ? "DESC" : "ASC");
+        SetSongSelectBoolean(_songSelect, "pack_expanded", packExpanded);
+        SetSongSelectBoolean(_songSelect, "sort_expanded", sortExpanded);
+        SetSongSelectBoolean(_songSelect, "search_active", searchActive);
+        SetSongSelectString(_songSelect, "search", safeSearch);
+        SetSongSelectNumber(_songSelect, "search_caret", Math.Clamp(searchCaret, 0, safeSearchLength));
+        SetSongSelectNumber(_songSelect, "search_selection_start", Math.Clamp(searchSelectionStart, 0, safeSearchLength));
+        SetSongSelectNumber(_songSelect, "search_selection_end", Math.Clamp(searchSelectionEnd, 0, safeSearchLength));
+        SetSongSelectString(_songSelect, "search_display", searchDisplay ?? safeSearch);
+        SetSongSelectNumber(_songSelect, "search_visible_start", safeVisibleStart);
+        SetSongSelectNumber(_songSelect, "search_visible_end", safeVisibleEnd);
+        SetSongSelectNumber(_songSelect, "search_caret_offset", Math.Max(0f, searchCaretOffset));
+        SetSongSelectNumber(_songSelect, "search_selection_offset", Math.Max(0f, searchSelectionOffset));
+        SetSongSelectNumber(_songSelect, "search_selection_width", Math.Max(0f, searchSelectionWidth));
+        SetSongSelectNumber(_songSelect, "scroll_speed", Math.Clamp(scrollSpeed, 0.25, 9.0));
+        SetSongSelectBoolean(_songSelect, "scroll_speed_expanded", scrollSpeedExpanded);
+        SetSongSelectBoolean(_songSelect, "autoplay", autoplay);
+        SetSongSelectString(_songSelect, "gauge", GameConfig.NormalizeGaugeType(gauge));
+        SetSongSelectString(_songSelect, "scroll_mode", GameConfig.NormalizeScrollMode(scrollMode));
+        SetSongSelectString(_songSelect, "chart_panel_mode", chartPanelMode ?? "hidden");
+        SetSongSelectBoolean(_songSelect, "edit_confirm_open", editConfirmOpen);
+        SetSongSelectString(_songSelect, "error", error);
+        SetSongSelectBoolean(_songSelect, "loading", loading);
+        SetSongSelectNumber(_songSelect, "song_count", Math.Max(0, songCount));
+        SetSongSelectNumber(_songSelect, "page", Math.Max(1, page));
+        SetSongSelectNumber(_songSelect, "page_count", Math.Max(1, pageCount));
+        SetSongSelectNumber(_songSelect, "pack_index", Math.Max(0, packIndex));
+        SetSongSelectNumber(_songSelect, "sort_index", Math.Max(0, sortIndex));
+        SetSongSelectNumber(_songSelect, "gallery_scroll", Math.Max(0.0, galleryScroll));
+        SetSongSelectNumber(_songSelect, "gallery_scroll_max", Math.Max(0.0, galleryScrollMax));
+        SetSongSelectNumber(_songSelect, "gallery_scroll_pixels", Math.Max(0.0, galleryScrollPixels));
         // Render-only continuous gallery coordinates. The absolute item index stays
         // available for selection, but Lua should position cards from this buffer.
-        _songSelect.Set("gallery_buffer_start_row", DynValue.NewNumber(Math.Max(0, galleryBufferStartRow)));
-        _songSelect.Set("gallery_fractional_pixels", DynValue.NewNumber(Math.Max(0.0, galleryFractionalPixels)));
+        SetSongSelectNumber(_songSelect, "gallery_buffer_start_row", Math.Max(0, galleryBufferStartRow));
+        SetSongSelectNumber(_songSelect, "gallery_fractional_pixels", Math.Max(0.0, galleryFractionalPixels));
         // Gallery dragging is managed by SongSelectMenu and is updated through the public state call.
         // The current boolean is intentionally left false here for compatibility; skins should
         // primarily use the pixel position rather than this advisory flag.
-        _songSelect.Set("songs", DynValue.NewTable(songs));
-        _songSelect.Set("pack_list", DynValue.NewTable(packTable));
-        _songSelect.Set("difficulties", DynValue.NewTable(difficultiesTable));
 
         if (selectedItem is null)
         {
-            _songSelect.Set("selected", DynValue.Nil);
+#if TSC_ANDROID
+            if (_songSelectSelectedTable is not null)
+                ClearSongSelectTable(_songSelectSelectedTable);
+#endif
+            var currentSelected = _songSelect.Get("selected");
+            if (currentSelected.Type != DataType.Nil)
+                _songSelect.Set("selected", DynValue.Nil);
             return;
         }
 
+#if TSC_ANDROID
+        var selected = _songSelectSelectedTable ??= new Table(_script);
+#else
         var selected = new Table(_script);
-        selected.Set("index", DynValue.NewNumber(selectedItem.index));
-        selected.Set("name", DynValue.NewString(selectedItem.name));
-        selected.Set("artist", DynValue.NewString(selectedItem.artist));
-        selected.Set("pack", DynValue.NewString(selectedItem.pack));
-        selected.Set("series", DynValue.NewString(selectedItem.series));
-        selected.Set("album", selectedItem.album is null ? DynValue.Nil : UserData.Create(selectedItem.album));
-        selected.Set("album_big", selectedItem.album_big is null ? DynValue.Nil : UserData.Create(selectedItem.album_big));
-        selected.Set("bpm", DynValue.NewNumber(selectedItem.bpm));
-        selected.Set("chart_difficulty", DynValue.NewString(selectedItem.chart_difficulty ?? string.Empty));
-        selected.Set("chart_level", selectedItem.chart_level.HasValue ? DynValue.NewNumber(selectedItem.chart_level.Value) : DynValue.Nil);
-        selected.Set("ez_level", selectedItem.ez_level.HasValue ? DynValue.NewNumber(selectedItem.ez_level.Value) : DynValue.Nil);
-        selected.Set("nm_level", selectedItem.nm_level.HasValue ? DynValue.NewNumber(selectedItem.nm_level.Value) : DynValue.Nil);
-        selected.Set("hd_level", selectedItem.hd_level.HasValue ? DynValue.NewNumber(selectedItem.hd_level.Value) : DynValue.Nil);
-        selected.Set("ex_level", selectedItem.ex_level.HasValue ? DynValue.NewNumber(selectedItem.ex_level.Value) : DynValue.Nil);
-        selected.Set("xt_level", selectedItem.xt_level.HasValue ? DynValue.NewNumber(selectedItem.xt_level.Value) : DynValue.Nil);
-        selected.Set("score", DynValue.NewNumber(Math.Max(0, selectedItem.score)));
-        selected.Set("accuracy", DynValue.NewNumber(Math.Clamp(selectedItem.accuracy, 0.0, 100.0)));
-        selected.Set("grade", DynValue.NewString(selectedItem.grade ?? string.Empty));
-        selected.Set("clear_type", DynValue.NewString(selectedItem.clear_type ?? string.Empty));
-        _songSelect.Set("selected", DynValue.NewTable(selected));
+#endif
+        UpdateSongSelectItemTable(selected, selectedItem, includeSelectedFlag: false, clampScoreAndAccuracy: true);
+        SetSongSelectTable(_songSelect, "selected", selected);
     }
+
+#if TSC_ANDROID
+    private void ClearSongSelectTable(Table table)
+    {
+        _songSelectStaleKeys.Clear();
+        foreach (var pair in table.Pairs)
+            _songSelectStaleKeys.Add(pair.Key);
+        foreach (var key in _songSelectStaleKeys)
+            table.Set(key, DynValue.Nil);
+    }
+#endif
 
     /// <summary>
     /// Queries the song-select Lua layout so input/navigation and the renderer share
@@ -4527,10 +5395,17 @@ public sealed class SkinRuntime : IDisposable
     /// Renders the current skin script command list into a caller-owned SpriteBatch.
     /// Used by startup/menu screens that share the same Lua drawing API as gameplay.
     /// </summary>
-    public bool RenderDrawCommands(SpriteBatch spriteBatch, Texture2D fallbackPixel, SpriteFont fallbackFont, int width, int height)
+    public bool RenderDrawCommands(
+        SpriteBatch spriteBatch,
+        Texture2D fallbackPixel,
+        SpriteFont fallbackFont,
+        int width,
+        int height,
+        bool reuseUnchangedCommands = false)
     {
         _defaultFallbackFont = fallbackFont;
-        var commands = BuildDrawCommands(width, height);
+        var commands = BuildDrawCommands(width, height, fallbackFont,
+            reuseUnchangedCommands: reuseUnchangedCommands);
         if (!commands.Any(HasVisibleDrawContent))
             return false;
 
@@ -4604,7 +5479,17 @@ public sealed class SkinRuntime : IDisposable
                 XnaRectangle? commandScissor = command.ScissorClip;
                 if (commandScissor is { } requestedClip)
                 {
-                    var clipped = XnaRectangle.Intersect(requestedClip, _graphics.Viewport.Bounds);
+                    // Lua clip rectangles are expressed in the viewport's local
+                    // coordinate space. ScissorRectangle uses backbuffer space,
+                    // so include the viewport origin when the 16:9 canvas is
+                    // centered inside a wider Android display.
+                    var viewport = _graphics.Viewport;
+                    var backBufferClip = new XnaRectangle(
+                        requestedClip.X + viewport.X,
+                        requestedClip.Y + viewport.Y,
+                        requestedClip.Width,
+                        requestedClip.Height);
+                    var clipped = XnaRectangle.Intersect(backBufferClip, viewport.Bounds);
                     if (clipped.Width <= 0 || clipped.Height <= 0)
                         continue;
                     commandScissor = clipped;
@@ -5763,7 +6648,7 @@ public sealed class SkinRuntime : IDisposable
         }
 
         var key = new SkinSparkleBakeKey(
-            $"procedural-crowd-v7-independent-green-chance-original-glow:{layerCount}",
+            $"procedural-crowd-v9-cross-platform-cpu-random-lookup:{layerCount}",
             0, 0,
             bakeWidth, bakeHeight, 0f,
             settings.GridX, settings.GridY, settings.Density,
@@ -5781,6 +6666,8 @@ public sealed class SkinRuntime : IDisposable
 
         RenderTarget2D? atlas = null;
         RenderTarget2D? flash = null;
+        Texture2D? randomTextureA = null;
+        Texture2D? randomTextureB = null;
         var graphics = _graphics;
         var oldTarget = graphics.GetRenderTargets();
         var oldViewport = graphics.Viewport;
@@ -5826,7 +6713,16 @@ public sealed class SkinRuntime : IDisposable
             _skinSparklesEffect.Parameters["WorldViewProjection"]?.SetValue(ortho);
             _skinSparklesEffect.Parameters["CrowdResolution"]?.SetValue(new Vector2(bakeWidth, bakeHeight));
             _skinSparklesEffect.Parameters["LayerCount"]?.SetValue((float)layerCount);
-            _skinSparklesEffect.Parameters["CrowdSeed"]?.SetValue(settings.Seed);
+
+            var crowdCellSize = 40f * (bakeHeight / 1080f);
+            var randomGridWidth = Math.Max(1, (int)MathF.Ceiling(bakeWidth / Math.Max(0.001f, crowdCellSize)) + 4);
+            var randomGridHeight = Math.Max(1, (int)MathF.Ceiling(bakeHeight / Math.Max(0.001f, crowdCellSize)) + 4);
+            (randomTextureA, randomTextureB) = CreateCrowdRandomTextures(
+                randomGridWidth, randomGridHeight, settings.Seed);
+            _skinSparklesEffect.Parameters["CrowdRandomTextureA"]?.SetValue(randomTextureA);
+            _skinSparklesEffect.Parameters["CrowdRandomTextureB"]?.SetValue(randomTextureB);
+            _skinSparklesEffect.Parameters["CrowdRandomGridSize"]?.SetValue(
+                new Vector2(randomGridWidth, randomGridHeight));
 
             foreach (var pass in _skinSparklesEffect.Techniques["BakedCrowdLayer"].Passes)
             {
@@ -5914,6 +6810,12 @@ public sealed class SkinRuntime : IDisposable
         }
         finally
         {
+            // The lookup textures are temporary bake inputs; the resulting atlas
+            // contains their data and does not reference them at runtime.
+            _skinSparklesEffect.Parameters["CrowdRandomTextureA"]?.SetValue((Texture2D?)null);
+            _skinSparklesEffect.Parameters["CrowdRandomTextureB"]?.SetValue((Texture2D?)null);
+            randomTextureA?.Dispose();
+            randomTextureB?.Dispose();
             graphics.Viewport = oldViewport;
             graphics.SetRenderTargets(oldTarget);
             graphics.BlendState = oldBlend;
@@ -5921,6 +6823,62 @@ public sealed class SkinRuntime : IDisposable
             graphics.RasterizerState = oldRasterizer;
             graphics.SamplerStates[0] = oldSampler;
         }
+    }
+
+    private (Texture2D TextureA, Texture2D TextureB) CreateCrowdRandomTextures(
+        int width, int height, float seed)
+    {
+        var count = checked(width * height);
+        var pixelsA = new XnaColor[count];
+        var pixelsB = new XnaColor[count];
+        var state = unchecked((uint)BitConverter.SingleToInt32Bits(seed)) ^ 0x9E3779B9u;
+        if (state == 0u)
+            state = 0x6D2B79F5u;
+
+        for (var i = 0; i < count; i++)
+        {
+            pixelsA[i] = new XnaColor(
+                (byte)(NextCrowdRandom(ref state) >> 24),
+                (byte)(NextCrowdRandom(ref state) >> 24),
+                (byte)(NextCrowdRandom(ref state) >> 24),
+                (byte)(NextCrowdRandom(ref state) >> 24));
+            pixelsB[i] = new XnaColor(
+                (byte)(NextCrowdRandom(ref state) >> 24),
+                (byte)(NextCrowdRandom(ref state) >> 24),
+                (byte)(NextCrowdRandom(ref state) >> 24),
+                (byte)(NextCrowdRandom(ref state) >> 24));
+        }
+
+        Texture2D? textureA = null;
+        Texture2D? textureB = null;
+        try
+        {
+            textureA = NativeResourceDiagnostics.TrackTexture(
+                new Texture2D(_graphics, width, height, false, SurfaceFormat.Color),
+                NativeResourceCategory.Skin);
+            textureA.SetData(pixelsA);
+            textureB = NativeResourceDiagnostics.TrackTexture(
+                new Texture2D(_graphics, width, height, false, SurfaceFormat.Color),
+                NativeResourceCategory.Skin);
+            textureB.SetData(pixelsB);
+            return (textureA, textureB);
+        }
+        catch
+        {
+            textureA?.Dispose();
+            textureB?.Dispose();
+            throw;
+        }
+    }
+
+    private static uint NextCrowdRandom(ref uint state)
+    {
+        // xorshift32 is deterministic, inexpensive, and runs at full integer
+        // precision on every supported CPU architecture.
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        return state;
     }
 
     private static SkinSparkleFlashInstance[] CreateCrowdFlashInstances(float seed)
@@ -6948,6 +7906,11 @@ public sealed class SkinRuntime : IDisposable
                 _skinQuad3DEffect.Parameters["MaskEnabled"]?.SetValue(maskTexture is not null ? 1f : 0f);
                 _skinQuad3DEffect.Parameters["ForceWhiteColor"]?.SetValue(command.ForceWhiteColor ? 1f : 0f);
                 _skinQuad3DEffect.Parameters["UseBilinearMapping"]?.SetValue(0f);
+                _skinQuad3DEffect.Parameters["ScreenHeight"]?.SetValue((float)graphics.Viewport.Height);
+                _skinQuad3DEffect.Parameters["ViewportSize"]?.SetValue(
+                    new Vector2(graphics.Viewport.Width, graphics.Viewport.Height));
+                _skinQuad3DEffect.Parameters["ViewportOrigin"]?.SetValue(
+                    new Vector2(graphics.Viewport.X, graphics.Viewport.Y));
                 SetSkinQuadClip(_skinQuad3DEffect, command.ClipRect);
                 _skinQuad3DEffect.Parameters["DiffuseColor"]?.SetValue(Vector3.One);
                 _skinQuad3DEffect.Parameters["Alpha"]?.SetValue(Math.Clamp(command.Alpha, 0f, 1f));
@@ -7079,6 +8042,11 @@ public sealed class SkinRuntime : IDisposable
         effect.Parameters["MaskEnabled"]?.SetValue(0f);
         effect.Parameters["ForceWhiteColor"]?.SetValue(0f);
         effect.Parameters["UseBilinearMapping"]?.SetValue(1f);
+        effect.Parameters["ScreenHeight"]?.SetValue((float)graphics.Viewport.Height);
+        effect.Parameters["ViewportSize"]?.SetValue(
+            new Vector2(graphics.Viewport.Width, graphics.Viewport.Height));
+        effect.Parameters["ViewportOrigin"]?.SetValue(
+            new Vector2(graphics.Viewport.X, graphics.Viewport.Y));
         SetSkinQuadClip(effect, clipRect);
 
         foreach (var pass in effect.CurrentTechnique.Passes)
@@ -7627,6 +8595,7 @@ public sealed class SkinRuntime : IDisposable
         return table;
     }
 
+#if DEBUG
     private Table CreateSkinPerfApi(Script script)
     {
         var table = new Table(script);
@@ -7653,6 +8622,7 @@ public sealed class SkinRuntime : IDisposable
         if ((uint)index >= (uint)_skinLuaProfileSections.Length)
             return DynValue.Nil;
 
+        DebugLastSkinPerfBeginCalls++;
         var section = _skinLuaProfileSections[index];
         section.StartAllocatedBytes = GC.GetAllocatedBytesForCurrentThread();
         section.StartTimestamp = Stopwatch.GetTimestamp();
@@ -7673,6 +8643,7 @@ public sealed class SkinRuntime : IDisposable
         if (!section.Active)
             return DynValue.Nil;
 
+        DebugLastSkinPerfStopCalls++;
         var allocatedBytes = GC.GetAllocatedBytesForCurrentThread();
         var timestamp = Stopwatch.GetTimestamp();
         // A section can bracket a repeated operation (for example, each of the
@@ -7683,6 +8654,7 @@ public sealed class SkinRuntime : IDisposable
         section.Active = false;
         return DynValue.Nil;
     }
+#endif
 
     private Table CreateUiApi(Script script)
     {
@@ -7764,85 +8736,100 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue RegisterUiControl(CallbackArguments args, bool isInput)
     {
-        var controlName = isInput ? "ui.input" : "ui.button";
-        if (args.Count < 1 || args[0].Type != DataType.Table)
-            throw new ScriptRuntimeException($"{controlName}(options) expects a table");
-
-        var options = args[0].Table!;
-        var id = GetOptionalString(options, "id")?.Trim();
-        if (string.IsNullOrWhiteSpace(id))
-            throw new ScriptRuntimeException($"{controlName} requires a non-empty id");
-        if (_layoutNodes.ContainsKey(id) || _uiButtons.ContainsKey(id) || _uiSliders.ContainsKey(id))
-            throw new ScriptRuntimeException($"ui control '{id}' is already registered this frame");
-
-        var parentId = GetOptionalString(options, "parent")?.Trim();
-        if (string.IsNullOrWhiteSpace(parentId)) parentId = null;
-        var x = GetOptionalNumber(options, "x", 0.0);
-        var y = GetOptionalNumber(options, "y", 0.0);
-        var width = GetOptionalNumber(options, "width", 0.0);
-        var height = GetOptionalNumber(options, "height", 0.0);
-        if (width <= 0 || height <= 0)
-            throw new ScriptRuntimeException($"{controlName} '{id}' requires positive width and height");
-
-        DynValue? onClick = null;
-        var callback = options.Get("on_click");
-        if (!callback.IsNil())
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
+        try
         {
-            if (callback.Type != DataType.Function)
-                throw new ScriptRuntimeException($"{controlName} '{id}' on_click must be a function");
-            onClick = callback;
-        }
+            var controlName = isInput ? "ui.input" : "ui.button";
+            if (args.Count < 1 || args[0].Type != DataType.Table)
+                throw new ScriptRuntimeException($"{controlName}(options) expects a table");
 
-        var actionValue = options.Get("value");
-        var action = GetOptionalString(options, "action")?.Trim();
-        var priorityValue = GetOptionalNumber(options, "hit_test_priority", 0.0);
-        var hitTestPriority = double.IsFinite(priorityValue)
-            ? (int)Math.Clamp(Math.Round(priorityValue), -1000.0, 1000.0)
-            : 0;
-        if (string.IsNullOrWhiteSpace(action))
-            action = null;
+            var options = args[0].Table!;
+            var id = GetOptionalString(options, "id")?.Trim();
+            if (string.IsNullOrWhiteSpace(id))
+                throw new ScriptRuntimeException($"{controlName} requires a non-empty id");
+            if (_layoutNodes.ContainsKey(id) || _uiButtons.ContainsKey(id) || _uiSliders.ContainsKey(id))
+                throw new ScriptRuntimeException($"ui control '{id}' is already registered this frame");
 
-        if (onClick is not null && action is not null)
-            throw new ScriptRuntimeException($"{controlName} '{id}' cannot use both on_click and action");
+            var parentId = GetOptionalString(options, "parent")?.Trim();
+            if (string.IsNullOrWhiteSpace(parentId)) parentId = null;
+            var x = GetOptionalNumber(options, "x", 0.0);
+            var y = GetOptionalNumber(options, "y", 0.0);
+            var width = GetOptionalNumber(options, "width", 0.0);
+            var height = GetOptionalNumber(options, "height", 0.0);
+            if (width <= 0 || height <= 0)
+                throw new ScriptRuntimeException($"{controlName} '{id}' requires positive width and height");
 
-        if (actionValue.Type != DataType.Nil && action is null)
-            throw new ScriptRuntimeException($"{controlName} '{id}' value requires action");
-
-        if (onClick is null && action is null)
-            throw new ScriptRuntimeException($"{controlName} '{id}' requires either on_click or action");
-
-        object? parsedActionValue = null;
-        if (action is not null)
-        {
-            parsedActionValue = actionValue.Type switch
+            DynValue? onClick = null;
+            var callback = options.Get("on_click");
+            if (!callback.IsNil())
             {
-                DataType.Nil => null,
-                DataType.Number => actionValue.Number,
-                DataType.String => actionValue.String,
-                DataType.Boolean => actionValue.Boolean,
-                _ => throw new ScriptRuntimeException(
-                    $"{controlName} '{id}' value must be a number, string, boolean, or nil"),
-            };
+                if (callback.Type != DataType.Function)
+                    throw new ScriptRuntimeException($"{controlName} '{id}' on_click must be a function");
+                onClick = callback;
+            }
+
+            var actionValue = options.Get("value");
+            var action = GetOptionalString(options, "action")?.Trim();
+            var priorityValue = GetOptionalNumber(options, "hit_test_priority", 0.0);
+            var hitTestPriority = double.IsFinite(priorityValue)
+                ? (int)Math.Clamp(Math.Round(priorityValue), -1000.0, 1000.0)
+                : 0;
+            if (string.IsNullOrWhiteSpace(action))
+                action = null;
+
+            if (onClick is not null && action is not null)
+                throw new ScriptRuntimeException($"{controlName} '{id}' cannot use both on_click and action");
+
+            if (actionValue.Type != DataType.Nil && action is null)
+                throw new ScriptRuntimeException($"{controlName} '{id}' value requires action");
+
+            if (onClick is null && action is null)
+                throw new ScriptRuntimeException($"{controlName} '{id}' requires either on_click or action");
+
+            object? parsedActionValue = null;
+            if (action is not null)
+            {
+                parsedActionValue = actionValue.Type switch
+                {
+                    DataType.Nil => null,
+                    DataType.Number => actionValue.Number,
+                    DataType.String => actionValue.String,
+                    DataType.Boolean => actionValue.Boolean,
+                    _ => throw new ScriptRuntimeException(
+                        $"{controlName} '{id}' value must be a number, string, boolean, or nil"),
+                };
+            }
+
+            var scissorClip = GetScissorClip(options);
+            var button = new SkinUiButton(
+                id,
+                parentId,
+                (float)x,
+                (float)y,
+                (float)width,
+                (float)height,
+                onClick,
+                action,
+                parsedActionValue,
+                hitTestPriority,
+                scissorClip,
+                isInput);
+            _uiButtons[id] = button;
+            RegisterInteractiveLayoutNode(id, parentId, (float)x, (float)y, (float)width, (float)height, button, null);
+
+            return DynValue.NewString(id);
         }
-
-        var scissorClip = GetScissorClip(options);
-        var button = new SkinUiButton(
-            id,
-            parentId,
-            (float)x,
-            (float)y,
-            (float)width,
-            (float)height,
-            onClick,
-            action,
-            parsedActionValue,
-            hitTestPriority,
-            scissorClip,
-            isInput);
-        _uiButtons[id] = button;
-        RegisterInteractiveLayoutNode(id, parentId, (float)x, (float)y, (float)width, (float)height, button, null);
-
-        return DynValue.NewString(id);
+        finally
+        {
+            if (measure)
+            {
+                DebugLastUiControlApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastUiControlApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
+                DebugLastUiControlApiCalls++;
+            }
+        }
     }
 
     private DynValue RegisterUiSlider(ScriptExecutionContext _, CallbackArguments args)
@@ -8043,6 +9030,8 @@ public sealed class SkinRuntime : IDisposable
     public void UpdateUiPointer(float x, float y, bool leftDown)
     {
         var wasLeftDown = _uiPointerLeftDown;
+        if (_uiPointerX != x || _uiPointerY != y || _uiPointerLeftDown != leftDown)
+            _songSelectRenderDirty = true;
         _uiPointerX = x;
         _uiPointerY = y;
         _uiPointerLeftDown = leftDown;
@@ -8749,8 +9738,8 @@ public sealed class SkinRuntime : IDisposable
     }
 
     internal bool InvokePlayfieldNoteRenderer(
-        IReadOnlyList<SkinPlayfieldGeometrySnapshot> geometry,
-        IReadOnlyList<SkinPlayfieldSpriteGeometrySnapshot> spriteGeometry,
+        List<SkinPlayfieldGeometrySnapshot> geometry,
+        List<SkinPlayfieldSpriteGeometrySnapshot> spriteGeometry,
         double time,
         double tick,
         double realTime)
@@ -8779,31 +9768,30 @@ public sealed class SkinRuntime : IDisposable
                 noteIndex = noteCount++;
                 _playfieldNoteIndices.Add(key, noteIndex);
                 EnsurePlayfieldNoteTableCapacity(noteIndex + 1);
-
-                var note = _playfieldNoteTables[noteIndex];
-                note.Set("type", DynValue.NewString(item.NoteType));
-                note.Set("track", DynValue.NewNumber(item.Track));
-                note.Set("tick", DynValue.NewNumber(item.Tick));
-                note.Set("attr", DynValue.NewNumber(item.Attr));
-                note.Set("duration_ticks", DynValue.NewNumber(item.DurationTicks));
-                note.Set("side", DynValue.NewString(item.Side));
-                note.Set("bank", DynValue.NewString(item.Bank));
-                note.Set("geometry", DynValue.NewTable(_playfieldNoteGeometryTables[noteIndex]));
-                notes.Set(noteCount, DynValue.NewTable(note));
                 _playfieldNoteGeometryCounts.Add(0);
             }
 
-            var currentNote = _playfieldNoteTables[noteIndex];
-            currentNote.Set("hit", DynValue.NewBoolean(item.Hit));
-            currentNote.Set("missed", DynValue.NewBoolean(item.Missed));
-            currentNote.Set("simultaneous", DynValue.NewBoolean(item.Simultaneous));
+            UpdatePlayfieldNoteTable(
+                notes, noteIndex, _playfieldNoteTables[noteIndex], _playfieldNoteGeometryTables[noteIndex],
+                _playfieldGeometryFrameId,
+                item.Track, item.Tick, item.EventIndex, item.NoteType, item.Attr,
+                item.DurationTicks, item.Side, item.Bank, null,
+                item.Hit, item.Missed, item.Simultaneous);
 
             geometryCount++;
-            var handle = new SkinPlayfieldGeometryHandle(item, _playfieldGeometryFrameId);
             var noteGeometryIndex = ++_playfieldNoteGeometryCounts[noteIndex];
-            _playfieldNoteGeometryTables[noteIndex].Set(
-                noteGeometryIndex,
-                UserData.Create(handle));
+            if (_playfieldNoteUsesNumericGeometryHandles)
+            {
+                _playfieldNoteGeometryTables[noteIndex].Set(
+                    noteGeometryIndex,
+                    DynValue.NewNumber(CreatePlayfieldGeometryToken(_playfieldGeometryFrameId, i, sprite: false)));
+                _playfieldNoteGeometryRoleTables[noteIndex]!.Set(noteGeometryIndex, GetPlayfieldGeometryRoleValue(item.Component));
+            }
+            else
+            {
+                var handle = new SkinPlayfieldGeometryHandle(item, _playfieldGeometryFrameId);
+                _playfieldNoteGeometryTables[noteIndex].Set(noteGeometryIndex, UserData.Create(handle));
+            }
         }
 
         for (var i = 0; i < spriteGeometry.Count; i++)
@@ -8815,39 +9803,39 @@ public sealed class SkinRuntime : IDisposable
                 noteIndex = noteCount++;
                 _playfieldNoteIndices.Add(key, noteIndex);
                 EnsurePlayfieldNoteTableCapacity(noteIndex + 1);
-
-                var note = _playfieldNoteTables[noteIndex];
-                note.Set("type", DynValue.NewString(item.NoteType));
-                note.Set("track", DynValue.NewNumber(item.Track));
-                note.Set("tick", DynValue.NewNumber(item.Tick));
-                note.Set("attr", DynValue.NewNumber(item.Attr));
-                note.Set("duration_ticks", DynValue.NewNumber(item.DurationTicks));
-                note.Set("side", DynValue.NewString(item.Side));
-                note.Set("bank", DynValue.NewString(item.Bank));
-                note.Set("family", DynValue.NewString(item.Family));
-                note.Set("geometry", DynValue.NewTable(_playfieldNoteGeometryTables[noteIndex]));
-                notes.Set(noteCount, DynValue.NewTable(note));
                 _playfieldNoteGeometryCounts.Add(0);
             }
 
-            var currentNote = _playfieldNoteTables[noteIndex];
-            currentNote.Set("hit", DynValue.NewBoolean(item.Hit));
-            currentNote.Set("missed", DynValue.NewBoolean(item.Missed));
-            currentNote.Set("simultaneous", DynValue.NewBoolean(item.Simultaneous));
-            currentNote.Set("family", DynValue.NewString(item.Family));
+            UpdatePlayfieldNoteTable(
+                notes, noteIndex, _playfieldNoteTables[noteIndex], _playfieldNoteGeometryTables[noteIndex],
+                _playfieldGeometryFrameId,
+                item.Track, item.Tick, item.EventIndex, item.NoteType, item.Attr,
+                item.DurationTicks, item.Side, item.Bank, item.Family,
+                item.Hit, item.Missed, item.Simultaneous);
 
-            var handle = new SkinPlayfieldSpriteGeometryHandle(item, _playfieldGeometryFrameId);
             var noteGeometryIndex = ++_playfieldNoteGeometryCounts[noteIndex];
-            _playfieldNoteGeometryTables[noteIndex].Set(
-                noteGeometryIndex,
-                UserData.Create(handle));
+            if (_playfieldNoteUsesNumericGeometryHandles)
+            {
+                _playfieldNoteGeometryTables[noteIndex].Set(
+                    noteGeometryIndex,
+                    DynValue.NewNumber(CreatePlayfieldGeometryToken(_playfieldGeometryFrameId, i, sprite: true)));
+                _playfieldNoteGeometryRoleTables[noteIndex]!.Set(noteGeometryIndex, GetPlayfieldGeometryRoleValue(item.Component));
+            }
+            else
+            {
+                var handle = new SkinPlayfieldSpriteGeometryHandle(item, _playfieldGeometryFrameId);
+                _playfieldNoteGeometryTables[noteIndex].Set(noteGeometryIndex, UserData.Create(handle));
+            }
         }
 
         for (var i = noteCount + 1; i <= _playfieldPreviousNoteCount; i++)
         {
             notes.Remove(i);
             _playfieldNoteGeometryTables[i - 1].Clear();
+            _playfieldNoteGeometryRoleTables[i - 1]?.Clear();
             _playfieldNotePreviousGeometryCounts[i - 1] = 0;
+            _playfieldNoteTableCaches[i - 1] = default;
+            _playfieldNoteTables[i - 1].Remove("family");
         }
         _playfieldPreviousNoteCount = noteCount;
 
@@ -8856,29 +9844,37 @@ public sealed class SkinRuntime : IDisposable
             var currentCount = _playfieldNoteGeometryCounts[i];
             var previousCount = _playfieldNotePreviousGeometryCounts[i];
             var geometryTable = _playfieldNoteGeometryTables[i];
+            var geometryRoleTable = _playfieldNoteGeometryRoleTables[i];
             for (var key = currentCount + 1; key <= previousCount; key++)
+            {
                 geometryTable.Remove(key);
+                geometryRoleTable?.Remove(key);
+            }
             _playfieldNotePreviousGeometryCounts[i] = currentCount;
         }
 
-        frame.Set("version", DynValue.NewNumber(3));
+        // Re-publish these stable references each frame; this costs no table or
+        // DynValue allocations and protects the callback contract from Lua-side
+        // reassignment of frame.version/frame.notes.
+        frame.Set("version", _playfieldNoteVersionValue);
+        frame.Set("notes", _playfieldNotesValue);
         frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
         frame.Set("real_time", DynValue.NewNumber(Math.Max(0.0, realTime)));
         frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
         frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
-        frame.Set("notes", DynValue.NewTable(notes));
         frame.Set("note_count", DynValue.NewNumber(noteCount));
         frame.Set("geometry_count", DynValue.NewNumber(geometryCount + spriteGeometry.Count));
         frame.Set("sprite_geometry_count", DynValue.NewNumber(spriteGeometry.Count));
-
         try
         {
             var function = _script.Globals.Get("render_notes");
             if (function.Type != DataType.Function)
                 return false;
 
+            _activePlayfieldNoteGeometry = geometry;
+            _activePlayfieldNoteSpriteGeometry = spriteGeometry;
             _insidePlayfieldNoteRenderer = true;
-            var result = _script.Call(function, DynValue.NewTable(frame));
+            var result = _script.Call(function, _playfieldNoteFrameValue);
             return result.Type == DataType.Boolean && result.Boolean;
         }
         catch (Exception ex)
@@ -8891,6 +9887,217 @@ public sealed class SkinRuntime : IDisposable
         finally
         {
             _insidePlayfieldNoteRenderer = false;
+            _activePlayfieldNoteGeometry = null;
+            _activePlayfieldNoteSpriteGeometry = null;
+        }
+    }
+
+    private DynValue GetPlayfieldGeometryRoleValue(string component)
+    {
+        if (_playfieldGeometryRoleValues.TryGetValue(component, out var value))
+            return value;
+
+        value = DynValue.NewString(component);
+        _playfieldGeometryRoleValues.Add(component, value);
+        return value;
+    }
+
+    // A skin may opt into numeric-v1 by setting
+    // TSC_PLAYFIELD_GEOMETRY_HANDLE_FORMAT before its first render_notes call.
+    // The sign selects note-quad vs sprite geometry; high bits are the frame
+    // generation and low bits are the index into the active callback snapshot.
+    // Unlike a reusable mutable userdata object, an old numeric token can never
+    // silently become a handle for a later frame.
+    private static double CreatePlayfieldGeometryToken(long frameId, int index, bool sprite)
+    {
+        if ((uint)index > (uint)PlayfieldGeometryTokenIndexMask)
+            throw new ScriptRuntimeException("numeric-v1 supports at most 8192 note geometry components per callback");
+
+        var frameTag = GetPlayfieldGeometryFrameTag(frameId);
+        var token = (frameTag << PlayfieldGeometryTokenIndexBits) | (uint)index;
+        return sprite ? -token : token;
+    }
+
+    private static long GetPlayfieldGeometryFrameTag(long frameId)
+    {
+        // Use 1..mask as the generation range so the zero value is never needed
+        // for a valid token (zero would collide with geometry index zero).
+        return ((frameId - 1) % PlayfieldGeometryTokenFrameMask) + 1;
+    }
+
+    private bool TryResolvePlayfieldGeometryToken(
+        DynValue tokenValue,
+        bool expectSprite,
+        out SkinPlayfieldGeometrySnapshot geometry,
+        out SkinPlayfieldSpriteGeometrySnapshot spriteGeometry)
+    {
+        geometry = default;
+        spriteGeometry = default;
+        if (!_insidePlayfieldNoteRenderer || !_playfieldNoteUsesNumericGeometryHandles ||
+            tokenValue.Type != DataType.Number)
+            return false;
+
+        var raw = tokenValue.Number;
+        if (!double.IsFinite(raw) || raw == 0.0 || raw != Math.Truncate(raw) || Math.Abs(raw) > 9007199254740991.0)
+            return false;
+        var isSprite = raw < 0.0;
+        if (isSprite != expectSprite)
+            return false;
+
+        var encoded = (long)Math.Abs(raw);
+        var frameTag = encoded >> PlayfieldGeometryTokenIndexBits;
+        if (frameTag != GetPlayfieldGeometryFrameTag(_playfieldGeometryFrameId))
+            return false;
+
+        var index = (int)(encoded & PlayfieldGeometryTokenIndexMask);
+        if (expectSprite)
+        {
+            var spriteList = _activePlayfieldNoteSpriteGeometry;
+            if (spriteList is null || (uint)index >= (uint)spriteList.Count)
+                return false;
+            spriteGeometry = spriteList[index];
+            return true;
+        }
+
+        var geometryList = _activePlayfieldNoteGeometry;
+        if (geometryList is null || (uint)index >= (uint)geometryList.Count)
+            return false;
+        geometry = geometryList[index];
+        return true;
+    }
+
+    private void UpdatePlayfieldNoteTable(
+        Table notes,
+        int noteIndex,
+        Table note,
+        Table geometryTable,
+        long frameId,
+        int track,
+        int tick,
+        int eventIndex,
+        string noteType,
+        int attr,
+        int durationTicks,
+        string side,
+        string bank,
+        string? family,
+        bool hit,
+        bool missed,
+        bool simultaneous)
+    {
+        ref var cache = ref CollectionsMarshal.AsSpan(_playfieldNoteTableCaches)[noteIndex];
+        var identityChanged = !cache.Initialized ||
+            cache.Track != track || cache.Tick != tick || cache.EventIndex != eventIndex;
+        var noteNeedsRefresh = identityChanged || cache.LastFrameId != frameId;
+        if (identityChanged)
+        {
+            note.Remove("family");
+            cache = new PlayfieldNoteTableCache
+            {
+                Initialized = true,
+                Track = track,
+                Tick = tick,
+                EventIndex = eventIndex,
+                NoteType = noteType,
+                Attr = attr,
+                DurationTicks = durationTicks,
+                Side = side,
+                Bank = bank,
+                Hit = hit,
+                Missed = missed,
+                Simultaneous = simultaneous,
+                NoteTypeValue = DynValue.NewString(noteType),
+                TrackValue = DynValue.NewNumber(track),
+                TickValue = DynValue.NewNumber(tick),
+                AttrValue = DynValue.NewNumber(attr),
+                DurationTicksValue = DynValue.NewNumber(durationTicks),
+                SideValue = DynValue.NewString(side),
+                BankValue = DynValue.NewString(bank),
+                HitValue = DynValue.NewBoolean(hit),
+                MissedValue = DynValue.NewBoolean(missed),
+                SimultaneousValue = DynValue.NewBoolean(simultaneous),
+            };
+        }
+        else if (noteNeedsRefresh)
+        {
+            if (!string.Equals(cache.NoteType, noteType, StringComparison.Ordinal))
+            {
+                cache.NoteType = noteType;
+                cache.NoteTypeValue = DynValue.NewString(noteType);
+            }
+            if (cache.Attr != attr)
+            {
+                cache.Attr = attr;
+                cache.AttrValue = DynValue.NewNumber(attr);
+            }
+            if (cache.DurationTicks != durationTicks)
+            {
+                cache.DurationTicks = durationTicks;
+                cache.DurationTicksValue = DynValue.NewNumber(durationTicks);
+            }
+            if (!string.Equals(cache.Side, side, StringComparison.Ordinal))
+            {
+                cache.Side = side;
+                cache.SideValue = DynValue.NewString(side);
+            }
+            if (!string.Equals(cache.Bank, bank, StringComparison.Ordinal))
+            {
+                cache.Bank = bank;
+                cache.BankValue = DynValue.NewString(bank);
+            }
+        }
+
+        // Preserve the mutable-table callback contract: each note's source
+        // fields are restored from engine-owned values once per frame. Cached
+        // DynValues avoid rebuilding strings/numbers when their values match.
+        if (noteNeedsRefresh)
+        {
+            notes.Set(noteIndex + 1, _playfieldNoteTableValues[noteIndex]);
+            note.Set("geometry", _playfieldNoteGeometryTableValues[noteIndex]);
+            if (_playfieldNoteUsesNumericGeometryHandles)
+            {
+                note.Set("geometry_roles", _playfieldNoteGeometryRoleTableValues[noteIndex]);
+            }
+            note.Set("type", cache.NoteTypeValue!);
+            note.Set("track", cache.TrackValue!);
+            note.Set("tick", cache.TickValue!);
+            note.Set("attr", cache.AttrValue!);
+            note.Set("duration_ticks", cache.DurationTicksValue!);
+            note.Set("side", cache.SideValue!);
+            note.Set("bank", cache.BankValue!);
+        }
+
+        // These can theoretically differ between component snapshots, so keep
+        // the original last-component-wins behavior while avoiding new DynValue
+        // objects when their boolean values have not changed.
+        if (cache.Hit != hit)
+        {
+            cache.Hit = hit;
+            cache.HitValue = DynValue.NewBoolean(hit);
+        }
+        if (cache.Missed != missed)
+        {
+            cache.Missed = missed;
+            cache.MissedValue = DynValue.NewBoolean(missed);
+        }
+        if (cache.Simultaneous != simultaneous)
+        {
+            cache.Simultaneous = simultaneous;
+            cache.SimultaneousValue = DynValue.NewBoolean(simultaneous);
+        }
+        note.Set("hit", cache.HitValue!);
+        note.Set("missed", cache.MissedValue!);
+        note.Set("simultaneous", cache.SimultaneousValue!);
+        cache.LastFrameId = frameId;
+
+        if (family is not null)
+        {
+            if (!string.Equals(cache.Family, family, StringComparison.Ordinal))
+            {
+                cache.Family = family;
+                cache.FamilyValue = DynValue.NewString(family);
+            }
+            note.Set("family", cache.FamilyValue!);
         }
     }
 
@@ -8902,12 +10109,26 @@ public sealed class SkinRuntime : IDisposable
             return;
 
         _playfieldTableOwner = script;
+        var geometryHandleFormat = script.Globals.Get("TSC_PLAYFIELD_GEOMETRY_HANDLE_FORMAT");
+        _playfieldNoteUsesNumericGeometryHandles = geometryHandleFormat.Type == DataType.String &&
+            string.Equals(geometryHandleFormat.String, "numeric-v1", StringComparison.Ordinal);
         _playfieldNoteFrameTable = new Table(script);
         _playfieldNotesTable = new Table(script);
+        _playfieldNoteFrameValue = DynValue.NewTable(_playfieldNoteFrameTable);
+        _playfieldNotesValue = DynValue.NewTable(_playfieldNotesTable);
+        _playfieldNoteVersionValue = DynValue.NewNumber(3);
+        _playfieldNoteFrameTable.Set("version", _playfieldNoteVersionValue);
+        _playfieldNoteFrameTable.Set("notes", _playfieldNotesValue);
         _playfieldNoteTables.Clear();
         _playfieldNoteGeometryTables.Clear();
+        _playfieldNoteGeometryRoleTables.Clear();
+        _playfieldGeometryRoleValues.Clear();
+        _playfieldNoteTableValues.Clear();
+        _playfieldNoteGeometryTableValues.Clear();
+        _playfieldNoteGeometryRoleTableValues.Clear();
         _playfieldNoteGeometryCounts.Clear();
         _playfieldNotePreviousGeometryCounts.Clear();
+        _playfieldNoteTableCaches.Clear();
         _playfieldNoteIndices.Clear();
         _playfieldPreviousNoteCount = 0;
     }
@@ -8916,9 +10137,17 @@ public sealed class SkinRuntime : IDisposable
     {
         while (_playfieldNoteTables.Count < required)
         {
-            _playfieldNoteTables.Add(new Table(_playfieldTableOwner!));
-            _playfieldNoteGeometryTables.Add(new Table(_playfieldTableOwner!));
+            var noteTable = new Table(_playfieldTableOwner!);
+            var geometryTable = new Table(_playfieldTableOwner!);
+            Table? geometryRoleTable = _playfieldNoteUsesNumericGeometryHandles ? new Table(_playfieldTableOwner!) : null;
+            _playfieldNoteTables.Add(noteTable);
+            _playfieldNoteGeometryTables.Add(geometryTable);
+            _playfieldNoteGeometryRoleTables.Add(geometryRoleTable);
+            _playfieldNoteTableValues.Add(DynValue.NewTable(noteTable));
+            _playfieldNoteGeometryTableValues.Add(DynValue.NewTable(geometryTable));
+            _playfieldNoteGeometryRoleTableValues.Add(geometryRoleTable is null ? DynValue.Nil : DynValue.NewTable(geometryRoleTable));
             _playfieldNotePreviousGeometryCounts.Add(0);
+            _playfieldNoteTableCaches.Add(default);
         }
     }
 
@@ -8961,7 +10190,7 @@ public sealed class SkinRuntime : IDisposable
             var scaleX = (float)Math.Clamp(GetNumber(options, "scale_x", 1f), 0.001, 100.0);
             var scaleY = (float)Math.Clamp(GetNumber(options, "scale_y", 1f), 0.001, 100.0);
             _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
-                asset, geometry, tint, alpha, layer, scaleX, scaleY));
+                asset, geometry.Snapshot, tint, alpha, layer, scaleX, scaleY));
             return DynValue.Nil;
         }
 
@@ -8996,6 +10225,27 @@ public sealed class SkinRuntime : IDisposable
         return table;
     }
 
+    private DynValue SubmitPlayfieldSpriteGeometryToken(SkinAssetHandle asset, Table options, DynValue tokenValue)
+    {
+        if (options.Get("shader").Type != DataType.Nil)
+            throw new ScriptRuntimeException("Shader overrides are not yet available for numeric playfield geometry tokens; use draw.sprite() without a geometry token.");
+        if (!TryResolvePlayfieldGeometryToken(tokenValue, expectSprite: true, out _, out var geometry))
+            throw new ScriptRuntimeException("draw.sprite numeric geometry_token is invalid or not from the current render_notes(frame) call");
+
+        var request = new SkinPlayfieldSpriteDrawRequest(
+            asset,
+            geometry,
+            GetColor(options, "color", XnaColor.White),
+            Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f),
+            (int)Math.Round(GetNumber(options, "layer", geometry.Layer)),
+            GetBool(options, "flip_x", false),
+            GetBool(options, "flip_y", false),
+            (float)Math.Clamp(GetNumber(options, "scale_x", 1f), 0.001, 100.0),
+            (float)Math.Clamp(GetNumber(options, "scale_y", 1f), 0.001, 100.0));
+        _playfieldSpriteDrawRequests.Add(request);
+        return DynValue.Nil;
+    }
+
     private DynValue SubmitPlayfieldSpriteGeometry(SkinAssetHandle asset, Table options)
     {
         if (options.Get("shader").Type != DataType.Nil)
@@ -9009,7 +10259,7 @@ public sealed class SkinRuntime : IDisposable
 
         var request = new SkinPlayfieldSpriteDrawRequest(
             asset,
-            geometry,
+            geometry.Snapshot,
             GetColor(options, "color", XnaColor.White),
             Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f),
             (int)Math.Round(GetNumber(options, "layer", geometry.layer)),
@@ -9035,13 +10285,22 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue DrawSprite(ScriptExecutionContext _, CallbackArguments args)
     {
-        var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
         try
         {
         if (args.Count < 1 || args[0].Type != DataType.UserData || args[0].UserData?.Object is not SkinAssetHandle asset)
             throw new ScriptRuntimeException("draw.sprite(asset, options) expects an asset from assets.load()");
 
         var options = GetOptions(args, 1);
+        var geometryToken = options.Get("geometry_token");
+        if (geometryToken.Type != DataType.Nil)
+        {
+            if (geometryToken.Type != DataType.Number)
+                throw new ScriptRuntimeException("draw.sprite option 'geometry_token' expects a numeric token from the current render_notes(frame) call");
+            return SubmitPlayfieldSpriteGeometryToken(asset, options, geometryToken);
+        }
         if (options.Get("geometry").Type != DataType.Nil)
             return SubmitPlayfieldSpriteGeometry(asset, options);
 
@@ -9152,6 +10411,7 @@ public sealed class SkinRuntime : IDisposable
             if (DebugMeasureApiAllocations)
             {
                 DebugLastSpriteApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastSpriteApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
                 DebugLastSpriteApiCalls++;
             }
         }
@@ -9243,7 +10503,7 @@ public sealed class SkinRuntime : IDisposable
     // Batch variants cross the MoonSharp-to-C# callback boundary once for many
     // commands. This avoids per-command VM dispatch allocations while preserving
     // the normal command parsing, pooling, layering and sort order.
-    private DynValue DrawQuad3DBatch(ScriptExecutionContext _, CallbackArguments args)
+    private DynValue DrawQuad3DBatch(ScriptExecutionContext context, CallbackArguments args)
     {
         var measure = DebugMeasureApiAllocations;
         var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
@@ -9275,11 +10535,52 @@ public sealed class SkinRuntime : IDisposable
                     asset = providedAsset;
                 }
 
-                var optionsValue = item.Get("options");
-                if (optionsValue.Type != DataType.Table || optionsValue.Table is null)
-                    throw new ScriptRuntimeException($"draw.quad3d_batch item {i} requires an options table");
+                // Flat note-geometry entries avoid allocating/looking up a nested
+                // options table for the common playfield case. This is an optional
+                // form of the shared batch API; existing { asset, options = {...} }
+                // entries continue through the fully general parser below.
+                var geometryValue = item.Get("geometry_handle");
+                if (geometryValue.Type != DataType.Nil)
+                {
+                    SkinPlayfieldGeometrySnapshot geometrySnapshot;
+                    int defaultLayer;
+                    if (geometryValue.Type == DataType.Number)
+                    {
+                        if (!TryResolvePlayfieldGeometryToken(geometryValue, expectSprite: false, out geometrySnapshot, out _))
+                            throw new ScriptRuntimeException("draw.quad3d_batch numeric geometry token is invalid or not from the current render_notes(frame) call");
+                        defaultLayer = geometrySnapshot.Layer;
+                    }
+                    else if (geometryValue.Type == DataType.UserData &&
+                             geometryValue.UserData?.Object is SkinPlayfieldGeometryHandle geometryHandle)
+                    {
+                        if (!_insidePlayfieldNoteRenderer || geometryHandle.FrameId != _playfieldGeometryFrameId)
+                            throw new ScriptRuntimeException("draw.quad3d_batch note geometry handles are only valid inside the current render_notes(frame) call");
+                        geometrySnapshot = geometryHandle.Snapshot;
+                        defaultLayer = geometryHandle.layer;
+                    }
+                    else
+                    {
+                        throw new ScriptRuntimeException($"draw.quad3d_batch item {i} geometry must be a note geometry handle or numeric geometry token from the current render_notes callback");
+                    }
+                    if (item.Get("shader").Type != DataType.Nil)
+                        throw new ScriptRuntimeException("Shader overrides are not yet available for playfield geometry handles; use draw.sprite() or a regular draw.quad3d() command.");
 
-                SubmitQuad3D(asset, optionsValue.Table!);
+                    var tint = GetColor(item, "color", XnaColor.White);
+                    var alpha = Math.Clamp(GetNumber(item, "alpha", 1f), 0f, 1f);
+                    var layer = (int)Math.Round(GetNumber(item, "layer", defaultLayer));
+                    var scaleX = (float)Math.Clamp(GetNumber(item, "scale_x", 1f), 0.001, 100.0);
+                    var scaleY = (float)Math.Clamp(GetNumber(item, "scale_y", 1f), 0.001, 100.0);
+                    _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
+                        asset, geometrySnapshot, tint, alpha, layer, scaleX, scaleY));
+                }
+                else
+                {
+                    var optionsValue = item.Get("options");
+                    if (optionsValue.Type != DataType.Table || optionsValue.Table is null)
+                        throw new ScriptRuntimeException($"draw.quad3d_batch item {i} requires an options table");
+
+                    SubmitQuad3D(asset, optionsValue.Table!);
+                }
                 queued++;
             }
 
@@ -10015,7 +11316,9 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue DrawText(ScriptExecutionContext _, CallbackArguments args)
     {
-        var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
         try
         {
             if (args.Count < 1 || args[0].Type != DataType.String)
@@ -10027,6 +11330,7 @@ public sealed class SkinRuntime : IDisposable
             if (DebugMeasureApiAllocations)
             {
                 DebugLastTextApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastTextApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
                 DebugLastTextApiCalls++;
             }
         }
@@ -10034,7 +11338,9 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue DrawUserText(ScriptExecutionContext _, CallbackArguments args)
     {
-        var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
         try
         {
             if (args.Count < 1 || args[0].Type != DataType.String)
@@ -10046,6 +11352,7 @@ public sealed class SkinRuntime : IDisposable
             if (DebugMeasureApiAllocations)
             {
                 DebugLastTextApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastTextApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
                 DebugLastTextApiCalls++;
             }
         }
@@ -10053,93 +11360,140 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue MeasureTextWidth(ScriptExecutionContext _, CallbackArguments args)
     {
-        if (args.Count < 1 || args[0].Type != DataType.String)
-            throw new ScriptRuntimeException("draw.measure_text(text, options) expects a string");
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
+        try
+        {
+            if (args.Count < 1 || args[0].Type != DataType.String)
+                throw new ScriptRuntimeException("draw.measure_text(text, options) expects a string");
 
-        var text = args[0].String ?? string.Empty;
-        var options = GetOptions(args, 1);
-        var fontPath = GetOptionalString(options, "font") ?? string.Empty;
-        var size = GetNumber(options, "size", 0f);
-        if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f)
-            return DynValue.NewNumber(0);
+            var text = args[0].String ?? string.Empty;
+            var options = GetOptions(args, 1);
+            var fontPath = GetOptionalString(options, "font") ?? string.Empty;
+            var size = GetNumber(options, "size", 0f);
+            if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f)
+                return DynValue.NewNumber(0);
 
-        // Use the same skin-font measurement and scale as draw.text(), rather than
-        // guessing character widths in Lua. This is useful for responsive text fit.
-        var width = MeasureTextWidthForUi(text, fontPath, size);
-        var scale = GetScale(options);
-        return DynValue.NewNumber(Math.Max(0f, width * Math.Abs(scale.X)));
+            // Use the same skin-font measurement and scale as draw.text(), rather than
+            // guessing character widths in Lua. This is useful for responsive text fit.
+            var width = MeasureTextWidthForUi(text, fontPath, size);
+            var scale = GetScale(options);
+            return DynValue.NewNumber(Math.Max(0f, width * Math.Abs(scale.X)));
+        }
+        finally
+        {
+            if (measure)
+            {
+                DebugLastMeasureTextApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastMeasureTextApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
+                DebugLastMeasureTextApiCalls++;
+            }
+        }
     }
 
     private DynValue MeasureUserTextWidth(ScriptExecutionContext _, CallbackArguments args)
     {
-        if (args.Count < 1 || args[0].Type != DataType.String)
-            throw new ScriptRuntimeException("draw.measure_user_text_width(text, options) expects a string");
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
+        try
+        {
+            if (args.Count < 1 || args[0].Type != DataType.String)
+                throw new ScriptRuntimeException("draw.measure_user_text_width(text, options) expects a string");
 
-        var text = args[0].String ?? string.Empty;
-        var options = GetOptions(args, 1);
-        var fontPath = GetOptionalString(options, "font") ?? string.Empty;
-        var size = GetNumber(options, "size", 0f);
-        if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f)
-            return DynValue.NewNumber(0);
+            var text = args[0].String ?? string.Empty;
+            var options = GetOptions(args, 1);
+            var fontPath = GetOptionalString(options, "font") ?? string.Empty;
+            var size = GetNumber(options, "size", 0f);
+            if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f)
+                return DynValue.NewNumber(0);
 
-        var font = _fonts.Load(fontPath, size);
-        if (font is null)
-            return DynValue.NewNumber(0);
-        var scale = GetScale(options);
-        var cacheKey = new SkinUserTextMeasureCacheKey(font.Font, text, size, 0f,
-            scale.X, 0f, UseLegacyUiTextSizing, Wrapped: false);
-        if (text.Length <= 2048 && TryGetCachedUserTextMeasure(cacheKey, out var cachedWidth))
-            return DynValue.NewNumber(cachedWidth);
+            var font = _fonts.Load(fontPath, size);
+            if (font is null)
+                return DynValue.NewNumber(0);
+            var scale = GetScale(options);
+            var cacheKey = new SkinUserTextMeasureCacheKey(font.Font, text, size, 0f,
+                scale.X, 0f, UseLegacyUiTextSizing, Wrapped: false);
+            if (text.Length <= 2048 && TryGetCachedUserTextMeasure(cacheKey, out var cachedWidth))
+                return DynValue.NewNumber(cachedWidth);
 
-        var measured = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
-        if (measured.X <= 0f || measured.Y <= 0f)
-            return DynValue.NewNumber(0);
-        var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? measured.Y : font.RasterSize);
-        var width = Math.Max(0f, measured.X * (size / sizeBasis) * Math.Abs(scale.X));
-        if (text.Length <= 2048)
-            CacheUserTextMeasure(cacheKey, width);
-        return DynValue.NewNumber(width);
+            var measured = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
+            if (measured.X <= 0f || measured.Y <= 0f)
+                return DynValue.NewNumber(0);
+            var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? measured.Y : font.RasterSize);
+            var width = Math.Max(0f, measured.X * (size / sizeBasis) * Math.Abs(scale.X));
+            if (text.Length <= 2048)
+                CacheUserTextMeasure(cacheKey, width);
+            return DynValue.NewNumber(width);
+        }
+        finally
+        {
+            if (measure)
+            {
+                DebugLastMeasureUserTextWidthApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastMeasureUserTextWidthApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
+                DebugLastMeasureUserTextWidthApiCalls++;
+            }
+        }
     }
 
     private DynValue MeasureUserTextHeight(ScriptExecutionContext _, CallbackArguments args)
     {
-        if (args.Count < 1 || args[0].Type != DataType.String)
-            throw new ScriptRuntimeException("draw.measure_user_text_height(text, options) expects a string");
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
+        try
+        {
+            if (args.Count < 1 || args[0].Type != DataType.String)
+                throw new ScriptRuntimeException("draw.measure_user_text_height(text, options) expects a string");
 
-        var text = args[0].String ?? string.Empty;
-        var options = GetOptions(args, 1);
-        var fontPath = GetOptionalString(options, "font") ?? string.Empty;
-        var size = GetNumber(options, "size", 0f);
-        var maxWidth = GetNumber(options, "max_width", 0f);
-        if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f || maxWidth <= 0f)
-            return DynValue.NewNumber(0);
+            var text = args[0].String ?? string.Empty;
+            var options = GetOptions(args, 1);
+            var fontPath = GetOptionalString(options, "font") ?? string.Empty;
+            var size = GetNumber(options, "size", 0f);
+            var maxWidth = GetNumber(options, "max_width", 0f);
+            if (string.IsNullOrWhiteSpace(fontPath) || size <= 0f || maxWidth <= 0f)
+                return DynValue.NewNumber(0);
 
-        var font = _fonts.Load(fontPath, size);
-        if (font is null)
-            return DynValue.NewNumber(0);
-        var transformScale = GetScale(options);
-        var cacheKey = new SkinUserTextMeasureCacheKey(font.Font, text, size, maxWidth,
-            transformScale.X, transformScale.Y, UseLegacyUiTextSizing, Wrapped: true);
-        if (text.Length <= 2048 && TryGetCachedUserTextMeasure(cacheKey, out var cachedHeight))
-            return DynValue.NewNumber(cachedHeight);
+            var font = _fonts.Load(fontPath, size);
+            if (font is null)
+                return DynValue.NewNumber(0);
+            var transformScale = GetScale(options);
+            var cacheKey = new SkinUserTextMeasureCacheKey(font.Font, text, size, maxWidth,
+                transformScale.X, transformScale.Y, UseLegacyUiTextSizing, Wrapped: true);
+            if (text.Length <= 2048 && TryGetCachedUserTextMeasure(cacheKey, out var cachedHeight))
+                return DynValue.NewNumber(cachedHeight);
 
-        var unwrapped = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
-        if (unwrapped.Y <= 0f)
-            return DynValue.NewNumber(0);
-        var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? unwrapped.Y : font.RasterSize);
-        var sizeScale = size / sizeBasis;
-        var xScale = Math.Max(0.01f, sizeScale * Math.Abs(transformScale.X));
-        var yScale = sizeScale * Math.Abs(transformScale.Y);
-        var measured = TSC.Rendering.BbCodeTextRenderer.MeasureWrapped(font.Font, text, maxWidth, xScale);
-        var height = Math.Max(0f, measured.Y * yScale / xScale);
-        if (text.Length <= 2048)
-            CacheUserTextMeasure(cacheKey, height);
-        return DynValue.NewNumber(height);
+            var unwrapped = TSC.Rendering.BbCodeTextRenderer.Measure(font.Font, text);
+            if (unwrapped.Y <= 0f)
+                return DynValue.NewNumber(0);
+            var sizeBasis = Math.Max(1f, UseLegacyUiTextSizing ? unwrapped.Y : font.RasterSize);
+            var sizeScale = size / sizeBasis;
+            var xScale = Math.Max(0.01f, sizeScale * Math.Abs(transformScale.X));
+            var yScale = sizeScale * Math.Abs(transformScale.Y);
+            var measured = TSC.Rendering.BbCodeTextRenderer.MeasureWrapped(font.Font, text, maxWidth, xScale);
+            var height = Math.Max(0f, measured.Y * yScale / xScale);
+            if (text.Length <= 2048)
+                CacheUserTextMeasure(cacheKey, height);
+            return DynValue.NewNumber(height);
+        }
+        finally
+        {
+            if (measure)
+            {
+                DebugLastMeasureUserTextHeightApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastMeasureUserTextHeightApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
+                DebugLastMeasureUserTextHeightApiCalls++;
+            }
+        }
     }
 
     private DynValue DrawTextBatch(ScriptExecutionContext _, CallbackArguments args)
     {
-        var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
         var queued = 0;
         try
         {
@@ -10171,6 +11525,7 @@ public sealed class SkinRuntime : IDisposable
             if (DebugMeasureApiAllocations)
             {
                 DebugLastTextApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastTextApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
                 DebugLastTextApiCalls += queued;
             }
         }
@@ -10287,63 +11642,78 @@ public sealed class SkinRuntime : IDisposable
     /// </summary>
     private DynValue DrawChartPanel(ScriptExecutionContext _, CallbackArguments args)
     {
-        var options = GetOptions(args, 0);
-        var size = GetNumber(options, "size", 0f);
-        var width = GetNumber(options, "width", size);
-        var height = GetNumber(options, "height", size);
-        if (!float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f)
-            throw new ScriptRuntimeException("draw.chart_panel(options) expects positive width/height or size");
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
+        try
+        {
+            var options = GetOptions(args, 0);
+            var size = GetNumber(options, "size", 0f);
+            var width = GetNumber(options, "width", size);
+            var height = GetNumber(options, "height", size);
+            if (!float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f)
+                throw new ScriptRuntimeException("draw.chart_panel(options) expects positive width/height or size");
 
-        var mode = GetString(options, "mode", "current").Trim().ToLowerInvariant();
-        if (mode is not ("current" or "radar" or "combo" or "combo_distribution" or "hidden"))
-            throw new ScriptRuntimeException("draw.chart_panel mode must be current, radar, combo, or hidden");
+            var mode = GetString(options, "mode", "current").Trim().ToLowerInvariant();
+            if (mode is not ("current" or "radar" or "combo" or "combo_distribution" or "hidden"))
+                throw new ScriptRuntimeException("draw.chart_panel mode must be current, radar, combo, or hidden");
 
-        var headerValue = options.Get("header");
-        var showHeader = headerValue.Type == DataType.Boolean
-            ? headerValue.Boolean
-            : GetBool(options, "show_header", true);
-        var headerText = headerValue.Type == DataType.String
-            ? headerValue.String
-            : GetOptionalString(options, "header_text");
+            var headerValue = options.Get("header");
+            var showHeader = headerValue.Type == DataType.Boolean
+                ? headerValue.Boolean
+                : GetBool(options, "show_header", true);
+            var headerText = headerValue.Type == DataType.String
+                ? headerValue.String
+                : GetOptionalString(options, "header_text");
 
-        var command = AcquireDrawCommand();
-        command.Kind = SkinDrawCommandKind.ChartPanel;
-        command.Id = GetOptionalString(options, "id")?.Trim();
-        command.ParentId = GetOptionalString(options, "parent")?.Trim();
-        if (string.IsNullOrWhiteSpace(command.ParentId))
-            command.ParentId = null;
-        command.Position = GetPosition(options);
-        command.Anchor = GetAnchor(options);
-        command.Size = new Vector2(width, height);
-        command.Alpha = Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f);
-        command.Layer = (int)Math.Clamp(Math.Round(GetNumber(options, "layer", 0f)), int.MinValue, int.MaxValue);
-        command.ScissorClip = GetScissorClip(options);
-        command.ChartPanelMode = mode;
-        command.ChartPanelHeaderText = headerText;
-        command.ChartPanelShowHeader = showHeader;
-        command.ChartPanelBackgroundColor = GetColor(options, "background_color", command.ChartPanelBackgroundColor);
-        command.ChartPanelBorderColor = GetColor(options, "border_color", command.ChartPanelBorderColor);
-        command.ChartPanelHeaderColor = GetColor(options, "header_color", command.ChartPanelHeaderColor);
-        command.ChartPanelDividerColor = GetColor(options, "divider_color", command.ChartPanelDividerColor);
-        command.ChartPanelRadarFillColor = GetColor(options, "radar_fill_color", command.ChartPanelRadarFillColor);
-        command.ChartPanelRadarLineColor = GetColor(options, "radar_line_color", command.ChartPanelRadarLineColor);
-        command.ChartPanelGuideColor = GetColor(options, "guide_color", command.ChartPanelGuideColor);
-        command.ChartPanelBarBackgroundColor = GetColor(options, "bar_background_color", command.ChartPanelBarBackgroundColor);
-        command.ChartPanelTapsColor = GetColor(options, "taps_color", command.ChartPanelTapsColor);
-        command.ChartPanelChordsColor = GetColor(options, "chords_color", command.ChartPanelChordsColor);
-        command.ChartPanelLongsColor = GetColor(options, "longs_color", command.ChartPanelLongsColor);
-        command.ChartPanelSlidesColor = GetColor(options, "slides_color", command.ChartPanelSlidesColor);
-        command.ChartPanelFlicksColor = GetColor(options, "flicks_color", command.ChartPanelFlicksColor);
-        command.ChartPanelStreamColor = GetColor(options, "stream_color", command.ChartPanelStreamColor);
-        command.ChartPanelTravelColor = GetColor(options, "travel_color", command.ChartPanelTravelColor);
-        command.ChartPanelBorderWidth = Math.Max(0f, GetNumber(options, "border_width", command.ChartPanelBorderWidth));
-        command.ChartPanelHeaderSize = Math.Max(0f, GetNumber(options, "header_size", command.ChartPanelHeaderSize));
-        command.ChartPanelBackgroundBleed = Math.Max(0f, GetNumber(options, "background_bleed", command.ChartPanelBackgroundBleed));
-        command.Order = _drawOrder++;
-        _drawCommands.Add(command);
-        RegisterLayoutNode(command, false);
-        RegisterChartPanelHitbox(command, options);
-        return DynValue.Nil;
+            var command = AcquireDrawCommand();
+            command.Kind = SkinDrawCommandKind.ChartPanel;
+            command.Id = GetOptionalString(options, "id")?.Trim();
+            command.ParentId = GetOptionalString(options, "parent")?.Trim();
+            if (string.IsNullOrWhiteSpace(command.ParentId))
+                command.ParentId = null;
+            command.Position = GetPosition(options);
+            command.Anchor = GetAnchor(options);
+            command.Size = new Vector2(width, height);
+            command.Alpha = Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f);
+            command.Layer = (int)Math.Clamp(Math.Round(GetNumber(options, "layer", 0f)), int.MinValue, int.MaxValue);
+            command.ScissorClip = GetScissorClip(options);
+            command.ChartPanelMode = mode;
+            command.ChartPanelHeaderText = headerText;
+            command.ChartPanelShowHeader = showHeader;
+            command.ChartPanelBackgroundColor = GetColor(options, "background_color", command.ChartPanelBackgroundColor);
+            command.ChartPanelBorderColor = GetColor(options, "border_color", command.ChartPanelBorderColor);
+            command.ChartPanelHeaderColor = GetColor(options, "header_color", command.ChartPanelHeaderColor);
+            command.ChartPanelDividerColor = GetColor(options, "divider_color", command.ChartPanelDividerColor);
+            command.ChartPanelRadarFillColor = GetColor(options, "radar_fill_color", command.ChartPanelRadarFillColor);
+            command.ChartPanelRadarLineColor = GetColor(options, "radar_line_color", command.ChartPanelRadarLineColor);
+            command.ChartPanelGuideColor = GetColor(options, "guide_color", command.ChartPanelGuideColor);
+            command.ChartPanelBarBackgroundColor = GetColor(options, "bar_background_color", command.ChartPanelBarBackgroundColor);
+            command.ChartPanelTapsColor = GetColor(options, "taps_color", command.ChartPanelTapsColor);
+            command.ChartPanelChordsColor = GetColor(options, "chords_color", command.ChartPanelChordsColor);
+            command.ChartPanelLongsColor = GetColor(options, "longs_color", command.ChartPanelLongsColor);
+            command.ChartPanelSlidesColor = GetColor(options, "slides_color", command.ChartPanelSlidesColor);
+            command.ChartPanelFlicksColor = GetColor(options, "flicks_color", command.ChartPanelFlicksColor);
+            command.ChartPanelStreamColor = GetColor(options, "stream_color", command.ChartPanelStreamColor);
+            command.ChartPanelTravelColor = GetColor(options, "travel_color", command.ChartPanelTravelColor);
+            command.ChartPanelBorderWidth = Math.Max(0f, GetNumber(options, "border_width", command.ChartPanelBorderWidth));
+            command.ChartPanelHeaderSize = Math.Max(0f, GetNumber(options, "header_size", command.ChartPanelHeaderSize));
+            command.ChartPanelBackgroundBleed = Math.Max(0f, GetNumber(options, "background_bleed", command.ChartPanelBackgroundBleed));
+            command.Order = _drawOrder++;
+            _drawCommands.Add(command);
+            RegisterLayoutNode(command, false);
+            RegisterChartPanelHitbox(command, options);
+            return DynValue.Nil;
+        }
+        finally
+        {
+            if (measure)
+            {
+                DebugLastChartPanelApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastChartPanelApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
+                DebugLastChartPanelApiCalls++;
+            }
+        }
     }
 
     /// <summary>
@@ -10470,7 +11840,9 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue DrawRect(ScriptExecutionContext _, CallbackArguments args)
     {
-        var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
         try
         {
         var options = GetOptions(args, 0);
@@ -10510,6 +11882,7 @@ public sealed class SkinRuntime : IDisposable
             if (DebugMeasureApiAllocations)
             {
                 DebugLastRectApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastRectApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
                 DebugLastRectApiCalls++;
             }
         }
@@ -10517,7 +11890,9 @@ public sealed class SkinRuntime : IDisposable
 
     private DynValue DrawShadow(ScriptExecutionContext _, CallbackArguments args)
     {
-        var allocStart = DebugMeasureApiAllocations ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
         try
         {
             var options = GetOptions(args, 0);
@@ -10572,6 +11947,7 @@ public sealed class SkinRuntime : IDisposable
             if (DebugMeasureApiAllocations)
             {
                 DebugLastShadowApiAllocatedBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
+                DebugLastShadowApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
                 DebugLastShadowApiCalls++;
             }
         }
@@ -10918,10 +12294,16 @@ public sealed class SkinRuntime : IDisposable
     /// </summary>
     private void RegisterLayoutNode(SkinDrawCommand command, bool isLine)
     {
-        if (string.IsNullOrWhiteSpace(command.Id))
+        var rawId = command.Id;
+        var rawParentId = command.ParentId;
+        if (string.IsNullOrWhiteSpace(rawId) && string.IsNullOrWhiteSpace(rawParentId))
             return;
 
-        var id = command.Id.Trim();
+        _drawCommandsNeedLayoutResolve = true;
+        if (string.IsNullOrWhiteSpace(rawId))
+            return;
+
+        var id = rawId.Trim();
         if (_layoutNodes.ContainsKey(id))
             throw new ScriptRuntimeException($"draw.{command.Kind.ToString().ToLowerInvariant()} id '{id}' is already used in this render");
 
@@ -10952,6 +12334,7 @@ public sealed class SkinRuntime : IDisposable
         SkinUiSlider? slider,
         Vector2? anchor = null)
     {
+        _drawCommandsNeedLayoutResolve = true;
         if (_layoutNodes.ContainsKey(id))
             throw new ScriptRuntimeException($"ui control '{id}' is already used in this render");
 
