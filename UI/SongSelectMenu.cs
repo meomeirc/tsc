@@ -52,8 +52,8 @@ public sealed class SongSelectMenu : IDisposable
         public required string Path { get; init; }
         public required string Difficulty { get; init; }
         public int? Level { get; init; }
-        public int? EstimatedLevel { get; set; }
-        public int? DisplayLevel => Level ?? EstimatedLevel;
+        public double? EstimatedLevel { get; set; }
+        public double? DisplayLevel => Level.HasValue ? (double)Level.Value : EstimatedLevel;
         public bool LevelIsEstimated => !Level.HasValue && EstimatedLevel.HasValue;
         public string Name { get; init; } = string.Empty;
         public string Artist { get; init; } = string.Empty;
@@ -293,9 +293,9 @@ public sealed class SongSelectMenu : IDisposable
     private string? _chartRadarError;
     private readonly Dictionary<string, ChartRadarResult> _chartRadarCache = new(StringComparer.OrdinalIgnoreCase);
     private string ChartLevelEstimateCachePath => Path.Combine(_songSelectStateDirectory, "chart-level-estimates.json");
-    private const int ChartLevelEstimateCacheVersion = 1;
+    private const int ChartLevelEstimateCacheVersion = 4;
     private const long ChartLevelEstimateCacheReadLimitBytes = 8L * 1024L * 1024L;
-    private readonly Dictionary<string, int> _chartLevelEstimateCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _chartLevelEstimateCache = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _chartLevelEstimateKeysByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _chartRadarKeysByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly Queue<ChartLevelEstimateRequest> _chartLevelEstimateQueue = new();
@@ -303,7 +303,6 @@ public sealed class SongSelectMenu : IDisposable
     private Task? _chartLevelEstimateCacheSaveTask;
     private bool _chartLevelEstimateCacheDirty;
     private string? _chartRadarTaskPath;
-    private string? _chartRadarTaskDifficulty;
 
     // Song previews are briefly debounced so holding a navigation key or moving
     // quickly through songs does not start every intermediate preview. Android
@@ -423,17 +422,17 @@ public sealed class SongSelectMenu : IDisposable
 
     private sealed class ChartLevelEstimateCache
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = 4;
         public List<ChartLevelEstimateCacheEntry> Entries { get; set; } = new();
     }
 
     private sealed class ChartLevelEstimateCacheEntry
     {
         public string Key { get; set; } = string.Empty;
-        public int Level { get; set; }
+        public double Level { get; set; }
     }
 
-    private readonly record struct ChartLevelEstimateRequest(string Key, string RadarKey, string Path, string Difficulty);
+    private readonly record struct ChartLevelEstimateRequest(string Key, string RadarKey, string Path);
 
     private sealed class SongListCache
     {
@@ -1886,9 +1885,9 @@ public sealed class SongSelectMenu : IDisposable
                 if (completedKey is not null)
                 {
                     _chartRadarCache[completedKey] = result;
-                    if (_chartRadarTaskPath is not null && _chartRadarTaskDifficulty is not null &&
+                    if (_chartRadarTaskPath is not null &&
                         _chartLevelEstimateKeysByPath.TryGetValue(_chartRadarTaskPath, out var estimateKey))
-                        ApplyChartLevelEstimate(_chartRadarTaskPath, estimateKey, _chartRadarTaskDifficulty, result);
+                        ApplyChartLevelEstimate(_chartRadarTaskPath, estimateKey, result);
                 }
                 if (string.Equals(completedKey, _chartRadarDesiredKey, StringComparison.OrdinalIgnoreCase))
                 {
@@ -1909,7 +1908,6 @@ public sealed class SongSelectMenu : IDisposable
             _chartRadarTask = null;
             _chartRadarTaskKey = null;
             _chartRadarTaskPath = null;
-            _chartRadarTaskDifficulty = null;
         }
 
         if (_chartPanelMode == ChartPanelMode.Hidden && !force)
@@ -1975,7 +1973,6 @@ public sealed class SongSelectMenu : IDisposable
             var requestedPath = _chartRadarDesiredPath;
             _chartRadarTaskKey = key;
             _chartRadarTaskPath = requestedPath;
-            _chartRadarTaskDifficulty = selectedChart.Difficulty;
             _chartRadarTask = Task.Run(() => ChartRadarAnalyzer.Analyze(requestedPath));
         }
     }
@@ -2014,13 +2011,12 @@ public sealed class SongSelectMenu : IDisposable
             var request = _chartLevelEstimateQueue.Dequeue();
             if (_chartRadarCache.TryGetValue(request.RadarKey, out var cached))
             {
-                ApplyChartLevelEstimate(request.Path, request.Key, request.Difficulty, cached);
+                ApplyChartLevelEstimate(request.Path, request.Key, cached);
                 continue;
             }
 
             _chartRadarTaskKey = request.RadarKey;
             _chartRadarTaskPath = request.Path;
-            _chartRadarTaskDifficulty = request.Difficulty;
             _chartRadarTask = Task.Run(() => ChartRadarAnalyzer.Analyze(request.Path));
             break;
         }
@@ -2047,7 +2043,7 @@ public sealed class SongSelectMenu : IDisposable
                     path, "|", info.Length.ToString(CultureInfo.InvariantCulture), "|",
                     info.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture));
                 key = string.Concat(
-                    radarKey, "|", chart.Difficulty, "|",
+                    radarKey, "|",
                     ChartLevelEstimator.ModelVersion.ToString(CultureInfo.InvariantCulture));
                 _chartLevelEstimateKeysByPath[path] = key;
                 _chartRadarKeysByPath[path] = radarKey;
@@ -2069,15 +2065,15 @@ public sealed class SongSelectMenu : IDisposable
         }
 
         if (_chartLevelEstimateRequestedKeys.Add(key))
-            _chartLevelEstimateQueue.Enqueue(new ChartLevelEstimateRequest(key, radarCacheKey, path, chart.Difficulty));
+            _chartLevelEstimateQueue.Enqueue(new ChartLevelEstimateRequest(key, radarCacheKey, path));
     }
 
-    private void ApplyChartLevelEstimate(string path, string key, string difficulty, ChartRadarResult radar)
+    private void ApplyChartLevelEstimate(string path, string key, ChartRadarResult radar)
     {
         if (!_chartLevelEstimateRequestedKeys.Contains(key))
             return;
 
-        var estimate = ChartLevelEstimator.Estimate(radar, difficulty);
+        var estimate = ChartLevelEstimator.Estimate(radar);
         if (!estimate.HasValue)
             return;
 
@@ -2102,7 +2098,7 @@ public sealed class SongSelectMenu : IDisposable
         _chartLevelEstimateCache[key] = estimate.Value;
         _chartLevelEstimateCacheDirty = true;
         Program.LogRuntime(
-            $"SONG_SELECT_LEVEL_ESTIMATE difficulty={difficulty} level={estimate.Value} " +
+            $"SONG_SELECT_LEVEL_ESTIMATE level={estimate.Value.ToString("F1", CultureInfo.InvariantCulture)} " +
             $"chart={Path.GetFileName(path)} radar_notes={radar.Notes.NormalizedValue:F1} " +
             $"radar_chords={radar.Chords.NormalizedValue:F1} radar_slides={radar.Slides.NormalizedValue:F1} " +
             $"radar_flicks={radar.Flicks.NormalizedValue:F1} radar_stream={radar.Stream.NormalizedValue:F1} " +
@@ -6683,7 +6679,12 @@ public sealed class SongSelectMenu : IDisposable
             var level = chart?.DisplayLevel;
             var label = DifficultyNames[i].ToUpperInvariant();
             if (level.HasValue)
-                label += $"  {(chart!.LevelIsEstimated ? "~" : string.Empty)}{level.Value:00}";
+            {
+                var levelText = chart!.LevelIsEstimated
+                    ? level.Value.ToString("00.0", CultureInfo.InvariantCulture)
+                    : level.Value.ToString("00", CultureInfo.InvariantCulture);
+                label += $"  {(chart.LevelIsEstimated ? "~" : string.Empty)}{levelText}";
+            }
 
             DrawText(label,
                 x + i * (buttonWidth + gap) + buttonWidth * 0.5f,
@@ -6724,7 +6725,9 @@ public sealed class SongSelectMenu : IDisposable
         DrawRect(x + width - 48f * scale, y + 4f * scale, 44f * scale, 44f * scale, chartColor);
         var displayLevel = displayChart.DisplayLevel;
         var displayLevelText = displayLevel.HasValue
-            ? $"{(displayChart.LevelIsEstimated ? "~" : string.Empty)}{displayLevel.Value:00}"
+            ? (displayChart.LevelIsEstimated
+                ? $"~{displayLevel.Value.ToString("00.0", CultureInfo.InvariantCulture)}"
+                : displayLevel.Value.ToString("00", CultureInfo.InvariantCulture))
             : "--";
         DrawText(displayLevelText, x + width - 26f * scale, y + 26f * scale, 21f * scale, XnaColor.White, centered: true);
 

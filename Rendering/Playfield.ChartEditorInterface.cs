@@ -92,7 +92,11 @@ public sealed partial class Playfield
                 if (transitionSeconds > duration) break;
 
                 var tickEvents = _editorTimelineTraceSuperFlicks
-                    .GetRange(groupStart, nextEventIndex - groupStart);
+                    .GetRange(groupStart, nextEventIndex - groupStart)
+                    .Where(ev => !IsEditorPreviewSuperFlickLocked(ev))
+                    .ToList();
+                if (tickEvents.Count == 0)
+                    continue;
                 var candidates = tickEvents.Where(ev =>
                 {
                     var key = SuperFlickKeyOf(ev);
@@ -633,6 +637,8 @@ public sealed partial class Playfield
             var isAlternateSelected = string.Equals(active, bank, StringComparison.OrdinalIgnoreCase) &&
                                       !string.Equals(active, authored, StringComparison.OrdinalIgnoreCase);
             item["intended"] = intendedBank;
+            item["locked"] = string.Equals(active, bank, StringComparison.OrdinalIgnoreCase) &&
+                              IsEditorPreviewBankLocked(side);
             item["variant"] = isAlternateSelected ? "danger" : intendedBank
                 ? (item["selected"] is true ? "success" : "warning")
                 : "secondary";

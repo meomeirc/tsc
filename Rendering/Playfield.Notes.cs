@@ -70,7 +70,7 @@ public sealed partial class Playfield
         _skinNoteGeometryContext = null;
         _skinNoteSimultaneousContext = false;
         _skinNoteMissedContext = false;
-        var counts = SimultaneousCounts(currentState);
+        var counts = MultiTextureCounts();
         var showEditorAttributes = _chartEditorMode && !_editorPreviewMode && _editorShowAttributes;
         _editorNoteAttributeLabels.Clear();
         // Use the same spatial coordinate as the cached event positions. In
@@ -294,13 +294,9 @@ public sealed partial class Playfield
             }
 
             _skinNoteGeometryContext = ev;
-            var noteIsInActiveBank = notePosition.Side == "left"
-                ? string.Equals(activeLeftBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase)
-                : string.Equals(activeRightBank, notePosition.Bank, StringComparison.OrdinalIgnoreCase);
-            var simultaneous = noteIsInActiveBank &&
-                (ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
-                    ? IsLinkChainSimultaneous(ev, counts)
-                    : IsSimultaneous(ev, counts));
+            var simultaneous = ev.NoteType is NoteType.LinkHead or NoteType.LinkTail
+                ? IsLinkChainSimultaneous(ev, counts)
+                : IsMultiTextureSimultaneous(ev, counts);
             _skinNoteSimultaneousContext = simultaneous;
             _skinNoteMissedContext = _gameplayMode && _missedEvents.Contains(eventKey);
 
@@ -2067,7 +2063,7 @@ public sealed partial class Playfield
     private void AddEditorConnectorPreviewCommands(
         double currentTick,
         GearState currentState,
-        Dictionary<int, int> counts)
+        Dictionary<(string Bank, int Tick), int> counts)
     {
         if (!_chartEditorMode || !_editorConnectorMode || !_editorMouseHoverActive ||
             IsEditorConnectorPreviewGestureBlocked() ||
@@ -2230,14 +2226,9 @@ public sealed partial class Playfield
         _editorConnectorExtensionPreviewNodes.Add(extensionPoint);
         _editorConnectorExtensionPreviewMarkerNode = extensionPoint;
 
-        var activeLeft = GearTimeline.ActiveBankForSide(currentState, "left");
-        var activeRight = GearTimeline.ActiveBankForSide(currentState, "right");
-        var sourceIsActive = sourcePosition.Value.Side == "left"
-            ? string.Equals(activeLeft, sourcePosition.Value.Bank, StringComparison.OrdinalIgnoreCase)
-            : string.Equals(activeRight, sourcePosition.Value.Bank, StringComparison.OrdinalIgnoreCase);
-        var simultaneous = sourceIsActive && (root.NoteType is NoteType.LinkHead or NoteType.LinkTail
+        var simultaneous = root.NoteType is NoteType.LinkHead or NoteType.LinkTail
             ? IsLinkChainSimultaneous(root, counts)
-            : IsSimultaneous(root, counts));
+            : IsMultiTextureSimultaneous(root, counts);
         var bodyTexture = _textures.Get(simultaneous ? NoteTextureAsset.BodyMulti : NoteTextureAsset.Body);
         var tailTexture = _textures.Get(simultaneous ? NoteTextureAsset.TailMulti : NoteTextureAsset.Tail);
         var targetSeconds = _tempo.TickToSeconds(previewEndTick);
@@ -3048,7 +3039,7 @@ public sealed partial class Playfield
     private void DrawGameplayRegularHold(
         ChartEvent ev,
         GearState currentState,
-        Dictionary<int, int> counts,
+        Dictionary<(string Bank, int Tick), int> counts,
         List<TexturedBodyCommand> bodyCommands,
         List<TexturedQuadCommand> headCommands,
         double currentTick,
@@ -3096,13 +3087,7 @@ public sealed partial class Playfield
         }
 
         var position = GearState.Position(ev.Track);
-        var activeLeft = GearTimeline.ActiveBankForSide(currentState, "left");
-        var activeRight = GearTimeline.ActiveBankForSide(currentState, "right");
-        var inActiveBank = position is { } holdPosition &&
-            (holdPosition.Side == "left"
-                ? string.Equals(activeLeft, holdPosition.Bank, StringComparison.OrdinalIgnoreCase)
-                : string.Equals(activeRight, holdPosition.Bank, StringComparison.OrdinalIgnoreCase));
-        var simultaneous = inActiveBank && IsSimultaneous(ev, counts);
+        var simultaneous = IsMultiTextureSimultaneous(ev, counts);
         var body = ev.NoteType == NoteType.Vibrato
             ? _textures.Get(simultaneous ? NoteTextureAsset.VibratoMulti : NoteTextureAsset.Vibrato)
             : _textures.Get(missVisual

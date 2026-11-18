@@ -3,83 +3,37 @@ using System;
 namespace TSC;
 
 /// <summary>
-/// Estimates a placeholder Song Select level from the six chart radar measurements.
-/// The model was fitted from the stock chart pack's Easy/Normal/Hard/Expert charts
-/// (228 charts per difficulty). SC charts were not used. Stock level 10 is treated
-/// as a lower-bound/censored label rather than an exact maximum, so predictions
-/// are deliberately not capped at 10.
+/// Estimates a placeholder level from the six chart radar measurements.
+/// One pooled stock-chart model is shared by every difficulty; the estimate depends
+/// only on the measured chart, never on its difficulty label. Stock level 10 is a
+/// lower-bound/censored label rather than an exact maximum, so predictions are not
+/// capped at 10.
 /// </summary>
 internal static class ChartLevelEstimator
 {
-    public const int ModelVersion = 1;
+    // Bump this whenever the mapping changes so persisted estimates are recalculated.
+    public const int ModelVersion = 4;
 
-    private readonly record struct Model(
-        double Intercept,
-        double Notes,
-        double Chords,
-        double Slides,
-        double Flicks,
-        double Stream,
-        double Travel);
+    // One difficulty-blind model fitted to all 912 stock Easy/Normal/Hard/Expert
+    // charts. The six radar axes keep their existing normalization references;
+    // only the level mapping is recalibrated. Stock level 10 is right-censored
+    // (10 or higher), and all SC charts are excluded from the fit.
+    //
+    // Fit method: Gaussian right-censored regression on ln(1 + radar / 100),
+    // with non-negative coefficients. The two zero coefficients are the fitted
+    // boundary solution for FLICKS and TRAVEL, not manually selected exclusions.
+    private const double Intercept = 0.297730176487025;
+    private const double Notes = 7.146377211976049;
+    private const double Chords = 0.905006046205730;
+    private const double Slides = 3.128733675190748;
+    private const double Flicks = 0.0;
+    private const double Stream = 6.015444898221029;
+    private const double Travel = 0.0;
 
-    // Positive coefficients keep the estimate monotonic: increasing any radar
-    // measurement cannot lower the predicted level. Each feature is transformed
-    // with ln(1 + normalizedRadar / 100) to reduce the effect of extreme values
-    // while still allowing the model to extrapolate above the stock level cap.
-    private static readonly Model Easy = new(
-        0.13374364185749993,
-        7.598986500885317,
-        0.16431991657054,
-        3.959298359728462,
-        0.0,
-        5.009083485857133,
-        0.24050485598993382);
-
-    private static readonly Model Normal = new(
-        0.8686294388729918,
-        4.977856612420676,
-        0.0,
-        2.058837946743678,
-        0.0,
-        6.842674427935254,
-        0.0);
-
-    private static readonly Model Hard = new(
-        2.0625869773057657,
-        4.395081515741018,
-        0.5442596360592317,
-        1.0434213562206571,
-        0.2822145103188899,
-        5.874302601885639,
-        0.0);
-
-    private static readonly Model Expert = new(
-        2.133579114730343,
-        4.577021460857592,
-        0.9795651286944509,
-        2.0745579932375673,
-        0.9839702356565755,
-        5.708209403867383,
-        0.0);
-
-    public static int? Estimate(ChartRadarResult radar, string difficulty)
+    public static double? Estimate(ChartRadarResult radar)
     {
         ArgumentNullException.ThrowIfNull(radar);
 
-        Model? model = difficulty.Trim().ToLowerInvariant() switch
-        {
-            "ez" or "easy" => Easy,
-            "nm" or "normal" => Normal,
-            "hd" or "hard" => Hard,
-            // The stock pack has no XT sample set. Use the closest available
-            // Expert calibration rather than inventing an untrained fifth model.
-            "ex" or "expert" or "xt" or "extra" => Expert,
-            _ => null
-        };
-        if (!model.HasValue)
-            return null;
-
-        var value = model.Value;
         var features = new[]
         {
             radar.Notes.NormalizedValue,
@@ -96,20 +50,20 @@ internal static class ChartLevelEstimator
         static double Transform(double normalizedValue)
             => Math.Log(1.0 + normalizedValue / 100.0);
 
-        var estimate = value.Intercept
-            + value.Notes * Transform(features[0])
-            + value.Chords * Transform(features[1])
-            + value.Slides * Transform(features[2])
-            + value.Flicks * Transform(features[3])
-            + value.Stream * Transform(features[4])
-            + value.Travel * Transform(features[5]);
+        var estimate = Intercept
+            + Notes * Transform(features[0])
+            + Chords * Transform(features[1])
+            + Slides * Transform(features[2])
+            + Flicks * Transform(features[3])
+            + Stream * Transform(features[4])
+            + Travel * Transform(features[5]);
 
         if (!double.IsFinite(estimate))
             return null;
 
-        // Only lower-bound the result. In particular, do not clamp to level 10:
-        // stock labels at 10 were treated as "10 or higher" during training.
-        var rounded = Math.Round(estimate, MidpointRounding.AwayFromZero);
-        return (int)Math.Clamp(rounded, 1.0, int.MaxValue);
+        // Preserve the continuous result. UI surfaces format it to one decimal
+        // place; rounding here would erase small differences before display.
+        // Do not clamp to level 10: stock labels at 10 mean "10 or higher".
+        return Math.Max(estimate, 1.0);
     }
 }

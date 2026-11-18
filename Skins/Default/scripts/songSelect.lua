@@ -860,9 +860,12 @@ local function get_song_presentation(song, fallback_index)
         for i = 1, #DIFF do
             local difficultyLevel = song[DIFF[i].key]
             cache.difficulty_levels[i] = difficultyLevel
-            local levelText = difficultyLevel and tostring(difficultyLevel) or "--"
-            if difficultyLevel ~= nil and estimatedFlags[i] then
-                levelText = "~" .. levelText
+            local levelText = "--"
+            if difficultyLevel ~= nil then
+                local numericLevel = tonumber(difficultyLevel) or 0
+                levelText = estimatedFlags[i]
+                    and string.format("~%.1f", numericLevel)
+                    or string.format("%d", numericLevel)
             end
             cache.difficulty_labels[i] = DIFF[i].name .. " " .. levelText
         end
@@ -885,7 +888,8 @@ local function get_song_presentation(song, fallback_index)
         end
         local displayedLevelIsEstimated = cache.diff_index ~= nil and estimatedFlags[cache.diff_index] == true
         cache.level_text = cache.level ~= nil
-            and (displayedLevelIsEstimated and "~" or "") .. string.format("%d", tonumber(cache.level) or 0)
+            and (displayedLevelIsEstimated and "~" or "") .. string.format(
+                displayedLevelIsEstimated and "%.1f" or "%d", tonumber(cache.level) or 0)
             or nil
     end
     return cache

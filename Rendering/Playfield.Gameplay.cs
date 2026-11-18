@@ -181,8 +181,12 @@ public sealed partial class Playfield
                     break;
 
                 var tickEvents = _editorTimelineTraceSuperFlicks
-                    .GetRange(groupStart, nextEventIndex - groupStart);
-                var applied = GearTimeline.ApplySuperFlickChangesForTick(state, tickEvents, tickEvents);
+                    .GetRange(groupStart, nextEventIndex - groupStart)
+                    .Where(ev => !IsEditorPreviewSuperFlickLocked(ev))
+                    .ToList();
+                var applied = tickEvents.Count == 0
+                    ? new List<ChartEvent>()
+                    : GearTimeline.ApplySuperFlickChangesForTick(state, tickEvents, tickEvents);
                 if (applied.Count > 0)
                     RecordEditorTimelineRouteState(transitionSeconds, state);
             }
@@ -211,7 +215,11 @@ public sealed partial class Playfield
 
                 var before = state.Copy();
                 var tickEvents = _editorTimelineTraceSuperFlicks
-                    .GetRange(groupStart, groupEndExclusive - groupStart);
+                    .GetRange(groupStart, groupEndExclusive - groupStart)
+                    .Where(ev => !IsEditorPreviewSuperFlickLocked(ev))
+                    .ToList();
+                if (tickEvents.Count == 0)
+                    continue;
                 var hasLeftInner = tickEvents.Any(ev => (ev.Attr is 60 or 70) &&
                     string.Equals(ev.GetSuperFlickSide(), "left", StringComparison.OrdinalIgnoreCase));
                 var hasRightInner = tickEvents.Any(ev => (ev.Attr is 60 or 70) &&
@@ -272,9 +280,9 @@ public sealed partial class Playfield
         SyncEditorPreviewBankIndicators(state);
     }
 
-    private static bool TryReverseEditorPreviewSuperFlick(ChartEvent ev, GearState before, GearState state)
+    private bool TryReverseEditorPreviewSuperFlick(ChartEvent ev, GearState before, GearState state)
     {
-        if (!ev.IsSuperFlick)
+        if (!ev.IsSuperFlick || IsEditorPreviewSuperFlickLocked(ev))
             return false;
 
         var position = GearState.Position(ev.Track);
@@ -420,9 +428,11 @@ public sealed partial class Playfield
             var state = EnsureEditorPreviewGearState();
             var before = state.Copy();
             var authoredTickEvents = _orderedRenderableEvents
-                .Where(ev => ev.Tick == tickGroup.Key && ev.IsSuperFlick)
+                .Where(ev => ev.Tick == tickGroup.Key && ev.IsSuperFlick && !IsEditorPreviewSuperFlickLocked(ev))
                 .ToList();
-            var successfulKeys = tickGroup.Select(KeyOf).ToHashSet();
+            if (authoredTickEvents.Count == 0)
+                continue;
+            var successfulKeys = tickGroup.Where(ev => !IsEditorPreviewSuperFlickLocked(ev)).Select(KeyOf).ToHashSet();
             var candidates = authoredTickEvents.Where(ev =>
             {
                 if (successfulKeys.Contains(KeyOf(ev)) || _hitEvents.Contains(KeyOf(ev)))
@@ -518,8 +528,13 @@ public sealed partial class Playfield
                 // one side. Offset 60/70 events and Attr 20/40 remain independent.
                 var authoredTickEvents = _orderedRenderableEvents
                     .Skip(i).Take(next - i)
-                    .Where(ev => ev.IsSuperFlick);
-                GearTimeline.ApplySuperFlickChangesForTick(state, authoredTickEvents, stateChanges);
+                    .Where(ev => ev.IsSuperFlick && !IsEditorPreviewSuperFlickLocked(ev))
+                    .ToList();
+                var unlockedStateChanges = stateChanges
+                    .Where(ev => !IsEditorPreviewSuperFlickLocked(ev))
+                    .ToList();
+                if (authoredTickEvents.Count > 0)
+                    GearTimeline.ApplySuperFlickChangesForTick(state, authoredTickEvents, unlockedStateChanges);
                 i = next;
             }
             return;
@@ -1493,7 +1508,8 @@ public sealed partial class Playfield
                      .OrderBy(tick => tick))
         {
             var authoredTickEvents = ordered
-                .Where(ev => ev.Tick == pendingTick && ev.IsSuperFlick)
+                .Where(ev => ev.Tick == pendingTick && ev.IsSuperFlick &&
+                    (!_chartEditorMode || !IsEditorPreviewSuperFlickLocked(ev)))
                 .ToList();
             // Include successful hits from earlier frames at this same chart tick.
             // This lets the second half of a same-tick 60/70 pair complete the
@@ -2191,6 +2207,41 @@ public sealed partial class Playfield
         }
         _simultaneousCountsCache[key] = counts;
         return counts;
+    }
+
+    // Multi-note textures are paired within a physical bank family (1K, 2K, or 3K),
+    // not within the currently active route. Left and right instances of the same
+    // family can therefore form a pair even when other bank families are active.
+    private Dictionary<(string Bank, int Tick), int> MultiTextureCounts()
+    {
+        var counts = new Dictionary<(string Bank, int Tick), int>();
+        if (_chart is null)
+            return counts;
+
+        foreach (var ev in _orderedRenderableEvents)
+        {
+            if ((_chart.PlayTick > 0 && ev.Tick > _chart.PlayTick) ||
+                ev.IsSuperFlick || ev.NoteType is NoteType.LinkTail or NoteType.End)
+                continue;
+
+            var position = GearState.Position(ev.Track);
+            if (position is null)
+                continue;
+
+            var key = (position.Value.Bank, ev.Tick);
+            counts[key] = counts.GetValueOrDefault(key) + 1;
+        }
+
+        return counts;
+    }
+
+    private bool IsMultiTextureSimultaneous(ChartEvent ev, Dictionary<(string Bank, int Tick), int> counts)
+    {
+        if (ev.IsSuperFlick || ev.NoteType is NoteType.LinkTail or NoteType.End)
+            return false;
+        var position = GearState.Position(ev.Track);
+        return position is { } bankPosition &&
+            counts.GetValueOrDefault((bankPosition.Bank, ev.Tick)) >= 2;
     }
 
     private bool IsSimultaneous(ChartEvent ev, Dictionary<int, int> counts) =>

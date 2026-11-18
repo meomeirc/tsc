@@ -425,6 +425,20 @@ public sealed partial class Playfield
                 UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, safeLabel,
                     new Vector2(bounds.Center.X - size.X * 0.5f, bounds.Center.Y - size.Y * 0.5f),
                     labelColor, 0f, Vector2.Zero, labelScale, SpriteEffects.None, 0f);
+
+                if (isSelected && IsEditorPreviewBankLocked(side))
+                {
+                    var badgeSize = Math.Max(10, (int)MathF.Round(13f * unit));
+                    var badgeRect = new Rectangle(bounds.Right - badgeSize - Math.Max(2, (int)MathF.Round(2f * unit)),
+                        bounds.Y + Math.Max(2, (int)MathF.Round(2f * unit)), badgeSize, badgeSize);
+                    _spriteBatch.Draw(_pixel, badgeRect, new Color(52, 211, 153, 255));
+                    var lockText = FontSafeText(labelFont, "L");
+                    var lockScale = GetEditorDefaultFontScale(lockText, 11f * unit);
+                    var lockSize = UnicodeTextRenderer.MeasureString(labelFont, lockText) * lockScale;
+                    UnicodeTextRenderer.DrawString(_spriteBatch, labelFont, lockText,
+                        new Vector2(badgeRect.Center.X - lockSize.X * 0.5f, badgeRect.Center.Y - lockSize.Y * 0.5f),
+                        Color.White, 0f, Vector2.Zero, lockScale, SpriteEffects.None, 0f);
+                }
             }
         }
         _spriteBatch.End();
@@ -1914,7 +1928,11 @@ public sealed partial class Playfield
                     break;
 
                 var tickEvents = _editorTimelineTraceSuperFlicks
-                    .GetRange(groupStart, nextEventIndex - groupStart);
+                    .GetRange(groupStart, nextEventIndex - groupStart)
+                    .Where(ev => !IsEditorPreviewSuperFlickLocked(ev))
+                    .ToList();
+                if (tickEvents.Count == 0)
+                    continue;
                 var candidates = tickEvents.Where(ev =>
                 {
                     var key = SuperFlickKeyOf(ev);
@@ -2257,8 +2275,8 @@ public sealed partial class Playfield
         var judgementPrefix = _editorCustomJudgementWindowsEnabled;
         var difficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
         var levelLabel = string.Equals(_editorMetaCategory, "SONG", StringComparison.OrdinalIgnoreCase) &&
-                         GetEditorEstimatedLevel(_chart, difficultyCode) is { } estimatedLevel
-            ? $"LEVEL (ESTIMATED ~{estimatedLevel})"
+                         GetEditorEstimatedLevel(_chart) is { } estimatedLevel
+            ? $"LEVEL (ESTIMATED ~{estimatedLevel.ToString("F1", CultureInfo.InvariantCulture)})"
             : "LEVEL";
 
         var rows = _editorMetaCategory switch

@@ -402,6 +402,16 @@ local function drawBankButtons(items, x, y, width, layer)
             selected = item.selected == true, variant = variant, font = F.medium, text_size = fontSize("body"),
             accent = variant == "secondary", accent_color = item.selected and C.accent or C.accent_dim,
             layer = (layer or 4) + 2 })
+        if item.locked == true then
+            local badgeSize = math.max(11, 12 * ACTIVE_SCALE)
+            local badgeX = bx + bw - badgeSize - 2 * ACTIVE_SCALE
+            local badgeY = by + 2 * ACTIVE_SCALE
+            draw.rect({ x = badgeX, y = badgeY, width = badgeSize, height = badgeSize,
+                color = C.accent, layer = (layer or 4) + 5 })
+            draw.text("L", { x = badgeX + badgeSize * 0.5, y = badgeY + badgeSize * 0.5,
+                size = 9 * ACTIVE_SCALE, color = C.primary_text, font = F.medium,
+                anchor = "center", layer = (layer or 4) + 6 })
+        end
     end
 end
 

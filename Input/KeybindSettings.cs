@@ -101,6 +101,7 @@ internal static class KeybindSettings
         ("editor_seek_forward_5_beats", "SEEK FORWARD 5 BEATS", "editor_view", new[] { 82 }, new[] { 225, 79 }),
         ("editor_switch_left_bank", "CYCLE LEFT BANK", "editor_view", new[] { 225, 45 }, Array.Empty<int>()),
         ("editor_switch_right_bank", "CYCLE RIGHT BANK", "editor_view", new[] { 225, 46 }, Array.Empty<int>()),
+        ("editor_lock_bank_modifier", "HOLD TO LOCK BANK", "editor_view", new[] { 224 }, new[] { 228 }),
         ("editor_toggle_view_mode", "TOGGLE 2D / 3D VIEW", "editor_view", new[] { 43 }, Array.Empty<int>()),
         ("editor_toggle_expand", "EXPAND / COLLAPSE VIEW", "editor_view", new[] { 6 }, Array.Empty<int>()),
         ("editor_toggle_beat_lines", "TOGGLE GRIDS", "editor_view", new[] { 5 }, Array.Empty<int>()),
@@ -682,6 +683,48 @@ internal static class KeybindSettings
         // Preserve the old merged-input behavior: a physical key press does not
         // create a second edge while the same touch action was already held.
         return physicalPressed && !TouchGameplayPrevious.Contains(action);
+    }
+
+    /// <summary>
+    /// Detects an action chord while allowing extra modifier families to be held.
+    /// The action's non-modifier keys and required modifier families must all be
+    /// down, and the chord must have a fresh press edge. This is used for Ctrl+
+    /// an existing editor bank-cycle binding without changing that binding.
+    /// </summary>
+    public static bool IsPressedWithAdditionalModifiers(string action)
+    {
+        if (IsTemporarilyDisabled(action) || !Bindings.TryGetValue(action, out var binding) ||
+            IsRepeatableMenuAction(action))
+            return false;
+
+        static bool ChordPressed(IReadOnlyList<int>? scancodes)
+        {
+            if (scancodes is null || scancodes.Count == 0)
+                return false;
+
+            var nonModifiers = scancodes.Where(scan => !PhysicalKeyboard.IsModifier(scan)).ToArray();
+            if (nonModifiers.Length == 0)
+                return false;
+            var requiredModifierFamilies = scancodes
+                .Where(PhysicalKeyboard.IsModifier)
+                .Select(PhysicalKeyboard.ModifierFamily)
+                .Where(family => family >= 0)
+                .Distinct()
+                .ToArray();
+
+            bool IsChordDown(bool previous)
+            {
+                if (nonModifiers.Any(scan => !PhysicalKeyboard.IsDown(scan, previous)))
+                    return false;
+                return requiredModifierFamilies.All(family =>
+                    Enumerable.Range(224, 8).Any(scan =>
+                        PhysicalKeyboard.ModifierFamily(scan) == family && PhysicalKeyboard.IsDown(scan, previous)));
+            }
+
+            return IsChordDown(previous: false) && !IsChordDown(previous: true);
+        }
+
+        return ChordPressed(binding.Primary.Scancodes) || ChordPressed(binding.Secondary.Scancodes);
     }
 
     public static bool IsPressed(string action)

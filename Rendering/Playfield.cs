@@ -74,7 +74,7 @@ public sealed partial class Playfield
     private static readonly string[] EditorDifficultyNames = { "Easy", "Normal", "Hard", "Expert", "Extra" };
     private static readonly string[] EditorMetaCategories = { "SONG", "MEDIA", "JUDGEMENT", "STATS", "TEST" };
     private readonly Dictionary<string, EditorDifficultyState> _editorDifficultyStates = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<AresChart, int?> _editorLevelEstimateCache = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<AresChart, double?> _editorLevelEstimateCache = new(ReferenceEqualityComparer.Instance);
     private readonly HashSet<string> _editorDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _editorCommittedDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private bool _editorDifficultySessionActive;
@@ -650,6 +650,8 @@ public sealed partial class Playfield
     private string? _editorPreviewRightBank;
     private string? _editorPreviewStartLeftBank;
     private string? _editorPreviewStartRightBank;
+    private bool _editorPreviewLeftBankLocked;
+    private bool _editorPreviewRightBankLocked;
     private GearState? _editorPreviewGearState;
     private enum EditorMenuSection
     {
@@ -1255,25 +1257,23 @@ public sealed partial class Playfield
         };
     }
 
-    private int? GetEditorEstimatedLevel(AresChart chart, string? difficultyCode = null)
+    private double? GetEditorEstimatedLevel(AresChart chart)
     {
         ArgumentNullException.ThrowIfNull(chart);
         if (_editorLevelEstimateCache.TryGetValue(chart, out var cached))
             return cached;
 
-        int? estimate = null;
+        double? estimate = null;
         try
         {
-            var code = GetEditorDifficultyCode(difficultyCode ?? chart.Difficulty, _sourceName);
-            estimate = ChartLevelEstimator.Estimate(ChartRadarAnalyzer.Analyze(chart), code);
+            estimate = ChartLevelEstimator.Estimate(ChartRadarAnalyzer.Analyze(chart));
         }
         catch (Exception ex)
         {
-            var logDifficulty = difficultyCode ?? chart.Difficulty ?? "unknown";
             var logChartName = chart.Name ?? "Untitled";
             Program.LogRuntime(
-                $"EDITOR_LEVEL_ESTIMATE_FAILED difficulty={logDifficulty} " +
-                $"chart={logChartName} error={ex.GetType().Name}: {ex.Message}");
+                $"EDITOR_LEVEL_ESTIMATE_FAILED chart={logChartName} " +
+                $"error={ex.GetType().Name}: {ex.Message}");
         }
 
         _editorLevelEstimateCache[chart] = estimate;
@@ -1332,9 +1332,14 @@ public sealed partial class Playfield
         if (levels[key] is JsonValue existingLevel && existingLevel.TryGetValue<int>(out _))
             return;
 
-        var estimate = GetEditorEstimatedLevel(chart, code);
+        var estimate = GetEditorEstimatedLevel(chart);
         if (estimate.HasValue)
-            levels[key] = estimate.Value;
+        {
+            // song.json difficulty levels are integer metadata. Keep the full
+            // fractional estimate for display, but retain the existing integer
+            // export contract for this metadata fallback.
+            levels[key] = (int)Math.Round(estimate.Value, MidpointRounding.AwayFromZero);
+        }
     }
 
     private static string? FindExistingEditorSongJson(string chartPath)
@@ -1605,6 +1610,8 @@ public sealed partial class Playfield
             _editorPreviewRightBank = null;
             _editorPreviewStartLeftBank = null;
             _editorPreviewStartRightBank = null;
+            _editorPreviewLeftBankLocked = false;
+            _editorPreviewRightBankLocked = false;
             _editorPreviewGearState = null;
             _editorMenuSection = EditorMenuSection.None;
             _editorBpmInputFocused = false;
@@ -4941,6 +4948,8 @@ public sealed partial class Playfield
         using (new LoadTimingScope("chart_gear_timeline"))
             _gear = new GearTimeline(_chart);
         _editorPreviewGearState = null;
+        _editorPreviewLeftBankLocked = false;
+        _editorPreviewRightBankLocked = false;
         _gameplayState = _gear.Initial;
         if (_chartEditorMode)
         {

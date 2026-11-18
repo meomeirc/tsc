@@ -4111,14 +4111,35 @@ public sealed partial class Playfield
         return false;
     }
 
-    private void SelectEditorPreviewBank(string side, string bank)
+    private bool IsEditorPreviewBankLocked(string side)
+        => side.Equals("left", StringComparison.OrdinalIgnoreCase)
+            ? _editorPreviewLeftBankLocked
+            : _editorPreviewRightBankLocked;
+
+    private bool IsEditorPreviewSuperFlickLocked(ChartEvent ev)
+    {
+        if (!_chartEditorMode)
+            return false;
+        var side = ev.GetSuperFlickSide() ?? GearState.Position(ev.Track)?.Side;
+        return side is not null && IsEditorPreviewBankLocked(side);
+    }
+
+    private void SelectEditorPreviewBank(string side, string bank, bool? lockBank = null)
     {
         // This selects the active preview route now and the route seed for
-        // Restart/seek. Future successful SuperFlicks can still change it.
+        // Restart/seek. Holding the lock modifier pins this side against all
+        // authored SuperFlick route changes until the next manual bank selection.
+        var shouldLock = lockBank ?? KeybindSettings.IsModifierBindingDown("editor_lock_bank_modifier");
         if (side.Equals("left", StringComparison.OrdinalIgnoreCase))
+        {
             _editorPreviewStartLeftBank = bank;
+            _editorPreviewLeftBankLocked = shouldLock;
+        }
         else
+        {
             _editorPreviewStartRightBank = bank;
+            _editorPreviewRightBankLocked = shouldLock;
+        }
 
         var previewState = EnsureEditorPreviewGearState();
         SetGearStateBank(previewState, side, bank);
@@ -4127,10 +4148,12 @@ public sealed partial class Playfield
         RecordEditorTimelineRouteState(_playSeconds, previewState);
         _editorHoverCacheValid = false;
         var modeLabel = bank switch { "Forward" => "1K", "Center" => "2K", _ => "3K" };
-        _statusMessage = $"Editor bank preview: {side} {bank} ({modeLabel}). Use the bank indicators or the side-specific bank keybinds to switch routes.";
+        var lockLabel = shouldLock ? "LOCKED - SuperFlick changes ignored" : "unlocked";
+        var modifierLabel = KeybindSettings.FormatAction("editor_lock_bank_modifier");
+        _statusMessage = $"Editor bank preview: {side} {bank} ({modeLabel}, {lockLabel}). Hold {modifierLabel} while selecting a bank to lock it.";
     }
 
-    private void CycleEditorPreviewBank(string side)
+    private void CycleEditorPreviewBank(string side, bool lockBank = false)
     {
         if (!_chartEditorMode)
             return;
@@ -4140,7 +4163,7 @@ public sealed partial class Playfield
             string.Equals(bank, activeBank, StringComparison.OrdinalIgnoreCase));
         if (index < 0) index = 0;
         var nextBank = EditorBankNames[(index + 1) % EditorBankNames.Length];
-        SelectEditorPreviewBank(side, nextBank);
+        SelectEditorPreviewBank(side, nextBank, lockBank);
     }
 
     private bool TryHandleEditorBankIndicatorClick(Vector2 point, int virtualWidth, int virtualHeight)
@@ -4334,6 +4357,11 @@ public sealed partial class Playfield
         if (KeybindSettings.IsPressed("editor_seek_forward_1_beat")) { SeekEditorByBeats(1.0); return true; }
         if (KeybindSettings.IsPressed("editor_seek_backward_5_beats")) { SeekEditorByBeats(-5.0); return true; }
         if (KeybindSettings.IsPressed("editor_seek_forward_5_beats")) { SeekEditorByBeats(5.0); return true; }
+        var lockBankModifierDown = KeybindSettings.IsModifierBindingDown("editor_lock_bank_modifier");
+        if (lockBankModifierDown && KeybindSettings.IsPressedWithAdditionalModifiers("editor_switch_left_bank"))
+        { CycleEditorPreviewBank("left", lockBank: true); return true; }
+        if (lockBankModifierDown && KeybindSettings.IsPressedWithAdditionalModifiers("editor_switch_right_bank"))
+        { CycleEditorPreviewBank("right", lockBank: true); return true; }
         if (KeybindSettings.IsPressed("editor_switch_left_bank")) { CycleEditorPreviewBank("left"); return true; }
         if (KeybindSettings.IsPressed("editor_switch_right_bank")) { CycleEditorPreviewBank("right"); return true; }
 

@@ -2533,12 +2533,12 @@ public sealed class SkinSongSelectItem
     public SkinAssetHandle? album_big { get; }
     public double bpm { get; }
     public string chart_difficulty { get; }
-    public int? chart_level { get; }
-    public int? ez_level { get; }
-    public int? nm_level { get; }
-    public int? hd_level { get; }
-    public int? ex_level { get; }
-    public int? xt_level { get; }
+    public double? chart_level { get; }
+    public double? ez_level { get; }
+    public double? nm_level { get; }
+    public double? hd_level { get; }
+    public double? ex_level { get; }
+    public double? xt_level { get; }
     public bool chart_level_estimated { get; }
     public bool ez_level_estimated { get; }
     public bool nm_level_estimated { get; }
@@ -2561,12 +2561,12 @@ public sealed class SkinSongSelectItem
         SkinAssetHandle? albumBig,
         double bpm,
         string chartDifficulty,
-        int? chartLevel,
-        int? ezLevel,
-        int? nmLevel,
-        int? hdLevel,
-        int? exLevel,
-        int? xtLevel,
+        double? chartLevel,
+        double? ezLevel,
+        double? nmLevel,
+        double? hdLevel,
+        double? exLevel,
+        double? xtLevel,
         bool selected,
         int score,
         double accuracy,
@@ -2607,7 +2607,7 @@ public sealed class SkinSongSelectItem
         this.clear_type = clearType ?? string.Empty;
     }
 
-    public int? GetLevel(string difficulty)
+    public double? GetLevel(string difficulty)
         => difficulty.Trim().ToLowerInvariant() switch
         {
             "ez" or "easy" => ez_level,
@@ -4896,7 +4896,7 @@ public sealed class SkinRuntime : IDisposable
         table.Set(key, DynValue.NewBoolean(value));
     }
 
-    private static void SetSongSelectNullableNumber(Table table, string key, int? value)
+    private static void SetSongSelectNullableNumber(Table table, string key, double? value)
     {
         var current = table.Get(key);
         if (!value.HasValue)

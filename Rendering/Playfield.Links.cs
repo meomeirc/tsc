@@ -18,7 +18,7 @@ public sealed partial class Playfield
 {
     // Link-chain drawing, connectors, tails, and link-specific helpers.
 
-    private void DrawLinkChainUnified(ChartEvent root, GearState currentState, Dictionary<int, int> counts,
+    private void DrawLinkChainUnified(ChartEvent root, GearState currentState, Dictionary<(string Bank, int Tick), int> counts,
         List<TexturedBodyCommand> bodyCommands, List<TexturedQuadCommand> connectorCommands,
         List<TexturedQuadCommand> headCommands, double currentTick)
     {
@@ -49,14 +49,7 @@ public sealed partial class Playfield
             _debugLinkChainCalls++;
 
         var terminal = nodeList[^1];
-        var rootPosition = GearState.Position(root.Track);
-        var activeLeftBank = GearTimeline.ActiveBankForSide(currentState, "left");
-        var activeRightBank = GearTimeline.ActiveBankForSide(currentState, "right");
-        var rootIsInActiveBank = rootPosition is { } activePosition &&
-            (activePosition.Side == "left"
-                ? string.Equals(activeLeftBank, activePosition.Bank, StringComparison.OrdinalIgnoreCase)
-                : string.Equals(activeRightBank, activePosition.Bank, StringComparison.OrdinalIgnoreCase));
-        var simultaneous = rootIsInActiveBank && IsLinkChainSimultaneous(root, counts);
+        var simultaneous = IsLinkChainSimultaneous(root, counts);
         var missVisual = interactive && (runtime!.StartMissed || runtime.Dropped);
         _skinNoteMissedContext = missVisual;
         var body = _textures.Get(missVisual ? NoteTextureAsset.BodyMiss : (simultaneous ? NoteTextureAsset.BodyMulti : NoteTextureAsset.Body));
@@ -669,10 +662,10 @@ public sealed partial class Playfield
         return !_linkHeadKeys.Contains(KeyOf(ev));
     }
 
-    private bool IsLinkChainSimultaneous(ChartEvent ev, Dictionary<int, int> counts)
+    private bool IsLinkChainSimultaneous(ChartEvent ev, Dictionary<(string Bank, int Tick), int> counts)
     {
         var root = FindLinkRootHead(ev);
-        return root is not null && IsSimultaneous(root, counts);
+        return root is not null && IsMultiTextureSimultaneous(root, counts);
     }
 
     private void AddLanePlaneTailCommand(
