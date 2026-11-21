@@ -29,14 +29,22 @@ jobs:
           New-Item -ItemType Directory -Path "build/PackageFiles/songs" -Force | Out-Null
           Set-Content -LiteralPath "build/PackageFiles/songs/ownership-policy-check.txt" -Value "owned by the application" -NoNewline
 
-      - name: Publish Windows x64 game with integrated updater
+      - name: Publish all Windows x64 backends and native launcher
         shell: pwsh
         run: |
           $publishRoot = Join-Path $env:GITHUB_WORKSPACE 'bin/Publish/win-x64'
           if (Test-Path -LiteralPath $publishRoot) {
             Remove-Item -LiteralPath $publishRoot -Recurse -Force
           }
-          dotnet publish TSC.csproj --configuration Publish --property:PublishProfile=TSC-Publish
+
+          Write-Host 'Installed .NET runtimes:'
+          dotnet --list-runtimes
+
+          $publishScript = Join-Path $env:GITHUB_WORKSPACE 'build/Publish-DualBackend.ps1'
+          if (-not (Test-Path -LiteralPath $publishScript -PathType Leaf)) {
+            throw "Dual-backend publish script was not found: $publishScript"
+          }
+          & $publishScript
 
       - name: Verify launcher and game publish layout
         shell: pwsh
@@ -47,17 +55,30 @@ jobs:
             (Join-Path $publishRoot "TSC.exe"),
             (Join-Path $publishRoot "songs/README.txt"),
             (Join-Path $publishRoot "songs/ownership-policy-check.txt"),
-            (Join-Path $publishRoot "Skins/Default/scripts/skin.lua"),
-            (Join-Path $dataDir "TSC.exe"),
-            (Join-Path $dataDir "TSC.dll"),
-            (Join-Path $dataDir "TSC.deps.json"),
-            (Join-Path $dataDir "TSC.runtimeconfig.json"),
-            (Join-Path $dataDir "coreclr.dll")
+            (Join-Path $publishRoot "Skins/Default/scripts/skin.lua")
           )
+          foreach ($backend in @('DesktopGL', 'DesktopVK', 'WindowsDX12')) {
+            $backendDir = Join-Path $dataDir $backend
+            foreach ($requiredName in @('TSC.exe', 'TSC.dll', 'TSC.deps.json', 'TSC.runtimeconfig.json')) {
+              $requiredFiles += (Join-Path $backendDir $requiredName)
+            }
+          }
 
           foreach ($path in $requiredFiles) {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
               throw "Expected publish file is missing: $path"
+            }
+          }
+
+          foreach ($runtimeRequirement in @(
+            @{ RelativeDirectory = 'runtime/host/fxr'; FileName = 'hostfxr.dll' },
+            @{ RelativeDirectory = 'runtime/shared/Microsoft.NETCore.App'; FileName = 'coreclr.dll' },
+            @{ RelativeDirectory = 'runtime/shared/Microsoft.WindowsDesktop.App'; FileName = 'System.Windows.Forms.dll' }
+          )) {
+            $runtimeDirectory = Join-Path $publishRoot $runtimeRequirement.RelativeDirectory
+            $runtimeFile = Get-ChildItem -LiteralPath $runtimeDirectory -Filter $runtimeRequirement.FileName -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $runtimeFile) {
+              throw "Shared runtime file '$($runtimeRequirement.FileName)' is missing under '$runtimeDirectory'."
             }
           }
 
@@ -76,11 +97,17 @@ jobs:
             throw "Game DLLs remain beside the launcher: $($rootDlls.Name -join ', ')"
           }
           if (Test-Path -LiteralPath (Join-Path $publishRoot "runtimes")) {
-            throw "The game runtime was not fully moved under data/."
+            throw "Legacy runtimes/ output remains beside the launcher; the shared runtime must be under runtime/."
           }
-
-          if (Test-Path -LiteralPath (Join-Path $dataDir "Skins/Default")) {
-            throw "Default skin is duplicated under data/ instead of staying beside the launcher."
+          foreach ($legacyDataFile in @('TSC.exe', 'TSC.dll', 'TSC.deps.json', 'TSC.runtimeconfig.json', 'coreclr.dll')) {
+            if (Test-Path -LiteralPath (Join-Path $dataDir $legacyDataFile)) {
+              throw "Legacy single-backend file remains directly under data/: $legacyDataFile"
+            }
+          }
+          foreach ($backend in @('DesktopGL', 'DesktopVK', 'WindowsDX12')) {
+            if (Test-Path -LiteralPath (Join-Path (Join-Path $dataDir $backend) 'Skins/Default')) {
+              throw "Default skin is duplicated under data/$backend instead of staying beside the launcher."
+            }
           }
 
           if (Test-Path -LiteralPath (Join-Path $publishRoot "updater")) {
@@ -98,7 +125,7 @@ jobs:
             throw "Tool files should live beside the launcher, not under data/."
           }
 
-          Write-Host "Verified tiny Native AOT launcher ($launcherSize bytes), game runtime under data/, user skin root, and tools/ payload without ffmpeg.exe."
+          Write-Host "Verified tiny Native AOT launcher ($launcherSize bytes), all three backend hosts under data/, shared .NET runtime under runtime/, user skin root, and tools/ payload without ffmpeg.exe."
 
       - name: Verify bridge compatibility and ownership-based packaging
         shell: pwsh
