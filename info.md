@@ -1,5 +1,12 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.58
+
+- added graphics API switch to the settings (OpenGL/Vulkan/D3D12)
+- changed level predictor to display one decimal place (prediction is unchanged)
+- changed some borderless window behaviors. now it should properly display overlays and dont have 1px gap on the right
+- other fixes
+
 # 0.0.57
 
 - added level predictor (shows in song select for unset levels and in chart editor level label)
