@@ -221,12 +221,7 @@ public sealed class Game1 : Game
     private KeyboardState _previousKeyboard;
     private string _appliedDisplayMode = string.Empty;
     private string _returnFromFullscreenDisplayMode = "windowed";
-    private bool _borderlessTopmostStateKnown;
-    private bool _borderlessTopmostState;
     private int _nativeDialogDepth;
-    private bool _borderlessFocusTargetKnown;
-    private bool _borderlessFocusTarget;
-    private long _borderlessFocusTargetSince;
     private IntPtr _cachedBackendWindowHandle;
     private IntPtr _cachedWindowsWindowHandle;
     private bool _returnToGameplayAfterLoad;
@@ -664,7 +659,6 @@ public sealed class Game1 : Game
             GraphicsDevice.PresentationParameters.BackBufferWidth,
             GraphicsDevice.PresentationParameters.BackBufferHeight);
 #else
-        UpdateBorderlessTopmost(inputActive);
         GlobalInput.UpdateMouse(Mouse.GetState(), inputActive);
 #endif
         PhysicalKeyboard.Update(keyboard, GlobalInput.Mouse, inputActive);
@@ -947,7 +941,7 @@ public sealed class Game1 : Game
             _graphics.SynchronizeWithVerticalRetrace = requestedVSync;
             _graphics.ApplyChanges();
             InvalidateWindowsWindowHandle();
-            RefreshBorderlessTopmostAfterGraphicsChange();
+            RefreshBorderlessFullscreenSignalAfterGraphicsChange();
             EnsureWindowCloseHook();
         }
     }
@@ -1494,21 +1488,9 @@ public sealed class Game1 : Game
         var previousWindowedHeight = _windowedHeight;
         Interlocked.Increment(ref _nativeDialogDepth);
         var temporarilyLeaveExclusiveFullscreen = OperatingSystem.IsWindows() && previousMode == "fullscreen";
-        var temporarilyLeaveBorderlessTopmost = OperatingSystem.IsWindows() && previousMode == "borderless";
 
         try
         {
-            if (temporarilyLeaveBorderlessTopmost)
-            {
-                // The borderless main window must not remain in the topmost band
-                // while a native dialog is opening. Otherwise it can sit above the
-                // dialog and make the dialog look visible but impossible to activate.
-                // Leave it non-topmost while the modal loop is running; the normal
-                // focus check will restore topmost only after TSC itself regains focus.
-                _borderlessFocusTargetKnown = false;
-                ApplyBorderlessTopmost(shouldBeTopmost: false, inputActive: false);
-            }
-
             if (temporarilyLeaveExclusiveFullscreen)
                 ApplyDisplayMode("windowed", persistConfiguration: false);
 
@@ -1531,14 +1513,6 @@ public sealed class Game1 : Game
                 _returnFromFullscreenDisplayMode = previousFullscreenReturnMode;
             }
 
-            if (temporarilyLeaveBorderlessTopmost)
-            {
-                // Do not re-raise the game window here. The modal dialog may have
-                // returned focus to another app; UpdateBorderlessTopmost will restore
-                // the taskbar workaround after Windows reports TSC as active again.
-                _borderlessFocusTargetKnown = false;
-            }
-
             Interlocked.Decrement(ref _nativeDialogDepth);
         }
     }
@@ -1549,132 +1523,71 @@ public sealed class Game1 : Game
         public IntPtr Handle { get; }
     }
 
-    private void RefreshBorderlessTopmostAfterGraphicsChange()
+    private void RefreshBorderlessFullscreenSignalAfterGraphicsChange()
     {
         if (!OperatingSystem.IsWindows() || _appliedDisplayMode != "borderless")
             return;
 
-        // ApplyChanges can disturb the HWND z-order while toggling VSync. The
-        // cached topmost state no longer describes the actual window, so restore
-        // it immediately according to the real foreground window (without taking
-        // activation away from a debug console or another application).
-        _borderlessFocusTargetKnown = false;
-        var inputActive = IsWindowInputActive();
-        if (inputActive)
-        {
-            _borderlessTopmostStateKnown = false;
-            ApplyBorderlessTopmost(shouldBeTopmost: true, inputActive: true);
-        }
-        else
-        {
-            // Force a native NOTOPMOST call even though we have invalidated the
-            // cache; otherwise the startup optimization in ApplyBorderlessTopmost
-            // could assume the recreated window is already non-topmost.
-            _borderlessTopmostStateKnown = true;
-            _borderlessTopmostState = true;
-            ApplyBorderlessTopmost(shouldBeTopmost: false, inputActive: false);
-        }
+        // GraphicsDeviceManager.ApplyChanges can recreate the HWND. Reapply the
+        // taskbar fullscreen signal to the current handle without activating it or
+        // changing its ordinary (non-topmost) window class.
+        ApplyWindowsBorderlessFullscreenSignal(fullscreen: true);
     }
 
-    private void UpdateBorderlessTopmost(bool inputActive)
+#if !TSC_ANDROID
+    private void ApplyWindowsBorderlessFullscreenSignal(bool fullscreen)
     {
         if (!OperatingSystem.IsWindows())
             return;
 
-        // A native modal dialog can run a nested message loop, and in some call paths
-        // the game loop may keep updating on a different thread. Never raise the game
-        // window while one of its dialogs is being shown; it can cover the dialog and
-        // prevent the user from activating it.
-        if (Volatile.Read(ref _nativeDialogDepth) > 0)
-            return;
-
-        // A normal borderless game window can sit underneath the Windows taskbar.
-        // Keep the game window topmost only while the game window itself is foreground;
-        // remove topmost immediately when focus moves elsewhere. Promotion is delayed
-        // briefly to avoid z-order thrashing while focus settles.
-        var shouldBeTopmost = _appliedDisplayMode == "borderless" && inputActive;
-        if (_appliedDisplayMode != "borderless")
-        {
-            _borderlessFocusTargetKnown = false;
-            ApplyBorderlessTopmost(shouldBeTopmost, inputActive);
-            return;
-        }
-
-        if (_borderlessTopmostStateKnown && shouldBeTopmost == _borderlessTopmostState)
-        {
-            _borderlessFocusTargetKnown = false;
-            return;
-        }
-
-        // Drop topmost immediately when another window becomes foreground. A
-        // delay here leaves the game above the debug console long enough to make
-        // the console appear unclickable. Promotion can still wait for focus to settle.
-        if (!shouldBeTopmost)
-        {
-            _borderlessFocusTargetKnown = false;
-            ApplyBorderlessTopmost(shouldBeTopmost: false, inputActive: false);
-            return;
-        }
-
-        if (!_borderlessFocusTargetKnown || shouldBeTopmost != _borderlessFocusTarget)
-        {
-            _borderlessFocusTarget = shouldBeTopmost;
-            _borderlessFocusTargetKnown = true;
-            _borderlessFocusTargetSince = Stopwatch.GetTimestamp();
-            return;
-        }
-
-        if (Stopwatch.GetElapsedTime(_borderlessFocusTargetSince) < TimeSpan.FromMilliseconds(120))
-            return;
-
-        _borderlessFocusTargetKnown = false;
-        ApplyBorderlessTopmost(shouldBeTopmost, inputActive);
-    }
-
-    private void ApplyBorderlessTopmost(bool shouldBeTopmost, bool inputActive)
-    {
-        if (_borderlessTopmostStateKnown && shouldBeTopmost == _borderlessTopmostState)
-            return;
-
-        // Windows creates ordinary game windows as non-topmost by default. Avoid a
-        // needless HWND_NOTOPMOST transition during initial startup when already so.
-        if (!_borderlessTopmostStateKnown && !shouldBeTopmost)
-        {
-            _borderlessTopmostState = false;
-            _borderlessTopmostStateKnown = true;
-            return;
-        }
-
         try
         {
-            // Resolve the SDL-backed MonoGame window to its native HWND before
-            // changing z-order (DesktopGL uses SDL_GetWindowWMInfo; native backends enumerate it).
             var hwnd = GetGameWindowHandle();
             if (hwnd == IntPtr.Zero || !IsWindow(hwnd))
                 return;
 
-            var insertAfter = shouldBeTopmost ? new IntPtr(-1) : new IntPtr(-2); // HWND_TOPMOST / HWND_NOTOPMOST
-            const uint flags = 0x0001 | 0x0002 | 0x0010 | 0x0200; // NOSIZE | NOMOVE | NOACTIVATE | NOOWNERZORDER
-            var succeeded = SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, flags);
-            if (!succeeded)
+            if (fullscreen)
             {
-                Program.LogRuntime($"BORDERLESS_ZORDER_FAILED topmost={shouldBeTopmost} active={inputActive} win32={Marshal.GetLastWin32Error()}");
-                _borderlessTopmostState = shouldBeTopmost;
-                _borderlessTopmostStateKnown = true;
-                return;
+                // The shell owns taskbar ordering for a marked fullscreen window.
+                // TSC must remain in the normal z-order band so flyouts and
+                // always-on-top overlays retain their usual priority.
+                const int GwlExStyle = -20;
+                const int WsExTopmost = 0x00000008;
+                if ((GetWindowLong(hwnd, GwlExStyle) & WsExTopmost) != 0)
+                {
+                    const uint flags = 0x0001 | 0x0002 | 0x0010 | 0x0200; // NOSIZE | NOMOVE | NOACTIVATE | NOOWNERZORDER
+                    if (!SetWindowPos(hwnd, new IntPtr(-2), 0, 0, 0, 0, flags)) // HWND_NOTOPMOST
+                        Program.LogRuntime($"BORDERLESS_NOTOPMOST_FAILED win32={Marshal.GetLastWin32Error()}");
+                }
             }
 
-            Program.LogRuntime($"BORDERLESS_ZORDER topmost={shouldBeTopmost} active={inputActive}");
-            _borderlessTopmostState = shouldBeTopmost;
-            _borderlessTopmostStateKnown = true;
+            ITaskbarList2? taskbar = null;
+            try
+            {
+                taskbar = (ITaskbarList2)new TaskbarList();
+                taskbar.HrInit();
+                taskbar.MarkFullscreenWindow(hwnd, fullscreen);
+                Program.LogRuntime($"BORDERLESS_TASKBAR_FULLSCREEN marked={fullscreen}");
+            }
+            finally
+            {
+                if (taskbar is not null && Marshal.IsComObject(taskbar))
+                    Marshal.ReleaseComObject(taskbar);
+            }
         }
         catch (Exception ex)
         {
-            Program.LogRuntime($"BORDERLESS_ZORDER_FAILED topmost={shouldBeTopmost} active={inputActive} error={ex}");
-            _borderlessTopmostState = shouldBeTopmost;
-            _borderlessTopmostStateKnown = true;
+            // This is a shell integration hint, not a reason to prevent the game
+            // from starting or changing display modes if Explorer is unavailable.
+            Program.LogRuntime($"BORDERLESS_TASKBAR_FULLSCREEN_FAILED marked={fullscreen} error={ex}");
         }
     }
+#else
+    private void ApplyWindowsBorderlessFullscreenSignal(bool fullscreen)
+    {
+        _ = fullscreen;
+    }
+#endif
 
     private IntPtr GetWindowsNativeHandle(IntPtr backendWindowHandle)
     {
@@ -1739,12 +1652,30 @@ public sealed class Game1 : Game
     private static extern int SDL_GetWindowWMInfo(IntPtr window, IntPtr info);
 #endif
 
+#if !TSC_ANDROID
+    [ComImport]
+    [Guid("56FDF344-FD6D-11D0-958A-006097C9A090")]
+    private class TaskbarList
+    {
+    }
+
+    [ComImport]
+    [Guid("602D4995-B13A-429B-A66E-1935E44F4317")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface ITaskbarList2
+    {
+        void HrInit();
+        void AddTab(IntPtr hwnd);
+        void DeleteTab(IntPtr hwnd);
+        void ActivateTab(IntPtr hwnd);
+        void SetActiveAlt(IntPtr hwnd);
+        void MarkFullscreenWindow(IntPtr hwnd, [MarshalAs(UnmanagedType.Bool)] bool fullscreen);
+    }
+#endif
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
-
-#if TSC_NATIVE_BACKEND
-    private const uint MonitorDefaultToNearest = 2;
 
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     private delegate bool EnumWindowsCallback(IntPtr hWnd, IntPtr lParam);
@@ -1755,6 +1686,21 @@ public sealed class Game1 : Game
 
     [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId", SetLastError = true)]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Win32Rect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+#if TSC_NATIVE_BACKEND
+    private const uint MonitorDefaultToNearest = 2;
 
     [DllImport("user32.dll", EntryPoint = "GetWindowTextLengthW", SetLastError = true)]
     private static extern int GetWindowTextLength(IntPtr hWnd);
@@ -1818,15 +1764,6 @@ public sealed class Game1 : Game
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct Win32Rect
-    {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
     private struct Win32MonitorInfo
     {
         public int Size;
@@ -1834,9 +1771,6 @@ public sealed class Game1 : Game
         public Win32Rect Work;
         public uint Flags;
     }
-
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
-    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
     private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int newLong);
@@ -1914,10 +1848,8 @@ public sealed class Game1 : Game
         if (foreground == IntPtr.Zero)
             return false;
 
-        // The debug console belongs to this process too, but it is not the game
-        // window. Treating every same-process window as active makes borderless
-        // topmost handling keep raising the game over the console, so it becomes
-        // nearly impossible to focus the console or return to the game normally.
+        // The debug console belongs to this process too, but it is a separate
+        // top-level window and must not inherit the game's input-active state.
         IntPtr gameWindow;
         try
         {
@@ -7080,6 +7012,7 @@ public sealed class Game1 : Game
 
             _appliedDisplayMode = mode;
             _skin.GameConfig.DisplayMode = mode;
+            ApplyWindowsBorderlessFullscreenSignal(fullscreen: mode == "borderless");
             if (persistConfiguration)
             {
                 try
