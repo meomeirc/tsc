@@ -221,6 +221,9 @@ public sealed class Game1 : Game
     private KeyboardState _previousKeyboard;
     private string _appliedDisplayMode = string.Empty;
     private string _returnFromFullscreenDisplayMode = "windowed";
+    private bool _borderlessWindowOversizeActive;
+    private int _borderlessLogicalBackBufferWidth;
+    private int _borderlessLogicalBackBufferHeight;
     private int _nativeDialogDepth;
     private IntPtr _cachedBackendWindowHandle;
     private IntPtr _cachedWindowsWindowHandle;
@@ -281,6 +284,8 @@ public sealed class Game1 : Game
 #endif
 
 #if !TSC_ANDROID
+        Window.ClientSizeChanged += HandleWindowClientSizeChanged;
+
         // Windowed mode starts at 80% of the current display in both dimensions.
         // The user can still resize it freely, and the aspect ratio is preserved.
         var initialDisplayBounds = GetCurrentDisplayBounds();
@@ -1528,9 +1533,32 @@ public sealed class Game1 : Game
         if (!OperatingSystem.IsWindows() || _appliedDisplayMode != "borderless")
             return;
 
-        // GraphicsDeviceManager.ApplyChanges can recreate the HWND. Reapply the
-        // taskbar fullscreen signal to the current handle without activating it or
-        // changing its ordinary (non-topmost) window class.
+        // GraphicsDeviceManager.ApplyChanges can recreate the HWND and restore its
+        // client size to the backbuffer dimensions. Reapply the borderless window
+        // geometry so the OpenGL/Vulkan width oversize remains in effect while the
+        // logical backbuffer stays at the monitor's exact resolution.
+        try
+        {
+            var displayBounds = GetCurrentDisplayBounds();
+            _borderlessLogicalBackBufferWidth = Math.Max(1, displayBounds.Width);
+            _borderlessLogicalBackBufferHeight = Math.Max(1, displayBounds.Height);
+            _borderlessWindowOversizeActive =
+                GetNativeWindowClientWidth(_borderlessLogicalBackBufferWidth, bordered: false) != _borderlessLogicalBackBufferWidth;
+            ApplyWindowedBounds(
+                displayBounds.X,
+                displayBounds.Y,
+                _borderlessLogicalBackBufferWidth,
+                _borderlessLogicalBackBufferHeight,
+                bordered: false);
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"BORDERLESS_WINDOW_GEOMETRY_REFRESH_FAILED {ex}");
+        }
+
+        // Keep the shell notification separate from the window-size workaround.
+        // Apply it after geometry changes, as this is intentionally a taskbar hint
+        // rather than a request for exclusive fullscreen presentation.
         ApplyWindowsBorderlessFullscreenSignal(fullscreen: true);
     }
 
@@ -6894,6 +6922,13 @@ public sealed class Game1 : Game
         _skin ??= SkinConfigStore.Load(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
         var previousMode = _appliedDisplayMode.Length == 0 ? "" : _appliedDisplayMode;
 
+        if (mode != "borderless")
+        {
+            _borderlessWindowOversizeActive = false;
+            _borderlessLogicalBackBufferWidth = 0;
+            _borderlessLogicalBackBufferHeight = 0;
+        }
+
         if (mode == "fullscreen" && previousMode != "fullscreen")
             _returnFromFullscreenDisplayMode = previousMode == "borderless" ? "borderless" : "windowed";
         else if (mode != "fullscreen")
@@ -6953,15 +6988,21 @@ public sealed class Game1 : Game
                     if (Window.IsBorderless)
                         Window.IsBorderless = false;
 
-                    // Work around the Windows/OpenGL full-monitor promotion bug. TSC-222 proved
-                    // that a normal borderless window avoids the focus/cursor problem when smaller.
-                    // Keep the full monitor height so the taskbar area is covered, but make
-                    // the client width one pixel narrower than the display. This avoids an
-                    // exact native-resolution match while remaining visually full-screen.
-                    var borderlessWidth = Math.Max(1, displayBounds.Width - 1);
+                    // Keep the logical backbuffer at the full monitor resolution.
+                    // On Windows OpenGL/Vulkan, ApplyWindowedBounds makes the native
+                    // client area one pixel wider instead. That extra pixel extends
+                    // beyond the right edge of the display, avoiding the driver's
+                    // exact-monitor-size promotion heuristic without leaving a gap
+                    // inside the rendered image. The viewport/backbuffer remains at
+                    // borderlessWidth x borderlessHeight.
+                    var borderlessWidth = Math.Max(1, displayBounds.Width);
                     var borderlessHeight = Math.Max(1, displayBounds.Height);
                     var borderlessX = displayBounds.X;
                     var borderlessY = displayBounds.Y;
+                    _borderlessLogicalBackBufferWidth = borderlessWidth;
+                    _borderlessLogicalBackBufferHeight = borderlessHeight;
+                    _borderlessWindowOversizeActive =
+                        GetNativeWindowClientWidth(borderlessWidth, bordered: false) != borderlessWidth;
 
                     _graphics.HardwareModeSwitch = false;
                     _graphics.IsFullScreen = false;
@@ -6970,10 +7011,9 @@ public sealed class Game1 : Game
                     _graphics.PreferredBackBufferHeight = borderlessHeight;
                     _graphics.ApplyChanges();
 
-                    // Apply the border change only after the graphics device has
-                    // finished resizing the ordinary window. There is no second
-                    // ApplyChanges call afterward, so the backend isn't asked to rebuild the
-                    // window again while it is borderless.
+                    // Apply the native window size only after the graphics device has
+                    // finished sizing its backbuffer. Do not call ApplyChanges after
+                    // this: doing so would reset the oversized native client area.
                     ApplyWindowedBounds(
                         borderlessX, borderlessY,
                         borderlessWidth, borderlessHeight,
@@ -7031,6 +7071,12 @@ public sealed class Game1 : Game
         catch (Exception ex)
         {
             _errorMessage = $"Could not change display mode: {ex.Message}";
+            if (mode == "borderless")
+            {
+                _borderlessWindowOversizeActive = false;
+                _borderlessLogicalBackBufferWidth = 0;
+                _borderlessLogicalBackBufferHeight = 0;
+            }
             Program.LogFatal("DISPLAY_MODE_APPLY", ex);
         }
         finally
@@ -7054,6 +7100,55 @@ public sealed class Game1 : Game
         }
     }
 
+    private void HandleWindowClientSizeChanged(object? sender, EventArgs e)
+    {
+        if (!_borderlessWindowOversizeActive || GraphicsDevice is null)
+            return;
+
+        var logicalWidth = Math.Max(1, _borderlessLogicalBackBufferWidth);
+        var logicalHeight = Math.Max(1, _borderlessLogicalBackBufferHeight);
+        var nativeBounds = Window.ClientBounds;
+        if (nativeBounds.Width <= 0 || nativeBounds.Height <= 0)
+            return;
+
+        var expectedNativeWidth = GetNativeWindowClientWidth(logicalWidth, bordered: false);
+        if (nativeBounds.Width != expectedNativeWidth || nativeBounds.Height != logicalHeight)
+            return;
+
+        var presentation = GraphicsDevice.PresentationParameters;
+        if (presentation.BackBufferWidth == logicalWidth && presentation.BackBufferHeight == logicalHeight)
+            return;
+
+        // MonoGame's SDL resize handler copies the physical client size into the
+        // presentation parameters and viewport. Keep the extra native pixel out of
+        // TSC's logical rendering/input coordinate space, as osu!framework does by
+        // overriding its game-facing window size.
+        presentation.BackBufferWidth = logicalWidth;
+        presentation.BackBufferHeight = logicalHeight;
+        GraphicsDevice.Viewport = new Viewport(0, 0, logicalWidth, logicalHeight);
+        GraphicsDevice.ScissorRectangle = new Rectangle(0, 0, logicalWidth, logicalHeight);
+        Program.LogRuntime(
+            $"BORDERLESS_LOGICAL_BACKBUFFER_RESTORED nativeClient={nativeBounds.Width}x{nativeBounds.Height} " +
+            $"logical={logicalWidth}x{logicalHeight}");
+    }
+
+    private static int GetNativeWindowClientWidth(int logicalWidth, bool bordered)
+    {
+        var width = Math.Max(1, logicalWidth);
+#if TSC_NATIVE_BACKEND && !TSC_DESKTOP_VK
+        // WindowsDX12 uses a native Direct3D presentation path and does not need
+        // the OpenGL/Vulkan window-width workaround.
+        return width;
+#else
+        // Match osu!framework's Windows borderless workaround: enlarge only the
+        // native client width for OpenGL/Vulkan, while TSC keeps its backbuffer and
+        // viewport at the unmodified logical display width.
+        return !bordered && OperatingSystem.IsWindows() && width < int.MaxValue
+            ? width + 1
+            : width;
+#endif
+    }
+
     private void ApplyWindowedBounds(int x, int y, int width, int height, bool bordered)
     {
 #if TSC_NATIVE_BACKEND
@@ -7070,8 +7165,10 @@ public sealed class Game1 : Game
             throw new InvalidOperationException("SDL could not leave fullscreen mode before changing window bounds.");
         }
 
+        var nativeClientWidth = GetNativeWindowClientWidth(width, bordered);
+        var nativeClientHeight = Math.Max(1, height);
         SDL_SetWindowBordered(sdlWindow, bordered ? 1 : 0);
-        SDL_SetWindowSize(sdlWindow, Math.Max(1, width), Math.Max(1, height));
+        SDL_SetWindowSize(sdlWindow, nativeClientWidth, nativeClientHeight);
         SDL_SetWindowPosition(sdlWindow, x, y);
 
         var flagsAfterChange = SDL_GetWindowFlags(sdlWindow);
@@ -7079,7 +7176,10 @@ public sealed class Game1 : Game
             throw new InvalidOperationException("SDL still reports fullscreen flags after applying a windowed display mode.");
 
         SDL_GetWindowSize(sdlWindow, out var actualWidth, out var actualHeight);
-        Program.LogRuntime($"SDL_WINDOW_BOUNDS bordered={bordered} requested={width}x{height}@{x},{y} actual={actualWidth}x{actualHeight} flags=0x{flagsAfterChange:X8}");
+        Program.LogRuntime(
+            $"SDL_WINDOW_BOUNDS bordered={bordered} logicalClient={Math.Max(1, width)}x{Math.Max(1, height)} " +
+            $"nativeRequested={nativeClientWidth}x{nativeClientHeight}@{x},{y} " +
+            $"actual={actualWidth}x{actualHeight} flags=0x{flagsAfterChange:X8}");
 #endif
     }
 
@@ -7121,15 +7221,17 @@ public sealed class Game1 : Game
                 throw new InvalidOperationException($"Could not change the native window style (Win32 {Marshal.GetLastPInvokeError()}).");
         }
 
-        // MonoGame's backbuffer dimensions are client dimensions. Win32
-        // SetWindowPos expects the outer window size, so account for the current
-        // non-client frame after applying the requested bordered/borderless style.
+        // Win32 SetWindowPos expects the outer window size. Convert the native
+        // client dimensions (including the optional extra borderless pixel) to an
+        // outer size after applying the requested bordered/borderless style.
+        var nativeClientWidth = GetNativeWindowClientWidth(width, bordered);
+        var nativeClientHeight = Math.Max(1, height);
         var outerBounds = new Win32Rect
         {
             Left = 0,
             Top = 0,
-            Right = Math.Max(1, width),
-            Bottom = Math.Max(1, height)
+            Right = nativeClientWidth,
+            Bottom = nativeClientHeight
         };
         if (!AdjustWindowRectEx(ref outerBounds, nextStyle, false, exStyle))
             throw new InvalidOperationException($"AdjustWindowRectEx failed (Win32 {Marshal.GetLastWin32Error()}).");
@@ -7147,7 +7249,10 @@ public sealed class Game1 : Game
 
         var actualWidth = Math.Max(0, actualClientBounds.Right - actualClientBounds.Left);
         var actualHeight = Math.Max(0, actualClientBounds.Bottom - actualClientBounds.Top);
-        Program.LogRuntime($"WIN32_WINDOW_BOUNDS bordered={bordered} requested={width}x{height}@{x},{y} actual={actualWidth}x{actualHeight} style=0x{nextStyle:X8}");
+        Program.LogRuntime(
+            $"WIN32_WINDOW_BOUNDS bordered={bordered} logicalClient={Math.Max(1, width)}x{Math.Max(1, height)} " +
+            $"nativeRequested={nativeClientWidth}x{nativeClientHeight}@{x},{y} " +
+            $"actual={actualWidth}x{actualHeight} style=0x{nextStyle:X8}");
     }
 #endif
 
