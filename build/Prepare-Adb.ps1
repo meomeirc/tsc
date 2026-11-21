@@ -46,7 +46,14 @@ if ($actualSha256 -ne $expectedSha256) {
 
 $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("TSC-PlatformTools-" + [Guid]::NewGuid().ToString('N'))
 try {
-    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $extractRoot -Force
+    # Do not use Expand-Archive here. The build invokes Windows PowerShell 5.1,
+    # which can inherit a PowerShell 7 PSModulePath from its parent process and
+    # accidentally load PowerShell 7's Microsoft.PowerShell.Archive module.
+    # That module calls a ZipFileExtensions overload unavailable on .NET Framework.
+    # Use the .NET Framework-compatible two-argument ZipFile API directly instead.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    New-Item -ItemType Directory -Path $extractRoot -Force | Out-Null
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $extractRoot)
     $platformTools = Join-Path $extractRoot 'platform-tools'
     $requiredFiles = @('adb.exe', 'AdbWinApi.dll', 'AdbWinUsbApi.dll')
     foreach ($file in $requiredFiles) {
