@@ -1,6 +1,4 @@
-# TSC Android menu prototype
-
-This is a separate Android target. The existing Windows project remains on .NET 8 / DesktopGL and continues to include the editor.
+# TSC Android Prototype
 
 ## Current scope
 

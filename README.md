@@ -7,6 +7,7 @@ TSC is a rhythm game and chart-editing project built with Monogame.
 - Windows x64
 - .NET 8 SDK
 - A network connection for restoring NuGet packages on the first build
+- The Vulkan SDK when building the `DesktopVK` target (MonoGame requirement)
 
 ## Build and run
 
@@ -16,22 +17,20 @@ From the project directory, run the default DesktopGL backend:
 dotnet run
 ```
 
-To try MonoGame's native Direct3D 12 backend instead, pass `TSCBackend` as an MSBuild property:
+To try MonoGame's native Vulkan backend, pass `TSCBackend=DesktopVK`. To try the native Direct3D 12 backend, pass `TSCBackend=WindowsDX12`.
 
 ```powershell
+dotnet run .\TSC.csproj -c Debug -p:TSCBackend=DesktopVK
+# or
 dotnet run .\TSC.csproj -c Debug -p:TSCBackend=WindowsDX12
 ```
 
-`TSCBackend` accepts `DesktopGL` (the default) or `WindowsDX12`. The selected backend is also used when compiling MonoGame content. Android remains on its Android backend.
+`TSCBackend` accepts `DesktopGL` (the default), `DesktopVK`, or `WindowsDX12`. The selected backend is also used when compiling MonoGame content. The Vulkan target uses MonoGame's `MonoGame.Framework.Native` and `MonoGame.Runtime.Windows.Vulkan` 3.8.6.1 packages. Android remains on its Android backend.
 
-The MGCB local tool is restored from `.config/dotnet-tools.json` using an explicit manifest path, then invoked with `dotnet tool run mgcb --`. This avoids relying on the shorter `dotnet mgcb` tool alias and makes tool-restore failures visible in the build output. The Android project has its own manifest because its content build runs from the `Android` project directory.
-
-The DX12 path currently does not support the skin system's direct GLSL shader API (`shaders.load`); those shader requests safely fall back to the regular MonoGame draw path. OpenAL-specific Windows audio-device recovery is DesktopGL-only.
-
-To publish using the included Windows x64 profile:
+To prepare a Windows x64 install with all three graphics backends and one shared .NET runtime:
 
 ```powershell
-dotnet publish TSC.csproj -c Publish -p:PublishProfile=TSC-Publish
+.\build\Publish-DualBackend.ps1
 ```
 
-The profile writes to `bin/Publish/win-x64/`.
+This creates `bin/Publish/win-x64/` with `data/DesktopGL/`, `data/DesktopVK/`, `data/WindowsDX12/`, one shared `runtime/`, and the root launcher. The launcher reads `graphicsApi` from `gameConfig.json`. Change it in Settings → Display; restart TSC to use the other backend.
