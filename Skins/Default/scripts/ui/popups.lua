@@ -31,8 +31,24 @@ function UI.draw_confirmation(options)
     local function modal_number(key, fallback)
         return tonumber(modal_value(key, fallback)) or fallback
     end
+    local message = tostring(options.message or "Are you sure?"):gsub("\r\n", "\n"):gsub("\r", "\n")
+    local message_lines = {}
+    for line in (message .. "\n"):gmatch("(.-)\n") do
+        message_lines[#message_lines + 1] = line
+    end
+
+    -- draw.text sizes legacy UI text against the full measured text block. A
+    -- multi-line message therefore gets smaller as more lines are added. Draw
+    -- each line separately so its font size stays the same as every other
+    -- confirmation, and grow the panel to make room for the extra lines.
+    local message_size = modal_number("message_size", 19) * scale
+    local message_line_spacing = modal_number(
+        "message_line_spacing", modal_number("message_size", 19) * 1.35) * scale
+    local message_extra_height = math.max(0, #message_lines - 1) * message_line_spacing
+    local max_panel_height = math.max(1, height - 32 * scale)
+    local base_panel_height = modal_number("panel_height", 232) * scale
     local panel_w = math.min(modal_number("panel_width", 560) * scale, math.max(1, width - 32 * scale))
-    local panel_h = math.min(modal_number("panel_height", 232) * scale, math.max(1, height - 32 * scale))
+    local panel_h = math.min(base_panel_height + message_extra_height, max_panel_height)
     local panel_x = (width - panel_w) * 0.5
     local panel_y = (height - panel_h) * 0.5
     local panel_id = id .. "_modal_panel"
@@ -81,15 +97,21 @@ function UI.draw_confirmation(options)
         anchor = "center",
         layer = layer + 3,
     })
-    draw.text(options.message or "Are you sure?", {
-        parent = panel_id,
-        x = panel_w * 0.5, y = modal_number("message_y", 82) * scale,
-        size = modal_number("message_size", 19) * scale,
-        color = modal_value("message_color", UI.colors.muted),
-        font = modal_value("message_font", UI.fonts.regular),
-        anchor = "center",
-        layer = layer + 3,
-    })
+    local message_center_y = modal_number("message_y", 82) * scale + message_extra_height * 0.5
+    for index, line in ipairs(message_lines) do
+        if line ~= "" then
+            local line_offset = (index - (#message_lines + 1) * 0.5) * message_line_spacing
+            draw.text(line, {
+                parent = panel_id,
+                x = panel_w * 0.5, y = message_center_y + line_offset,
+                size = message_size,
+                color = modal_value("message_color", UI.colors.muted),
+                font = modal_value("message_font", UI.fonts.regular),
+                anchor = "center",
+                layer = layer + 3,
+            })
+        end
+    end
 
     UI.draw_button({
         id = id .. "_modal_cancel", parent = panel_id,

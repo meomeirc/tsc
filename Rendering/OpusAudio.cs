@@ -409,6 +409,12 @@ public sealed class OpusAudioPlayer : IDisposable
 
     public void PrepareInitialPlayback(bool retainPcmForSeeking = true)
     {
+#if TSC_NATIVE_BACKEND
+        // DesktopVK and WindowsDX12 use MonoGame's native audio backend rather than OpenAL.
+        // Keep decoded PCM available so chart-clock seeks/resyncs can rebuild a
+        // trimmed SoundEffect instead of relying on OpenAL's source-offset extension.
+        retainPcmForSeeking = true;
+#endif
         if (!IsLoaded || _effect is not null)
             return;
 
@@ -431,10 +437,9 @@ public sealed class OpusAudioPlayer : IDisposable
             _instance.IsLooped = _isLooped;
             _instance.Volume = _volume;
 
-            // The normal menu-play path never seeks. Once the full-song effect is
-            // prepared, keeping the decoded PCM around is just another large copy
-            // of the music. Debug/editor playback retains it because its manual
-            // seek controls still use the PCM slice path.
+            // The normal DesktopGL menu-play path never seeks. Once the full-song
+            // effect is prepared, keeping decoded PCM is an extra large copy of the
+            // music; DX12 keeps it because this path has no OpenAL source offset API.
             if (!retainPcmForSeeking)
                 _pcm = null;
             bufferCreateSucceeded = true;
@@ -646,6 +651,11 @@ public sealed class OpusAudioPlayer : IDisposable
 
     private static bool TrySetOpenAlSourceOffset(SoundEffectInstance instance, double seconds, string logPrefix)
     {
+#if TSC_NATIVE_BACKEND
+        // The native Windows platform does not expose OpenAL source IDs.
+        // The retained PCM path in StartAtAudioTime handles seeks on this backend.
+        return false;
+#else
         if (OpenAlSourceIdField?.GetValue(instance) is not int sourceId || sourceId <= 0)
             return false;
 
@@ -666,6 +676,7 @@ public sealed class OpusAudioPlayer : IDisposable
             TSC.Program.LogRuntime($"{logPrefix}_OFFSET_EXCEPTION {ex.Message}");
             return false;
         }
+#endif
     }
 
     private static SoundEffect CreateTrackedSoundBuffer(byte[] pcm)

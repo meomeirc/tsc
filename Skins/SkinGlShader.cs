@@ -46,6 +46,10 @@ internal sealed class SkinShaderStore : IDisposable
     public SkinShaderHandle Load(string vertexPath, string fragmentPath)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+#if TSC_NATIVE_BACKEND
+        throw new PlatformNotSupportedException(
+            "This skin uses native GLSL shaders, which are currently available only on OpenGL backends.");
+#else
         var vertexFullPath = ResolvePath(vertexPath, ".vs");
         var fragmentFullPath = ResolvePath(fragmentPath, ".fs");
         var key = vertexFullPath + "\n" + fragmentFullPath;
@@ -74,6 +78,7 @@ internal sealed class SkinShaderStore : IDisposable
         var handle = new SkinShaderHandle(program);
         _cache[key] = handle;
         return handle;
+#endif
     }
 
     private string ResolvePath(string requestedPath, string requiredExtension)
@@ -312,7 +317,7 @@ internal sealed class SkinGlShaderProgram : IDisposable
 }
 
 /// <summary>
-/// Minimal OpenGL 2.0 entry-point loader. MonoGame 3.8.5 DesktopGL uses SDL's
+/// Minimal OpenGL 2.0 entry-point loader. MonoGame's DesktopGL backend uses SDL's
 /// current GL context; resolving through its SDL_GL_GetProcAddress avoids adding
 /// a second OpenGL binding or relying on platform-specific opengl32 exports.
 /// </summary>
@@ -467,7 +472,7 @@ internal static class SkinOpenGl
             var sdlType = assembly.GetType("Sdl", throwOnError: false) ??
                 assembly.GetTypes().FirstOrDefault(type => string.Equals(type.Name, "Sdl", StringComparison.Ordinal));
 
-            // In MonoGame 3.8.5.1 the SDL_GL_GetProcAddress delegate is exposed
+            // In MonoGame DesktopGL the SDL_GL_GetProcAddress delegate is exposed
             // on the nested Sdl.GL class. It is not a member of the outer Sdl type.
             // Looking only on Sdl (as the first GLSL implementation did) always
             // returned null and prevented every shader from loading.

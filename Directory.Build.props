@@ -1,0 +1,17 @@
+<Project>
+  <!--
+    Keep each MonoGame graphics backend in a separate build tree.
+
+    DesktopGL, DesktopVK, and WindowsDX12 produce incompatible MGFX effect
+    binaries and use different runtime packages. Sharing bin/ and obj/ lets a
+    build for one backend overwrite the content or restore assets used by
+    another backend. TSCBackend must be set before SDK/NuGet path evaluation,
+    so define its default here rather than only in TSC.csproj.
+  -->
+  <PropertyGroup>
+    <TSCBackend Condition="'$(TSCBackend)' == ''">DesktopGL</TSCBackend>
+    <BaseOutputPath>$(MSBuildThisFileDirectory)bin\$(TSCBackend)\</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)obj\$(TSCBackend)\</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(MSBuildThisFileDirectory)obj\$(TSCBackend)\</MSBuildProjectExtensionsPath>
+  </PropertyGroup>
+</Project>

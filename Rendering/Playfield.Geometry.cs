@@ -1695,22 +1695,21 @@ public sealed partial class Playfield
             var submitStartTimestamp = measureSubmit ? Stopwatch.GetTimestamp() : 0L;
             if (commands[commandIndex].IsLine)
             {
-                // The line stays as one real 3D quad. BasicEffect's texture
-                // coordinates are perspective-correct, which makes the texture
-                // fan when the quad is given screen-space-preserved width. The
-                // dedicated line effect cancels that interpolation correction so
-                // the existing 0..1 UVs stay affine in screen space.
-                _laneLineEffect.Parameters["WorldViewProjection"]?.SetValue(
-                    _textureEffect.World * _textureEffect.View * _textureEffect.Projection);
+                // Keep lane lines as the original 3D quad. Its pixel shader maps
+                // U against the four projected edges, so the line follows camera
+                // perspective without tessellation or depth flattening.
+                var lineWorldViewProjection =
+                    _textureEffect.World * _textureEffect.View * _textureEffect.Projection;
+                _laneLineEffect.Parameters["WorldViewProjection"]?.SetValue(lineWorldViewProjection);
                 _laneLineEffect.Parameters["Texture"]?.SetValue(texture);
                 var laneViewport = _graphics.Viewport;
                 _laneLineEffect.Parameters["ScreenHeight"]?.SetValue((float)laneViewport.Height);
                 _laneLineEffect.Parameters["ViewportSize"]?.SetValue(
                     new Vector2(laneViewport.Width, laneViewport.Height));
+                _laneLineEffect.Parameters["ViewportOrigin"]?.SetValue(
+                    new Vector2(laneViewport.X, laneViewport.Y));
 
-                // Give the shader the exact four projected quad corners. It uses
-                // those edges directly for the line texture's U coordinate, so
-                // there is no centerline/perpendicular approximation left.
+                // Supply the actual projected corners used by the fragment shader.
                 var lineFarLeftScreen = _projection.ScreenPositionFromCameraSpace(
                     _laneTextureBatchScratch[0].Position);
                 var lineFarRightScreen = _projection.ScreenPositionFromCameraSpace(
@@ -1720,19 +1719,93 @@ public sealed partial class Playfield
                 var lineNearLeftScreen = _projection.ScreenPositionFromCameraSpace(
                     _laneTextureBatchScratch[5].Position);
 
+#if TSC_SM6_BACKEND
+                // The SM6 vertex shader consumes only POSITION and TEXCOORD0.
+                // Colour is uniform for a six-vertex lane-line quad, so pass it
+                // separately rather than exposing an unused COLOR vertex field.
+                var lineColor = _laneTextureBatchScratch[0].Color;
+                _laneLineEffect.Parameters["VertexColor"]?.SetValue(new Vector4(
+                    lineColor.R / 255f,
+                    lineColor.G / 255f,
+                    lineColor.B / 255f,
+                    lineColor.A / 255f));
+                if (_laneLineSm6Scratch.Length < vertexCount)
+                    Array.Resize(ref _laneLineSm6Scratch, vertexCount);
+                for (var vertexIndex = 0; vertexIndex < vertexCount; vertexIndex++)
+                {
+                    var vertex = _laneTextureBatchScratch[vertexIndex];
+                    _laneLineSm6Scratch[vertexIndex] = new VertexPositionTexture(
+                        vertex.Position,
+                        vertex.TextureCoordinate);
+                }
+#endif
                 _laneLineEffect.Parameters["LineFarLeft"]?.SetValue(lineFarLeftScreen);
                 _laneLineEffect.Parameters["LineFarRight"]?.SetValue(lineFarRightScreen);
                 _laneLineEffect.Parameters["LineNearLeft"]?.SetValue(lineNearLeftScreen);
                 _laneLineEffect.Parameters["LineNearRight"]?.SetValue(lineNearRightScreen);
 
+#if TSC_WINDOWS_DX12
+                var dx12LaneLineAttempt = WindowsDx12Diagnostics.BeginLaneLineAttempt();
+                var traceDx12LaneLine = WindowsDx12Diagnostics.ShouldTraceLaneLineAttempt(dx12LaneLineAttempt);
+                if (traceDx12LaneLine)
+                {
+                    WindowsDx12Diagnostics.LogLaneLineDrawState(
+                        dx12LaneLineAttempt,
+                        commandIndex,
+                        texture,
+                        _laneLineEffect,
+                        laneViewport,
+                        _laneLineSm6Scratch,
+                        vertexCount,
+                        lineWorldViewProjection,
+                        lineFarLeftScreen,
+                        lineFarRightScreen,
+                        lineNearLeftScreen,
+                        lineNearRightScreen,
+                        lineColor);
+                }
+#endif
+                var laneLinePassIndex = 0;
                 foreach (var pass in _laneLineEffect.CurrentTechnique.Passes)
                 {
+#if TSC_WINDOWS_DX12
+                    if (traceDx12LaneLine)
+                        Program.LogRuntime($"DX12_LANELINE attempt={dx12LaneLineAttempt} stage=pass_apply_begin pass={laneLinePassIndex}");
+#endif
                     pass.Apply();
+#if TSC_WINDOWS_DX12
+                    if (traceDx12LaneLine)
+                        Program.LogRuntime($"DX12_LANELINE attempt={dx12LaneLineAttempt} stage=draw_begin pass={laneLinePassIndex} primitiveType=TriangleList primitiveCount={vertexCount / 3}");
+                    try
+                    {
+                        _graphics.DrawUserPrimitives(
+                            PrimitiveType.TriangleList,
+                            _laneLineSm6Scratch,
+                            0,
+                            vertexCount / 3);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (traceDx12LaneLine)
+                            Program.LogRuntime($"DX12_LANELINE attempt={dx12LaneLineAttempt} stage=draw_exception pass={laneLinePassIndex} exception={ex}");
+                        throw;
+                    }
+                    if (traceDx12LaneLine)
+                        Program.LogRuntime($"DX12_LANELINE attempt={dx12LaneLineAttempt} stage=draw_return pass={laneLinePassIndex}");
+#elif TSC_DESKTOP_VK
+                    _graphics.DrawUserPrimitives(
+                        PrimitiveType.TriangleList,
+                        _laneLineSm6Scratch,
+                        0,
+                        vertexCount / 3);
+#else
                     _graphics.DrawUserPrimitives(
                         PrimitiveType.TriangleList,
                         _laneTextureBatchScratch,
                         0,
                         vertexCount / 3);
+#endif
+                    laneLinePassIndex++;
                     if (_performanceDebugInstrumentFrame)
                     {
                         _debugTexturedDrawCalls++;
@@ -1746,11 +1819,29 @@ public sealed partial class Playfield
                 foreach (var pass in _textureEffect.CurrentTechnique.Passes)
                 {
                     pass.Apply();
+#if TSC_WINDOWS_DX12
+                    // The identity index stream retains the same triangle-list
+                    // order while exercising MonoGame's separate indexed DX12
+                    // draw entry point instead of GraphicsDevice_Draw.
+                    if (_laneTextureDx12IdentityIndices.Length < vertexCount)
+                        Array.Resize(ref _laneTextureDx12IdentityIndices, vertexCount);
+                    for (var index = 0; index < vertexCount; index++)
+                        _laneTextureDx12IdentityIndices[index] = index;
+                    _graphics.DrawUserIndexedPrimitives(
+                        PrimitiveType.TriangleList,
+                        _laneTextureBatchScratch,
+                        0,
+                        vertexCount,
+                        _laneTextureDx12IdentityIndices,
+                        0,
+                        vertexCount / 3);
+#else
                     _graphics.DrawUserPrimitives(
                         PrimitiveType.TriangleList,
                         _laneTextureBatchScratch,
                         0,
                         vertexCount / 3);
+#endif
                     if (_performanceDebugInstrumentFrame)
                     {
                         _debugTexturedDrawCalls++;

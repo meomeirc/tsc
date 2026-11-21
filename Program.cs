@@ -16,6 +16,12 @@ public static class Program
             return;
         }
 
+#if TSC_WINDOWS_DX12
+        // The D3D12 debug layer must be enabled before MonoGame probes or creates
+        // its native graphics device. This is deliberately before Game1 creation.
+        TSC.Rendering.WindowsDx12Diagnostics.InitializeBeforeGraphicsDevice();
+#endif
+
 #if !TSC_PUBLISH
         SkinDebugConsole.Initialize();
 #endif
@@ -31,6 +37,10 @@ public static class Program
         EnforceExistingLogSizeLimit(Path.Combine(UserDataPaths.RootDirectory, "Logs", "superFlick_debug.log"));
         EnforceExistingLogSizeLimit(Path.Combine(UserDataPaths.RootDirectory, "Logs", "ffmpeg-download.log"));
         LogRuntime("START");
+#if TSC_WINDOWS_DX12
+        if (TSC.Rendering.WindowsDx12Diagnostics.StartupMessage is { } dx12DiagnosticsMessage)
+            LogRuntime(dx12DiagnosticsMessage);
+#endif
 
         try
         {

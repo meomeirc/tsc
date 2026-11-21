@@ -185,6 +185,12 @@ public sealed partial class Playfield
         int Layer = 0);
 
     private VertexPositionColorTexture[] _laneTextureBatchScratch = Array.Empty<VertexPositionColorTexture>();
+#if TSC_WINDOWS_DX12
+    private int[] _laneTextureDx12IdentityIndices = Array.Empty<int>();
+#endif
+#if TSC_SM6_BACKEND
+    private VertexPositionTexture[] _laneLineSm6Scratch = Array.Empty<VertexPositionTexture>();
+#endif
     private readonly List<LaneTextureMeshCommand> _laneCommandsScratch = new(18);
     private readonly List<LaneTextureMeshCommand> _lineCommandsScratch = new(18);
     private readonly List<SkinPlayfieldSurfaceGeometrySnapshot> _skinPlayfieldSurfaceScratch = new(36);

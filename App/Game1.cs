@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using System.Text;
 using System.Runtime.InteropServices;
 using System.Diagnostics;
 using System.Globalization;
@@ -116,6 +117,7 @@ public sealed class Game1 : Game
     private string _keybindCategory = "navigation";
     private string _keybindEditorSubcategory = "file";
     private bool _settingsSkinDropdownOpen;
+    private bool _graphicsApiRelaunchConfirmOpen;
     private bool _returnToEditorFromSettings;
     private double _settingsSkinDropdownScroll;
     private readonly SmoothScrollHandler _skinDropdownScrollState = new();
@@ -124,7 +126,7 @@ public sealed class Game1 : Game
     private static readonly string[] FallbackSettingsLabels =
     {
         "Chart scroll speed", "Scroll mode", "Music volume", "Tap volume", "Link volume", "Lane switch volume",
-        "Metronome volume", "Frame rate limit", "VSync", "Gauge", "Display mode", "Skin", "Back"
+        "Metronome volume", "Frame rate limit", "VSync", "Gauge", "Display mode", "Graphics API", "Skin", "Back"
     };
     private static readonly int[] FallbackFrameRateOptions = { 0, 30, 60, 120, 144, 165, 240, 360, 500, 1000 };
 
@@ -225,7 +227,7 @@ public sealed class Game1 : Game
     private bool _borderlessFocusTargetKnown;
     private bool _borderlessFocusTarget;
     private long _borderlessFocusTargetSince;
-    private IntPtr _cachedSdlWindowHandle;
+    private IntPtr _cachedBackendWindowHandle;
     private IntPtr _cachedWindowsWindowHandle;
     private bool _returnToGameplayAfterLoad;
     private bool _pendingPlayMode;
@@ -256,11 +258,10 @@ public sealed class Game1 : Game
             SynchronizeWithVerticalRetrace = true,
             IsFullScreen = false
         };
-#if TSC_PUBLISH
-        Content.RootDirectory = Path.Combine(AppContext.BaseDirectory, "Content");
-#else
+        // MonoGame's TitleContainer.OpenStream expects a relative asset path.
+        // AppContext.BaseDirectory already points at the selected backend folder
+        // in dual-backend installs, so "Content" resolves to that backend's assets.
         Content.RootDirectory = "Content";
-#endif
         IsMouseVisible = true;
 #if !TSC_ANDROID
         Window.AllowUserResizing = true;
@@ -269,9 +270,10 @@ public sealed class Game1 : Game
         UserDataPaths.Initialize();
         KeybindSettings.Initialize(UserDataPaths.KeybindsPath);
 
-#if !TSC_ANDROID
-        // Monitor for Windows audio endpoint loss. Recovery recreates MonoGame's
-        // entire OpenAL device/context on the game thread after earphone hot-plugging.
+#if !TSC_ANDROID && !TSC_NATIVE_BACKEND
+        // DesktopGL uses OpenAL, so monitor Windows endpoint loss and rebuild its
+        // device/context on the game thread after earphone hot-plugging. The native
+        // DesktopVK and WindowsDX12 audio backends do not use this OpenAL recovery path.
         OpenALAudioDeviceRecovery.Start();
 #endif
     }
@@ -646,7 +648,7 @@ public sealed class Game1 : Game
         // disposal/recreation and MonoGame audio-context lifecycle work must run
         // on the game thread. Process it before gameplay/UI can play another sound.
         var recoveryPlayfield = _playfield;
-#if !TSC_ANDROID
+#if !TSC_ANDROID && !TSC_NATIVE_BACKEND
         Func<bool>? prepareSongAudio = recoveryPlayfield is null ? null : recoveryPlayfield.PrepareAudioForDeviceReset;
         Action? suspendSongAudio = recoveryPlayfield is null ? null : recoveryPlayfield.SuspendAudioForDeviceReset;
         Action? restoreSongAudio = recoveryPlayfield is null ? null : recoveryPlayfield.RestoreAudioAfterDeviceReset;
@@ -665,7 +667,7 @@ public sealed class Game1 : Game
         UpdateBorderlessTopmost(inputActive);
         GlobalInput.UpdateMouse(Mouse.GetState(), inputActive);
 #endif
-        PhysicalKeyboard.Update(keyboard, GlobalInput.Mouse);
+        PhysicalKeyboard.Update(keyboard, GlobalInput.Mouse, inputActive);
         if (_startupScreen != StartupScreen.Gameplay || _transitionPhase != TransitionPhase.None)
             KeybindSettings.UpdateTouchGameplayActions(Array.Empty<string>(), suppressPressEdges: true);
         KeybindSettings.UpdateRepeat(gameTime.ElapsedGameTime.TotalSeconds);
@@ -737,7 +739,9 @@ public sealed class Game1 : Game
             StartupScreen.Gameplay or StartupScreen.GameplayResult;
         // Escape remains a text-edit cancel key, but ordinary menu/gameplay Back
         // navigation is controlled by the configurable scancode binding.
-        var physicalEscapeForExternalTextField = physicalEscapePressed && (_settingsEditingKey is not null || searchTyping);
+        var physicalEscapeForExternalTextField = physicalEscapePressed &&
+            (_settingsEditingKey is not null || searchTyping ||
+             (_startupScreen == StartupScreen.SettingsMenu && _graphicsApiRelaunchConfirmOpen));
         var chartEditorOwnsBack = _startupScreen == StartupScreen.Gameplay &&
             _playfield?.ChartEditorMode == true;
         // The chart editor handles its own Back binding. Do not intercept it here:
@@ -752,7 +756,11 @@ public sealed class Game1 : Game
         {
             if (_startupScreen == StartupScreen.SettingsMenu)
             {
-                if (_keybindCaptureAction is not null)
+                if (_graphicsApiRelaunchConfirmOpen)
+                {
+                    CancelGraphicsApiRelaunch();
+                }
+                else if (_keybindCaptureAction is not null)
                 {
                     ResetKeybindCapture();
                 }
@@ -1111,8 +1119,8 @@ public sealed class Game1 : Game
             {
                 if (_playfield is { ChartEditorMode: true })
                 {
-                    // SDL normally translates WM_CLOSE into SDL_WINDOWEVENT_CLOSE,
-                    // which MonoGame handles by calling Game.Exit immediately. Swallow
+                    // MonoGame's desktop backends translate WM_CLOSE into their own
+                    // close event, which normally calls Game.Exit immediately. Swallow
                     // it while the editor is active so the game thread can checkpoint
                     // first. Alt+F4/window close intentionally does not ask to discard.
                     Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 1);
@@ -1122,7 +1130,7 @@ public sealed class Game1 : Game
             catch (Exception ex)
             {
                 Program.LogRuntime($"WINDOW_CLOSE_INTERCEPT_FAILED {ex}");
-                // If inspection fails, let SDL perform its normal close behavior.
+                // If inspection fails, let the backend perform its normal close behavior.
             }
         }
 
@@ -1453,7 +1461,7 @@ public sealed class Game1 : Game
     }
 
     /// <summary>
-    /// Shows a modal Windows dialog owned by the SDL game window. Exclusive fullscreen
+    /// Shows a modal Windows dialog owned by the game window. Exclusive fullscreen
     /// is temporarily left while the dialog is open because Windows file pickers cannot
     /// reliably receive clicks while the game owns an exclusive display switch.
     /// </summary>
@@ -1580,7 +1588,7 @@ public sealed class Game1 : Game
         if (Volatile.Read(ref _nativeDialogDepth) > 0)
             return;
 
-        // A normal SDL borderless window can sit underneath the Windows taskbar.
+        // A normal borderless game window can sit underneath the Windows taskbar.
         // Keep the game window topmost only while the game window itself is foreground;
         // remove topmost immediately when focus moves elsewhere. Promotion is delayed
         // briefly to avoid z-order thrashing while focus settles.
@@ -1628,7 +1636,7 @@ public sealed class Game1 : Game
         if (_borderlessTopmostStateKnown && shouldBeTopmost == _borderlessTopmostState)
             return;
 
-        // Windows creates ordinary SDL windows as non-topmost by default. Avoid a
+        // Windows creates ordinary game windows as non-topmost by default. Avoid a
         // needless HWND_NOTOPMOST transition during initial startup when already so.
         if (!_borderlessTopmostStateKnown && !shouldBeTopmost)
         {
@@ -1639,8 +1647,12 @@ public sealed class Game1 : Game
 
         try
         {
-            // MonoGame DesktopGL's Window.Handle is an SDL_Window*, not a Windows HWND.
+            // Resolve the SDL-backed MonoGame window to its native HWND before
+            // changing z-order (DesktopGL uses SDL_GetWindowWMInfo; native backends enumerate it).
             var hwnd = GetGameWindowHandle();
+            if (hwnd == IntPtr.Zero || !IsWindow(hwnd))
+                return;
+
             var insertAfter = shouldBeTopmost ? new IntPtr(-1) : new IntPtr(-2); // HWND_TOPMOST / HWND_NOTOPMOST
             const uint flags = 0x0001 | 0x0002 | 0x0010 | 0x0200; // NOSIZE | NOMOVE | NOACTIVATE | NOOWNERZORDER
             var succeeded = SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, flags);
@@ -1664,8 +1676,18 @@ public sealed class Game1 : Game
         }
     }
 
-    private static IntPtr GetWindowsNativeHandle(IntPtr sdlWindow)
+    private IntPtr GetWindowsNativeHandle(IntPtr backendWindowHandle)
     {
+#if TSC_NATIVE_BACKEND
+        // MonoGame's Native backend still uses SDL2 for window management.
+        // Window.Handle is therefore an SDL_Window*, not an HWND. Resolve the
+        // process-owned Win32 top-level window by its current TSC window title;
+        // this avoids a dependency on a separately loadable SDL2.dll.
+        _ = backendWindowHandle;
+        return FindNativeBackendWindowHandle();
+#else
+        // MonoGame DesktopGL exposes an SDL_Window*, so translate it to the HWND
+        // before calling Win32 APIs.
         const int SdlSysWmWindows = 1;
         const int SubsystemOffset = 4;
         const int WindowsHwndOffset = 8;
@@ -1682,7 +1704,7 @@ public sealed class Game1 : Game
             Marshal.WriteByte(info, 1, version.Minor);
             Marshal.WriteByte(info, 2, version.Patch);
 
-            if (SDL_GetWindowWMInfo(sdlWindow, info) == 0)
+            if (SDL_GetWindowWMInfo(backendWindowHandle, info) == 0)
                 throw new InvalidOperationException("SDL_GetWindowWMInfo failed while retrieving the native Windows window handle.");
 
             var subsystem = Marshal.ReadInt32(info, SubsystemOffset);
@@ -1698,8 +1720,10 @@ public sealed class Game1 : Game
         {
             Marshal.FreeHGlobal(info);
         }
+#endif
     }
 
+#if !TSC_NATIVE_BACKEND
     [StructLayout(LayoutKind.Sequential)]
     private struct SdlVersion
     {
@@ -1713,25 +1737,142 @@ public sealed class Game1 : Game
 
     [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetWindowWMInfo")]
     private static extern int SDL_GetWindowWMInfo(IntPtr window, IntPtr info);
+#endif
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
 
+#if TSC_NATIVE_BACKEND
+    private const uint MonitorDefaultToNearest = 2;
+
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private delegate bool EnumWindowsCallback(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr lParam);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowTextLengthW", SetLastError = true)]
+    private static extern int GetWindowTextLength(IntPtr hWnd);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowTextW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
+
+    private IntPtr FindNativeBackendWindowHandle()
+    {
+        var expectedTitle = Window.Title;
+        if (string.IsNullOrWhiteSpace(expectedTitle))
+            return IntPtr.Zero;
+
+        var currentProcessId = (uint)Environment.ProcessId;
+        var exactMatch = IntPtr.Zero;
+        var prefixedMatch = IntPtr.Zero;
+        var prefixedMatchCount = 0;
+
+        // The title is changed by TSC as the user moves between screens, but it
+        // always starts with "TSC". Prefer an exact title match; accept a unique
+        // TSC-prefixed window as a fallback in case SDL has not yet synchronized
+        // the latest caption when this lookup runs.
+        EnumWindowsCallback callback = (hWnd, _) =>
+        {
+            if (!IsWindow(hWnd))
+                return true;
+
+            GetWindowThreadProcessId(hWnd, out var ownerProcessId);
+            if (ownerProcessId != currentProcessId)
+                return true;
+
+            var titleLength = GetWindowTextLength(hWnd);
+            if (titleLength <= 0)
+                return true;
+
+            var titleBuffer = new StringBuilder(titleLength + 1);
+            if (GetWindowText(hWnd, titleBuffer, titleBuffer.Capacity) <= 0)
+                return true;
+
+            var title = titleBuffer.ToString();
+            if (string.Equals(title, expectedTitle, StringComparison.Ordinal))
+            {
+                exactMatch = hWnd;
+                return false;
+            }
+
+            if (title.StartsWith("TSC", StringComparison.Ordinal))
+            {
+                prefixedMatch = hWnd;
+                prefixedMatchCount++;
+            }
+
+            return true;
+        };
+
+        EnumWindows(callback, IntPtr.Zero);
+        if (exactMatch != IntPtr.Zero)
+            return exactMatch;
+
+        return prefixedMatchCount == 1 ? prefixedMatch : IntPtr.Zero;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Win32Rect
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Win32MonitorInfo
+    {
+        public int Size;
+        public Win32Rect Monitor;
+        public Win32Rect Work;
+        public uint Flags;
+    }
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+    private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int newLong);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AdjustWindowRectEx(ref Win32Rect lpRect, int dwStyle, [MarshalAs(UnmanagedType.Bool)] bool bMenu, int dwExStyle);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetClientRect(IntPtr hWnd, out Win32Rect lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    [DllImport("user32.dll", EntryPoint = "GetMonitorInfoW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref Win32MonitorInfo lpmi);
+#endif
+
     private void InvalidateWindowsWindowHandle()
     {
         RemoveWindowCloseHook();
-        _cachedSdlWindowHandle = IntPtr.Zero;
+        _cachedBackendWindowHandle = IntPtr.Zero;
         _cachedWindowsWindowHandle = IntPtr.Zero;
     }
 
     private IntPtr GetGameWindowHandle()
     {
-        var sdlWindow = Window.Handle;
-        if (_cachedWindowsWindowHandle == IntPtr.Zero || _cachedSdlWindowHandle != sdlWindow)
+        var backendWindowHandle = Window.Handle;
+        if (_cachedWindowsWindowHandle == IntPtr.Zero ||
+            _cachedBackendWindowHandle != backendWindowHandle ||
+            !IsWindow(_cachedWindowsWindowHandle))
         {
-            _cachedSdlWindowHandle = sdlWindow;
-            _cachedWindowsWindowHandle = GetWindowsNativeHandle(sdlWindow);
+            _cachedBackendWindowHandle = backendWindowHandle;
+            _cachedWindowsWindowHandle = GetWindowsNativeHandle(backendWindowHandle);
         }
 
         EnsureWindowCloseHookForHandle(_cachedWindowsWindowHandle);
@@ -1740,7 +1881,7 @@ public sealed class Game1 : Game
 
     private void EnsureWindowCloseHookForHandle(IntPtr hwnd)
     {
-        if (!OperatingSystem.IsWindows() || hwnd == IntPtr.Zero || hwnd == _windowCloseSubclassHandle)
+        if (!OperatingSystem.IsWindows() || hwnd == IntPtr.Zero || !IsWindow(hwnd) || hwnd == _windowCloseSubclassHandle)
             return;
 
         RemoveWindowCloseHook();
@@ -1786,7 +1927,9 @@ public sealed class Game1 : Game
         {
             return false;
         }
-        if (gameWindow == IntPtr.Zero || foreground != gameWindow)
+        if (gameWindow == IntPtr.Zero)
+            return IsActive;
+        if (foreground != gameWindow)
             return false;
 
         return !IsIconic(foreground);
@@ -1799,6 +1942,10 @@ public sealed class Game1 : Game
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsIconic(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindow(IntPtr hWnd);
+
     protected override void Dispose(bool disposing)
     {
         if (disposing)
@@ -1807,10 +1954,15 @@ public sealed class Game1 : Game
             // raised (for example, a failure during Draw or window teardown).
             CaptureEditorRecoveryCheckpoint("game_dispose", finalAttempt: true);
             RemoveWindowCloseHook();
+#if TSC_NATIVE_BACKEND
+            PhysicalKeyboard.Shutdown();
+#endif
             Interlocked.Exchange(ref _pendingNativeWindowCloseRequest, 0);
             if (ReferenceEquals(_currentInstance, this))
                 _currentInstance = null;
+#if !TSC_ANDROID && !TSC_NATIVE_BACKEND
             OpenALAudioDeviceRecovery.Stop();
+#endif
             _playfield?.Dispose();
             _chartEditorLoadPlayfield?.Dispose();
             _songSelect?.Dispose();
@@ -2668,7 +2820,9 @@ public sealed class Game1 : Game
                 _keybindCategory,
                 _keybindEditorSubcategory,
                 _keybindCapturePreview,
-                _settingsTab);
+                _settingsTab,
+                _graphicsApiRelaunchConfirmOpen,
+                GetGraphicsApiRelaunchConfirmationMessage());
 
             _settingsMenuRuntime.UpdateScreen(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
             _settingsMenuRuntime.UpdateUiPointer(mouse.Position.X, mouse.Position.Y, mouseDown);
@@ -2685,6 +2839,20 @@ public sealed class Game1 : Game
         {
             UpdateFallbackSettingsMenu(keyboard);
             return;
+        }
+
+        if (_graphicsApiRelaunchConfirmOpen)
+        {
+            if (KeybindSettings.IsPressed("menu_back") || Pressed(keyboard, Keys.Escape))
+            {
+                CancelGraphicsApiRelaunch();
+                return;
+            }
+            if (KeybindSettings.IsPressed("menu_confirm") || Pressed(keyboard, Keys.Enter))
+            {
+                ConfirmGraphicsApiRelaunch();
+                return;
+            }
         }
 
         if (mousePressed)
@@ -2723,8 +2891,8 @@ public sealed class Game1 : Game
         var height = viewport.Height;
         var panelWidth = Math.Min(1000, Math.Max(320, width - 48));
         var panelLeft = (width - panelWidth) / 2;
-        var rowHeight = Math.Clamp((int)(height * 0.052f), 30, 50);
-        var gap = Math.Clamp((int)(height * 0.007f), 4, 8);
+        var rowHeight = Math.Clamp((int)(height * 0.045f), 30, 50);
+        var gap = Math.Clamp((int)(height * 0.005f), 3, 6);
         var rowWidth = Math.Min(850, panelWidth - 40);
         var rowLeft = (width - rowWidth) / 2;
         var totalRowsHeight = FallbackSettingsLabels.Length * rowHeight + (FallbackSettingsLabels.Length - 1) * gap;
@@ -2778,6 +2946,22 @@ public sealed class Game1 : Game
         _startupSpriteBatch.End();
     }
 
+    private static string NextGraphicsApi(string? current)
+        => GameConfig.NormalizeGraphicsApi(current) switch
+        {
+            "DesktopGL" => "DesktopVK",
+            "DesktopVK" => "WindowsDX12",
+            _ => "DesktopGL"
+        };
+
+    private static string GetGraphicsApiDisplayName(string? value)
+        => GameConfig.NormalizeGraphicsApi(value) switch
+        {
+            "DesktopVK" => "Vulkan",
+            "WindowsDX12" => "Direct3D 12",
+            _ => "OpenGL"
+        };
+
     private string GetFallbackSettingsValue(int index, GameConfig config)
         => index switch
         {
@@ -2792,7 +2976,13 @@ public sealed class Game1 : Game
             8 => config.VSync ? "ON" : "OFF",
             9 => GameConfig.NormalizeGaugeType(config.Gauge).ToUpperInvariant(),
             10 => GameConfig.NormalizeDisplayMode(config.DisplayMode).ToUpperInvariant(),
-            11 => string.IsNullOrWhiteSpace(config.Skin) ? "Default" : config.Skin,
+            11 => GameConfig.NormalizeGraphicsApi(config.GraphicsApi) switch
+            {
+                "DesktopVK" => "VULKAN",
+                "WindowsDX12" => "DIRECT3D 12",
+                _ => "OPENGL"
+            },
+            12 => string.IsNullOrWhiteSpace(config.Skin) ? "Default" : config.Skin,
             _ => "OPEN"
         };
 
@@ -2825,8 +3015,8 @@ public sealed class Game1 : Game
         {
             var width = GraphicsDevice.Viewport.Width;
             var height = GraphicsDevice.Viewport.Height;
-            var rowHeight = Math.Clamp((int)(height * 0.052f), 30, 50);
-            var gap = Math.Clamp((int)(height * 0.007f), 4, 8);
+            var rowHeight = Math.Clamp((int)(height * 0.045f), 30, 50);
+            var gap = Math.Clamp((int)(height * 0.005f), 3, 6);
             var rowWidth = Math.Min(850, Math.Max(280, width - 88));
             var rowLeft = (width - rowWidth) / 2;
             var totalRowsHeight = FallbackSettingsLabels.Length * rowHeight + (FallbackSettingsLabels.Length - 1) * gap;
@@ -2912,6 +3102,19 @@ public sealed class Game1 : Game
             }
             case 11:
             {
+                var previousApi = config.GraphicsApi;
+                config.GraphicsApi = NextGraphicsApi(config.GraphicsApi);
+                if (!SaveFallbackSettings())
+                    config.GraphicsApi = previousApi;
+                else
+                {
+                    var apiName = GetGraphicsApiDisplayName(config.GraphicsApi);
+                    _errorMessage = $"Graphics API set to {apiName}. Leave Settings to restart TSC.";
+                }
+                return;
+            }
+            case 12:
+            {
                 var skins = GetAvailableSkinNames();
                 if (skins.Count == 0) return;
                 var current = Array.FindIndex(skins.ToArray(), value => string.Equals(value, config.Skin, StringComparison.OrdinalIgnoreCase));
@@ -2922,7 +3125,7 @@ public sealed class Game1 : Game
                 ReloadActiveSkinFromSettings();
                 return;
             }
-            case 12:
+            case 13:
                 ReturnToMainMenuFromSettings();
                 return;
             default:
@@ -2932,7 +3135,7 @@ public sealed class Game1 : Game
         SaveFallbackSettings();
     }
 
-    private void SaveFallbackSettings()
+    private bool SaveFallbackSettings()
     {
         try
         {
@@ -2941,11 +3144,13 @@ public sealed class Game1 : Game
             _appliedMaxFrameRate = int.MinValue;
             _appliedVSync = null;
             ApplyMaxFrameRateConfig();
+            return true;
         }
         catch (Exception ex)
         {
             _errorMessage = $"Could not save settings: {ex.Message}";
             Program.LogFatal("FALLBACK_SETTINGS_SAVE", ex);
+            return false;
         }
     }
 
@@ -3068,6 +3273,16 @@ public sealed class Game1 : Game
         }
 
         var name = action.Name.Trim().ToLowerInvariant();
+        if (name == "cancel_graphics_api_relaunch")
+        {
+            CancelGraphicsApiRelaunch();
+            return;
+        }
+        if (name == "confirm_graphics_api_relaunch")
+        {
+            ConfirmGraphicsApiRelaunch();
+            return;
+        }
         if (name == "edit_setting_value")
         {
             var settingKey = action.Value as string;
@@ -3191,6 +3406,29 @@ public sealed class Game1 : Game
             return;
         }
 
+        if (name == "toggle_graphics_api")
+        {
+            var config = _skin?.GameConfig;
+            if (config is null)
+                return;
+
+            var previousApi = config.GraphicsApi;
+            config.GraphicsApi = NextGraphicsApi(config.GraphicsApi);
+            try
+            {
+                SkinConfigStore.SaveGameConfig(UserDataPaths.GameConfigPath, config);
+                var apiName = GetGraphicsApiDisplayName(config.GraphicsApi);
+                _errorMessage = $"Graphics API set to {apiName}. Leave Settings to restart TSC.";
+            }
+            catch (Exception ex)
+            {
+                config.GraphicsApi = previousApi;
+                _errorMessage = $"Could not save graphics API: {ex.Message}";
+                Program.LogFatal("GRAPHICS_API_SAVE", ex);
+            }
+            return;
+        }
+
         if (name == "toggle_gauge")
         {
             var gauge = _skin?.GameConfig.Gauge ?? "hard";
@@ -3271,6 +3509,68 @@ public sealed class Game1 : Game
     private void ReturnToMainMenuFromSettings()
     {
         CommitSettingsValueEdit();
+
+        var selectedGraphicsApi = GameConfig.NormalizeGraphicsApi(_skin?.GameConfig.GraphicsApi);
+        var runningGraphicsApi = GetRunningGraphicsApi();
+        var graphicsApiChanged = !string.Equals(selectedGraphicsApi, runningGraphicsApi, StringComparison.OrdinalIgnoreCase);
+        if (graphicsApiChanged)
+        {
+            // Keep Settings open and show the same skin-rendered confirmation used by
+            // Song Select and the chart editor. This lets the popup match the active UI theme.
+            _graphicsApiRelaunchConfirmOpen = true;
+            _settingsSkinDropdownOpen = false;
+            _settingsKeybindsOpen = false;
+            ResetKeybindCapture();
+            return;
+        }
+
+        CompleteReturnToMainMenuFromSettings(errorMessage: null);
+    }
+
+    private string GetGraphicsApiRelaunchConfirmationMessage()
+    {
+        var selectedGraphicsApi = GameConfig.NormalizeGraphicsApi(_skin?.GameConfig.GraphicsApi);
+        var runningGraphicsApi = GetRunningGraphicsApi();
+        var currentName = GetGraphicsApiDisplayName(runningGraphicsApi);
+        var selectedName = GetGraphicsApiDisplayName(selectedGraphicsApi);
+        return $"Graphics API changed from {currentName} to {selectedName}.\n\nRelaunch TSC now to apply this change?";
+    }
+
+    private void CancelGraphicsApiRelaunch()
+    {
+        if (!_graphicsApiRelaunchConfirmOpen)
+            return;
+
+        _graphicsApiRelaunchConfirmOpen = false;
+        var selectedName = GetGraphicsApiDisplayName(_skin?.GameConfig.GraphicsApi);
+        CompleteReturnToMainMenuFromSettings(
+            $"Graphics API set to {selectedName}. Restart TSC to apply it.");
+    }
+
+    private void ConfirmGraphicsApiRelaunch()
+    {
+        if (!_graphicsApiRelaunchConfirmOpen)
+            return;
+
+        var selectedGraphicsApi = GameConfig.NormalizeGraphicsApi(_skin?.GameConfig.GraphicsApi);
+        _graphicsApiRelaunchConfirmOpen = false;
+        try
+        {
+            StartGraphicsApiRelaunch(selectedGraphicsApi);
+            Exit();
+        }
+        catch (Exception ex)
+        {
+            Program.LogFatal("GRAPHICS_API_RELAUNCH", ex);
+            CompleteReturnToMainMenuFromSettings(
+                $"Could not relaunch TSC: {ex.Message}. The selected API is saved; close and start TSC again to apply it.");
+        }
+    }
+
+    private void CompleteReturnToMainMenuFromSettings(string? errorMessage)
+    {
+        var shouldReturnToEditor = _returnToEditorFromSettings;
+        _graphicsApiRelaunchConfirmOpen = false;
         _settingsSkinDropdownOpen = false;
         _skinDropdownScrollState.Reset();
         _settingsSkinDropdownScroll = 0;
@@ -3278,11 +3578,96 @@ public sealed class Game1 : Game
         ResetKeybindCapture();
         _keybindScrollState.Reset();
         _keybindScroll = 0;
-        _startupScreen = _returnToEditorFromSettings ? StartupScreen.Gameplay : StartupScreen.Menu;
+
+        _errorMessage = errorMessage;
+        _startupScreen = shouldReturnToEditor ? StartupScreen.Gameplay : StartupScreen.Menu;
         _returnToEditorFromSettings = false;
         _mainMenuSelectedIndex = MainMenuSettingsIndex;
-        _errorMessage = null;
     }
+
+    private static string GetRunningGraphicsApi()
+    {
+#if TSC_WINDOWS_DX12
+        return "WindowsDX12";
+#elif TSC_DESKTOP_VK
+        return "DesktopVK";
+#else
+        return "DesktopGL";
+#endif
+    }
+
+    private static void StartGraphicsApiRelaunch(string graphicsApi)
+    {
+        // Installed builds must go through the root launcher. It reads gameConfig.json
+        // and starts the matching backend executable; starting this backend executable
+        // directly would simply reopen the same graphics API.
+        var installRoot = UserDataPaths.GameRootDirectory;
+        var launcherPath = Path.Combine(installRoot, "TSC.exe");
+        if (File.Exists(launcherPath))
+        {
+            var launcherStart = new ProcessStartInfo
+            {
+                FileName = launcherPath,
+                WorkingDirectory = installRoot,
+                UseShellExecute = false
+            };
+            _ = Process.Start(launcherStart)
+                ?? throw new InvalidOperationException("The TSC launcher could not be started.");
+            Program.LogRuntime($"GRAPHICS_API_RELAUNCH_STARTED backend={graphicsApi} launcher=installed");
+            return;
+        }
+
+#if !TSC_PUBLISH && !TSC_ANDROID
+        // Developer builds are started from a backend-specific bin/<backend>/<config>
+        // folder. Re-run the project with the selected backend so its package references,
+        // content pipeline, and output directory all match the requested API.
+        var projectRoot = FindDeveloperProjectRoot();
+        if (projectRoot is not null)
+        {
+            var outputDirectory = new DirectoryInfo(Path.TrimEndingDirectorySeparator(AppContext.BaseDirectory));
+            var configuration = outputDirectory.Parent?.Name;
+            if (configuration is not ("Debug" or "Release" or "Publish"))
+                configuration = "Debug";
+
+            var dotnetHost = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
+            var start = new ProcessStartInfo
+            {
+                FileName = string.IsNullOrWhiteSpace(dotnetHost) ? "dotnet" : dotnetHost.Trim('"'),
+                WorkingDirectory = projectRoot,
+                UseShellExecute = false
+            };
+            start.ArgumentList.Add("run");
+            start.ArgumentList.Add("--no-launch-profile");
+            start.ArgumentList.Add("--project");
+            start.ArgumentList.Add(Path.Combine(projectRoot, "TSC.csproj"));
+            start.ArgumentList.Add("--configuration");
+            start.ArgumentList.Add(configuration);
+            start.ArgumentList.Add($"--property:TSCBackend={graphicsApi}");
+
+            _ = Process.Start(start)
+                ?? throw new InvalidOperationException("The .NET CLI could not be started.");
+            Program.LogRuntime($"GRAPHICS_API_RELAUNCH_STARTED backend={graphicsApi} launcher=dotnet configuration={configuration}");
+            return;
+        }
+#endif
+
+        throw new InvalidOperationException(
+            "The TSC launcher or developer project could not be found. Start TSC again manually to apply the saved graphics API.");
+    }
+
+#if !TSC_PUBLISH && !TSC_ANDROID
+    private static string? FindDeveloperProjectRoot()
+    {
+        DirectoryInfo? directory = new DirectoryInfo(Path.GetFullPath(AppContext.BaseDirectory));
+        while (directory is not null)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "TSC.csproj")))
+                return directory.FullName;
+            directory = directory.Parent;
+        }
+        return null;
+    }
+#endif
 
     private string GetSettingsValueForEditing(string settingKey)
     {
@@ -6596,9 +6981,8 @@ public sealed class Game1 : Game
             {
                 case "windowed":
                 {
-                    // Let MonoGame/SDL leave exclusive fullscreen first. From here on,
-                    // use SDL's normal windowed APIs only; don't overwrite the HWND
-                    // styles directly, since that can leave the game unselectable.
+                    // Let MonoGame leave exclusive fullscreen first. Use the backend-specific
+                    // window API only after the graphics device has returned to windowed mode.
                     if (_graphics.IsFullScreen)
                     {
                         _graphics.IsFullScreen = false;
@@ -6618,14 +7002,14 @@ public sealed class Game1 : Game
 
                     var windowedX = displayBounds.X + Math.Max(0, (displayBounds.Width - _windowedWidth) / 2);
                     var windowedY = displayBounds.Y + Math.Max(0, (displayBounds.Height - _windowedHeight) / 2);
-                    ApplySdlWindowedBounds(windowedX, windowedY, _windowedWidth, _windowedHeight, bordered: true);
+                    ApplyWindowedBounds(windowedX, windowedY, _windowedWidth, _windowedHeight, bordered: true);
                     break;
                 }
 
                 case "borderless":
                 {
-                    // Borderless is still a normal SDL window, not a fullscreen
-                    // window. Keep MonoGame's IsBorderless flag false so its focus
+                    // Borderless is still an ordinary window, not an exclusive fullscreen
+                    // swapchain. Keep MonoGame's IsBorderless flag false so its focus
                     // handling never tries to re-apply a competing window style.
                     if (_graphics.IsFullScreen)
                     {
@@ -6637,9 +7021,8 @@ public sealed class Game1 : Game
                     if (Window.IsBorderless)
                         Window.IsBorderless = false;
 
-                    // Work around the Windows/OpenGL full-monitor promotion bug without
-                    // using native HWND style hacks. TSC-222 proved that an ordinary SDL
-                    // borderless window avoids the focus/cursor problem when it is smaller.
+                    // Work around the Windows/OpenGL full-monitor promotion bug. TSC-222 proved
+                    // that a normal borderless window avoids the focus/cursor problem when smaller.
                     // Keep the full monitor height so the taskbar area is covered, but make
                     // the client width one pixel narrower than the display. This avoids an
                     // exact native-resolution match while remaining visually full-screen.
@@ -6657,9 +7040,9 @@ public sealed class Game1 : Game
 
                     // Apply the border change only after the graphics device has
                     // finished resizing the ordinary window. There is no second
-                    // ApplyChanges call afterward, so SDL isn't asked to rebuild the
+                    // ApplyChanges call afterward, so the backend isn't asked to rebuild the
                     // window again while it is borderless.
-                    ApplySdlWindowedBounds(
+                    ApplyWindowedBounds(
                         borderlessX, borderlessY,
                         borderlessWidth, borderlessHeight,
                         bordered: false);
@@ -6678,9 +7061,9 @@ public sealed class Game1 : Game
                     if (Window.IsBorderless)
                         Window.IsBorderless = false;
 
-                    // Restore ordinary SDL window chrome before asking MonoGame to
-                    // enter hardware fullscreen.
-                    ApplySdlWindowedBounds(
+                    // Restore ordinary window chrome before asking MonoGame to enter
+                    // hardware fullscreen.
+                    ApplyWindowedBounds(
                         displayBounds.X + Math.Max(0, (displayBounds.Width - _windowedWidth) / 2),
                         displayBounds.Y + Math.Max(0, (displayBounds.Height - _windowedHeight) / 2),
                         _windowedWidth, _windowedHeight,
@@ -6738,8 +7121,11 @@ public sealed class Game1 : Game
         }
     }
 
-    private void ApplySdlWindowedBounds(int x, int y, int width, int height, bool bordered)
+    private void ApplyWindowedBounds(int x, int y, int width, int height, bool bordered)
     {
+#if TSC_NATIVE_BACKEND
+        ApplyWin32WindowedBounds(x, y, width, height, bordered);
+#else
         var sdlWindow = Window.Handle;
         const uint SdlWindowFullscreen = 0x00000001;
 
@@ -6761,10 +7147,107 @@ public sealed class Game1 : Game
 
         SDL_GetWindowSize(sdlWindow, out var actualWidth, out var actualHeight);
         Program.LogRuntime($"SDL_WINDOW_BOUNDS bordered={bordered} requested={width}x{height}@{x},{y} actual={actualWidth}x{actualHeight} flags=0x{flagsAfterChange:X8}");
+#endif
     }
 
-    private SdlRect GetCurrentDisplayBounds()
+#if TSC_NATIVE_BACKEND
+    private void ApplyWin32WindowedBounds(int x, int y, int width, int height, bool bordered)
     {
+        const int GwlStyle = -16;
+        const int GwlExStyle = -20;
+        const int WsPopup = unchecked((int)0x80000000);
+        const int WsOverlappedWindow = 0x00CF0000;
+        const uint SwpNoZOrder = 0x0004;
+        const uint SwpNoActivate = 0x0010;
+        const uint SwpFrameChanged = 0x0020;
+
+        var hwnd = GetWindowsNativeHandle(Window.Handle);
+        if (hwnd == IntPtr.Zero || !IsWindow(hwnd))
+        {
+            // The SDL window is still available through MonoGame's GameWindow API.
+            // Preserve the requested position and let a later mode change retry the
+            // native border/style update once Windows has exposed its HWND.
+            Window.Position = new Point(x, y);
+            Program.LogRuntime("WIN32_WINDOW_BOUNDS_PARTIAL reason=SDL_window_hwnd_not_ready position_applied=true");
+            return;
+        }
+
+        var style = GetWindowLong(hwnd, GwlStyle);
+        var exStyle = GetWindowLong(hwnd, GwlExStyle);
+        var nextStyle = bordered
+            ? (style & ~WsPopup) | WsOverlappedWindow
+            : (style & ~WsOverlappedWindow) | WsPopup;
+
+        if (nextStyle != style)
+        {
+            // Clear the last-error slot first: SetWindowLong may legitimately
+            // return zero if the previous style value was zero.
+            Marshal.SetLastPInvokeError(0);
+            var previousStyle = SetWindowLong(hwnd, GwlStyle, nextStyle);
+            if (previousStyle == 0 && Marshal.GetLastPInvokeError() != 0)
+                throw new InvalidOperationException($"Could not change the native window style (Win32 {Marshal.GetLastPInvokeError()}).");
+        }
+
+        // MonoGame's backbuffer dimensions are client dimensions. Win32
+        // SetWindowPos expects the outer window size, so account for the current
+        // non-client frame after applying the requested bordered/borderless style.
+        var outerBounds = new Win32Rect
+        {
+            Left = 0,
+            Top = 0,
+            Right = Math.Max(1, width),
+            Bottom = Math.Max(1, height)
+        };
+        if (!AdjustWindowRectEx(ref outerBounds, nextStyle, false, exStyle))
+            throw new InvalidOperationException($"AdjustWindowRectEx failed (Win32 {Marshal.GetLastWin32Error()}).");
+
+        var outerWidth = Math.Max(1, outerBounds.Right - outerBounds.Left);
+        var outerHeight = Math.Max(1, outerBounds.Bottom - outerBounds.Top);
+        if (!SetWindowPos(hwnd, IntPtr.Zero, x, y, outerWidth, outerHeight,
+                SwpNoZOrder | SwpNoActivate | SwpFrameChanged))
+        {
+            throw new InvalidOperationException($"SetWindowPos failed while applying the display mode (Win32 {Marshal.GetLastWin32Error()}).");
+        }
+
+        if (!GetClientRect(hwnd, out var actualClientBounds))
+            throw new InvalidOperationException($"GetClientRect failed after applying the display mode (Win32 {Marshal.GetLastWin32Error()}).");
+
+        var actualWidth = Math.Max(0, actualClientBounds.Right - actualClientBounds.Left);
+        var actualHeight = Math.Max(0, actualClientBounds.Bottom - actualClientBounds.Top);
+        Program.LogRuntime($"WIN32_WINDOW_BOUNDS bordered={bordered} requested={width}x{height}@{x},{y} actual={actualWidth}x{actualHeight} style=0x{nextStyle:X8}");
+    }
+#endif
+
+    private DisplayBoundsRect GetCurrentDisplayBounds()
+    {
+#if TSC_NATIVE_BACKEND
+        // Native backends use SDL2 for window management, so resolve its SDL_Window*
+        // to the process-owned HWND before querying the nearest monitor. This keeps
+        // multi-monitor layouts and negative monitor coordinates working.
+        try
+        {
+            var hwnd = GetWindowsNativeHandle(Window.Handle);
+            var monitor = hwnd != IntPtr.Zero && IsWindow(hwnd)
+                ? MonitorFromWindow(hwnd, MonitorDefaultToNearest)
+                : IntPtr.Zero;
+            var info = new Win32MonitorInfo { Size = Marshal.SizeOf<Win32MonitorInfo>() };
+            if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info) &&
+                info.Monitor.Right > info.Monitor.Left && info.Monitor.Bottom > info.Monitor.Top)
+            {
+                return new DisplayBoundsRect
+                {
+                    X = info.Monitor.Left,
+                    Y = info.Monitor.Top,
+                    Width = info.Monitor.Right - info.Monitor.Left,
+                    Height = info.Monitor.Bottom - info.Monitor.Top
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"WIN32_DISPLAY_BOUNDS_FAILED {ex.Message}");
+        }
+#else
         try
         {
             var displayIndex = SDL_GetWindowDisplayIndex(Window.Handle);
@@ -6774,9 +7257,10 @@ public sealed class Game1 : Game
         }
         catch (DllNotFoundException) { }
         catch (EntryPointNotFoundException) { }
+#endif
 
         var displayMode = GraphicsAdapter.DefaultAdapter.CurrentDisplayMode;
-        return new SdlRect
+        return new DisplayBoundsRect
         {
             X = 0,
             Y = 0,
@@ -6786,7 +7270,7 @@ public sealed class Game1 : Game
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct SdlRect
+    private struct DisplayBoundsRect
     {
         public int X;
         public int Y;
@@ -6794,11 +7278,12 @@ public sealed class Game1 : Game
         public int Height;
     }
 
+#if !TSC_NATIVE_BACKEND
     [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetWindowDisplayIndex")]
     private static extern int SDL_GetWindowDisplayIndex(IntPtr window);
 
     [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetDisplayBounds")]
-    private static extern int SDL_GetDisplayBounds(int displayIndex, out SdlRect rect);
+    private static extern int SDL_GetDisplayBounds(int displayIndex, out DisplayBoundsRect rect);
 
     [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_SetWindowFullscreen")]
     private static extern int SDL_SetWindowFullscreen(IntPtr window, uint flags);
@@ -6817,5 +7302,6 @@ public sealed class Game1 : Game
 
     [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl, EntryPoint = "SDL_GetWindowFlags")]
     private static extern uint SDL_GetWindowFlags(IntPtr window);
+#endif
 
 }

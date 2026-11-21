@@ -63,10 +63,18 @@ public static class UserDataPaths
                 return Path.GetFullPath(configuredRoot);
 
 #if TSC_PUBLISH
-            // Directly launching data/TSC.exe is also supported: infer the install root
-            // from the standard data/ layout when the tiny launcher wasn't used.
+            // Backend executables live under data/DesktopGL, data/DesktopVK, or data/WindowsDX12.
+            // Infer the shared install root for direct launches when possible.
             var appDirectory = Path.GetFullPath(AppContext.BaseDirectory);
             var appFolderName = Path.GetFileName(Path.TrimEndingDirectorySeparator(appDirectory));
+            if (appFolderName.Equals("DesktopGL", StringComparison.OrdinalIgnoreCase) ||
+                appFolderName.Equals("DesktopVK", StringComparison.OrdinalIgnoreCase) ||
+                appFolderName.Equals("WindowsDX12", StringComparison.OrdinalIgnoreCase))
+            {
+                var dataDirectory = Directory.GetParent(Path.TrimEndingDirectorySeparator(appDirectory));
+                if (dataDirectory?.Name.Equals("data", StringComparison.OrdinalIgnoreCase) == true)
+                    return dataDirectory.Parent?.FullName ?? dataDirectory.FullName;
+            }
             if (appFolderName.Equals("data", StringComparison.OrdinalIgnoreCase))
                 return Directory.GetParent(Path.TrimEndingDirectorySeparator(appDirectory))?.FullName ?? appDirectory;
             return appDirectory;

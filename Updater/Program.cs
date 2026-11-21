@@ -26,7 +26,7 @@ internal static class UpdaterEntry
         }
         finally
         {
-            // Clean the temporary app/runtime copy after this process exits, including
+            // Clean the temporary updater host copy after this process exits, including
             // the case where a user closes an update-error dialog.
             try { UpdateRunnerLauncher.ScheduleCleanupAfterExit(); } catch { }
         }
@@ -1166,8 +1166,8 @@ internal sealed class UpdateEngine
 
     private async Task ScheduleRestartAsync(ReleaseInfo target)
     {
-        // The updater runs from a temporary copy of TSC.exe, so the installed
-        // executable and runtime files are not locked when the game restarts.
+        // The updater runs from a temporary copy of the selected backend host, so its
+        // application files are not locked when the root launcher restarts the game.
         var scriptPath = Path.Combine(_work, "finish-update.ps1");
         var script = "param([int]$UpdaterProcessId,[string]$InstallRoot,[string]$WorkRoot)\n" +
                      "$ErrorActionPreference = 'Stop'\n" +

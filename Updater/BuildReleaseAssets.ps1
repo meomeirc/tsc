@@ -129,7 +129,7 @@ function Get-ManagedManifest([string]$Root, [string]$PackVersion, [string]$Kind,
 }
 
 function Remove-ExcludedFiles([string]$Root, $Rules) {
-    # The update mode lives in data/TSC.exe; only the small Native AOT launcher is at root.
+    # Update mode lives in each backend-specific host; the small Native AOT launcher is at root.
     # Remove leftovers if this publish directory was previously built by an older version.
     foreach ($legacyName in @('updater', 'updater.next', 'updater.old', 'data/updater', 'data/updater.next', 'data/updater.old')) {
         $legacyPath = Join-Path $Root $legacyName
@@ -272,11 +272,23 @@ try {
         if ($null -eq $policyRules.rules) { throw "Package file policy is missing its rules array: $policyPath" }
     }
 
-    foreach ($required in @('TSC.exe', 'songs/README.txt', 'data/TSC.exe', 'data/TSC.dll', 'data/TSC.deps.json', 'data/TSC.runtimeconfig.json', 'data/coreclr.dll', 'Skins/Default/scripts/skin.lua')) {
+    foreach ($required in @(
+        'TSC.exe', 'songs/README.txt',
+        'data/DesktopGL/TSC.exe', 'data/DesktopGL/TSC.dll', 'data/DesktopGL/TSC.deps.json', 'data/DesktopGL/TSC.runtimeconfig.json',
+        'data/DesktopVK/TSC.exe', 'data/DesktopVK/TSC.dll', 'data/DesktopVK/TSC.deps.json', 'data/DesktopVK/TSC.runtimeconfig.json',
+        'data/WindowsDX12/TSC.exe', 'data/WindowsDX12/TSC.dll', 'data/WindowsDX12/TSC.deps.json', 'data/WindowsDX12/TSC.runtimeconfig.json',
+        'Skins/Default/scripts/skin.lua'
+    )) {
         $requiredPath = Join-Path $publish ($required.Replace('/', [IO.Path]::DirectorySeparatorChar))
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
-            throw "Publish output is incomplete; missing '$requiredPath'. Run the TSC-Publish profile successfully before packaging."
+            throw "Publish output is incomplete; missing '$requiredPath'. Run build/Publish-DualBackend.ps1 successfully before packaging."
         }
+    }
+    $sharedHostFxr = Get-ChildItem -LiteralPath (Join-Path $publish 'runtime/host/fxr') -Filter 'hostfxr.dll' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    $sharedCoreClr = Get-ChildItem -LiteralPath (Join-Path $publish 'runtime/shared/Microsoft.NETCore.App') -Filter 'coreclr.dll' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    $sharedWindowsForms = Get-ChildItem -LiteralPath (Join-Path $publish 'runtime/shared/Microsoft.WindowsDesktop.App') -Filter 'System.Windows.Forms.dll' -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $sharedHostFxr -or -not $sharedCoreClr -or -not $sharedWindowsForms) {
+        throw 'Publish output is incomplete; the shared .NET 8 and Windows Desktop runtimes must be present under runtime/. Run build/Publish-DualBackend.ps1.'
     }
     $launcherSize = (Get-Item -LiteralPath (Join-Path $publish 'TSC.exe')).Length
     if ($launcherSize -gt 5MB) { throw "Launcher is too large ($launcherSize bytes). The release package must use the small Native AOT launcher." }

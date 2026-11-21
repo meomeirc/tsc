@@ -20,6 +20,10 @@ public sealed class GameConfig
     // Optional Android Debug Bridge reverse forwarding for the chart editor's Local Test.
     public bool UseAdb { get; set; } = true;
 
+    // Selects the backend that the root launcher starts. This is saved immediately,
+    // but takes effect only after restarting the launcher/game.
+    public string GraphicsApi { get; set; } = "DesktopGL";
+
     // Windowed keeps a normal resizable window, borderless fills the current display
     // without entering fullscreen, and fullscreen requests a hardware display switch.
     public string DisplayMode { get; set; } = "borderless";
@@ -60,6 +64,14 @@ public sealed class GameConfig
             "borderless" => "borderless",
             "fullscreen" => "fullscreen",
             _ => "windowed"
+        };
+
+    public static string NormalizeGraphicsApi(string? value)
+        => value?.Trim().ToLowerInvariant() switch
+        {
+            "windowsdx12" or "dx12" or "direct3d12" or "directx12" => "WindowsDX12",
+            "desktopvk" or "vk" or "vulkan" => "DesktopVK",
+            _ => "DesktopGL"
         };
 }
 
@@ -130,6 +142,20 @@ public sealed class SkinSettingsView
             if (!string.Equals(GameConfig.NormalizeDisplayMode(_config.DisplayMode), normalized, StringComparison.Ordinal))
             {
                 _config.DisplayMode = normalized;
+                _save();
+            }
+        }
+    }
+
+    public string graphics_api
+    {
+        get => GameConfig.NormalizeGraphicsApi(_config.GraphicsApi);
+        set
+        {
+            var normalized = GameConfig.NormalizeGraphicsApi(value);
+            if (!string.Equals(GameConfig.NormalizeGraphicsApi(_config.GraphicsApi), normalized, StringComparison.Ordinal))
+            {
+                _config.GraphicsApi = normalized;
                 _save();
             }
         }
@@ -623,6 +649,7 @@ public static class SkinConfigStore
             config.Gauge = GameConfig.NormalizeGaugeType(config.Gauge);
             config.ScrollMode = GameConfig.NormalizeScrollMode(config.ScrollMode);
             config.DisplayMode = GameConfig.NormalizeDisplayMode(config.DisplayMode);
+            config.GraphicsApi = GameConfig.NormalizeGraphicsApi(config.GraphicsApi);
             config.MaxFrameRate = GameConfig.NormalizeMaxFrameRate(config.MaxFrameRate);
             config.ScrollSpeedScale = float.IsFinite(config.ScrollSpeedScale)
                 ? Math.Clamp(config.ScrollSpeedScale, 0.25f, 9.0f)

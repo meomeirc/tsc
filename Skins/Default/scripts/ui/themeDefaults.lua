@@ -107,6 +107,7 @@ local UI = {
         },
         editor_exit = {},
         song_select_confirm = {},
+        graphics_api_relaunch = {},
     },
 }
 

@@ -2684,6 +2684,14 @@ public sealed class SkinRuntime : IDisposable
     private double _skinEffectDeltaTime;
     private readonly Texture2D _skin3DWhiteTexture;
     private readonly VertexPositionColorTexture[] _skin3DQuadVertices = new VertexPositionColorTexture[6];
+#if TSC_SM6_BACKEND
+    // Both native SM6 targets use the compact VertexPositionTexture input
+    // signature; tint and mask UVs are supplied as per-quad shader constants.
+    private readonly VertexPositionTexture[] _skin3DQuadSm6Vertices = new VertexPositionTexture[6];
+#if TSC_WINDOWS_DX12
+    private static readonly int[] _skin3DQuadDx12Indices = { 0, 1, 2, 3, 4, 5 };
+#endif
+#endif
     // A reusable vertex buffer for consecutive ordinary 3D quads that share
     // texture/blend state. Most background cards and lights can share one GPU
     // submission instead of issuing one DrawUserPrimitives call per quad.
@@ -3854,7 +3862,9 @@ public sealed class SkinRuntime : IDisposable
         string? keybindCategory = "navigation",
         string? keybindEditorSubcategory = "file",
         string? keybindCapturePreview = null,
-        string? settingsTab = "general")
+        string? settingsTab = "general",
+        bool graphicsApiRelaunchConfirmOpen = false,
+        string? graphicsApiRelaunchMessage = null)
     {
         if (_mainMenu is null || _script is null)
             return;
@@ -3880,6 +3890,10 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("keybind_editor_subcategory", DynValue.NewString(keybindEditorSubcategory ?? "file"));
         _mainMenu.Set("keybind_capture_preview", DynValue.NewString(keybindCapturePreview ?? string.Empty));
         _mainMenu.Set("settings_tab", DynValue.NewString(settingsTab is "audio" or "display" ? settingsTab : "general"));
+        _mainMenu.Set("graphics_api_relaunch_confirm_open", DynValue.NewBoolean(graphicsApiRelaunchConfirmOpen));
+        _mainMenu.Set("graphics_api_relaunch_message", string.IsNullOrWhiteSpace(graphicsApiRelaunchMessage)
+            ? DynValue.Nil
+            : DynValue.NewString(graphicsApiRelaunchMessage));
 
         var keybinds = new Table(_script);
         if (keybindRows is not null)
@@ -6537,6 +6551,17 @@ public sealed class SkinRuntime : IDisposable
 
             var ortho = Microsoft.Xna.Framework.Matrix.CreateOrthographicOffCenter(
                 0f, frameWidth, frameHeight, 0f, 0f, 1f);
+#if TSC_SM6_BACKEND
+            var quad = new VertexPositionTexture[6]
+            {
+                new(new Vector3(0f, 0f, 0f), new Vector2(0f, 0f)),
+                new(new Vector3(frameWidth, 0f, 0f), new Vector2(1f, 0f)),
+                new(new Vector3(frameWidth, frameHeight, 0f), new Vector2(1f, 1f)),
+                new(new Vector3(0f, 0f, 0f), new Vector2(0f, 0f)),
+                new(new Vector3(frameWidth, frameHeight, 0f), new Vector2(1f, 1f)),
+                new(new Vector3(0f, frameHeight, 0f), new Vector2(0f, 1f))
+            };
+#else
             var quad = new VertexPositionColorTexture[6]
             {
                 new(new Vector3(0f, 0f, 0f), XnaColor.White, new Vector2(0f, 0f)),
@@ -6546,6 +6571,7 @@ public sealed class SkinRuntime : IDisposable
                 new(new Vector3(frameWidth, frameHeight, 0f), XnaColor.White, new Vector2(1f, 1f)),
                 new(new Vector3(0f, frameHeight, 0f), XnaColor.White, new Vector2(0f, 1f))
             };
+#endif
 
             _skinSparklesEffect.Parameters["WorldViewProjection"]?.SetValue(ortho);
             _skinSparklesEffect.Parameters["GridSize"]?.SetValue(new Vector2(settings.GridX, settings.GridY));
@@ -6675,6 +6701,8 @@ public sealed class SkinRuntime : IDisposable
         var oldDepth = graphics.DepthStencilState;
         var oldRasterizer = graphics.RasterizerState;
         var oldSampler = graphics.SamplerStates[0];
+        var oldSampler1 = graphics.SamplerStates[1];
+        var oldSampler2 = graphics.SamplerStates[2];
 
         try
         {
@@ -6696,10 +6724,26 @@ public sealed class SkinRuntime : IDisposable
             graphics.DepthStencilState = DepthStencilState.None;
             graphics.RasterizerState = RasterizerState.CullNone;
             graphics.SamplerStates[0] = SamplerState.LinearClamp;
+            // The SM6 effect uses separate sampler registers for the two CPU-
+            // generated random lookup textures. Preserve their point sampling
+            // behavior from the legacy sampler_state declarations.
+            graphics.SamplerStates[1] = SamplerState.PointClamp;
+            graphics.SamplerStates[2] = SamplerState.PointClamp;
             graphics.Clear(XnaColor.Transparent);
 
             var ortho = Microsoft.Xna.Framework.Matrix.CreateOrthographicOffCenter(
                 0f, bakeWidth, bakeHeight, 0f, 0f, 1f);
+#if TSC_SM6_BACKEND
+            var quad = new VertexPositionTexture[6]
+            {
+                new(new Vector3(0f, 0f, 0f), new Vector2(0f, 0f)),
+                new(new Vector3(bakeWidth, 0f, 0f), new Vector2(1f, 0f)),
+                new(new Vector3(bakeWidth, bakeHeight, 0f), new Vector2(1f, 1f)),
+                new(new Vector3(0f, 0f, 0f), new Vector2(0f, 0f)),
+                new(new Vector3(bakeWidth, bakeHeight, 0f), new Vector2(1f, 1f)),
+                new(new Vector3(0f, bakeHeight, 0f), new Vector2(0f, 1f))
+            };
+#else
             var quad = new VertexPositionColorTexture[6]
             {
                 new(new Vector3(0f, 0f, 0f), XnaColor.White, new Vector2(0f, 0f)),
@@ -6709,6 +6753,7 @@ public sealed class SkinRuntime : IDisposable
                 new(new Vector3(bakeWidth, bakeHeight, 0f), XnaColor.White, new Vector2(1f, 1f)),
                 new(new Vector3(0f, bakeHeight, 0f), XnaColor.White, new Vector2(0f, 1f))
             };
+#endif
 
             _skinSparklesEffect.Parameters["WorldViewProjection"]?.SetValue(ortho);
             _skinSparklesEffect.Parameters["CrowdResolution"]?.SetValue(new Vector2(bakeWidth, bakeHeight));
@@ -6763,6 +6808,17 @@ public sealed class SkinRuntime : IDisposable
             graphics.Clear(XnaColor.Transparent);
             var flashOrtho = Microsoft.Xna.Framework.Matrix.CreateOrthographicOffCenter(
                 0f, flashSize, flashSize, 0f, 0f, 1f);
+#if TSC_SM6_BACKEND
+            var flashQuad = new VertexPositionTexture[6]
+            {
+                new(new Vector3(0f, 0f, 0f), new Vector2(0f, 0f)),
+                new(new Vector3(flashSize, 0f, 0f), new Vector2(1f, 0f)),
+                new(new Vector3(flashSize, flashSize, 0f), new Vector2(1f, 1f)),
+                new(new Vector3(0f, 0f, 0f), new Vector2(0f, 0f)),
+                new(new Vector3(flashSize, flashSize, 0f), new Vector2(1f, 1f)),
+                new(new Vector3(0f, flashSize, 0f), new Vector2(0f, 1f))
+            };
+#else
             var flashQuad = new VertexPositionColorTexture[6]
             {
                 new(new Vector3(0f, 0f, 0f), XnaColor.White, new Vector2(0f, 0f)),
@@ -6772,6 +6828,7 @@ public sealed class SkinRuntime : IDisposable
                 new(new Vector3(flashSize, flashSize, 0f), XnaColor.White, new Vector2(1f, 1f)),
                 new(new Vector3(0f, flashSize, 0f), XnaColor.White, new Vector2(0f, 1f))
             };
+#endif
             _skinSparklesEffect.Parameters["WorldViewProjection"]?.SetValue(flashOrtho);
             _skinSparklesEffect.Parameters["CrowdResolution"]?.SetValue(new Vector2(bakeWidth, bakeHeight));
             foreach (var pass in _skinSparklesEffect.Techniques["BakedPurpleFlash"].Passes)
@@ -6822,6 +6879,8 @@ public sealed class SkinRuntime : IDisposable
             graphics.DepthStencilState = oldDepth;
             graphics.RasterizerState = oldRasterizer;
             graphics.SamplerStates[0] = oldSampler;
+            graphics.SamplerStates[1] = oldSampler1;
+            graphics.SamplerStates[2] = oldSampler2;
         }
     }
 
@@ -7724,6 +7783,52 @@ public sealed class SkinRuntime : IDisposable
         destination[offset + 8] = color.A / 255f;
     }
 
+    private void DrawSkinQuad3DEffectVertices(
+        GraphicsDevice graphics,
+        VertexPositionColorTexture[] vertices)
+    {
+#if TSC_SM6_BACKEND
+        // Native SM6 effects intentionally consume only POSITION and
+        // TEXCOORD0. Keep this declaration identical to the shader signature
+        // instead of submitting the extra per-vertex COLOR and mask UV fields.
+        for (var i = 0; i < 6; i++)
+        {
+            var vertex = vertices[i];
+            _skin3DQuadSm6Vertices[i] = new VertexPositionTexture(
+                vertex.Position,
+                vertex.TextureCoordinate);
+        }
+
+#if TSC_WINDOWS_DX12
+        // Identity indices preserve the original six-vertex triangle-list order
+        // exactly while submitting the compact SM6 declaration through DX12's
+        // indexed draw path.
+        graphics.DrawUserIndexedPrimitives(
+            PrimitiveType.TriangleList,
+            _skin3DQuadSm6Vertices,
+            0,
+            6,
+            _skin3DQuadDx12Indices,
+            0,
+            2);
+#else
+        // Vulkan uses the same compact SM6 input declaration but retains its
+        // ordinary non-indexed triangle-list submission.
+        graphics.DrawUserPrimitives(
+            PrimitiveType.TriangleList,
+            _skin3DQuadSm6Vertices,
+            0,
+            2);
+#endif
+#else
+        graphics.DrawUserPrimitives(
+            PrimitiveType.TriangleList,
+            vertices,
+            0,
+            2);
+#endif
+    }
+
     private void RenderSkinQuad3D(SkinDrawCommand command, int width, int height)
     {
         if (width <= 0 || height <= 0 || command.Size.X <= 0f || command.Size.Y <= 0f)
@@ -7876,9 +7981,15 @@ public sealed class SkinRuntime : IDisposable
                                 (MathF.Abs(quadWidthValue.Top - quadWidthValue.Bottom) > 0.001f ||
                                  MathF.Abs(quadWidthValue.Left - quadWidthValue.Right) > 0.001f);
 
+            var skinQuad3DEffect = _skinQuad3DEffect;
+            // The custom effect is safe to use on DX12 now that its SM6 pixel
+            // shader input signature matches the vertex shader output signature.
+            // Keep the existing BasicEffect path only when the effect is absent.
+            var useCustomSkinQuadEffect = skinQuad3DEffect is not null;
+
             if ((command.ForceWhiteColor || maskTexture is not null ||
                  (command.ClipRect.HasValue && !irregularQuad)) &&
-                _skinQuad3DEffect is not null)
+                useCustomSkinQuadEffect && skinQuad3DEffect is { } activeSkinQuad3DEffect)
             {
                 // By default the mask covers the drawn quad. An optional mask_uv
                 // rectangle lets a skin lock the mask texture to an external
@@ -7889,6 +8000,18 @@ public sealed class SkinRuntime : IDisposable
                 var maskU1 = maskUv.Z;
                 var maskV1 = maskUv.W;
 
+#if TSC_SM6_BACKEND
+                // Native SM6 effect input layouts are deliberately reduced to
+                // VertexPositionTexture; color and mask UVs are draw constants.
+                var colorVector = new Vector4(
+                    tint.R / 255f,
+                    tint.G / 255f,
+                    tint.B / 255f,
+                    tint.A / 255f);
+                activeSkinQuad3DEffect.Parameters["VertexColor"]?.SetValue(colorVector);
+                activeSkinQuad3DEffect.Parameters["MaskUv"]?.SetValue(maskUv);
+                activeSkinQuad3DEffect.Parameters["TextureUvRect"]?.SetValue(new Vector4(u0, v0, u1, v1));
+#else
                 _skin3DMaskedQuadVertices[0] = new SkinQuad3DMaskedVertex(
                     _skin3DQuadVertices[0].Position, tint, new Vector2(u0, v0), new Vector2(maskU0, maskV0));
                 _skin3DMaskedQuadVertices[1] = new SkinQuad3DMaskedVertex(
@@ -7899,33 +8022,39 @@ public sealed class SkinRuntime : IDisposable
                 _skin3DMaskedQuadVertices[4] = _skin3DMaskedQuadVertices[2];
                 _skin3DMaskedQuadVertices[5] = new SkinQuad3DMaskedVertex(
                     _skin3DQuadVertices[5].Position, tint, new Vector2(u0, v1), new Vector2(maskU0, maskV1));
+#endif
 
-                _skinQuad3DEffect.Parameters["WorldViewProjection"]?.SetValue(worldViewProjection);
-                _skinQuad3DEffect.Parameters["Texture"]?.SetValue(texture);
-                _skinQuad3DEffect.Parameters["MaskTexture"]?.SetValue(maskTexture ?? _skin3DWhiteTexture);
-                _skinQuad3DEffect.Parameters["MaskEnabled"]?.SetValue(maskTexture is not null ? 1f : 0f);
-                _skinQuad3DEffect.Parameters["ForceWhiteColor"]?.SetValue(command.ForceWhiteColor ? 1f : 0f);
-                _skinQuad3DEffect.Parameters["UseBilinearMapping"]?.SetValue(0f);
-                _skinQuad3DEffect.Parameters["ScreenHeight"]?.SetValue((float)graphics.Viewport.Height);
-                _skinQuad3DEffect.Parameters["ViewportSize"]?.SetValue(
+                activeSkinQuad3DEffect.Parameters["WorldViewProjection"]?.SetValue(worldViewProjection);
+                activeSkinQuad3DEffect.Parameters["Texture"]?.SetValue(texture);
+                activeSkinQuad3DEffect.Parameters["MaskTexture"]?.SetValue(maskTexture ?? _skin3DWhiteTexture);
+                activeSkinQuad3DEffect.Parameters["MaskEnabled"]?.SetValue(maskTexture is not null ? 1f : 0f);
+                activeSkinQuad3DEffect.Parameters["ForceWhiteColor"]?.SetValue(command.ForceWhiteColor ? 1f : 0f);
+                activeSkinQuad3DEffect.Parameters["UseBilinearMapping"]?.SetValue(0f);
+                activeSkinQuad3DEffect.Parameters["ScreenHeight"]?.SetValue((float)graphics.Viewport.Height);
+                activeSkinQuad3DEffect.Parameters["ViewportSize"]?.SetValue(
                     new Vector2(graphics.Viewport.Width, graphics.Viewport.Height));
-                _skinQuad3DEffect.Parameters["ViewportOrigin"]?.SetValue(
+                activeSkinQuad3DEffect.Parameters["ViewportOrigin"]?.SetValue(
                     new Vector2(graphics.Viewport.X, graphics.Viewport.Y));
-                SetSkinQuadClip(_skinQuad3DEffect, command.ClipRect);
-                _skinQuad3DEffect.Parameters["DiffuseColor"]?.SetValue(Vector3.One);
-                _skinQuad3DEffect.Parameters["Alpha"]?.SetValue(Math.Clamp(command.Alpha, 0f, 1f));
+                SetSkinQuadClip(activeSkinQuad3DEffect, command.ClipRect);
+                activeSkinQuad3DEffect.Parameters["DiffuseColor"]?.SetValue(Vector3.One);
+                activeSkinQuad3DEffect.Parameters["Alpha"]?.SetValue(Math.Clamp(command.Alpha, 0f, 1f));
 
-                foreach (var pass in _skinQuad3DEffect.CurrentTechnique.Passes)
+                foreach (var pass in activeSkinQuad3DEffect.CurrentTechnique.Passes)
                 {
                     pass.Apply();
+#if TSC_SM6_BACKEND
+                    DrawSkinQuad3DEffectVertices(graphics, _skin3DQuadVertices);
+#else
                     graphics.DrawUserPrimitives(
                         PrimitiveType.TriangleList,
                         _skin3DMaskedQuadVertices,
                         0,
                         2);
+#endif
                 }
             }
-            else if (irregularQuad && _skinQuad3DEffect is not null)
+            else if (irregularQuad && useCustomSkinQuadEffect &&
+                     skinQuad3DEffect is { } bilinearSkinQuad3DEffect)
             {
                 // The light-cone needs a stable texture mapping across the actual
                 // four projected edges of the irregular quad. Do this in the
@@ -7939,7 +8068,7 @@ public sealed class SkinRuntime : IDisposable
                 {
                     RenderSkinQuad3DBilinear(
                         graphics,
-                        _skinQuad3DEffect,
+                        bilinearSkinQuad3DEffect,
                         texture,
                         _skin3DQuadVertices,
                         command.Alpha,
@@ -8018,7 +8147,7 @@ public sealed class SkinRuntime : IDisposable
         return float.IsFinite(screenPosition.X) && float.IsFinite(screenPosition.Y);
     }
 
-    private static void RenderSkinQuad3DBilinear(
+    private void RenderSkinQuad3DBilinear(
         GraphicsDevice graphics,
         Effect effect,
         Texture2D texture,
@@ -8033,6 +8162,17 @@ public sealed class SkinRuntime : IDisposable
     {
         effect.Parameters["WorldViewProjection"]?.SetValue(worldViewProjection);
         effect.Parameters["Texture"]?.SetValue(texture);
+#if TSC_SM6_BACKEND
+        var tint = vertices[0].Color;
+        effect.Parameters["VertexColor"]?.SetValue(new Vector4(
+            tint.R / 255f, tint.G / 255f, tint.B / 255f, tint.A / 255f));
+        effect.Parameters["MaskUv"]?.SetValue(new Vector4(0f, 0f, 1f, 1f));
+        effect.Parameters["TextureUvRect"]?.SetValue(new Vector4(
+            vertices[0].TextureCoordinate.X,
+            vertices[0].TextureCoordinate.Y,
+            vertices[2].TextureCoordinate.X,
+            vertices[2].TextureCoordinate.Y));
+#endif
         effect.Parameters["ScreenTopLeft"]?.SetValue(screenTopLeft);
         effect.Parameters["ScreenTopRight"]?.SetValue(screenTopRight);
         effect.Parameters["ScreenBottomRight"]?.SetValue(screenBottomRight);
@@ -8052,11 +8192,7 @@ public sealed class SkinRuntime : IDisposable
         foreach (var pass in effect.CurrentTechnique.Passes)
         {
             pass.Apply();
-            graphics.DrawUserPrimitives(
-                PrimitiveType.TriangleList,
-                vertices,
-                0,
-                2);
+            DrawSkinQuad3DEffectVertices(graphics, vertices);
         }
     }
 

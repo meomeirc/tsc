@@ -3,8 +3,8 @@ using System.Diagnostics;
 namespace TSC.Updater;
 
 /// <summary>
-/// Starts the update mode of TSC.exe from a temporary copy of its apphost and
-/// runtime files. This keeps the installed executable free to be replaced.
+/// Starts the update mode of the selected backend from a temporary copy of its
+/// apphost, application files, and shared .NET runtime. This leaves the install free to update.
 /// </summary>
 internal static class UpdateRunnerLauncher
 {
@@ -23,7 +23,12 @@ internal static class UpdateRunnerLauncher
             CopyHostFiles(gameDirectory, hostRoot);
             var hostExe = Path.Combine(hostRoot, "TSC.exe");
             if (!File.Exists(hostExe) || !File.Exists(Path.Combine(hostRoot, "TSC.dll")))
-                throw new InvalidOperationException("The installed game does not contain the required self-contained app files. Reinstall it from a complete release ZIP.");
+                throw new InvalidOperationException("The installed game is missing its apphost or application assemblies. Reinstall it from a complete release ZIP.");
+
+            var installedRuntime = Path.Combine(installRoot, "runtime");
+            var temporaryRuntime = Path.Combine(hostRoot, "runtime");
+            if (Directory.Exists(installedRuntime))
+                CopyDirectory(installedRuntime, temporaryRuntime);
 
             var start = new ProcessStartInfo
             {
@@ -31,6 +36,17 @@ internal static class UpdateRunnerLauncher
                 WorkingDirectory = hostRoot,
                 UseShellExecute = false
             };
+            var bundledRuntime = Directory.Exists(Path.Combine(temporaryRuntime, "host", "fxr"))
+                ? temporaryRuntime
+                : installedRuntime;
+            if (Directory.Exists(Path.Combine(bundledRuntime, "host", "fxr")))
+            {
+                // Run the updater on a temporary runtime copy. The installed shared
+                // runtime can then be safely replaced while this updater is running.
+                start.Environment["DOTNET_ROOT"] = bundledRuntime;
+                start.Environment["DOTNET_ROOT_X64"] = bundledRuntime;
+            }
+            start.Environment["TSC_INSTALL_ROOT"] = installRoot;
             start.ArgumentList.Add("--updater");
             start.ArgumentList.Add("--repository"); start.ArgumentList.Add(repository);
             start.ArgumentList.Add("--install-dir"); start.ArgumentList.Add(installRoot);
@@ -48,8 +64,8 @@ internal static class UpdateRunnerLauncher
 
     private static void CopyHostFiles(string gameDirectory, string hostRoot)
     {
-        // The actual self-contained game lives in data/. Copy its apphost, assemblies,
-        // and runtime DLLs to a temporary folder so Windows can replace /data during the update.
+        // Copy the selected backend's apphost, assemblies, and native package payloads
+        // so the installed backend directory can be replaced during the update.
         foreach (var source in Directory.EnumerateFiles(gameDirectory, "*", SearchOption.TopDirectoryOnly))
         {
             var name = Path.GetFileName(source);

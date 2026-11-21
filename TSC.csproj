@@ -1,10 +1,23 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <Configurations>Debug;Release;Publish</Configurations>
-    <MonoGamePlatform>DesktopGL</MonoGamePlatform>
-    <!-- This is the DesktopGL project. Keep MGCB discovery explicit so the Android-only
-         Content.Android.mgcb is not auto-added with the same Content/ target paths. -->
+    <!-- DesktopGL remains the default. DesktopVK and WindowsDX12 use MonoGame's native backend. -->
+    <TSCBackend Condition="'$(TSCBackend)' == ''">DesktopGL</TSCBackend>
+    <MonoGamePlatform>$(TSCBackend)</MonoGamePlatform>
+    <!-- MonoGame's content task composes its restore and MGCB commands from this property.
+         Some SDK/IDE launch paths leave it unset, so default to the dotnet executable on PATH
+         while still allowing callers to override it with -p:DotnetCommand=... . -->
+    <DotnetCommand Condition="'$(DotnetCommand)' == ''">dotnet</DotnetCommand>
+    <DefineConstants Condition="'$(TSCBackend)' == 'WindowsDX12'">$(DefineConstants);TSC_WINDOWS_DX12;TSC_NATIVE_BACKEND;TSC_SM6_BACKEND</DefineConstants>
+    <DefineConstants Condition="'$(TSCBackend)' == 'DesktopVK'">$(DefineConstants);TSC_DESKTOP_VK;TSC_NATIVE_BACKEND;TSC_SM6_BACKEND</DefineConstants>
+    <!-- Keep MGCB discovery explicit so the Android-only Content.Android.mgcb is not
+         auto-added with the same Content/ target paths. -->
     <EnableMGCBItems>false</EnableMGCBItems>
+    <!-- Restore the local MGCB tool from this project's explicit manifest below. The
+         package task's automatic restore hides the underlying Exec error, and its
+         `dotnet mgcb` shorthand is less reliable than `dotnet tool run mgcb`. -->
+    <AutoRestoreMGCBTool>false</AutoRestoreMGCBTool>
+    <_Command Condition="'$(_Command)' == ''">&quot;$(DotnetCommand)&quot; tool run mgcb --</_Command>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
@@ -13,6 +26,24 @@
     <PlatformTarget>x64</PlatformTarget>
     <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
   </PropertyGroup>
+  <Target Name="RestoreTscMgcbLocalTool"
+          BeforeTargets="CollectPackageReferences"
+          Condition="'$(DesignTimeBuild)' != 'true'"
+          Inputs="$(MSBuildProjectFullPath);$(MSBuildProjectDirectory)\.config\dotnet-tools.json"
+          Outputs="$(IntermediateOutputPath)mgcb.tool.restore">
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)\.config\dotnet-tools.json')"
+           Text="The local MGCB tool manifest is missing: $(MSBuildProjectDirectory)\.config\dotnet-tools.json" />
+    <MakeDir Directories="$(IntermediateOutputPath)" Condition="!Exists('$(IntermediateOutputPath)')" />
+    <Exec Command="&quot;$(DotnetCommand)&quot; tool restore --tool-manifest &quot;$(MSBuildProjectDirectory)\.config\dotnet-tools.json&quot;"
+          WorkingDirectory="$(MSBuildProjectDirectory)" />
+    <Touch Files="$(IntermediateOutputPath)mgcb.tool.restore" AlwaysCreate="true" />
+  </Target>
+
+  <Target Name="ValidateTscBackend" BeforeTargets="Prepare;PrepareForBuild">
+    <Error Condition="'$(TSCBackend)' != 'DesktopGL' and '$(TSCBackend)' != 'DesktopVK' and '$(TSCBackend)' != 'WindowsDX12'"
+           Text="Unsupported TSCBackend '$(TSCBackend)'. Supported values are DesktopGL, DesktopVK, and WindowsDX12." />
+  </Target>
+
   <PropertyGroup Condition="'$(Configuration)' == 'Publish'">
     <!-- Publish is a separate feature-reduced build; Debug and Release remain full-featured. -->
     <DefineConstants>$(DefineConstants);TSC_PUBLISH</DefineConstants>
@@ -30,10 +61,22 @@
   <ItemGroup>
     <PackageReference Include="SharpCompress" Version="0.50.4" />
     <PackageReference Include="Moonsharp" Version="2.0.0" />
-    <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.5.1" />
-    <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.5.1" />
+    <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.6.1" />
     <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
     <PackageReference Include="Concentus.Oggfile" Version="1.0.7" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TSCBackend)' == 'DesktopGL'">
+    <PackageReference Include="MonoGame.Framework.DesktopGL" Version="3.8.6.1" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TSCBackend)' == 'DesktopVK'">
+    <PackageReference Include="MonoGame.Framework.Native" Version="3.8.6.1" />
+    <!-- DesktopVK uses the native MonoGame host with the Windows Vulkan runtime. -->
+    <PackageReference Include="MonoGame.Runtime.Windows.Vulkan" Version="3.8.6.1" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TSCBackend)' == 'WindowsDX12'">
+    <PackageReference Include="MonoGame.Framework.Native" Version="3.8.6.1" />
+    <!-- Keep the native DX12 runtime aligned with MonoGame.Framework.Native to avoid native ABI mismatches. -->
+    <PackageReference Include="MonoGame.Runtime.Windows.DX12" Version="3.8.6.1" />
   </ItemGroup>
   <ItemGroup>
     <!-- The updater UI and update engine are part of TSC.exe now. Exclude only stale
@@ -56,8 +99,9 @@
          locally downloaded FFmpeg executable; users can install that one themselves. -->
     <None Update="tools\**\*" CopyToOutputDirectory="Never" CopyToPublishDirectory="Never" />
   </ItemGroup>
-  <!-- Final install layout: the game and its self-contained .NET 8 runtime live in data/;
-       the tiny Native AOT launcher, user files, Default skin, and tools stay at the install root. -->
+  <!-- Final install layout: backend-specific framework-dependent game hosts live in
+       data/DesktopGL, data/DesktopVK, and data/WindowsDX12. One shared .NET 8 runtime,
+       the Native AOT launcher, user files, Default skin, and tools stay at the install root. -->
   <PropertyGroup Condition="'$(Configuration)' == 'Publish'">
     <TSCInstallRoot Condition="'$(TSCInstallRoot)' == ''">$(MSBuildProjectDirectory)\bin\Publish\win-x64\</TSCInstallRoot>
     <TSCLauncherStage>$(MSBuildProjectDirectory)\obj\tsc-launcher-publish</TSCLauncherStage>

@@ -1,4 +1,12 @@
-#if OPENGL
+#if defined(SM6) || defined(VULKAN)
+// Native Direct3D 12 uses SM6; DesktopVK compiles HLSL to SPIR-V with Vulkan semantics.
+#define VS_SHADERMODEL vs_6_0
+#define PS_SHADERMODEL ps_6_0
+// Shader Model 6 requires a system-value render-target semantic. COLOR0 is
+// retained for legacy DirectX and OpenGL effect profiles.
+#define PS_OUTPUT_SEMANTIC SV_Target0
+#elif OPENGL
+#define PS_OUTPUT_SEMANTIC COLOR0
 #if TSC_ANDROID
 // Keep the Android GLES shader profile's SV_POSITION compatibility mapping
 // isolated from DesktopGL, where the native SV_POSITION semantic is required.
@@ -7,12 +15,21 @@
 #define VS_SHADERMODEL vs_3_0
 #define PS_SHADERMODEL ps_3_0
 #else
+#define PS_OUTPUT_SEMANTIC COLOR0
 #define VS_SHADERMODEL vs_4_0_level_9_1
 #define PS_SHADERMODEL ps_4_0_level_9_1
 #endif
 
-float4x4 WorldViewProjection;
+#if defined(SM6) || defined(VULKAN)
+Texture2D Texture : register(t0);
+SamplerState TextureSampler : register(s0);
+#define SAMPLE_TEXTURE(textureName, samplerName, uv) textureName.Sample(samplerName, uv)
+#else
 texture Texture;
+#define SAMPLE_TEXTURE(textureName, samplerName, uv) tex2D(samplerName, uv)
+#endif
+
+float4x4 WorldViewProjection;
 float Time;
 float2 GridSize;
 float Density;
@@ -34,6 +51,7 @@ float TextureIndex;
 float QuadAspect;
 float TextureAspect;
 
+#if !defined(SM6) && !defined(VULKAN)
 sampler TextureSampler = sampler_state
 {
     Texture = <Texture>;
@@ -43,13 +61,25 @@ sampler TextureSampler = sampler_state
     AddressU = Clamp;
     AddressV = Clamp;
 };
+#endif
 
+#if SM6
+// Keep the DX12 input signature identical to VertexPositionTexture. MonoGame
+// 3.8.6.x can crash in the native DX12 draw path when an effect's VSInput
+// layout carries attributes the input assembler does not need.
+struct VSInput
+{
+    float3 Position : POSITION0;
+    float2 TexCoord : TEXCOORD0;
+};
+#else
 struct VSInput
 {
     float4 Position : POSITION0;
     float4 Color    : COLOR0;
     float2 TexCoord : TEXCOORD0;
 };
+#endif
 
 struct VSOutput
 {
@@ -61,8 +91,13 @@ struct VSOutput
 VSOutput MainVS(VSInput input)
 {
     VSOutput output;
+#if SM6
+    output.Position = mul(float4(input.Position, 1.0f), WorldViewProjection);
+    output.Color = float4(1.0f, 1.0f, 1.0f, 1.0f);
+#else
     output.Position = mul(input.Position, WorldViewProjection);
     output.Color = input.Color;
+#endif
     output.TexCoord = input.TexCoord;
     return output;
 }
@@ -104,7 +139,7 @@ float2 HashCell2(float2 cell, float salt)
         HashCell(cell, salt + 71.91f));
 }
 
-float4 MainPS(VSOutput input) : COLOR0
+float4 MainPS(VSOutput input) : PS_OUTPUT_SEMANTIC
 {
     float2 uv = saturate(input.TexCoord);
     float2 baseCell = floor(uv * GridSize);
@@ -280,7 +315,7 @@ float4 MainPS(VSOutput input) : COLOR0
                 rotated.y / max(0.0001f, size * 2.0f)) + 0.5f;
 
             sparkleUv.y = 1.0f - sparkleUv.y;
-            float4 sparkle = tex2D(TextureSampler, sparkleUv);
+            float4 sparkle = SAMPLE_TEXTURE(Texture, TextureSampler, sparkleUv);
             result += sparkle * flash;
         }
     }
@@ -291,7 +326,7 @@ float4 MainPS(VSOutput input) : COLOR0
 }
 
 
-float4 BakeSparklesPS(VSOutput input) : COLOR0
+float4 BakeSparklesPS(VSOutput input) : PS_OUTPUT_SEMANTIC
 {
     float2 uv = saturate(input.TexCoord);
     float2 baseCell = floor(uv * GridSize);
@@ -414,7 +449,7 @@ float4 BakeSparklesPS(VSOutput input) : COLOR0
                 rotated.y / max(0.0001f, size * 2.0f)) + 0.5f;
             sparkleUv.y = 1.0f - sparkleUv.y;
 
-            float4 sparkle = tex2D(TextureSampler, sparkleUv);
+            float4 sparkle = SAMPLE_TEXTURE(Texture, TextureSampler, sparkleUv);
             result += sparkle * flash;
         }
     }
@@ -436,6 +471,12 @@ float2 CrowdResolution;
 float LayerIndex;
 float LayerCount;
 float2 CrowdRandomGridSize;
+#if defined(SM6) || defined(VULKAN)
+Texture2D CrowdRandomTextureA : register(t1);
+Texture2D CrowdRandomTextureB : register(t2);
+SamplerState CrowdRandomSamplerA : register(s1);
+SamplerState CrowdRandomSamplerB : register(s2);
+#else
 texture CrowdRandomTextureA;
 texture CrowdRandomTextureB;
 
@@ -458,13 +499,14 @@ sampler CrowdRandomSamplerB = sampler_state
     AddressU = Clamp;
     AddressV = Clamp;
 };
+#endif
 
 float3 HexColorCrowd(float3 rgb)
 {
     return rgb / 255.0f;
 }
 
-float4 BakeCrowdLayerPS(VSOutput input) : COLOR0
+float4 BakeCrowdLayerPS(VSOutput input) : PS_OUTPUT_SEMANTIC
 {
     const float CELL_SIZE = 40.0f;
     const float DOT_DENSITY = 5.0f;
@@ -506,8 +548,8 @@ float4 BakeCrowdLayerPS(VSOutput input) : COLOR0
             // stable random tuple.
             float2 randomCell = cell + float2(2.0f, 2.0f);
             float2 randomUv = (randomCell + 0.5f) / max(CrowdRandomGridSize, float2(1.0f, 1.0f));
-            float4 randomA = tex2D(CrowdRandomSamplerA, randomUv);
-            float4 randomB = tex2D(CrowdRandomSamplerB, randomUv);
+            float4 randomA = SAMPLE_TEXTURE(CrowdRandomTextureA, CrowdRandomSamplerA, randomUv);
+            float4 randomB = SAMPLE_TEXTURE(CrowdRandomTextureB, CrowdRandomSamplerB, randomUv);
             float r1 = randomA.r;
             float r2 = randomA.g;
             float r3 = randomA.b;
@@ -557,7 +599,7 @@ float4 BakeCrowdLayerPS(VSOutput input) : COLOR0
     return float4(accumulatedRgb, accumulatedAlpha);
 }
 
-float4 BakePurpleFlashPS(VSOutput input) : COLOR0
+float4 BakePurpleFlashPS(VSOutput input) : PS_OUTPUT_SEMANTIC
 {
     const float STAR_SIZE = 20.0f;
     const float STAR_RAY_LENGTH = 2.5f;

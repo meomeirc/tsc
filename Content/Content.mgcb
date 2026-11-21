@@ -3,7 +3,7 @@
 
 /outputDir:bin/$(Platform)/$(Configuration)/Content
 /intermediateDir:obj/$(Platform)/$(Configuration)/Content
-/platform:DesktopGL
+# Platform is supplied by MonoGame.Content.Builder.Task from TSC.csproj (TSCBackend).
 
 #-------------------------------- References --------------------------------#
 

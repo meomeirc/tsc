@@ -611,8 +611,11 @@ function render()
     local display_mode = tostring(settings.display_mode or "borderless"):lower()
     local display_mode_label = display_mode == "borderless" and "BORDERLESS WINDOW"
         or (display_mode == "fullscreen" and "FULLSCREEN" or "WINDOWED")
+    local graphics_api = tostring(settings.graphics_api or "DesktopGL"):lower()
+    local graphics_api_label = graphics_api == "windowsdx12" and "DIRECT3D 12"
+        or ((graphics_api == "desktopvk" or graphics_api == "vulkan" or graphics_api == "vk") and "VULKAN" or "OPENGL")
 
-    local row_count = tab == "general" and 6 or (tab == "display" and 4 or 5)
+    local row_count = tab == "general" and 6 or 5
     local available_panel_height = math.max(1, height - panel_top - (tonumber(style.panel_bottom_padding or 115) or 115))
     row_height = math.min(row_height, math.max(24, (available_panel_height - padding * 2 - row_gap * (row_count - 1)) / row_count))
     local panel_height = math.min(padding * 2 + row_height * row_count + row_gap * (row_count - 1), available_panel_height)
@@ -624,7 +627,7 @@ function render()
         size = tonumber(style.heading_size or UI.sizes.heading) or UI.sizes.heading,
         color = UI.colors.text, font = UI.fonts.bold, anchor = "center", layer = 2,
     })
-    draw.text("Changes are saved automatically", {
+    draw.text("Saved automatically  ·  Relaunch to apply graphics API changes", {
         parent = "settings_viewport", x = width * 0.5,
         y = (tonumber(style.heading_y or 48) or 48) + 35,
         size = UI.sizes.small, color = UI.colors.muted, font = UI.fonts.regular,
@@ -734,6 +737,11 @@ function render()
             label = "DISPLAY MODE", button_width = 360, button_height = math.min(48, row_height - 4),
             button_label = display_mode_label, action = "toggle_display_mode", selected = display_mode ~= "windowed" })
         next_row()
+        draw_plain_row({ parent = "settings_panel", id = "setting_graphics_api_row", control_id = "setting_graphics_api",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "GRAPHICS API", button_width = 360, button_height = math.min(48, row_height - 4),
+            button_label = graphics_api_label, action = "toggle_graphics_api", selected = graphics_api ~= "desktopgl" and graphics_api ~= "opengl" })
+        next_row()
         draw_plain_row({ parent = "settings_panel", id = "setting_skin_row", control_id = "setting_skin_dropdown",
             x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
             label = "SKIN", button_width = 360, button_height = math.min(48, row_height - 4),
@@ -754,5 +762,22 @@ function render()
 
     if menu.skin_dropdown_open and tab == "display" then
         draw_skin_dropdown(width, height, screen.ref_scale or 1)
+    end
+
+    if menu.graphics_api_relaunch_confirm_open then
+        UI.draw_confirmation({
+            id = "graphics_api_relaunch",
+            width = width, height = height,
+            scale = screen.ref_scale or 1,
+            layer = 150,
+            style = "graphics_api_relaunch",
+            title = "RELAUNCH TSC?",
+            message = menu.graphics_api_relaunch_message or "The graphics API changed. Relaunch TSC to apply it?",
+            cancel_label = "NOT NOW",
+            confirm_label = "RELAUNCH",
+            cancel_action = "cancel_graphics_api_relaunch",
+            dismiss_action = "cancel_graphics_api_relaunch",
+            confirm_action = "confirm_graphics_api_relaunch",
+        })
     end
 end
