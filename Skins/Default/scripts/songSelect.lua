@@ -1,6 +1,8 @@
 -- Song Select skin matching the supplied reference layout.
 
 local UI = import("uiStyle")
+local ScreenManager = import("ui/screenManager")
+local screen_manager = ScreenManager.new()
 
 -- This screen has no time-driven visual animation. Let SkinRuntime reuse the
 -- previous resolved command list while its state and pointer remain unchanged.
@@ -576,6 +578,7 @@ end
 function update(dt)
     dt = math.max(0, tonumber(dt or 0) or 0)
     pulse = pulse + dt
+    screen_manager:update(dt)
 end
 
 local function truncate(value, chars)
@@ -1539,7 +1542,7 @@ local function draw_editor_confirmation(viewport_w, viewport_h, scale, screen_w,
     })
 end
 
-function render()
+local function render_song_select()
     local w = screen.width
     local h = screen.height
     local metrics = song_select_layout_metrics(w, h)
@@ -1663,4 +1666,47 @@ function render()
         submit_text("LOADING SONGS...", nil, "song_loading_overlay", loading_x, loading_y,
             px(LAYOUT.loading.text_size, scale), WHITE, FONT_BOLD, "center", 102)
     end
+end
+
+-- The host keeps Song Select as the real C# screen. Skin-owned pages are stacked
+-- inside this Lua renderer, so they can add flows such as a pre-game options page
+-- without taking over chart loading or gameplay transitions.
+screen_manager:register("song_select", {
+    render = render_song_select,
+})
+screen_manager:set_root("song_select")
+
+-- Optional custom-skin extension. A skin can add scripts/screens/songSelect.lua
+-- that returns a function(manager) ... end or { register = function(manager) ... end }.
+-- Missing extensions are normal; broken optional extensions are reported without
+-- making the built-in Song Select page unusable.
+local extension_ok, extension = pcall(import, "screens/songSelect")
+if extension_ok then
+    if type(extension) == "function" then
+        extension(screen_manager)
+    elseif type(extension) == "table" and type(extension.register) == "function" then
+        extension.register(screen_manager)
+    else
+        print("[screen_manager] screens/songSelect.lua must return a function or a table with register(manager)")
+    end
+else
+    local extension_error = tostring(extension)
+    if not string.find(extension_error, "file not found", 1, true) then
+        print("[screen_manager] could not load screens/songSelect.lua: " .. extension_error)
+    end
+end
+
+function render()
+    screen_manager:render()
+end
+
+-- SkinRuntime calls this before native Song Select keyboard/controller actions.
+-- The manager consumes input on custom pages and preserves native behavior at
+-- the Song Select root when no page handles the action.
+function on_song_select_input(action)
+    return screen_manager:input(action)
+end
+
+function on_song_select_action(action, value)
+    return screen_manager:action(action, value)
 end

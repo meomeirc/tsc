@@ -905,8 +905,13 @@ public sealed class SongSelectMenu : IDisposable
 
     private void HandleNormalNavigation(KeyboardState keyboard, KeyboardState previousKeyboard)
     {
+        // A skin can implement custom keyboard/controller navigation for pages
+        // drawn from songSelect.lua. Native behavior remains the fallback whenever
+        // the optional callback is absent or returns false.
         if (KeybindSettings.IsPressed("menu_open_pack"))
         {
+            if (_skinRuntime?.HandleSongSelectInput("open_pack") == true)
+                return;
             _packExpanded = true;
             _sortExpanded = false;
             return;
@@ -914,6 +919,8 @@ public sealed class SongSelectMenu : IDisposable
 
         if (KeybindSettings.IsPressed("menu_open_sort"))
         {
+            if (_skinRuntime?.HandleSongSelectInput("open_sort") == true)
+                return;
             _sortExpanded = true;
             _packExpanded = false;
             return;
@@ -921,6 +928,8 @@ public sealed class SongSelectMenu : IDisposable
 
         if (KeybindSettings.IsPressed("menu_toggle_sort"))
         {
+            if (_skinRuntime?.HandleSongSelectInput("toggle_sort") == true)
+                return;
             _descending = !_descending;
             RefreshVisibleSongs(resetSelection: false);
             SaveLastSelection();
@@ -929,26 +938,48 @@ public sealed class SongSelectMenu : IDisposable
 
         if (KeybindSettings.IsPressed("menu_search"))
         {
+            if (_skinRuntime?.HandleSongSelectInput("search") == true)
+                return;
             OpenSearch();
             return;
         }
 
         if (NavigationPressed("menu_up"))
+        {
+            if (_skinRuntime?.HandleSongSelectInput("up") == true)
+                return;
             MoveSelection(-1, 0);
+        }
         else if (NavigationPressed("menu_down"))
+        {
+            if (_skinRuntime?.HandleSongSelectInput("down") == true)
+                return;
             MoveSelection(1, 0);
+        }
         else if (NavigationPressed("menu_left"))
+        {
+            if (_skinRuntime?.HandleSongSelectInput("left") == true)
+                return;
             MoveSelection(0, -1);
+        }
         else if (NavigationPressed("menu_right"))
+        {
+            if (_skinRuntime?.HandleSongSelectInput("right") == true)
+                return;
             MoveSelection(0, 1);
+        }
 
         if (KeybindSettings.IsPressed("menu_previous_difficulty"))
         {
+            if (_skinRuntime?.HandleSongSelectInput("previous_difficulty") == true)
+                return;
             SelectDifficulty(Math.Max(0, _selectedDifficultyIndex - 1));
             return;
         }
         if (KeybindSettings.IsPressed("menu_next_difficulty"))
         {
+            if (_skinRuntime?.HandleSongSelectInput("next_difficulty") == true)
+                return;
             SelectDifficulty(Math.Min(DifficultyNames.Length - 1, _selectedDifficultyIndex + 1));
             return;
         }
@@ -958,13 +989,19 @@ public sealed class SongSelectMenu : IDisposable
             var key = (XnaKeys)((int)XnaKeys.D1 + i);
             if (Pressed(keyboard, previousKeyboard, key))
             {
+                if (_skinRuntime?.HandleSongSelectInput($"difficulty_{i + 1}") == true)
+                    return;
                 SelectDifficulty(i);
                 return;
             }
         }
 
         if (KeybindSettings.IsPressed("menu_confirm"))
+        {
+            if (_skinRuntime?.HandleSongSelectInput("confirm") == true)
+                return;
             TryPlaySelected();
+        }
     }
 
     private void UpdateNavigationKeyRepeats(KeyboardState keyboard, KeyboardState previousKeyboard, double deltaSeconds)
@@ -1372,6 +1409,12 @@ public sealed class SongSelectMenu : IDisposable
             return true;
         }
 
+        // Native overlays above keep their established Back behavior. Once they
+        // are closed, let the skin consume Back for custom in-screen pages before
+        // Game1 interprets it as leaving Song Select.
+        if (_skinRuntime?.HandleSongSelectInput("back") == true)
+            return true;
+
         return false;
     }
 
@@ -1477,6 +1520,9 @@ public sealed class SongSelectMenu : IDisposable
 
     private void HandleSkinAction(SkinUiAction action)
     {
+        if (_skinRuntime?.HandleSongSelectAction(action) == true)
+            return;
+
         switch (action.Name.Trim().ToLowerInvariant())
         {
             case "cycle_chart_panel":
@@ -1484,6 +1530,12 @@ public sealed class SongSelectMenu : IDisposable
                 break;
 
             case "continue":
+                // Treat a clicked Continue button the same as keyboard/controller Confirm.
+                // This lets a skin open an in-screen page (for example, pre-game options)
+                // before the native chart-start action runs. A custom page can return
+                // false from its own Confirm handler to continue into normal gameplay.
+                if (_skinRuntime?.HandleSongSelectInput("confirm") == true)
+                    break;
                 TryPlaySelected();
                 break;
 

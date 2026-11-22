@@ -13,10 +13,218 @@ using System.Drawing.Text;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Linq;
+using System.Text.Json;
 using TSC.Ares;
 using TSC.Rendering;
 
 namespace TSC;
+
+/// <summary>
+/// Per-skin visual settings for the Default skin. These values are stored in
+/// the selected skin directory, never in gameConfig.json, so switching skins
+/// does not carry one skin's presentation choices into another.
+/// </summary>
+public sealed class SkinDisplaySettingsView
+{
+    private static readonly object SharedInstancesLock = new();
+    private static readonly Dictionary<string, SkinDisplaySettingsView> SharedInstances = new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly Dictionary<string, bool> DefaultValues = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["background_character_panels"] = true,
+        ["background_stage_lights"] = true,
+        ["background_crowds"] = true,
+        ["background_sky"] = true,
+        ["background_window"] = true,
+        ["background_floor"] = true,
+        ["lane_touch_highlight"] = true,
+        ["lane_hit_effects"] = true,
+        ["hud_judgement_counter"] = true,
+        ["hud_score"] = true,
+        ["hud_grade"] = true,
+        ["hud_accuracy"] = true,
+        ["hud_gauge"] = true,
+        ["hud_judgement"] = true,
+        ["hud_combo"] = true,
+        ["hud_early_late"] = true,
+        ["hud_timing"] = true,
+        // This element is off in the current Default skin, so preserve that default.
+        ["hud_hit_delta_bars"] = false,
+        ["events_intro_text"] = true,
+        ["events_rank_up_animation"] = true,
+        ["events_clear_animation"] = true,
+    };
+
+    private static readonly Dictionary<string, double> DefaultNumberValues = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // Dim before reaching A, then ease back to a lighter background dim.
+        ["default_dim"] = 50.0,
+        ["rank_up_dim"] = 10.0,
+    };
+
+    private readonly string _path;
+    private readonly Dictionary<string, bool> _values = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, double> _numberValues = new(StringComparer.OrdinalIgnoreCase);
+    private long _revision;
+
+    public long revision => _revision;
+
+    public bool background_character_panels { get => Get("background_character_panels"); set => Set("background_character_panels", value); }
+    public bool background_stage_lights { get => Get("background_stage_lights"); set => Set("background_stage_lights", value); }
+    public bool background_crowds { get => Get("background_crowds"); set => Set("background_crowds", value); }
+    public bool background_sky { get => Get("background_sky"); set => Set("background_sky", value); }
+    public bool background_window { get => Get("background_window"); set => Set("background_window", value); }
+    public bool background_floor { get => Get("background_floor"); set => Set("background_floor", value); }
+    public bool lane_touch_highlight { get => Get("lane_touch_highlight"); set => Set("lane_touch_highlight", value); }
+    public bool lane_hit_effects { get => Get("lane_hit_effects"); set => Set("lane_hit_effects", value); }
+    public bool hud_judgement_counter { get => Get("hud_judgement_counter"); set => Set("hud_judgement_counter", value); }
+    public bool hud_score { get => Get("hud_score"); set => Set("hud_score", value); }
+    public bool hud_grade { get => Get("hud_grade"); set => Set("hud_grade", value); }
+    public bool hud_accuracy { get => Get("hud_accuracy"); set => Set("hud_accuracy", value); }
+    public bool hud_gauge { get => Get("hud_gauge"); set => Set("hud_gauge", value); }
+    public bool hud_judgement { get => Get("hud_judgement"); set => Set("hud_judgement", value); }
+    public bool hud_combo { get => Get("hud_combo"); set => Set("hud_combo", value); }
+    public bool hud_early_late { get => Get("hud_early_late"); set => Set("hud_early_late", value); }
+    public bool hud_timing { get => Get("hud_timing"); set => Set("hud_timing", value); }
+    public bool hud_hit_delta_bars { get => Get("hud_hit_delta_bars"); set => Set("hud_hit_delta_bars", value); }
+    public bool events_intro_text { get => Get("events_intro_text"); set => Set("events_intro_text", value); }
+    public bool events_rank_up_animation { get => Get("events_rank_up_animation"); set => Set("events_rank_up_animation", value); }
+    public bool events_clear_animation { get => Get("events_clear_animation"); set => Set("events_clear_animation", value); }
+
+    internal static SkinDisplaySettingsView ForSkinDirectory(string skinDirectory)
+    {
+        var fullDirectory = Path.GetFullPath(skinDirectory);
+        lock (SharedInstancesLock)
+        {
+            if (SharedInstances.TryGetValue(fullDirectory, out var existing))
+                return existing;
+            var created = new SkinDisplaySettingsView(fullDirectory);
+            SharedInstances[fullDirectory] = created;
+            return created;
+        }
+    }
+
+    private SkinDisplaySettingsView(string fullSkinDirectory)
+    {
+        _path = Path.Combine(fullSkinDirectory, "skinSettings.json");
+        foreach (var pair in DefaultValues)
+            _values[pair.Key] = pair.Value;
+        foreach (var pair in DefaultNumberValues)
+            _numberValues[pair.Key] = pair.Value;
+        Load();
+    }
+
+    public bool Get(string name)
+        => !string.IsNullOrWhiteSpace(name) && _values.TryGetValue(name.Trim(), out var value)
+            ? value
+            : false;
+
+    public double GetNumber(string name)
+        => !string.IsNullOrWhiteSpace(name) && _numberValues.TryGetValue(name.Trim(), out var value)
+            ? value
+            : 0.0;
+
+    public bool SetNumber(string name, double value)
+    {
+        if (string.IsNullOrWhiteSpace(name) || !double.IsFinite(value)) return false;
+        var key = name.Trim();
+        if (!_numberValues.TryGetValue(key, out var current)) return false;
+        value = Math.Clamp(value, 0.0, 100.0);
+        if (Math.Abs(current - value) < 0.0001) return true;
+        _numberValues[key] = value;
+        _revision++;
+        Save();
+        return true;
+    }
+
+    public bool Toggle(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        var key = name.Trim();
+        if (!_values.TryGetValue(key, out var current)) return false;
+        Set(key, !current);
+        return true;
+    }
+
+    public bool Set(string name, bool value)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        var key = name.Trim();
+        if (!_values.TryGetValue(key, out var current)) return false;
+        if (current == value) return true;
+        _values[key] = value;
+        _revision++;
+        Save();
+        return true;
+    }
+
+    private void Load()
+    {
+        if (!File.Exists(_path)) return;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(_path));
+            if (document.RootElement.ValueKind != JsonValueKind.Object) return;
+            var root = document.RootElement;
+            var hasLegacySky = false;
+            var hasWindowSetting = false;
+            foreach (var property in root.EnumerateObject())
+            {
+                hasLegacySky |= string.Equals(property.Name, "background_sky", StringComparison.OrdinalIgnoreCase);
+                hasWindowSetting |= string.Equals(property.Name, "background_window", StringComparison.OrdinalIgnoreCase);
+                if (DefaultValues.ContainsKey(property.Name) &&
+                    property.Value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                {
+                    _values[property.Name] = property.Value.GetBoolean();
+                }
+                else if (DefaultNumberValues.ContainsKey(property.Name) && property.Value.ValueKind == JsonValueKind.Number &&
+                    property.Value.TryGetDouble(out var number) && double.IsFinite(number))
+                {
+                    _numberValues[property.Name] = Math.Clamp(number, 0.0, 100.0);
+                }
+            }
+
+            // Before WINDOW became independent, SKY controlled both the scrolling
+            // star layers and the stage-window overlay. Preserve that choice for
+            // existing skinSettings.json files while allowing new files to keep
+            // the two options independent.
+            var migratedLegacyWindow = hasLegacySky && !hasWindowSetting;
+            if (migratedLegacyWindow)
+            {
+                _values["background_window"] = _values["background_sky"];
+                Save();
+            }
+            _revision++;
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"SKIN_DISPLAY_SETTINGS_LOAD_FAILED path={_path} error={ex.Message}");
+        }
+    }
+
+    private void Save()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(_path);
+            if (!string.IsNullOrWhiteSpace(directory))
+                Directory.CreateDirectory(directory);
+            var temporaryPath = _path + ".tmp";
+            var combined = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in _values) combined[pair.Key] = pair.Value;
+            foreach (var pair in _numberValues) combined[pair.Key] = pair.Value;
+            File.WriteAllText(temporaryPath, JsonSerializer.Serialize(combined, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            }));
+            File.Move(temporaryPath, _path, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            Program.LogRuntime($"SKIN_DISPLAY_SETTINGS_SAVE_FAILED path={_path} error={ex.Message}");
+        }
+    }
+}
 
 /// <summary>
 /// Read-only gameplay view exposed to skin.lua.
@@ -30,6 +238,7 @@ public sealed class SkinGameView
     private double _tick;
     private bool _editorMode;
     private readonly SkinSettingsView _settings;
+    private readonly SkinDisplaySettingsView _skinDisplay;
 
     private double _songLength;
     private int _lastPlayableTick = -1;
@@ -109,10 +318,13 @@ public sealed class SkinGameView
     /// <summary>Minimum displayed score for each grade, shared with gameplay grading.</summary>
     public SkinGradeThresholdsView grade_thresholds => _gradeThresholds;
     public SkinSettingsView settings => _settings;
+    /// <summary>Per-skin visual enable/disable options, persisted in skinSettings.json.</summary>
+    public SkinDisplaySettingsView skin_display => _skinDisplay;
 
-    internal SkinGameView(GameConfig config, Action saveSettings)
+    internal SkinGameView(GameConfig config, Action saveSettings, SkinDisplaySettingsView skinDisplay)
     {
         _settings = new SkinSettingsView(config, saveSettings);
+        _skinDisplay = skinDisplay;
     }
 
     internal void Update(
@@ -3395,6 +3607,7 @@ public sealed class SkinRuntime : IDisposable
     {
         UserData.RegisterType<SkinGameView>();
         UserData.RegisterType<SkinSettingsView>();
+        UserData.RegisterType<SkinDisplaySettingsView>();
         UserData.RegisterType<SkinGaugeView>();
         UserData.RegisterType<SkinJudgementView>();
         UserData.RegisterType<SkinGradeThresholdsView>();
@@ -3448,8 +3661,8 @@ public sealed class SkinRuntime : IDisposable
     {
         _gameConfig = gameConfig ?? new GameConfig();
         _gameConfigPath = gameConfigPath ?? UserDataPaths.GameConfigPath;
-        _game = new SkinGameView(_gameConfig, SaveGameConfig);
         _skinDirectory = Path.GetFullPath(skinDirectory);
+        _game = new SkinGameView(_gameConfig, SaveGameConfig, SkinDisplaySettingsView.ForSkinDirectory(_skinDirectory));
         var normalizedScriptFileName = Path.GetFileName(scriptFileName);
         // All Lua files, including the gameplay entry point, live under scripts/.
         // SkinScriptPathResolver still accepts older skins that kept scripts at root.
@@ -3864,7 +4077,8 @@ public sealed class SkinRuntime : IDisposable
         string? keybindCapturePreview = null,
         string? settingsTab = "general",
         bool graphicsApiRelaunchConfirmOpen = false,
-        string? graphicsApiRelaunchMessage = null)
+        string? graphicsApiRelaunchMessage = null,
+        double skinSettingsScroll = 0)
     {
         if (_mainMenu is null || _script is null)
             return;
@@ -3889,7 +4103,8 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("keybind_category", DynValue.NewString(string.Equals(keybindCategory, "gameplay", StringComparison.OrdinalIgnoreCase) ? "gameplay" : string.Equals(keybindCategory, "editor", StringComparison.OrdinalIgnoreCase) ? "editor" : "navigation"));
         _mainMenu.Set("keybind_editor_subcategory", DynValue.NewString(keybindEditorSubcategory ?? "file"));
         _mainMenu.Set("keybind_capture_preview", DynValue.NewString(keybindCapturePreview ?? string.Empty));
-        _mainMenu.Set("settings_tab", DynValue.NewString(settingsTab is "audio" or "display" ? settingsTab : "general"));
+        _mainMenu.Set("settings_tab", DynValue.NewString(settingsTab is "audio" or "display" or "skin" ? settingsTab : "general"));
+        _mainMenu.Set("skin_settings_scroll", DynValue.NewNumber(Math.Max(0, skinSettingsScroll)));
         _mainMenu.Set("graphics_api_relaunch_confirm_open", DynValue.NewBoolean(graphicsApiRelaunchConfirmOpen));
         _mainMenu.Set("graphics_api_relaunch_message", string.IsNullOrWhiteSpace(graphicsApiRelaunchMessage)
             ? DynValue.Nil
@@ -3917,6 +4132,17 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("skin_options", DynValue.NewTable(skins));
     }
 
+    /// <summary>Toggles a Default-skin visibility option and persists it in the active skin folder.</summary>
+    public bool ToggleSkinDisplaySetting(string name)
+        => _game.skin_display.Toggle(name);
+
+    /// <summary>Gets a per-skin dim opacity percentage.</summary>
+    public double GetSkinDisplayNumber(string name)
+        => _game.skin_display.GetNumber(name);
+
+    /// <summary>Current score grade from the same state exposed to skin.lua.</summary>
+    public string CurrentGrade => _game.grade;
+
     /// <summary>Updates a setting using the same normalization as Lua skins.</summary>
     public bool SetGameSetting(string name, object? value)
     {
@@ -3925,6 +4151,10 @@ public sealed class SkinRuntime : IDisposable
 
         switch (name.Trim().ToLowerInvariant())
         {
+            case "default_dim" when value is double defaultDim && double.IsFinite(defaultDim):
+                return _game.skin_display.SetNumber("default_dim", defaultDim);
+            case "rank_up_dim" when value is double rankUpDim && double.IsFinite(rankUpDim):
+                return _game.skin_display.SetNumber("rank_up_dim", rankUpDim);
             case "scroll_speed" when value is double scrollSpeed && double.IsFinite(scrollSpeed):
                 _game.settings.scroll_speed = scrollSpeed;
                 return true;
@@ -4861,6 +5091,112 @@ public sealed class SkinRuntime : IDisposable
     // shared by every skin runtime.
     public SkinUiAction? ConsumeSongSelectAction()
         => ConsumeUiAction();
+
+    /// <summary>
+    /// Gives a Song Select skin first refusal on a keyboard/controller action.
+    /// Returning true consumes the action; returning false preserves the native
+    /// Song Select behavior. This lets a skin implement additional pages (such as
+    /// a pre-game screen) without replacing chart selection or gameplay loading.
+    /// </summary>
+    public bool HandleSongSelectInput(string action)
+    {
+        if (_script is null || LastError is not null || string.IsNullOrWhiteSpace(action))
+            return false;
+
+        var callback = _script.Globals.Get("on_song_select_input");
+        if (callback.Type != DataType.Function)
+            return false;
+
+        LastCallback = $"on_song_select_input:{action}";
+        CallbackCount++;
+        try
+        {
+            var result = _script.Call(callback, DynValue.NewString(action));
+            // Song Select may opt into static command caching. An input callback
+            // can change Lua-only page state without changing the native song
+            // selection state, so explicitly invalidate that cached render.
+            _songSelectRenderDirty = true;
+            return result.Type == DataType.Boolean && result.Boolean;
+        }
+        catch (Exception ex)
+        {
+            // Do not let a failed custom page accidentally fall through to the
+            // native Confirm action (which would start the selected chart).
+            HandleScriptRuntimeFailure(ex, LastCallback);
+            return true;
+        }
+    }
+
+    /// <summary>Routes a clicked Song Select UI action to the active skin-defined page.</summary>
+    public bool HandleSongSelectAction(SkinUiAction? action)
+        => InvokeMenuScreenAction("on_song_select_action", action);
+
+    /// <summary>Gives a skin-defined Main Menu page first refusal on navigation input.</summary>
+    public bool HandleMainMenuScreenInput(string action)
+        => InvokeMenuScreenInput("on_main_menu_input", action);
+
+    /// <summary>Routes a clicked Main Menu UI action to the active skin-defined page.</summary>
+    public bool HandleMainMenuScreenAction(SkinUiAction? action)
+        => InvokeMenuScreenAction("on_main_menu_action", action);
+
+    /// <summary>Gives a skin-defined Settings page first refusal on navigation input.</summary>
+    public bool HandleSettingsMenuScreenInput(string action)
+        => InvokeMenuScreenInput("on_settings_menu_input", action);
+
+    /// <summary>Routes a clicked Settings UI action to the active skin-defined page.</summary>
+    public bool HandleSettingsMenuScreenAction(SkinUiAction? action)
+        => InvokeMenuScreenAction("on_settings_menu_action", action);
+
+    private bool InvokeMenuScreenInput(string callbackName, string action)
+    {
+        if (_script is null || LastError is not null || string.IsNullOrWhiteSpace(action))
+            return false;
+
+        var callback = _script.Globals.Get(callbackName);
+        if (callback.Type != DataType.Function)
+            return false;
+
+        LastCallback = $"{callbackName}:{action}";
+        CallbackCount++;
+        try
+        {
+            var result = _script.Call(callback, DynValue.NewString(action));
+            return result.Type == DataType.Boolean && result.Boolean;
+        }
+        catch (Exception ex)
+        {
+            // Fail closed: a broken custom page must not accidentally activate a
+            // built-in menu item beneath it. The normal skin fallback is still used.
+            HandleScriptRuntimeFailure(ex, LastCallback);
+            return true;
+        }
+    }
+
+    private bool InvokeMenuScreenAction(string callbackName, SkinUiAction? action)
+    {
+        if (_script is null || LastError is not null || action is null)
+            return false;
+
+        var callback = _script.Globals.Get(callbackName);
+        if (callback.Type != DataType.Function)
+            return false;
+
+        LastCallback = $"{callbackName}:{action.Name}";
+        CallbackCount++;
+        try
+        {
+            var result = _script.Call(
+                callback,
+                DynValue.NewString(action.Name),
+                CreateUiActionValue(action.Value));
+            return result.Type == DataType.Boolean && result.Boolean;
+        }
+        catch (Exception ex)
+        {
+            HandleScriptRuntimeFailure(ex, LastCallback);
+            return true;
+        }
+    }
 
     private static object? ReadUiActionValue(DynValue value)
     {

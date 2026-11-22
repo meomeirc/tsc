@@ -121,6 +121,8 @@ public sealed class Game1 : Game
     private bool _returnToEditorFromSettings;
     private double _settingsSkinDropdownScroll;
     private readonly SmoothScrollHandler _skinDropdownScrollState = new();
+    private double _settingsSkinScroll;
+    private readonly SmoothScrollHandler _settingsSkinScrollState = new();
     private IReadOnlyList<string> _availableSettingsSkins = Array.Empty<string>();
     private int _fallbackSettingsSelectedIndex;
     private static readonly string[] FallbackSettingsLabels =
@@ -2329,7 +2331,10 @@ public sealed class Game1 : Game
 
             if (mousePressed && _mainMenuRuntime.HandleUiPointerPressed(mouse.Position.X, mouse.Position.Y))
             {
-                HandleMainMenuAction(_mainMenuRuntime.ConsumeUiAction());
+                var action = _mainMenuRuntime.ConsumeUiAction();
+                if (_mainMenuRuntime.HandleMainMenuScreenAction(action))
+                    return;
+                HandleMainMenuAction(action);
                 return;
             }
 
@@ -2340,13 +2345,38 @@ public sealed class Game1 : Game
             }
         }
 
-        // Keep keyboard selection independent of Lua so the menu remains
-        // usable with arrow keys even when the menu layout is being customized.
+        // Skin-owned menu pages get first refusal on keyboard/controller input.
+        // If no page consumes the action, the original native selection behavior runs.
+        if (KeybindSettings.IsPressed("menu_back") || Pressed(keyboard, Keys.Escape))
+        {
+            if (_mainMenuRuntime?.HandleMainMenuScreenInput("back") == true)
+                return;
+        }
+        if (KeybindSettings.IsPressed("menu_up"))
+        {
+            if (_mainMenuRuntime?.HandleMainMenuScreenInput("up") == true)
+                return;
+        }
+        else if (KeybindSettings.IsPressed("menu_left"))
+        {
+            if (_mainMenuRuntime?.HandleMainMenuScreenInput("left") == true)
+                return;
+        }
         if (KeybindSettings.IsPressed("menu_left") || KeybindSettings.IsPressed("menu_up"))
         {
             _mainMenuSelectedIndex = (_mainMenuSelectedIndex + MainMenuItemCount - 1) % MainMenuItemCount;
             _mainMenuRuntime?.UpdateMainMenuState(_errorMessage, _mainMenuSelectedIndex);
             return;
+        }
+        if (KeybindSettings.IsPressed("menu_down"))
+        {
+            if (_mainMenuRuntime?.HandleMainMenuScreenInput("down") == true)
+                return;
+        }
+        else if (KeybindSettings.IsPressed("menu_right"))
+        {
+            if (_mainMenuRuntime?.HandleMainMenuScreenInput("right") == true)
+                return;
         }
         if (KeybindSettings.IsPressed("menu_right") || KeybindSettings.IsPressed("menu_down"))
         {
@@ -2356,6 +2386,8 @@ public sealed class Game1 : Game
         }
         if (KeybindSettings.IsPressed("menu_confirm"))
         {
+            if (_mainMenuRuntime?.HandleMainMenuScreenInput("confirm") == true)
+                return;
             ActivateMainMenuItem(_mainMenuSelectedIndex);
             return;
         }
@@ -2606,6 +2638,7 @@ public sealed class Game1 : Game
             {
                 "settings_keybind_scrollbar" => _keybindScrollState,
                 "settings_skin_dropdown_scrollbar" => _skinDropdownScrollState,
+                "settings_skin_scrollbar" => _settingsSkinScrollState,
                 _ => null
             });
             return _settingsMenuRuntime.IsLoaded;
@@ -2640,6 +2673,9 @@ public sealed class Game1 : Game
         var settingsRowsForScroll = KeybindSettings.GetUiRows(_keybindCategory, _keybindEditorSubcategory);
         var keybindScrollMetrics = GetSettingsKeybindScrollMetrics(settingsRowsForScroll.Count);
         _keybindScrollState.SetMaximum(Math.Max(0.0, keybindScrollMetrics.ContentExtent - keybindScrollMetrics.ViewportExtent));
+        var skinSettingsScrollMetrics = GetSettingsSkinScrollMetrics(GraphicsDevice.Viewport.Height);
+        _settingsSkinScrollState.SetMaximum(Math.Max(0.0,
+            skinSettingsScrollMetrics.ContentExtent - skinSettingsScrollMetrics.ViewportExtent));
 
         var skinRowHeight = 46.0;
         var skinRowGap = 6.0;
@@ -2736,11 +2772,22 @@ public sealed class Game1 : Game
             if (wheelDelta != 0)
                 _skinDropdownScrollState.HandleWheel(wheelDelta, wheelPixelsPerNotch);
         }
+        else if (string.Equals(_settingsTab, "skin", StringComparison.OrdinalIgnoreCase))
+        {
+            if (wheelDelta != 0)
+                _settingsSkinScrollState.HandleWheel(wheelDelta, wheelPixelsPerNotch);
+            if (KeybindSettings.IsPressed("menu_up"))
+                _settingsSkinScrollState.ScrollBy(-skinSettingsScrollMetrics.RowPitch);
+            else if (KeybindSettings.IsPressed("menu_down"))
+                _settingsSkinScrollState.ScrollBy(skinSettingsScrollMetrics.RowPitch);
+        }
 
         _keybindScrollState.Update(gameTime.ElapsedGameTime.TotalSeconds);
         _skinDropdownScrollState.Update(gameTime.ElapsedGameTime.TotalSeconds);
+        _settingsSkinScrollState.Update(gameTime.ElapsedGameTime.TotalSeconds);
         _keybindScroll = _keybindScrollState.Position;
         _settingsSkinDropdownScroll = _skinDropdownScrollState.Position;
+        _settingsSkinScroll = _settingsSkinScrollState.Position;
 
         if (!handlingKeybindCapture && _keybindCaptureAction is null && _settingsEditingKey is not null)
         {
@@ -2782,7 +2829,8 @@ public sealed class Game1 : Game
                 _keybindCapturePreview,
                 _settingsTab,
                 _graphicsApiRelaunchConfirmOpen,
-                GetGraphicsApiRelaunchConfirmationMessage());
+                GetGraphicsApiRelaunchConfirmationMessage(),
+                _settingsSkinScroll);
 
             _settingsMenuRuntime.UpdateScreen(GraphicsDevice.Viewport.Width, GraphicsDevice.Viewport.Height);
             _settingsMenuRuntime.UpdateUiPointer(mouse.Position.X, mouse.Position.Y, mouseDown);
@@ -2813,6 +2861,23 @@ public sealed class Game1 : Game
                 ConfirmGraphicsApiRelaunch();
                 return;
             }
+        }
+
+        if (!handlingKeybindCapture && _keybindCaptureAction is null && !_settingsKeybindsOpen &&
+            _settingsEditingKey is null && !_graphicsApiRelaunchConfirmOpen)
+        {
+            if (KeybindSettings.IsPressed("menu_back") || Pressed(keyboard, Keys.Escape))
+            {
+                if (_settingsMenuRuntime.HandleSettingsMenuScreenInput("back"))
+                    return;
+                ReturnToMainMenuFromSettings();
+                return;
+            }
+            if (KeybindSettings.IsPressed("menu_up") && _settingsMenuRuntime.HandleSettingsMenuScreenInput("up")) return;
+            if (KeybindSettings.IsPressed("menu_down") && _settingsMenuRuntime.HandleSettingsMenuScreenInput("down")) return;
+            if (KeybindSettings.IsPressed("menu_left") && _settingsMenuRuntime.HandleSettingsMenuScreenInput("left")) return;
+            if (KeybindSettings.IsPressed("menu_right") && _settingsMenuRuntime.HandleSettingsMenuScreenInput("right")) return;
+            if (KeybindSettings.IsPressed("menu_confirm") && _settingsMenuRuntime.HandleSettingsMenuScreenInput("confirm")) return;
         }
 
         if (mousePressed)
@@ -3130,6 +3195,30 @@ public sealed class Game1 : Game
         return (contentExtent, viewportExtent, rowPitch);
     }
 
+    private static (double ContentExtent, double ViewportExtent, double RowPitch) GetSettingsSkinScrollMetrics(int viewportHeight)
+    {
+        // Keep this geometry in sync with settingsMenu.lua's SKIN panel. The
+        // left column contains 17 rows: BACKGROUND, LANE, EVENTS and DIMMER.
+        // The same scroll offset moves both columns.
+        const double panelTop = 176.0;
+        const double panelBottomPadding = 115.0;
+        const double panelPadding = 24.0;
+        const double rowGap = 7.0;
+        const double baseRowHeight = 66.0;
+        const double sizingRowCount = 10.0;
+        const double contentRowCount = 17.0;
+
+        var availablePanelHeight = Math.Max(1.0, viewportHeight - panelTop - panelBottomPadding);
+        var rowHeight = Math.Min(baseRowHeight, Math.Max(24.0,
+            (availablePanelHeight - panelPadding * 2.0 - rowGap * (sizingRowCount - 1.0)) / sizingRowCount));
+        var panelHeight = Math.Min(panelPadding * 2.0 + rowHeight * contentRowCount + rowGap * (contentRowCount - 1.0),
+            availablePanelHeight);
+        var viewportExtent = Math.Max(1.0, panelHeight - panelPadding * 2.0);
+        var rowPitch = rowHeight + rowGap;
+        var contentExtent = 17.0 * rowPitch - rowGap;
+        return (contentExtent, viewportExtent, rowPitch);
+    }
+
     private void ResetKeybindCapture()
     {
         _keybindCaptureAction = null;
@@ -3263,6 +3352,9 @@ public sealed class Game1 : Game
             return;
         }
 
+        if (_settingsMenuRuntime.HandleSettingsMenuScreenAction(action))
+            return;
+
         CommitSettingsValueEdit();
         _settingsMouseSelecting = false;
 
@@ -3273,10 +3365,12 @@ public sealed class Game1 : Game
         }
 
         if (name == "set_settings_tab" && action.Value is string settingsTab &&
-            settingsTab is "general" or "audio" or "display")
+            settingsTab is "general" or "audio" or "display" or "skin")
         {
             _settingsTab = settingsTab;
             _settingsSkinDropdownOpen = false;
+            _settingsSkinScrollState.Reset();
+            _settingsSkinScroll = 0;
             return;
         }
 
@@ -3343,6 +3437,12 @@ public sealed class Game1 : Game
                 _keybindCaptureAction = parts[0];
                 _keybindCaptureSlot = string.Equals(parts[1], "secondary", StringComparison.OrdinalIgnoreCase) ? "secondary" : "primary";
             }
+            return;
+        }
+
+        if (name == "toggle_skin_display" && action.Value is string skinDisplaySetting)
+        {
+            _settingsMenuRuntime.ToggleSkinDisplaySetting(skinDisplaySetting);
             return;
         }
 
@@ -3728,6 +3828,8 @@ public sealed class Game1 : Game
         _settingsSkinDropdownOpen = false;
         _skinDropdownScrollState.Reset();
         _settingsSkinDropdownScroll = 0;
+        _settingsSkinScrollState.Reset();
+        _settingsSkinScroll = 0;
         _settingsMenuRuntime?.Dispose();
         _settingsMenuRuntime = null;
         _mainMenuRuntime?.Dispose();

@@ -1,4 +1,4 @@
-using TSC;
+﻿using TSC;
 using TSC.Ares;
 using TSC.Input;
 using Microsoft.Xna.Framework;
@@ -217,7 +217,10 @@ public sealed partial class Playfield
             for (var commandIndex = 0; commandIndex < _skinDrawCommands.Count; commandIndex++)
             {
                 var command = _skinDrawCommands[commandIndex];
-                if (command.Layer < 0 && !command.IsHitEffect &&
+                var isBetweenDimAndLane =
+                    command.Layer >= SkinUiLayerAfterDimBeforeLaneMin &&
+                    command.Layer <= SkinUiLayerAfterDimBeforeLaneMax;
+                if (command.Layer < 0 && !isBetweenDimAndLane && !command.IsHitEffect &&
                     (command.Kind == SkinDrawCommandKind.Sprite || command.Kind == SkinDrawCommandKind.Sparkles))
                     backgroundCommandCount++;
             }
@@ -226,17 +229,31 @@ public sealed partial class Playfield
         _debugAllocSkinDrawBytes += GC.GetAllocatedBytesForCurrentThread() - allocStart;
 #endif
 
-        // The editor owns its background dimmer: dim background/skin layers by
-        // 50% in top-down 2D, but keep the lanes and notes at full brightness.
-        // 3D view (including preview mode) deliberately leaves the background undimmed.
-        if (_chartEditorMode && !_editorPreviewMode && _topDownViewEnabled && !_editorPanelsViewEnabled)
+        // The editor owns its dimmer. Apply it after skin/background layers,
+        // then draw the reserved between-dimmer-and-lane skin layer. This keeps
+        // rank-up effects visible without letting them cover notes or lanes.
+        // 2D always uses DEFAULT DIM; panels always use RANK UP DIM; 3D switches
+        // at grade A (and above) and follows the current grade when it changes.
+        if (_chartEditorMode)
         {
-            _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.NonPremultiplied);
-            _spriteBatch.Draw(_pixel, new Rectangle(0, 0, virtualWidth, virtualHeight), new Color(0, 0, 0, 128));
-            _spriteBatch.End();
+            var rankUpGrade = _skinRuntime.CurrentGrade is "A" or "S" or "S+" or "SP";
+            var useRankUpDim = _editorPanelsViewEnabled || (!_topDownViewEnabled && rankUpGrade);
+            var dimPercent = _skinRuntime.GetSkinDisplayNumber(useRankUpDim ? "rank_up_dim" : "default_dim");
+            var dimAlpha = (byte)Math.Clamp((int)Math.Round(dimPercent * 2.55), 0, 255);
+            if (dimAlpha > 0)
+            {
+                _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.NonPremultiplied);
+                _spriteBatch.Draw(_pixel, new Rectangle(0, 0, virtualWidth, virtualHeight), new Color((byte)0, (byte)0, (byte)0, dimAlpha));
+                _spriteBatch.End();
+            }
         }
 
 #if DEBUG
+        var rankUpSkinDrawStartTimestamp = Stopwatch.GetTimestamp();
+#endif
+        DrawSkinScriptUiLayers(_skinDrawCommands, false, _skinRuntime, betweenDimAndLane: true);
+#if DEBUG
+        _debugSkinDrawMs += ElapsedMilliseconds(rankUpSkinDrawStartTimestamp);
         var laneDrawCallsStart = _debugTexturedDrawCalls;
         var laneVerticesStart = _debugTexturedVertices;
 #endif
@@ -774,6 +791,7 @@ public sealed partial class Playfield
                     _chartEditorMode && _topDownViewEnabled ? "editor" : "gameplay");
                 warmed = commands.Count > 0;
                 DrawSkinScriptUiLayers(commands, true, _skinRuntime);
+                DrawSkinScriptUiLayers(commands, false, _skinRuntime, betweenDimAndLane: true);
                 DrawSkinScriptUiLayers(commands, false, _skinRuntime);
             }
             finally

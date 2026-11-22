@@ -1,6 +1,8 @@
 -- Main menu presentation and mouse hitboxes are fully Lua-customizable.
 
 local UI = import("uiStyle")
+local ScreenManager = import("ui/screenManager")
+local screen_manager = ScreenManager.new()
 -- The logo is supplied by the selected skin; do not load a loose project-root logo.
 local LOGO = assets.load("logo.png", true)
 
@@ -8,10 +10,10 @@ function init()
 end
 
 function update(dt)
-    _ = dt
+    screen_manager:update(dt)
 end
 
-function render()
+local function render_main_menu()
     local width = screen.width or 1920
     local height = screen.height or 1080
     local style = UI.main_menu or {}
@@ -122,4 +124,46 @@ function render()
             layer = 4,
         })
     end
+end
+
+-- The C# host remains the real Main Menu screen. The page stack lets skins
+-- insert their own sub-pages without replacing TSC startup/navigation logic.
+screen_manager:register("main_menu", {
+    render = render_main_menu,
+})
+screen_manager:set_root("main_menu")
+
+-- Optional skin extension: scripts/screens/mainMenu.lua. Missing files are normal.
+local extension_ok, extension = pcall(import, "screens/mainMenu")
+local extension_registered = false
+if extension_ok then
+    if type(extension) == "function" then
+        extension(screen_manager)
+        extension_registered = true
+    elseif type(extension) == "table" and type(extension.register) == "function" then
+        extension.register(screen_manager)
+        extension_registered = true
+    else
+        print("[screen_manager] screens/mainMenu.lua must return a function or a table with register(manager)")
+    end
+    if extension_registered then
+        print("[screen_manager] loaded screens/mainMenu.lua")
+    end
+else
+    local extension_error = tostring(extension)
+    if not string.find(extension_error, "file not found", 1, true) then
+        print("[screen_manager] could not load screens/mainMenu.lua: " .. extension_error)
+    end
+end
+
+function render()
+    screen_manager:render()
+end
+
+function on_main_menu_input(action)
+    return screen_manager:input(action)
+end
+
+function on_main_menu_action(action, value)
+    return screen_manager:action(action, value)
 end

@@ -2,12 +2,14 @@
 
 local UI = import("uiStyle")
 local Scroll = import("uiScroll")
+local ScreenManager = import("ui/screenManager")
+local screen_manager = ScreenManager.new()
 
 function init()
 end
 
 function update(dt)
-    _ = dt
+    screen_manager:update(dt)
 end
 
 local function clamp(value, minimum, maximum)
@@ -28,11 +30,11 @@ local function draw_slider_row(options)
     local row_width = options.width
     local row_height = options.height
     local style = UI.settings_menu or {}
-    local padding = tonumber(style.panel_padding or 24) or 24
-    local label_width = tonumber(style.label_width or 355) or 355
-    local right_padding = tonumber(style.slider_right_padding or 28) or 28
+    local padding = tonumber(options.padding or style.panel_padding or 24) or 24
+    local label_width = tonumber(options.label_width or style.label_width or 355) or 355
+    local right_padding = tonumber(options.slider_right_padding or style.slider_right_padding or 28) or 28
     local slider_height = tonumber(style.slider_height or 26) or 26
-    local value_width = tonumber(style.value_width or 160) or 160
+    local value_width = tonumber(options.value_width or style.value_width or 160) or 160
     local slider_x = padding + label_width + 18
     local value_x = row_width - padding - value_width
     local slider_width = math.max(80, value_x - slider_x - right_padding)
@@ -207,6 +209,44 @@ local function draw_plain_row(options)
         selected = options.selected == true,
         variant = options.variant or "secondary",
         layer = 13,
+    })
+end
+
+local function draw_skin_toggle(options)
+    UI.draw_panel({
+        id = options.id, parent = options.parent,
+        x = options.x, y = options.y, width = options.width, height = options.height,
+        color = UI.colors.panel, alpha = 0.92, clip = options.clip, layer = 10,
+    })
+    draw.text(options.label, {
+        parent = options.id, x = options.padding, y = options.height * 0.5,
+        size = UI.sizes.small, color = UI.colors.text, font = UI.fonts.medium,
+        anchor = "left", clip = options.clip, layer = 12,
+    })
+    UI.draw_button({
+        id = options.id .. "_toggle", parent = options.id,
+        x = options.width - options.padding - options.button_width,
+        y = (options.height - options.button_height) * 0.5,
+        width = options.button_width, height = options.button_height,
+        label = options.enabled and "ON" or "OFF",
+        text_size = UI.sizes.small, font = UI.fonts.bold,
+        action = "toggle_skin_display", value = options.setting,
+        selected = options.enabled,
+        variant = options.enabled and "primary" or "secondary",
+        clip = options.clip, layer = 13,
+    })
+end
+
+local function draw_skin_section_header(options)
+    draw.text(options.label, {
+        parent = options.parent, x = options.x, y = options.y + options.height * 0.5,
+        size = UI.sizes.small, color = UI.colors.accent, font = UI.fonts.bold,
+        anchor = "left", clip = options.clip, layer = 12,
+    })
+    draw.rect({
+        parent = options.parent, x = options.x, y = options.y + options.height - 4,
+        width = options.width, height = 1, color = UI.colors.accent_dim,
+        clip = options.clip, layer = 11,
     })
 end
 
@@ -577,7 +617,7 @@ local function draw_keybinds_page(width, height)
     end
 end
 
-function render()
+local function render_settings_menu()
     local width = screen.width or 1920
     local height = screen.height or 1080
     if menu.keybinds_open then
@@ -594,7 +634,7 @@ function render()
     local row_height = tonumber(style.row_height or 66) or 66
     local row_gap = tonumber(style.row_gap or 7) or 7
     local tab = tostring(menu.settings_tab or "general")
-    if tab ~= "audio" and tab ~= "display" then tab = "general" end
+    if tab ~= "audio" and tab ~= "display" and tab ~= "skin" then tab = "general" end
 
     local settings = game.settings
     local speed = tonumber(settings.scroll_speed or 1.0) or 1.0
@@ -615,10 +655,14 @@ function render()
     local graphics_api_label = graphics_api == "windowsdx12" and "DIRECT3D 12"
         or ((graphics_api == "desktopvk" or graphics_api == "vulkan" or graphics_api == "vk") and "VULKAN" or "OPENGL")
 
-    local row_count = tab == "general" and 6 or 5
+    local row_count = tab == "general" and 6 or (tab == "skin" and 10 or 5)
     local available_panel_height = math.max(1, height - panel_top - (tonumber(style.panel_bottom_padding or 115) or 115))
     row_height = math.min(row_height, math.max(24, (available_panel_height - padding * 2 - row_gap * (row_count - 1)) / row_count))
-    local panel_height = math.min(padding * 2 + row_height * row_count + row_gap * (row_count - 1), available_panel_height)
+    -- Keep the SKIN controls at a comfortable row size and let the panel grow
+    -- to fit them when the display is tall enough. Shorter displays use the
+    -- same panel viewport with scrolling instead of shrinking every toggle.
+    local panel_row_count = tab == "skin" and 14 or row_count
+    local panel_height = math.min(padding * 2 + row_height * panel_row_count + row_gap * (panel_row_count - 1), available_panel_height)
 
     UI.layout_box({ id = "settings_viewport", width = width, height = height })
     draw.text("SETTINGS", {
@@ -638,10 +682,11 @@ function render()
         { id = "general", label = "GENERAL" },
         { id = "audio", label = "AUDIO" },
         { id = "display", label = "DISPLAY" },
+        { id = "skin", label = "SKIN" },
     }
     local tab_gap = 10
-    local tab_width = math.min(220, (panel_width - tab_gap * 2) / 3)
-    local tabs_width = tab_width * 3 + tab_gap * 2
+    local tab_width = math.min(220, (panel_width - tab_gap * (#tabs - 1)) / #tabs)
+    local tabs_width = tab_width * #tabs + tab_gap * (#tabs - 1)
     local tabs_x = (width - tabs_width) * 0.5
     for index, item in ipairs(tabs) do
         UI.draw_button({
@@ -721,6 +766,105 @@ function render()
             setting_key = "metronome_volume", x = row_x, y = row_y, width = row_width, height = row_height,
             label = "METRONOME VOLUME", current = metronome_volume, minimum = 0, maximum = 1, step = 0,
             action = "set_metronome_volume", value_label = value_text("%.0f%%", metronome_volume * 100, "100%") })
+    elseif tab == "skin" then
+        local skin_display = game.skin_display
+        local column_gap = 14
+        local scrollbar_width = 9
+        local scrollbar_reserved = scrollbar_width + 8
+        local content_width = math.max(1, row_width - scrollbar_reserved)
+        local column_width = math.max(1, (content_width - column_gap) * 0.5)
+        local right_x = row_x + column_width + column_gap
+        local skin_padding = 12
+        local toggle_button_width = 76
+        local toggle_button_height = math.max(24, math.min(36, row_height - 6))
+        local viewport_height = math.max(1, panel_height - padding * 2)
+        local row_pitch = row_height + row_gap
+        -- Both columns share one scroll position so the page moves as a
+        -- single surface rather than splitting into two lists.
+        local content_extent = 16 * row_pitch - row_gap
+        local max_scroll = math.max(0, content_extent - viewport_height)
+        local scroll_position = clamp(tonumber(menu.skin_settings_scroll or 0) or 0, 0, max_scroll)
+        local clip = {
+            left = panel_x + padding,
+            top = panel_top + padding,
+            right = panel_x + padding + content_width,
+            bottom = panel_top + panel_height - padding,
+        }
+        local left_y, right_y = row_y - scroll_position, row_y - scroll_position
+
+        local function section(x, y, width, label)
+            draw_skin_section_header({ parent = "settings_panel", x = x, y = y, width = width,
+                height = row_height, label = label, clip = clip })
+            return y + row_height + row_gap
+        end
+        local function toggle(x, y, width, label, setting, enabled)
+            draw_skin_toggle({
+                parent = "settings_panel", id = "skin_toggle_" .. setting,
+                x = x, y = y, width = width, height = row_height,
+                padding = skin_padding, label = label, setting = setting, enabled = enabled == true,
+                button_width = toggle_button_width, button_height = toggle_button_height, clip = clip,
+            })
+            return y + row_height + row_gap
+        end
+
+        left_y = section(row_x, left_y, column_width, "BACKGROUND")
+        left_y = toggle(row_x, left_y, column_width, "CHARACTER PANELS", "background_character_panels", skin_display.background_character_panels)
+        left_y = toggle(row_x, left_y, column_width, "STAGE LIGHTS", "background_stage_lights", skin_display.background_stage_lights)
+        left_y = toggle(row_x, left_y, column_width, "CROWDS", "background_crowds", skin_display.background_crowds)
+        left_y = toggle(row_x, left_y, column_width, "SKY", "background_sky", skin_display.background_sky)
+        -- Use the string-keyed accessor for WINDOW so the new option does not depend on a direct CLR property binding.
+        left_y = toggle(row_x, left_y, column_width, "WINDOW", "background_window", skin_display:Get("background_window"))
+        left_y = toggle(row_x, left_y, column_width, "FLOOR", "background_floor", skin_display.background_floor)
+        local default_dim = skin_display:GetNumber("default_dim")
+        draw_slider_row({ parent = "settings_panel", id = "skin_default_dim_row", control_id = "skin_default_dim",
+            setting_key = "default_dim", x = row_x, y = left_y, width = column_width, height = row_height,
+            label = "DEFAULT DIM", current = default_dim, minimum = 0, maximum = 100, step = 1,
+            padding = skin_padding, label_width = 140, value_width = 64, slider_right_padding = 10,
+            action = "set_default_dim", value_label = value_text("%.0f%%", default_dim, "50%") })
+        left_y = left_y + row_height + row_gap
+        local rank_up_dim = skin_display:GetNumber("rank_up_dim")
+        draw_slider_row({ parent = "settings_panel", id = "skin_rank_up_dim_row", control_id = "skin_rank_up_dim",
+            setting_key = "rank_up_dim", x = row_x, y = left_y, width = column_width, height = row_height,
+            label = "RANK UP DIM", current = rank_up_dim, minimum = 0, maximum = 100, step = 1,
+            padding = skin_padding, label_width = 140, value_width = 64, slider_right_padding = 10,
+            action = "set_rank_up_dim", value_label = value_text("%.0f%%", rank_up_dim, "10%") })
+        left_y = left_y + row_height + row_gap
+        left_y = section(row_x, left_y, column_width, "LANE")
+        left_y = toggle(row_x, left_y, column_width, "TOUCH HIGHLIGHT", "lane_touch_highlight", skin_display.lane_touch_highlight)
+        left_y = toggle(row_x, left_y, column_width, "HIT EFFECTS", "lane_hit_effects", skin_display.lane_hit_effects)
+        left_y = section(row_x, left_y, column_width, "EVENTS")
+        left_y = toggle(row_x, left_y, column_width, "INTRO TEXT", "events_intro_text", skin_display.events_intro_text)
+        left_y = toggle(row_x, left_y, column_width, "RANK UP ANIMATION", "events_rank_up_animation", skin_display.events_rank_up_animation)
+        left_y = toggle(row_x, left_y, column_width, "CLEAR ANIMATION", "events_clear_animation", skin_display.events_clear_animation)
+        right_y = section(right_x, right_y, column_width, "HUD")
+        local hud_items = {
+            { "JUDGEMENT COUNTER", "hud_judgement_counter", skin_display.hud_judgement_counter },
+            { "SCORE", "hud_score", skin_display.hud_score },
+            { "GRADE", "hud_grade", skin_display.hud_grade },
+            { "ACCURACY", "hud_accuracy", skin_display.hud_accuracy },
+            { "GAUGE", "hud_gauge", skin_display.hud_gauge },
+            { "JUDGEMENT", "hud_judgement", skin_display.hud_judgement },
+            { "COMBO", "hud_combo", skin_display.hud_combo },
+            { "EARLY/LATE", "hud_early_late", skin_display.hud_early_late },
+            { "TIMING", "hud_timing", skin_display.hud_timing },
+            { "HIT DELTA BARS", "hud_hit_delta_bars", skin_display.hud_hit_delta_bars },
+        }
+        for index = 1, #hud_items do
+            local item = hud_items[index]
+            right_y = toggle(right_x, right_y, column_width, item[1], item[2], item[3])
+        end
+
+        if max_scroll > 0 then
+            Scroll.draw_bar({
+                id = "settings_skin_scrollbar", parent = "settings_panel",
+                x = panel_width - padding - scrollbar_width, y = padding,
+                width = scrollbar_width, height = viewport_height,
+                position = scroll_position, maximum = max_scroll,
+                content_extent = content_extent, visible_extent = viewport_height,
+                minimum_thumb = 28, track_color = UI.colors.panel,
+                thumb_color = UI.colors.accent, layer = 16,
+            })
+        end
     else
         draw_slider_row({ parent = "settings_panel", id = "setting_max_frame_rate_row", control_id = "setting_max_frame_rate",
             setting_key = "max_frame_rate", x = row_x, y = row_y, width = row_width, height = row_height,
@@ -780,4 +924,46 @@ function render()
             confirm_action = "confirm_graphics_api_relaunch",
         })
     end
+end
+
+-- The C# host still owns Settings and its native setting actions. The Lua page
+-- stack adds skin-defined sub-pages and alternate settings layouts.
+screen_manager:register("settings_menu", {
+    render = render_settings_menu,
+})
+screen_manager:set_root("settings_menu")
+
+-- Optional skin extension: scripts/screens/settingsMenu.lua.
+local extension_ok, extension = pcall(import, "screens/settingsMenu")
+local extension_registered = false
+if extension_ok then
+    if type(extension) == "function" then
+        extension(screen_manager)
+        extension_registered = true
+    elseif type(extension) == "table" and type(extension.register) == "function" then
+        extension.register(screen_manager)
+        extension_registered = true
+    else
+        print("[screen_manager] screens/settingsMenu.lua must return a function or a table with register(manager)")
+    end
+    if extension_registered then
+        print("[screen_manager] loaded screens/settingsMenu.lua")
+    end
+else
+    local extension_error = tostring(extension)
+    if not string.find(extension_error, "file not found", 1, true) then
+        print("[screen_manager] could not load screens/settingsMenu.lua: " .. extension_error)
+    end
+end
+
+function render()
+    screen_manager:render()
+end
+
+function on_settings_menu_input(action)
+    return screen_manager:input(action)
+end
+
+function on_settings_menu_action(action, value)
+    return screen_manager:action(action, value)
 end

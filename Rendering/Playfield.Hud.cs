@@ -3473,11 +3473,18 @@ public sealed partial class Playfield
         }
     }
 
+    // Reserved Lua layer band for skin elements drawn after the editor/gameplay
+    // dimmer but before playfield lanes and notes. The Default skin uses this for
+    // the rank-up animation so it is not dimmed and never covers the lane.
+    private const int SkinUiLayerAfterDimBeforeLaneMin = -89;
+    private const int SkinUiLayerAfterDimBeforeLaneMax = -85;
+
     private void DrawSkinScriptUiLayers(
         IReadOnlyList<SkinDrawCommand> allCommands,
         bool belowLane,
         SkinRuntime runtime,
-        bool hitEffectsOnly = false)
+        bool hitEffectsOnly = false,
+        bool betweenDimAndLane = false)
     {
         // BuildDrawCommands() has already sorted these by Lua layer/order. Keep that
         // exact ordering across both 2D SpriteBatch commands and real 3D quads.
@@ -3493,7 +3500,20 @@ public sealed partial class Playfield
             var command = allCommands[i];
             if (command.IsHitEffect != hitEffectsOnly)
                 continue;
-            if (hitEffectsOnly || (belowLane ? command.Layer < 0 : command.Layer >= 0))
+            if (hitEffectsOnly)
+            {
+                commands.Add(command);
+                continue;
+            }
+
+            var betweenDimAndLaneLayer =
+                command.Layer >= SkinUiLayerAfterDimBeforeLaneMin &&
+                command.Layer <= SkinUiLayerAfterDimBeforeLaneMax;
+            if (betweenDimAndLane
+                    ? betweenDimAndLaneLayer
+                    : belowLane
+                        ? command.Layer < 0 && !betweenDimAndLaneLayer
+                        : command.Layer >= 0)
                 commands.Add(command);
         }
 
