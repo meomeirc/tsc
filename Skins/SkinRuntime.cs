@@ -20,55 +20,78 @@ using TSC.Rendering;
 namespace TSC;
 
 /// <summary>
-/// Per-skin visual settings for the Default skin. These values are stored in
-/// the selected skin directory, never in gameConfig.json, so switching skins
+/// Generic settings declared by each skin in scripts/settings.lua. Values are
+/// stored in that skin's directory, never in gameConfig.json, so switching skins
 /// does not carry one skin's presentation choices into another.
 /// </summary>
 public sealed class SkinDisplaySettingsView
 {
+    private sealed class SettingDefinition
+    {
+        public required string Id { get; init; }
+        public required string Label { get; init; }
+        public required string Type { get; init; }
+        public bool DefaultBoolean { get; init; }
+        public double DefaultNumber { get; init; }
+        public double Minimum { get; init; }
+        public double Maximum { get; init; }
+        public double Step { get; init; }
+        public string Format { get; init; } = "%.2f";
+    }
+
+    private sealed class SettingGroup
+    {
+        public required string Id { get; init; }
+        public required string Label { get; init; }
+        public required string Column { get; init; }
+        public required List<SettingDefinition> Settings { get; init; }
+    }
+
     private static readonly object SharedInstancesLock = new();
     private static readonly Dictionary<string, SkinDisplaySettingsView> SharedInstances = new(StringComparer.OrdinalIgnoreCase);
 
-    private static readonly Dictionary<string, bool> DefaultValues = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["background_character_panels"] = true,
-        ["background_stage_lights"] = true,
-        ["background_crowds"] = true,
-        ["background_sky"] = true,
-        ["background_window"] = true,
-        ["background_floor"] = true,
-        ["lane_touch_highlight"] = true,
-        ["lane_hit_effects"] = true,
-        ["hud_judgement_counter"] = true,
-        ["hud_score"] = true,
-        ["hud_grade"] = true,
-        ["hud_accuracy"] = true,
-        ["hud_gauge"] = true,
-        ["hud_judgement"] = true,
-        ["hud_combo"] = true,
-        ["hud_early_late"] = true,
-        ["hud_timing"] = true,
-        // This element is off in the current Default skin, so preserve that default.
-        ["hud_hit_delta_bars"] = false,
-        ["events_intro_text"] = true,
-        ["events_rank_up_animation"] = true,
-        ["events_clear_animation"] = true,
-    };
-
-    private static readonly Dictionary<string, double> DefaultNumberValues = new(StringComparer.OrdinalIgnoreCase)
-    {
-        // Dim before reaching A, then ease back to a lighter background dim.
-        ["default_dim"] = 50.0,
-        ["rank_up_dim"] = 10.0,
-    };
-
     private readonly string _path;
+    private readonly List<SettingGroup> _groups;
+    private readonly Dictionary<string, SettingDefinition> _definitions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, bool> _values = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, double> _numberValues = new(StringComparer.OrdinalIgnoreCase);
     private long _revision;
 
     public long revision => _revision;
 
+    internal static SkinDisplaySettingsView ForSkinDirectory(string skinDirectory, string defaultSkinDirectory)
+    {
+        var fullDirectory = Path.GetFullPath(skinDirectory);
+        lock (SharedInstancesLock)
+        {
+            if (SharedInstances.TryGetValue(fullDirectory, out var existing))
+                return existing;
+            var created = new SkinDisplaySettingsView(fullDirectory, Path.GetFullPath(defaultSkinDirectory));
+            SharedInstances[fullDirectory] = created;
+            return created;
+        }
+    }
+
+    private SkinDisplaySettingsView(string fullSkinDirectory, string defaultSkinDirectory)
+    {
+        _path = Path.Combine(fullSkinDirectory, "skinSettings.json");
+        _groups = LoadDefinitions(fullSkinDirectory, defaultSkinDirectory);
+        foreach (var group in _groups)
+        {
+            foreach (var definition in group.Settings)
+            {
+                _definitions[definition.Id] = definition;
+                if (definition.Type == "toggle")
+                    _values[definition.Id] = definition.DefaultBoolean;
+                else
+                    _numberValues[definition.Id] = NormalizeNumber(definition, definition.DefaultNumber);
+            }
+        }
+        Load();
+    }
+
+    // Legacy named properties remain as compatibility aliases for older skin scripts.
+    // New settings should use Get("id") / GetNumber("id") and be declared in settings.lua.
     public bool background_character_panels { get => Get("background_character_panels"); set => Set("background_character_panels", value); }
     public bool background_stage_lights { get => Get("background_stage_lights"); set => Set("background_stage_lights", value); }
     public bool background_crowds { get => Get("background_crowds"); set => Set("background_crowds", value); }
@@ -91,34 +114,13 @@ public sealed class SkinDisplaySettingsView
     public bool events_rank_up_animation { get => Get("events_rank_up_animation"); set => Set("events_rank_up_animation", value); }
     public bool events_clear_animation { get => Get("events_clear_animation"); set => Set("events_clear_animation", value); }
 
-    internal static SkinDisplaySettingsView ForSkinDirectory(string skinDirectory)
-    {
-        var fullDirectory = Path.GetFullPath(skinDirectory);
-        lock (SharedInstancesLock)
-        {
-            if (SharedInstances.TryGetValue(fullDirectory, out var existing))
-                return existing;
-            var created = new SkinDisplaySettingsView(fullDirectory);
-            SharedInstances[fullDirectory] = created;
-            return created;
-        }
-    }
-
-    private SkinDisplaySettingsView(string fullSkinDirectory)
-    {
-        _path = Path.Combine(fullSkinDirectory, "skinSettings.json");
-        foreach (var pair in DefaultValues)
-            _values[pair.Key] = pair.Value;
-        foreach (var pair in DefaultNumberValues)
-            _numberValues[pair.Key] = pair.Value;
-        Load();
-    }
-
+    /// <summary>Reads a toggle declared by this skin's scripts/settings.lua.</summary>
     public bool Get(string name)
         => !string.IsNullOrWhiteSpace(name) && _values.TryGetValue(name.Trim(), out var value)
             ? value
             : false;
 
+    /// <summary>Reads a slider/number declared by this skin's scripts/settings.lua.</summary>
     public double GetNumber(string name)
         => !string.IsNullOrWhiteSpace(name) && _numberValues.TryGetValue(name.Trim(), out var value)
             ? value
@@ -128,8 +130,10 @@ public sealed class SkinDisplaySettingsView
     {
         if (string.IsNullOrWhiteSpace(name) || !double.IsFinite(value)) return false;
         var key = name.Trim();
-        if (!_numberValues.TryGetValue(key, out var current)) return false;
-        value = Math.Clamp(value, 0.0, 100.0);
+        if (!_numberValues.TryGetValue(key, out var current) || !_definitions.TryGetValue(key, out var definition))
+            return false;
+
+        value = NormalizeNumber(definition, value);
         if (Math.Abs(current - value) < 0.0001) return true;
         _numberValues[key] = value;
         _revision++;
@@ -158,6 +162,196 @@ public sealed class SkinDisplaySettingsView
         return true;
     }
 
+    /// <summary>Creates the ordered, value-bearing settings description consumed by the Lua settings menu.</summary>
+    internal Table CreateLuaGroupsTable(Script script)
+    {
+        var groups = new Table(script);
+        for (var groupIndex = 0; groupIndex < _groups.Count; groupIndex++)
+        {
+            var group = _groups[groupIndex];
+            var groupTable = new Table(script);
+            groupTable.Set("id", DynValue.NewString(group.Id));
+            groupTable.Set("label", DynValue.NewString(group.Label));
+            groupTable.Set("column", DynValue.NewString(group.Column));
+
+            var settings = new Table(script);
+            for (var settingIndex = 0; settingIndex < group.Settings.Count; settingIndex++)
+            {
+                var definition = group.Settings[settingIndex];
+                var settingTable = new Table(script);
+                settingTable.Set("id", DynValue.NewString(definition.Id));
+                settingTable.Set("label", DynValue.NewString(definition.Label));
+                settingTable.Set("type", DynValue.NewString(definition.Type));
+                settingTable.Set("format", DynValue.NewString(definition.Format));
+                if (definition.Type == "toggle")
+                {
+                    settingTable.Set("value", DynValue.NewBoolean(Get(definition.Id)));
+                }
+                else
+                {
+                    settingTable.Set("value", DynValue.NewNumber(GetNumber(definition.Id)));
+                    settingTable.Set("minimum", DynValue.NewNumber(definition.Minimum));
+                    settingTable.Set("maximum", DynValue.NewNumber(definition.Maximum));
+                    settingTable.Set("step", DynValue.NewNumber(definition.Step));
+                }
+                settings.Set(settingIndex + 1, DynValue.NewTable(settingTable));
+            }
+            groupTable.Set("settings", DynValue.NewTable(settings));
+            groups.Set(groupIndex + 1, DynValue.NewTable(groupTable));
+        }
+        return groups;
+    }
+
+    /// <summary>Returns the number of section headers plus controls in one menu column.</summary>
+    public int GetColumnRowCount(string column)
+    {
+        var normalized = string.Equals(column, "right", StringComparison.OrdinalIgnoreCase) ? "right" : "left";
+        return _groups.Where(group => group.Column == normalized).Sum(group => 1 + group.Settings.Count);
+    }
+
+    private static List<SettingGroup> LoadDefinitions(string skinDirectory, string defaultSkinDirectory)
+    {
+        var candidates = new List<string>();
+        AddCandidate(candidates, SkinScriptPathResolver.Preferred(skinDirectory, "settings.lua"));
+        AddCandidate(candidates, SkinScriptPathResolver.Preferred(defaultSkinDirectory, "settings.lua"));
+
+        foreach (var path in candidates)
+        {
+            if (!File.Exists(path)) continue;
+            try
+            {
+                var script = new Script(CoreModules.Preset_HardSandbox | CoreModules.ErrorHandling);
+                var result = script.DoString(File.ReadAllText(path), script.Globals, path);
+                if (result.Type != DataType.Table || result.Table is null)
+                    throw new InvalidDataException("The settings declaration must return an array of groups.");
+
+                var groups = new List<SettingGroup>();
+                var knownIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var nextAutoColumn = "left";
+                for (var groupIndex = 1; groupIndex <= 128; groupIndex++)
+                {
+                    var groupValue = result.Table.Get(groupIndex);
+                    if (groupValue.IsNil()) break;
+                    if (groupValue.Type != DataType.Table || groupValue.Table is null) continue;
+
+                    var groupId = ReadString(groupValue.Table, "id", $"group_{groupIndex}");
+                    var groupLabel = ReadString(groupValue.Table, "label", groupId.Replace('_', ' ').ToUpperInvariant());
+                    var column = ReadString(groupValue.Table, "column", nextAutoColumn).ToLowerInvariant();
+                    if (column is not ("left" or "right"))
+                    {
+                        column = nextAutoColumn;
+                    }
+                    nextAutoColumn = column == "left" ? "right" : "left";
+
+                    var settingsValue = groupValue.Table.Get("settings");
+                    var settings = new List<SettingDefinition>();
+                    if (settingsValue.Type == DataType.Table && settingsValue.Table is not null)
+                    {
+                        for (var settingIndex = 1; settingIndex <= 256; settingIndex++)
+                        {
+                            var settingValue = settingsValue.Table.Get(settingIndex);
+                            if (settingValue.IsNil()) break;
+                            if (settingValue.Type != DataType.Table || settingValue.Table is null) continue;
+
+                            var id = ReadString(settingValue.Table, "id", string.Empty).Trim();
+                            if (!IsValidSettingId(id) || !knownIds.Add(id))
+                                continue;
+                            var label = ReadString(settingValue.Table, "label", id.Replace('_', ' ').ToUpperInvariant());
+                            var type = ReadString(settingValue.Table, "type", "toggle").ToLowerInvariant();
+                            if (type == "boolean") type = "toggle";
+                            if (type == "number") type = "slider";
+                            if (type is not ("toggle" or "slider"))
+                                continue;
+
+                            if (type == "toggle")
+                            {
+                                var defaultValue = settingValue.Table.Get("default");
+                                settings.Add(new SettingDefinition
+                                {
+                                    Id = id,
+                                    Label = label,
+                                    Type = type,
+                                    DefaultBoolean = defaultValue.Type == DataType.Boolean && defaultValue.Boolean,
+                                    Format = ReadString(settingValue.Table, "format", "%.0f")
+                                });
+                            }
+                            else
+                            {
+                                var minimum = ReadNumber(settingValue.Table, "min", 0.0);
+                                var maximum = ReadNumber(settingValue.Table, "max", 100.0);
+                                if (!double.IsFinite(minimum) || !double.IsFinite(maximum) || maximum <= minimum)
+                                    continue;
+                                var step = ReadNumber(settingValue.Table, "step", 1.0);
+                                if (!double.IsFinite(step) || step < 0) step = 0;
+                                var defaultNumber = ReadNumber(settingValue.Table, "default", minimum);
+                                if (!double.IsFinite(defaultNumber)) defaultNumber = minimum;
+                                settings.Add(new SettingDefinition
+                                {
+                                    Id = id,
+                                    Label = label,
+                                    Type = type,
+                                    DefaultNumber = Math.Clamp(defaultNumber, minimum, maximum),
+                                    Minimum = minimum,
+                                    Maximum = maximum,
+                                    Step = step,
+                                    Format = ReadString(settingValue.Table, "format", "%.2f")
+                                });
+                            }
+                        }
+                    }
+
+                    if (settings.Count > 0)
+                    {
+                        groups.Add(new SettingGroup
+                        {
+                            Id = groupId,
+                            Label = groupLabel,
+                            Column = column,
+                            Settings = settings
+                        });
+                    }
+                }
+
+                if (groups.Count > 0 || result.Table.Get(1).IsNil())
+                    return groups;
+                throw new InvalidDataException("The settings declaration contains no valid settings.");
+            }
+            catch (Exception ex)
+            {
+                Program.LogRuntime($"SKIN_SETTINGS_DEFINITION_LOAD_FAILED path={path} error={ex.Message}");
+            }
+        }
+
+        return new List<SettingGroup>();
+    }
+
+    private static void AddCandidate(List<string> candidates, string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        if (!candidates.Any(existing => string.Equals(existing, fullPath, StringComparison.OrdinalIgnoreCase)))
+            candidates.Add(fullPath);
+    }
+
+    private static bool IsValidSettingId(string id)
+    {
+        if (id.Length is < 1 or > 80 || !char.IsAsciiLetter(id[0])) return false;
+        return id.All(character => char.IsAsciiLetterOrDigit(character) || character == '_');
+    }
+
+    private static string ReadString(Table table, string key, string fallback)
+    {
+        var value = table.Get(key);
+        return value.Type == DataType.String && !string.IsNullOrWhiteSpace(value.String)
+            ? value.String.Trim()
+            : fallback;
+    }
+
+    private static double ReadNumber(Table table, string key, double fallback)
+    {
+        var value = table.Get(key);
+        return value.Type == DataType.Number ? value.Number : fallback;
+    }
+
     private void Load()
     {
         if (!File.Exists(_path)) return;
@@ -165,31 +359,29 @@ public sealed class SkinDisplaySettingsView
         {
             using var document = JsonDocument.Parse(File.ReadAllText(_path));
             if (document.RootElement.ValueKind != JsonValueKind.Object) return;
-            var root = document.RootElement;
             var hasLegacySky = false;
             var hasWindowSetting = false;
-            foreach (var property in root.EnumerateObject())
+            foreach (var property in document.RootElement.EnumerateObject())
             {
                 hasLegacySky |= string.Equals(property.Name, "background_sky", StringComparison.OrdinalIgnoreCase);
                 hasWindowSetting |= string.Equals(property.Name, "background_window", StringComparison.OrdinalIgnoreCase);
-                if (DefaultValues.ContainsKey(property.Name) &&
-                    property.Value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                if (!_definitions.TryGetValue(property.Name, out var definition))
+                    continue;
+                if (definition.Type == "toggle" && property.Value.ValueKind is JsonValueKind.True or JsonValueKind.False)
                 {
-                    _values[property.Name] = property.Value.GetBoolean();
+                    _values[definition.Id] = property.Value.GetBoolean();
                 }
-                else if (DefaultNumberValues.ContainsKey(property.Name) && property.Value.ValueKind == JsonValueKind.Number &&
+                else if (definition.Type == "slider" && property.Value.ValueKind == JsonValueKind.Number &&
                     property.Value.TryGetDouble(out var number) && double.IsFinite(number))
                 {
-                    _numberValues[property.Name] = Math.Clamp(number, 0.0, 100.0);
+                    _numberValues[definition.Id] = NormalizeNumber(definition, number);
                 }
             }
 
-            // Before WINDOW became independent, SKY controlled both the scrolling
-            // star layers and the stage-window overlay. Preserve that choice for
-            // existing skinSettings.json files while allowing new files to keep
-            // the two options independent.
-            var migratedLegacyWindow = hasLegacySky && !hasWindowSetting;
-            if (migratedLegacyWindow)
+            // Older files used SKY to control both the scrolling sky and WINDOW.
+            // Keep the old choice when loading a file that predates the separate option.
+            if (hasLegacySky && !hasWindowSetting && _values.ContainsKey("background_sky") &&
+                _values.ContainsKey("background_window"))
             {
                 _values["background_window"] = _values["background_sky"];
                 Save();
@@ -200,6 +392,14 @@ public sealed class SkinDisplaySettingsView
         {
             Program.LogRuntime($"SKIN_DISPLAY_SETTINGS_LOAD_FAILED path={_path} error={ex.Message}");
         }
+    }
+
+    private static double NormalizeNumber(SettingDefinition definition, double value)
+    {
+        value = Math.Clamp(value, definition.Minimum, definition.Maximum);
+        if (definition.Step > 0)
+            value = definition.Minimum + Math.Round((value - definition.Minimum) / definition.Step, MidpointRounding.AwayFromZero) * definition.Step;
+        return Math.Clamp(value, definition.Minimum, definition.Maximum);
     }
 
     private void Save()
@@ -3662,13 +3862,14 @@ public sealed class SkinRuntime : IDisposable
         _gameConfig = gameConfig ?? new GameConfig();
         _gameConfigPath = gameConfigPath ?? UserDataPaths.GameConfigPath;
         _skinDirectory = Path.GetFullPath(skinDirectory);
-        _game = new SkinGameView(_gameConfig, SaveGameConfig, SkinDisplaySettingsView.ForSkinDirectory(_skinDirectory));
+        var skinParentDirectory = Directory.GetParent(_skinDirectory)?.FullName ?? UserDataPaths.GameRootDirectory;
+        _defaultSkinDirectory = Path.GetFullPath(Path.Combine(skinParentDirectory, "Default"));
+        _game = new SkinGameView(_gameConfig, SaveGameConfig,
+            SkinDisplaySettingsView.ForSkinDirectory(_skinDirectory, _defaultSkinDirectory));
         var normalizedScriptFileName = Path.GetFileName(scriptFileName);
         // All Lua files, including the gameplay entry point, live under scripts/.
         // SkinScriptPathResolver still accepts older skins that kept scripts at root.
         _scriptPath = SkinScriptPathResolver.Preferred(_skinDirectory, normalizedScriptFileName);
-        var skinParentDirectory = Directory.GetParent(_skinDirectory)?.FullName ?? UserDataPaths.GameRootDirectory;
-        _defaultSkinDirectory = Path.GetFullPath(Path.Combine(skinParentDirectory, "Default"));
         var screenScriptName = Path.GetFileName(scriptFileName);
         // Keep the pre-resolution-change sizing for menu-style screens. Their fonts
         // are rasterized at each requested display size, so using rasterSize as the
@@ -4105,6 +4306,7 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("keybind_capture_preview", DynValue.NewString(keybindCapturePreview ?? string.Empty));
         _mainMenu.Set("settings_tab", DynValue.NewString(settingsTab is "audio" or "display" or "skin" ? settingsTab : "general"));
         _mainMenu.Set("skin_settings_scroll", DynValue.NewNumber(Math.Max(0, skinSettingsScroll)));
+        _mainMenu.Set("skin_settings_groups", DynValue.NewTable(_game.skin_display.CreateLuaGroupsTable(_script)));
         _mainMenu.Set("graphics_api_relaunch_confirm_open", DynValue.NewBoolean(graphicsApiRelaunchConfirmOpen));
         _mainMenu.Set("graphics_api_relaunch_message", string.IsNullOrWhiteSpace(graphicsApiRelaunchMessage)
             ? DynValue.Nil
@@ -4136,7 +4338,15 @@ public sealed class SkinRuntime : IDisposable
     public bool ToggleSkinDisplaySetting(string name)
         => _game.skin_display.Toggle(name);
 
-    /// <summary>Gets a per-skin dim opacity percentage.</summary>
+    /// <summary>Gets the larger of the two skin-settings columns for scroll sizing.</summary>
+    public int GetSkinSettingsContentRowCount()
+        => Math.Max(_game.skin_display.GetColumnRowCount("left"), _game.skin_display.GetColumnRowCount("right"));
+
+    /// <summary>Sets a numeric setting declared by the active skin.</summary>
+    public bool SetSkinDisplayNumber(string name, double value)
+        => _game.skin_display.SetNumber(name, value);
+
+    /// <summary>Gets a per-skin numeric setting.</summary>
     public double GetSkinDisplayNumber(string name)
         => _game.skin_display.GetNumber(name);
 
@@ -4151,10 +4361,6 @@ public sealed class SkinRuntime : IDisposable
 
         switch (name.Trim().ToLowerInvariant())
         {
-            case "default_dim" when value is double defaultDim && double.IsFinite(defaultDim):
-                return _game.skin_display.SetNumber("default_dim", defaultDim);
-            case "rank_up_dim" when value is double rankUpDim && double.IsFinite(rankUpDim):
-                return _game.skin_display.SetNumber("rank_up_dim", rankUpDim);
             case "scroll_speed" when value is double scrollSpeed && double.IsFinite(scrollSpeed):
                 _game.settings.scroll_speed = scrollSpeed;
                 return true;

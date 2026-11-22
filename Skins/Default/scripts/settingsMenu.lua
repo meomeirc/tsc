@@ -655,13 +655,20 @@ local function render_settings_menu()
     local graphics_api_label = graphics_api == "windowsdx12" and "DIRECT3D 12"
         or ((graphics_api == "desktopvk" or graphics_api == "vulkan" or graphics_api == "vk") and "VULKAN" or "OPENGL")
 
+    local skin_groups = menu.skin_settings_groups or {}
+    local skin_column_rows = { left = 0, right = 0 }
+    for _, group in ipairs(skin_groups) do
+        local column = tostring(group.column or "left"):lower()
+        if column ~= "right" then column = "left" end
+        skin_column_rows[column] = skin_column_rows[column] + 1 + #(group.settings or {})
+    end
+    local skin_content_rows = math.max(skin_column_rows.left, skin_column_rows.right)
     local row_count = tab == "general" and 6 or (tab == "skin" and 10 or 5)
     local available_panel_height = math.max(1, height - panel_top - (tonumber(style.panel_bottom_padding or 115) or 115))
     row_height = math.min(row_height, math.max(24, (available_panel_height - padding * 2 - row_gap * (row_count - 1)) / row_count))
-    -- Keep the SKIN controls at a comfortable row size and let the panel grow
-    -- to fit them when the display is tall enough. Shorter displays use the
-    -- same panel viewport with scrolling instead of shrinking every toggle.
-    local panel_row_count = tab == "skin" and 14 or row_count
+    -- The skin page grows to fit the declared settings when possible. On shorter
+    -- displays it keeps the normal row size and scrolls the two columns together.
+    local panel_row_count = tab == "skin" and math.max(14, skin_content_rows) or row_count
     local panel_height = math.min(padding * 2 + row_height * panel_row_count + row_gap * (panel_row_count - 1), available_panel_height)
 
     UI.layout_box({ id = "settings_viewport", width = width, height = height })
@@ -767,7 +774,6 @@ local function render_settings_menu()
             label = "METRONOME VOLUME", current = metronome_volume, minimum = 0, maximum = 1, step = 0,
             action = "set_metronome_volume", value_label = value_text("%.0f%%", metronome_volume * 100, "100%") })
     elseif tab == "skin" then
-        local skin_display = game.skin_display
         local column_gap = 14
         local scrollbar_width = 9
         local scrollbar_reserved = scrollbar_width + 8
@@ -781,7 +787,7 @@ local function render_settings_menu()
         local row_pitch = row_height + row_gap
         -- Both columns share one scroll position so the page moves as a
         -- single surface rather than splitting into two lists.
-        local content_extent = 16 * row_pitch - row_gap
+        local content_extent = math.max(0, skin_content_rows * row_pitch - row_gap)
         local max_scroll = math.max(0, content_extent - viewport_height)
         local scroll_position = clamp(tonumber(menu.skin_settings_scroll or 0) or 0, 0, max_scroll)
         local clip = {
@@ -797,61 +803,48 @@ local function render_settings_menu()
                 height = row_height, label = label, clip = clip })
             return y + row_height + row_gap
         end
-        local function toggle(x, y, width, label, setting, enabled)
+        local function toggle(x, y, width, setting)
             draw_skin_toggle({
-                parent = "settings_panel", id = "skin_toggle_" .. setting,
+                parent = "settings_panel", id = "skin_toggle_" .. setting.id,
                 x = x, y = y, width = width, height = row_height,
-                padding = skin_padding, label = label, setting = setting, enabled = enabled == true,
+                padding = skin_padding, label = setting.label, setting = setting.id,
+                enabled = setting.value == true,
                 button_width = toggle_button_width, button_height = toggle_button_height, clip = clip,
             })
             return y + row_height + row_gap
         end
+        local function slider(x, y, width, setting)
+            local current = tonumber(setting.value or setting.minimum or 0) or 0
+            local minimum = tonumber(setting.minimum or 0) or 0
+            local maximum = tonumber(setting.maximum or 100) or 100
+            local format_string = tostring(setting.format or "%.2f")
+            draw_slider_row({
+                parent = "settings_panel", id = "skin_setting_" .. setting.id .. "_row",
+                control_id = "skin_setting_" .. setting.id,
+                setting_key = "skin:" .. setting.id, x = x, y = y, width = width, height = row_height,
+                label = setting.label, current = current, minimum = minimum, maximum = maximum,
+                step = tonumber(setting.step or 0) or 0,
+                padding = skin_padding, label_width = 140, value_width = 64, slider_right_padding = 10,
+                action = "set_skin_setting_" .. setting.id,
+                value_label = value_text(format_string, current, tostring(current)),
+            })
+            return y + row_height + row_gap
+        end
 
-        left_y = section(row_x, left_y, column_width, "BACKGROUND")
-        left_y = toggle(row_x, left_y, column_width, "CHARACTER PANELS", "background_character_panels", skin_display.background_character_panels)
-        left_y = toggle(row_x, left_y, column_width, "STAGE LIGHTS", "background_stage_lights", skin_display.background_stage_lights)
-        left_y = toggle(row_x, left_y, column_width, "CROWDS", "background_crowds", skin_display.background_crowds)
-        left_y = toggle(row_x, left_y, column_width, "SKY", "background_sky", skin_display.background_sky)
-        -- Use the string-keyed accessor for WINDOW so the new option does not depend on a direct CLR property binding.
-        left_y = toggle(row_x, left_y, column_width, "WINDOW", "background_window", skin_display:Get("background_window"))
-        left_y = toggle(row_x, left_y, column_width, "FLOOR", "background_floor", skin_display.background_floor)
-        local default_dim = skin_display:GetNumber("default_dim")
-        draw_slider_row({ parent = "settings_panel", id = "skin_default_dim_row", control_id = "skin_default_dim",
-            setting_key = "default_dim", x = row_x, y = left_y, width = column_width, height = row_height,
-            label = "DEFAULT DIM", current = default_dim, minimum = 0, maximum = 100, step = 1,
-            padding = skin_padding, label_width = 140, value_width = 64, slider_right_padding = 10,
-            action = "set_default_dim", value_label = value_text("%.0f%%", default_dim, "50%") })
-        left_y = left_y + row_height + row_gap
-        local rank_up_dim = skin_display:GetNumber("rank_up_dim")
-        draw_slider_row({ parent = "settings_panel", id = "skin_rank_up_dim_row", control_id = "skin_rank_up_dim",
-            setting_key = "rank_up_dim", x = row_x, y = left_y, width = column_width, height = row_height,
-            label = "RANK UP DIM", current = rank_up_dim, minimum = 0, maximum = 100, step = 1,
-            padding = skin_padding, label_width = 140, value_width = 64, slider_right_padding = 10,
-            action = "set_rank_up_dim", value_label = value_text("%.0f%%", rank_up_dim, "10%") })
-        left_y = left_y + row_height + row_gap
-        left_y = section(row_x, left_y, column_width, "LANE")
-        left_y = toggle(row_x, left_y, column_width, "TOUCH HIGHLIGHT", "lane_touch_highlight", skin_display.lane_touch_highlight)
-        left_y = toggle(row_x, left_y, column_width, "HIT EFFECTS", "lane_hit_effects", skin_display.lane_hit_effects)
-        left_y = section(row_x, left_y, column_width, "EVENTS")
-        left_y = toggle(row_x, left_y, column_width, "INTRO TEXT", "events_intro_text", skin_display.events_intro_text)
-        left_y = toggle(row_x, left_y, column_width, "RANK UP ANIMATION", "events_rank_up_animation", skin_display.events_rank_up_animation)
-        left_y = toggle(row_x, left_y, column_width, "CLEAR ANIMATION", "events_clear_animation", skin_display.events_clear_animation)
-        right_y = section(right_x, right_y, column_width, "HUD")
-        local hud_items = {
-            { "JUDGEMENT COUNTER", "hud_judgement_counter", skin_display.hud_judgement_counter },
-            { "SCORE", "hud_score", skin_display.hud_score },
-            { "GRADE", "hud_grade", skin_display.hud_grade },
-            { "ACCURACY", "hud_accuracy", skin_display.hud_accuracy },
-            { "GAUGE", "hud_gauge", skin_display.hud_gauge },
-            { "JUDGEMENT", "hud_judgement", skin_display.hud_judgement },
-            { "COMBO", "hud_combo", skin_display.hud_combo },
-            { "EARLY/LATE", "hud_early_late", skin_display.hud_early_late },
-            { "TIMING", "hud_timing", skin_display.hud_timing },
-            { "HIT DELTA BARS", "hud_hit_delta_bars", skin_display.hud_hit_delta_bars },
-        }
-        for index = 1, #hud_items do
-            local item = hud_items[index]
-            right_y = toggle(right_x, right_y, column_width, item[1], item[2], item[3])
+        for _, group in ipairs(skin_groups) do
+            local column = tostring(group.column or "left"):lower()
+            local x = column == "right" and right_x or row_x
+            local width = column_width
+            local y = column == "right" and right_y or left_y
+            y = section(x, y, width, tostring(group.label or group.id or "SETTINGS"))
+            for _, setting in ipairs(group.settings or {}) do
+                if setting.type == "slider" then
+                    y = slider(x, y, width, setting)
+                elseif setting.type == "toggle" then
+                    y = toggle(x, y, width, setting)
+                end
+            end
+            if column == "right" then right_y = y else left_y = y end
         end
 
         if max_scroll > 0 then

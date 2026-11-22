@@ -2673,7 +2673,8 @@ public sealed class Game1 : Game
         var settingsRowsForScroll = KeybindSettings.GetUiRows(_keybindCategory, _keybindEditorSubcategory);
         var keybindScrollMetrics = GetSettingsKeybindScrollMetrics(settingsRowsForScroll.Count);
         _keybindScrollState.SetMaximum(Math.Max(0.0, keybindScrollMetrics.ContentExtent - keybindScrollMetrics.ViewportExtent));
-        var skinSettingsScrollMetrics = GetSettingsSkinScrollMetrics(GraphicsDevice.Viewport.Height);
+        var skinSettingsScrollMetrics = GetSettingsSkinScrollMetrics(
+            GraphicsDevice.Viewport.Height, _settingsMenuRuntime.GetSkinSettingsContentRowCount());
         _settingsSkinScrollState.SetMaximum(Math.Max(0.0,
             skinSettingsScrollMetrics.ContentExtent - skinSettingsScrollMetrics.ViewportExtent));
 
@@ -3195,27 +3196,27 @@ public sealed class Game1 : Game
         return (contentExtent, viewportExtent, rowPitch);
     }
 
-    private static (double ContentExtent, double ViewportExtent, double RowPitch) GetSettingsSkinScrollMetrics(int viewportHeight)
+    private static (double ContentExtent, double ViewportExtent, double RowPitch) GetSettingsSkinScrollMetrics(int viewportHeight, int contentRowCount)
     {
-        // Keep this geometry in sync with settingsMenu.lua's SKIN panel. The
-        // left column contains 17 rows: BACKGROUND, LANE, EVENTS and DIMMER.
-        // The same scroll offset moves both columns.
+        // Keep this geometry in sync with settingsMenu.lua. Each category header
+        // and each declared setting occupies one row; both columns share a scroll.
         const double panelTop = 176.0;
         const double panelBottomPadding = 115.0;
         const double panelPadding = 24.0;
         const double rowGap = 7.0;
         const double baseRowHeight = 66.0;
         const double sizingRowCount = 10.0;
-        const double contentRowCount = 17.0;
+        var safeContentRowCount = Math.Max(0, contentRowCount);
+        var panelRowCount = Math.Max(14, safeContentRowCount);
 
         var availablePanelHeight = Math.Max(1.0, viewportHeight - panelTop - panelBottomPadding);
         var rowHeight = Math.Min(baseRowHeight, Math.Max(24.0,
             (availablePanelHeight - panelPadding * 2.0 - rowGap * (sizingRowCount - 1.0)) / sizingRowCount));
-        var panelHeight = Math.Min(panelPadding * 2.0 + rowHeight * contentRowCount + rowGap * (contentRowCount - 1.0),
+        var panelHeight = Math.Min(panelPadding * 2.0 + rowHeight * panelRowCount + rowGap * (panelRowCount - 1.0),
             availablePanelHeight);
         var viewportExtent = Math.Max(1.0, panelHeight - panelPadding * 2.0);
         var rowPitch = rowHeight + rowGap;
-        var contentExtent = 17.0 * rowPitch - rowGap;
+        var contentExtent = safeContentRowCount > 0 ? safeContentRowCount * rowPitch - rowGap : 0.0;
         return (contentExtent, viewportExtent, rowPitch);
     }
 
@@ -3559,6 +3560,14 @@ public sealed class Game1 : Game
             return;
         }
 
+        const string skinSettingPrefix = "set_skin_setting_";
+        if (name.StartsWith(skinSettingPrefix, StringComparison.OrdinalIgnoreCase) &&
+            action.Value is double skinValue && double.IsFinite(skinValue))
+        {
+            _settingsMenuRuntime.SetSkinDisplayNumber(name[skinSettingPrefix.Length..], skinValue);
+            return;
+        }
+
         if (!name.StartsWith("set_", StringComparison.OrdinalIgnoreCase) ||
             action.Value is not double value || !double.IsFinite(value))
             return;
@@ -3765,6 +3774,13 @@ public sealed class Game1 : Game
             !double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) ||
             !double.IsFinite(value))
             return;
+
+        const string skinSettingKeyPrefix = "skin:";
+        if (settingKey.StartsWith(skinSettingKeyPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            _settingsMenuRuntime.SetSkinDisplayNumber(settingKey[skinSettingKeyPrefix.Length..], value);
+            return;
+        }
 
         if (settingKey == "scroll_speed")
             value = Math.Clamp(value, 0.25, 9.0);

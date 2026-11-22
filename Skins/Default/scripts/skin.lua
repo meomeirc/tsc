@@ -28,7 +28,7 @@ end
 -- hit events; this module is the Default skin's choice to use sprite sequences.
 _TSC_DEFAULT_HIT_EFFECTS = import("hitEffects")
 function on_hit_effect(note, judgement, offset_ms, real_time, chart_time, view)
-    if game.skin_display ~= nil and game.skin_display.lane_hit_effects == false then return false end
+    if game.skin_display ~= nil and game.skin_display:Get("lane_hit_effects") == false then return false end
     return _TSC_DEFAULT_HIT_EFFECTS.on_hit_effect(
         note, judgement, offset_ms, real_time, chart_time, view)
 end
@@ -43,7 +43,7 @@ function on_hit_effect_view_changed(view, projections)
     _TSC_DEFAULT_HIT_EFFECTS.on_view_changed(view, projections)
 end
 function render_hit_effects(frame)
-    if game.skin_display ~= nil and game.skin_display.lane_hit_effects == false then
+    if game.skin_display ~= nil and game.skin_display:Get("lane_hit_effects") == false then
         _TSC_DEFAULT_HIT_EFFECTS.reset()
         return false
     end
@@ -207,33 +207,33 @@ local function refresh_display_config()
     -- here, beside the Default skin's existing display switches, so one setting
     -- controls every visual component belonging to that element.
     if skin_display ~= nil then
-        resolved_display.character_panels = resolved_display.character_panels ~= false and skin_display.background_character_panels ~= false
-        resolved_display.background_panel_bases = resolved_display.background_panel_bases ~= false and skin_display.background_character_panels ~= false
-        resolved_display.stage_lights = resolved_display.stage_lights ~= false and skin_display.background_stage_lights ~= false
+        resolved_display.character_panels = resolved_display.character_panels ~= false and skin_display:Get("background_character_panels") ~= false
+        resolved_display.background_panel_bases = resolved_display.background_panel_bases ~= false and skin_display:Get("background_character_panels") ~= false
+        resolved_display.stage_lights = resolved_display.stage_lights ~= false and skin_display:Get("background_stage_lights") ~= false
         resolved_display.background_panels = resolved_display.background_panels ~= false and (
             resolved_display.background_panel_bases or resolved_display.character_panels or resolved_display.stage_lights)
-        resolved_display.background_sparkles = resolved_display.background_sparkles ~= false and skin_display.background_crowds ~= false
-        resolved_display.background_tiles = resolved_display.background_tiles ~= false and skin_display.background_sky ~= false
+        resolved_display.background_sparkles = resolved_display.background_sparkles ~= false and skin_display:Get("background_crowds") ~= false
+        resolved_display.background_tiles = resolved_display.background_tiles ~= false and skin_display:Get("background_sky") ~= false
         -- Read WINDOW through the same string-keyed API used by the settings page.
         resolved_display.background_stage_window = resolved_display.background_stage_window ~= false and skin_display:Get("background_window") ~= false
-        resolved_display.background_shadow = resolved_display.background_shadow ~= false and skin_display.background_floor ~= false
-        resolved_display.background_shadow_gradient = resolved_display.background_shadow_gradient ~= false and skin_display.background_floor ~= false
-        resolved_display.background_top_gradient = resolved_display.background_top_gradient ~= false and skin_display.background_floor ~= false
-        resolved_display.background_bottom_gradient = resolved_display.background_bottom_gradient ~= false and skin_display.background_floor ~= false
-        resolved_display.lane_highlight = skin_display.lane_touch_highlight ~= false
-        resolved_display.judgement_counts = resolved_display.judgement_counts ~= false and skin_display.hud_judgement_counter ~= false
-        resolved_display.score = resolved_display.score ~= false and skin_display.hud_score ~= false
-        resolved_display.grade = resolved_display.grade ~= false and skin_display.hud_grade ~= false
-        resolved_display.accuracy = resolved_display.accuracy ~= false and skin_display.hud_accuracy ~= false
-        resolved_display.gauge = resolved_display.gauge ~= false and skin_display.hud_gauge ~= false
-        resolved_display.judgement = resolved_display.judgement ~= false and skin_display.hud_judgement ~= false
-        resolved_display.combo = resolved_display.combo ~= false and skin_display.hud_combo ~= false
-        resolved_display.early_late = resolved_display.early_late ~= false and skin_display.hud_early_late ~= false
-        resolved_display.timing = resolved_display.timing ~= false and skin_display.hud_timing ~= false
-        resolved_display.hit_delta = resolved_display.hit_delta ~= false and skin_display.hud_hit_delta_bars ~= false
-        resolved_display.stage = resolved_display.stage ~= false and skin_display.events_intro_text ~= false
-        resolved_display.rank_up = resolved_display.rank_up ~= false and skin_display.events_rank_up_animation ~= false
-        resolved_display.clear = resolved_display.clear ~= false and skin_display.events_clear_animation ~= false
+        resolved_display.background_shadow = resolved_display.background_shadow ~= false and skin_display:Get("background_floor") ~= false
+        resolved_display.background_shadow_gradient = resolved_display.background_shadow_gradient ~= false and skin_display:Get("background_floor") ~= false
+        resolved_display.background_top_gradient = resolved_display.background_top_gradient ~= false and skin_display:Get("background_floor") ~= false
+        resolved_display.background_bottom_gradient = resolved_display.background_bottom_gradient ~= false and skin_display:Get("background_floor") ~= false
+        resolved_display.lane_highlight = skin_display:Get("lane_touch_highlight") ~= false
+        resolved_display.judgement_counts = resolved_display.judgement_counts ~= false and skin_display:Get("hud_judgement_counter") ~= false
+        resolved_display.score = resolved_display.score ~= false and skin_display:Get("hud_score") ~= false
+        resolved_display.grade = resolved_display.grade ~= false and skin_display:Get("hud_grade") ~= false
+        resolved_display.accuracy = resolved_display.accuracy ~= false and skin_display:Get("hud_accuracy") ~= false
+        resolved_display.gauge = resolved_display.gauge ~= false and skin_display:Get("hud_gauge") ~= false
+        resolved_display.judgement = resolved_display.judgement ~= false and skin_display:Get("hud_judgement") ~= false
+        resolved_display.combo = resolved_display.combo ~= false and skin_display:Get("hud_combo") ~= false
+        resolved_display.early_late = resolved_display.early_late ~= false and skin_display:Get("hud_early_late") ~= false
+        resolved_display.timing = resolved_display.timing ~= false and skin_display:Get("hud_timing") ~= false
+        resolved_display.hit_delta = resolved_display.hit_delta ~= false and skin_display:Get("hud_hit_delta_bars") ~= false
+        resolved_display.stage = resolved_display.stage ~= false and skin_display:Get("events_intro_text") ~= false
+        resolved_display.rank_up = resolved_display.rank_up ~= false and skin_display:Get("events_rank_up_animation") ~= false
+        resolved_display.clear = resolved_display.clear ~= false and skin_display:Get("events_clear_animation") ~= false
     end
     return resolved_display
 end
@@ -796,9 +796,9 @@ function prepare_gameplay_animation_fonts(use_gameplay_display)
     local font_display = use_gameplay_display == true and display or resolved_display
     local skin_display = game.skin_display
     local rank_up_enabled = font_display.rank_up ~= false and
-        (skin_display == nil or skin_display.events_rank_up_animation ~= false)
+        (skin_display == nil or skin_display:Get("events_rank_up_animation") ~= false)
     local clear_enabled = font_display.clear ~= false and
-        (skin_display == nil or skin_display.events_clear_animation ~= false)
+        (skin_display == nil or skin_display:Get("events_clear_animation") ~= false)
     if rank_up_enabled then ensure_rank_up_fonts() end
     if clear_enabled then ensure_clear_fonts() end
 end
@@ -920,7 +920,7 @@ end
 -- Init
 
 function init()
-    if game.skin_display == nil or game.skin_display.lane_hit_effects ~= false then
+    if game.skin_display == nil or game.skin_display:Get("lane_hit_effects") ~= false then
         _TSC_DEFAULT_HIT_EFFECTS.begin_preload()
     end
     sound.preload("ready.wav")
@@ -1512,7 +1512,7 @@ end
 -- Update
 
 function update(dt)
-    if game.skin_display == nil or game.skin_display.lane_hit_effects ~= false then
+    if game.skin_display == nil or game.skin_display:Get("lane_hit_effects") ~= false then
         _TSC_DEFAULT_HIT_EFFECTS.update(dt)
     else
         _TSC_DEFAULT_HIT_EFFECTS.reset()
