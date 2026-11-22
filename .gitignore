@@ -27,3 +27,5 @@ release-assets/
 !/Skins/*.cs
 !/Skins/Default/
 !/Skins/Default/**
+
+/Skins/Default/skinSettings.json
