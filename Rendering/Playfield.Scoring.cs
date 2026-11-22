@@ -448,7 +448,10 @@ public sealed partial class Playfield
         while (lo < hi)
         {
             var mid = lo + ((hi - lo) / 2);
-            if (values[mid] <= tick)
+            // A note or hold checkpoint exactly on a bank-switch tick still
+            // belongs to the pre-switch segment. The new bank becomes active
+            // strictly after that tick, so use a strict comparison here.
+            if (values[mid] < tick - 1e-9)
                 lo = mid + 1;
             else
                 hi = mid;
@@ -585,8 +588,13 @@ public sealed partial class Playfield
         if (_gear is null)
             return false;
 
+        // A bank switch takes effect strictly after its SuperFlick tick. Notes
+        // stamped on that same tick are judged against the route that was active
+        // before the switch, matching manual gameplay and the editor preview.
+        // Fractional hold checkpoints after the boundary use the new route.
         var tick = (int)Math.Floor(entry.Tick);
-        return _gear.AtTick(tick, includeTickChanges: true).IsActive(entry.Track);
+        var isExactTick = Math.Abs(entry.Tick - tick) <= 1e-9;
+        return _gear.AtTick(tick, includeTickChanges: !isExactTick).IsActive(entry.Track);
     }
 
     private int LowerBoundScoreEntries(double target)
