@@ -1,5 +1,9 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.60
+
+- excluded my skinSettings.json from the update. oops
+
 # 0.0.59
 
 - added skin settings for the default skin to toggle playfield ui elements
