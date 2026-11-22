@@ -1,5 +1,10 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.59
+
+- added skin settings for the default skin to toggle playfield ui elements
+- fixed scoring for same-tick notes at bank switch (should fix editor scoring to actually reach 11M)
+
 # 0.0.58
 
 - added graphics API switch to the settings (OpenGL/Vulkan/D3D12)
