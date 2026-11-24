@@ -831,8 +831,10 @@ public sealed partial class Playfield
             ["visualizer_height"] = GetEditorPreviewVideoVisualizerHeight(),
             ["visualizer_opacity"] = GetEditorPreviewVideoVisualizerOpacity(),
             ["visualizer_gap"] = GetEditorPreviewVideoVisualizerGap(),
-            ["visualizer_fft_size"] = GetEditorPreviewVideoVisualizerFftSize(),
+            ["visualizer_image_pulse"] = GetEditorPreviewVideoVisualizerImagePulse(),
             ["visualizer_preview_bands"] = GetEditorVisualizerSkinPreviewBands(),
+            ["visualizer_preview_image_scale"] = _editorVisualizerPreviewImageScale,
+            ["visualizer_fft_size"] = GetEditorPreviewVideoVisualizerFftSize(),
             ["visualizer_preview_color"] = GetEditorVisualizerSkinPreviewColor(),
             ["visualizer_preview_time"] = FormatEditorProgressTimestamp(GetEditorVisualizerPreviewSourceSeconds()),
             ["meta_visible_rows"] = metaVisibleRows,
@@ -1300,6 +1302,9 @@ public sealed partial class Playfield
                 return true;
             case "editor.visualizer.gap.change":
                 SetEditorPreviewVideoVisualizerSetting("gap", value);
+                return true;
+            case "editor.visualizer.image_pulse.change":
+                SetEditorPreviewVideoVisualizerSetting("image_pulse", value);
                 return true;
             case "editor.visualizer.save":
                 SaveEditorPreviewVideoVisualizerSettings();

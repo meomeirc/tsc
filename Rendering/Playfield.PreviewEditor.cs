@@ -78,10 +78,14 @@ public sealed partial class Playfield
     private double _editorVisualizerPreviewDurationSeconds;
     private long _editorVisualizerPreviewStartTimestamp;
     private readonly float[] _editorVisualizerPreviewBands = new float[90];
+    private readonly float[] _editorVisualizerPreviewPulseBands = new float[90];
+    private float _editorVisualizerPreviewPulseEnvelope;
+    private float _editorVisualizerPreviewImageScale = 1f;
+    private long _editorVisualizerPreviewPulseLastTimestamp;
 
     private enum EditorVisualizerSlider
     {
-        Gain, BarCount, Height, Opacity, Gap
+        Gain, BarCount, Height, Opacity, Gap, ImagePulse
     }
 
     private bool _editorPreviewAssetDirectoryCacheValid;
@@ -1298,7 +1302,10 @@ public sealed partial class Playfield
         => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerHeight, 60, 240);
 
     private int GetEditorPreviewVideoVisualizerOpacity()
-        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerOpacity, 10, 100);
+        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerOpacity, 0, 100);
+
+    private int GetEditorPreviewVideoVisualizerImagePulse()
+        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerImagePulse, 0, 100);
 
     private int GetEditorPreviewVideoVisualizerGap()
         => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerGap, 0, 6);
@@ -1316,6 +1323,7 @@ public sealed partial class Playfield
             _skin.GameConfig.PreviewVideoVisualizerHeight = GetEditorPreviewVideoVisualizerHeight();
             _skin.GameConfig.PreviewVideoVisualizerOpacity = GetEditorPreviewVideoVisualizerOpacity();
             _skin.GameConfig.PreviewVideoVisualizerGap = GetEditorPreviewVideoVisualizerGap();
+            _skin.GameConfig.PreviewVideoVisualizerImagePulse = GetEditorPreviewVideoVisualizerImagePulse();
             _skin.GameConfig.PreviewVideoVisualizerFftSize = GetEditorPreviewVideoVisualizerFftSize();
             SkinConfigStore.SaveGameConfig(UserDataPaths.GameConfigPath, _skin.GameConfig);
             _statusMessage = "Preview visualizer settings saved.";
@@ -1386,14 +1394,22 @@ public sealed partial class Playfield
         var visualizerAlpha = (visualizerOpacity / 100.0).ToString("0.###", CultureInfo.InvariantCulture);
         var visualizerGain = GetEditorPreviewVideoVisualizerGain();
         var visualizerFftSize = GetEditorPreviewVideoVisualizerFftSize();
+        var imagePulse = GetEditorPreviewVideoVisualizerImagePulse();
+        var pulseZoomExpression = imagePulse > 0
+            ? BuildEditorPreviewVideoImagePulseZoomExpression(startSeconds, clipDuration, fadeSeconds,
+                volumePercent, imagePulse, visualizerGain, visualizerFftSize, frameRate)
+            : null;
+        var coverFilter = $"scale={outputSize}:{outputSize}:force_original_aspect_ratio=decrease," +
+            $"pad={outputSize}:{outputSize}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1";
+        if (!string.IsNullOrWhiteSpace(pulseZoomExpression))
+            coverFilter += $",zoompan=z='{pulseZoomExpression}':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={outputSize}x{outputSize}:fps={frameRate}";
         var filter =
             $"[1:a:0]asetpts=PTS-STARTPTS," +
             $"afade=t=in:st=0:d={fade}:curve=tri," +
             $"afade=t=out:st={fadeOut}:d={fade}:curve=tri," +
             $"volume={volume}[previewAudio];" +
             $"[2:v:0]format=rgba,geq=r='{visualizerColor.R}':g='{visualizerColor.G}':b='{visualizerColor.B}':a='r(X,Y)*{visualizerAlpha}'[bars];" +
-            $"[0:v:0]scale={outputSize}:{outputSize}:force_original_aspect_ratio=decrease," +
-            $"pad={outputSize}:{outputSize}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[cover];" +
+            $"[0:v:0]{coverFilter}[cover];" +
             $"[cover][bars]overlay=x=0:y={visualizerTop}:format=auto:shortest=1,format=yuv420p[video]";
 
         var temporaryDirectory = Path.Combine(Path.GetTempPath(), "TSC-preview-video-" + Guid.NewGuid().ToString("N"));
@@ -1405,10 +1421,12 @@ public sealed partial class Playfield
             : NormalizeEditorAudioSourceExtension(_chart.MusicPath);
         var musicPath = Path.Combine(temporaryDirectory, "music" + musicExtension);
         var renderedPath = Path.Combine(temporaryDirectory, "preview.mp4");
+        var filterScriptPath = Path.Combine(temporaryDirectory, "filter.txt");
         try
         {
             File.WriteAllBytes(albumPath, albumBytes);
             File.WriteAllBytes(musicPath, musicBytes);
+            File.WriteAllText(filterScriptPath, filter, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
 
             RunEditorPreviewFfmpegWithVisualizerFrames(ffmpeg, new[]
             {
@@ -1422,7 +1440,7 @@ public sealed partial class Playfield
                 "-f", "rawvideo", "-pixel_format", "gray",
                 "-video_size", $"{outputSize}x{visualizerHeight}",
                 "-framerate", frameRate.ToString(CultureInfo.InvariantCulture), "-i", "pipe:0",
-                "-filter_complex", filter,
+                "-/filter_complex", filterScriptPath,
                 "-map", "[video]", "-map", "[previewAudio]",
                 "-t", duration,
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", frameRate.ToString(CultureInfo.InvariantCulture),
@@ -1447,6 +1465,53 @@ public sealed partial class Playfield
         {
             try { Directory.Delete(temporaryDirectory, recursive: true); } catch { }
         }
+    }
+
+    private string BuildEditorPreviewVideoImagePulseZoomExpression(double startSeconds, double clipDuration,
+        double fadeSeconds, int musicVolumePercent, int pulsePercent, int gain, int fftSize, int frameRate)
+    {
+        var frameCount = Math.Max(1, (int)Math.Ceiling(clipDuration * frameRate - 1e-9));
+        var zoomValues = new float[frameCount];
+        var spectrum = new float[90];
+        var musicVolume = Math.Clamp(musicVolumePercent, 0, 100) / 100f;
+        var pulseEnvelope = 0f;
+        var attack = 1f - MathF.Exp(-1f / (frameRate * 0.045f));
+        var release = 1f - MathF.Exp(-1f / (frameRate * 0.14f));
+
+        for (var frameIndex = 0; frameIndex < frameCount; frameIndex++)
+        {
+            var clipElapsed = Math.Min(frameIndex / (double)frameRate, clipDuration);
+            var sourceSeconds = startSeconds + clipElapsed;
+            if (!_audio.TryGetSpectrumBands(sourceSeconds, fftSize, gain, spectrum))
+                throw new InvalidOperationException("The decoded song audio became unavailable while rendering image pulse.");
+
+            // The first 24 of 90 logarithmic bands cover the bass region. Its
+            // strongest band drives a gently smoothed artwork zoom.
+            var bassLevel = 0f;
+            for (var bandIndex = 0; bandIndex < 24; bandIndex++)
+                bassLevel = Math.Max(bassLevel, spectrum[bandIndex]);
+
+            var fadeGain = fadeSeconds > 0
+                ? Math.Clamp(Math.Min(clipElapsed / fadeSeconds, (clipDuration - clipElapsed) / fadeSeconds), 0.0, 1.0)
+                : 1.0;
+            var target = Math.Clamp(bassLevel * musicVolume * (float)fadeGain, 0f, 1f);
+            var smoothing = target > pulseEnvelope ? attack : release;
+            pulseEnvelope += (target - pulseEnvelope) * smoothing;
+            zoomValues[frameIndex] = 1f + (pulsePercent / 100f) * 0.08f * pulseEnvelope;
+        }
+
+        // Build a balanced expression tree so FFmpeg's expression parser does
+        // not hit its nesting limit on longer preview ranges. `on` is the
+        // zoompan output-frame index; d=1 keeps it aligned to the 60 fps export.
+        string BuildRange(int first, int end)
+        {
+            if (end - first == 1)
+                return zoomValues[first].ToString("0.000000", CultureInfo.InvariantCulture);
+            var middle = first + (end - first) / 2;
+            return $"if(lt(on,{middle}),{BuildRange(first, middle)},{BuildRange(middle, end)})";
+        }
+
+        return BuildRange(0, zoomValues.Length);
     }
 
     private void WriteEditorPreviewVideoVisualizerFrames(Stream destination, double startSeconds,
@@ -2582,7 +2647,7 @@ public sealed partial class Playfield
     {
         var controls = GetEditorVisualizerSettingsControlsBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var y = controls.Y + (int)MathF.Round(5 * 46f * unit + 26f * unit);
+        var y = controls.Y + (int)MathF.Round(6 * 46f * unit + 26f * unit);
         var gap = Math.Max(4, (int)MathF.Round(8f * unit));
         var width = Math.Max(1, (controls.Width - gap * 2) / 3);
         var index = fftSize switch { 1024 => 0, 2048 => 1, 4096 => 2, _ => 1 };
@@ -2801,6 +2866,7 @@ public sealed partial class Playfield
     // to use exactly the same FFT, gain, music-volume, and fade calculations.
     private float[] GetEditorVisualizerSkinPreviewBands()
     {
+        UpdateEditorVisualizerPreviewImageScale();
         if (!_editorVisualizerSettingsOpen || !_audio.IsLoaded || _audio.PcmBytes <= 0)
             return Array.Empty<float>();
 
@@ -2823,6 +2889,52 @@ public sealed partial class Playfield
         for (var index = 0; index < bands.Length; index++)
             bands[index] *= scale;
         return bands;
+    }
+
+    private void UpdateEditorVisualizerPreviewImageScale()
+    {
+        var pulsePercent = GetEditorPreviewVideoVisualizerImagePulse();
+        if (!_editorVisualizerSettingsOpen || pulsePercent <= 0 || !_audio.IsLoaded || _audio.PcmBytes <= 0)
+        {
+            _editorVisualizerPreviewPulseEnvelope = 0f;
+            _editorVisualizerPreviewImageScale = 1f;
+            _editorVisualizerPreviewPulseLastTimestamp = 0;
+            return;
+        }
+
+        var sourceSeconds = GetEditorVisualizerPreviewSourceSeconds();
+        if (!_audio.TryGetSpectrumBands(sourceSeconds, GetEditorPreviewVideoVisualizerFftSize(),
+                GetEditorPreviewVideoVisualizerGain(), _editorVisualizerPreviewPulseBands))
+        {
+            _editorVisualizerPreviewImageScale = 1f;
+            return;
+        }
+
+        var bassLevel = 0f;
+        for (var index = 0; index < 24; index++)
+            bassLevel = Math.Max(bassLevel, _editorVisualizerPreviewPulseBands[index]);
+
+        var musicVolume = Math.Clamp(_editorMusicVolumePendingPercent, 0, 100) / 100f;
+        var clipElapsed = Math.Clamp(sourceSeconds - _editorVisualizerPreviewStartSeconds,
+            0, _editorVisualizerPreviewDurationSeconds);
+        var fadeSeconds = GetEditorPreviewFadeDurationSeconds(_editorVisualizerPreviewDurationSeconds);
+        var fadeGain = fadeSeconds > 0
+            ? Math.Clamp(Math.Min(clipElapsed / fadeSeconds,
+                (_editorVisualizerPreviewDurationSeconds - clipElapsed) / fadeSeconds), 0.0, 1.0)
+            : 1.0;
+        var target = Math.Clamp(bassLevel * musicVolume * (float)fadeGain, 0f, 1f);
+
+        var now = Stopwatch.GetTimestamp();
+        var elapsed = _editorVisualizerPreviewPulseLastTimestamp > 0
+            ? Math.Clamp((now - _editorVisualizerPreviewPulseLastTimestamp) / (double)Stopwatch.Frequency, 0.0, 0.1)
+            : 1.0 / 60.0;
+        _editorVisualizerPreviewPulseLastTimestamp = now;
+        var timeConstant = target > _editorVisualizerPreviewPulseEnvelope ? 0.045f : 0.14f;
+        var smoothing = 1f - MathF.Exp(-(float)elapsed / timeConstant);
+        _editorVisualizerPreviewPulseEnvelope +=
+            (target - _editorVisualizerPreviewPulseEnvelope) * smoothing;
+        _editorVisualizerPreviewImageScale = 1f + (pulsePercent / 100f) * 0.08f *
+            _editorVisualizerPreviewPulseEnvelope;
     }
 
     private Dictionary<string, object?> GetEditorVisualizerSkinPreviewColor()
@@ -2862,13 +2974,14 @@ public sealed partial class Playfield
             case "gain": _skin.GameConfig.PreviewVideoVisualizerGain = Math.Clamp(rounded, 1, 48); break;
             case "bars": _skin.GameConfig.PreviewVideoVisualizerBarCount = Math.Clamp(rounded, 15, 90); break;
             case "height": _skin.GameConfig.PreviewVideoVisualizerHeight = Math.Clamp(rounded, 60, 240); break;
-            case "opacity": _skin.GameConfig.PreviewVideoVisualizerOpacity = Math.Clamp(rounded, 10, 100); break;
+            case "opacity": _skin.GameConfig.PreviewVideoVisualizerOpacity = Math.Clamp(rounded, 0, 100); break;
             case "gap": _skin.GameConfig.PreviewVideoVisualizerGap = Math.Clamp(rounded, 0, 6); break;
+            case "image_pulse": _skin.GameConfig.PreviewVideoVisualizerImagePulse = Math.Clamp(rounded, 0, 100); break;
         }
     }
 
     private static bool IsEditorVisualizerNumericField(string? field)
-        => field is "gain" or "bars" or "height" or "opacity" or "gap";
+        => field is "gain" or "bars" or "height" or "opacity" or "gap" or "image_pulse";
 
     private string GetEditorVisualizerNumericFieldValue(string field)
         => field switch
@@ -2878,6 +2991,7 @@ public sealed partial class Playfield
             "height" => GetEditorPreviewVideoVisualizerHeight().ToString(CultureInfo.InvariantCulture),
             "opacity" => GetEditorPreviewVideoVisualizerOpacity().ToString(CultureInfo.InvariantCulture),
             "gap" => GetEditorPreviewVideoVisualizerGap().ToString(CultureInfo.InvariantCulture),
+            "image_pulse" => GetEditorPreviewVideoVisualizerImagePulse().ToString(CultureInfo.InvariantCulture),
             _ => string.Empty
         };
 
@@ -2993,6 +3107,7 @@ public sealed partial class Playfield
         _skin.GameConfig.PreviewVideoVisualizerHeight = 180;
         _skin.GameConfig.PreviewVideoVisualizerOpacity = 60;
         _skin.GameConfig.PreviewVideoVisualizerGap = 2;
+        _skin.GameConfig.PreviewVideoVisualizerImagePulse = 0;
         _skin.GameConfig.PreviewVideoVisualizerFftSize = 2048;
         SaveEditorPreviewVideoVisualizerSettings();
     }
@@ -3016,10 +3131,13 @@ public sealed partial class Playfield
                 _skin.GameConfig.PreviewVideoVisualizerHeight = 60 + (int)Math.Round(ratio * 180.0);
                 break;
             case EditorVisualizerSlider.Opacity:
-                _skin.GameConfig.PreviewVideoVisualizerOpacity = 10 + (int)Math.Round(ratio * 90.0);
+                _skin.GameConfig.PreviewVideoVisualizerOpacity = (int)Math.Round(ratio * 100.0);
                 break;
             case EditorVisualizerSlider.Gap:
                 _skin.GameConfig.PreviewVideoVisualizerGap = (int)Math.Round(ratio * 6.0);
+                break;
+            case EditorVisualizerSlider.ImagePulse:
+                _skin.GameConfig.PreviewVideoVisualizerImagePulse = (int)Math.Round(ratio * 100.0);
                 break;
         }
     }
@@ -3068,6 +3186,7 @@ public sealed partial class Playfield
                 _skin.GameConfig.PreviewVideoVisualizerHeight = 180;
                 _skin.GameConfig.PreviewVideoVisualizerOpacity = 60;
                 _skin.GameConfig.PreviewVideoVisualizerGap = 2;
+                _skin.GameConfig.PreviewVideoVisualizerImagePulse = 0;
                 _skin.GameConfig.PreviewVideoVisualizerFftSize = 2048;
                 SaveEditorPreviewVideoVisualizerSettings();
                 return true;
@@ -3147,6 +3266,7 @@ public sealed partial class Playfield
         if (!_editorVisualizerSettingsOpen)
             return;
 
+        UpdateEditorVisualizerPreviewImageScale();
         var unit = _projection.ScalePixels(1f);
         var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
         var preview = GetEditorVisualizerPreviewBounds(virtualWidth, virtualHeight);
@@ -3165,8 +3285,45 @@ public sealed partial class Playfield
         // same letterbox/pillarbox fill used by the video export.
         _spriteBatch.Draw(_pixel, preview, Color.Black);
         var albumTexture = GetEditorArtworkTexture("album");
-        if (albumTexture is not null)
-            _spriteBatch.Draw(albumTexture, preview, Color.White);
+        if (albumTexture is not null && albumTexture.Width > 0 && albumTexture.Height > 0)
+        {
+            // Fit the artwork into the fixed preview frame, then scale it around
+            // the frame center. Crop only the portion outside the frame so pulse
+            // remains visible without stretching non-square artwork or moving the
+            // preview bounds themselves.
+            var imageScale = Math.Max(1f, _editorVisualizerPreviewImageScale);
+            var fitScale = Math.Min(preview.Width / (float)albumTexture.Width,
+                preview.Height / (float)albumTexture.Height);
+            var imageWidth = Math.Max(1, (int)MathF.Round(albumTexture.Width * fitScale * imageScale));
+            var imageHeight = Math.Max(1, (int)MathF.Round(albumTexture.Height * fitScale * imageScale));
+            var imageDestination = new Rectangle(
+                preview.X + (preview.Width - imageWidth) / 2,
+                preview.Y + (preview.Height - imageHeight) / 2,
+                imageWidth, imageHeight);
+            var clippedDestination = Rectangle.Intersect(preview, imageDestination);
+            if (clippedDestination.Width > 0 && clippedDestination.Height > 0)
+            {
+                var sourceLeft = (clippedDestination.Left - imageDestination.Left) /
+                    (float)imageDestination.Width;
+                var sourceTop = (clippedDestination.Top - imageDestination.Top) /
+                    (float)imageDestination.Height;
+                var sourceRight = (clippedDestination.Right - imageDestination.Left) /
+                    (float)imageDestination.Width;
+                var sourceBottom = (clippedDestination.Bottom - imageDestination.Top) /
+                    (float)imageDestination.Height;
+                var sourceX = Math.Clamp((int)MathF.Floor(sourceLeft * albumTexture.Width),
+                    0, albumTexture.Width - 1);
+                var sourceY = Math.Clamp((int)MathF.Floor(sourceTop * albumTexture.Height),
+                    0, albumTexture.Height - 1);
+                var sourceRightX = Math.Clamp((int)MathF.Ceiling(sourceRight * albumTexture.Width),
+                    sourceX + 1, albumTexture.Width);
+                var sourceBottomY = Math.Clamp((int)MathF.Ceiling(sourceBottom * albumTexture.Height),
+                    sourceY + 1, albumTexture.Height);
+                var source = new Rectangle(sourceX, sourceY,
+                    sourceRightX - sourceX, sourceBottomY - sourceY);
+                _spriteBatch.Draw(albumTexture, clippedDestination, source, Color.White);
+            }
+        }
 
         var count = GetEditorPreviewVideoVisualizerBarCount();
         var bars = _editorVisualizerPreviewBands.AsSpan(0, count);
@@ -3235,12 +3392,14 @@ public sealed partial class Playfield
         DrawEditorVisualizerSlider(EditorVisualizerSlider.Height, "HEIGHT", $"{GetEditorPreviewVideoVisualizerHeight()} px",
             GetEditorPreviewVideoVisualizerHeight(), 60, 240, virtualWidth, virtualHeight, unit);
         DrawEditorVisualizerSlider(EditorVisualizerSlider.Opacity, "OPACITY", $"{GetEditorPreviewVideoVisualizerOpacity()}%",
-            GetEditorPreviewVideoVisualizerOpacity(), 10, 100, virtualWidth, virtualHeight, unit);
+            GetEditorPreviewVideoVisualizerOpacity(), 0, 100, virtualWidth, virtualHeight, unit);
         DrawEditorVisualizerSlider(EditorVisualizerSlider.Gap, "BAR GAP", $"{GetEditorPreviewVideoVisualizerGap()} px",
             GetEditorPreviewVideoVisualizerGap(), 0, 6, virtualWidth, virtualHeight, unit);
+        DrawEditorVisualizerSlider(EditorVisualizerSlider.ImagePulse, "IMAGE PULSE", $"{GetEditorPreviewVideoVisualizerImagePulse()}%",
+            GetEditorPreviewVideoVisualizerImagePulse(), 0, 100, virtualWidth, virtualHeight, unit);
 
         DrawEditorPreviewLabel("FFT WINDOW", new Rectangle(controls.X,
-            controls.Y + (int)MathF.Round(5 * 46f * unit), controls.Width / 2, Math.Max(1, (int)MathF.Round(20f * unit))), Muted, unit);
+            controls.Y + (int)MathF.Round(6 * 46f * unit), controls.Width / 2, Math.Max(1, (int)MathF.Round(20f * unit))), Muted, unit);
         foreach (var fftSize in new[] { 1024, 2048, 4096 })
         {
             var selected = GetEditorPreviewVideoVisualizerFftSize() == fftSize;

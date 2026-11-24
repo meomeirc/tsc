@@ -11091,6 +11091,7 @@ public sealed class SkinRuntime : IDisposable
         command.CropCover = cropCover;
         command.Fill = fill;
         command.NineSlice = nineSlice;
+        command.ScissorClip = GetScissorClip(options);
         command.Order = _drawOrder++;
         _drawCommands.Add(command);
         RegisterLayoutNode(command, false);

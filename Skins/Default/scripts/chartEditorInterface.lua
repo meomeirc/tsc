@@ -2699,12 +2699,15 @@ local function drawVisualizerSettings(state, w, h, layer)
         local sourceW = math.max(1, num(artwork.width, previewSize))
         local sourceH = math.max(1, num(artwork.height, previewSize))
         local fit = math.min(previewSize / sourceW, previewSize / sourceH)
-        local imageW = sourceW * fit
-        local imageH = sourceH * fit
+        local imagePulseScale = math.max(1, num(state.visualizer_preview_image_scale, 1))
+        local imageW = sourceW * fit * imagePulseScale
+        local imageH = sourceH * fit * imagePulseScale
+        local previewClip = { left = previewX, top = previewY,
+            right = previewX + previewSize, bottom = previewY + previewSize }
         draw.sprite(artwork, {
             x = previewX + (previewSize - imageW) * 0.5,
             y = previewY + (previewSize - imageH) * 0.5,
-            width = imageW, height = imageH, alpha = 1.0,
+            width = imageW, height = imageH, alpha = 1.0, clip = previewClip,
             anchor = "top-left", layer = base + 4,
         })
     else
@@ -2843,10 +2846,11 @@ local function drawVisualizerSettings(state, w, h, layer)
     drawVisualizerSlider("gain", "GAIN", state.visualizer_gain, 1, 48, "x", 0)
     drawVisualizerSlider("bars", "BAR COUNT", state.visualizer_bar_count, 15, 90, "", 1)
     drawVisualizerSlider("height", "HEIGHT", state.visualizer_height, 60, 240, " px", 2)
-    drawVisualizerSlider("opacity", "OPACITY", state.visualizer_opacity, 10, 100, "%", 3)
+    drawVisualizerSlider("opacity", "OPACITY", state.visualizer_opacity, 0, 100, "%", 3)
     drawVisualizerSlider("gap", "BAR GAP", state.visualizer_gap, 0, 6, " px", 4)
+    drawVisualizerSlider("image_pulse", "IMAGE PULSE", state.visualizer_image_pulse, 0, 100, "%", 5)
 
-    local fftY = controlTop + 5 * rowHeight + 2 * scale
+    local fftY = controlTop + 6 * rowHeight + 2 * scale
     label("FFT WINDOW", controlsX, fftY, fontSize("small"), C.muted, nil, base + 4, F.medium)
     local fftGap = 8 * scale
     local fftW = math.max(1, (controlsW - fftGap * 2) / 3)

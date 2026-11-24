@@ -50,6 +50,7 @@ public sealed class GameConfig
     public int PreviewVideoVisualizerHeight { get; set; } = 180;
     public int PreviewVideoVisualizerOpacity { get; set; } = 60;
     public int PreviewVideoVisualizerGap { get; set; } = 2;
+    public int PreviewVideoVisualizerImagePulse { get; set; } = 0;
     public int PreviewVideoVisualizerFftSize { get; set; } = 2048;
 
     public static string NormalizeScrollMode(string? value)
