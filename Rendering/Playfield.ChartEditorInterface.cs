@@ -120,12 +120,11 @@ public sealed partial class Playfield
     }
 
     private (double CaretOffset, double SelectionOffset, double SelectionWidth, double TextWidth) GetEditorTextFieldMetrics(
-        string text, int caret, int anchor)
+        string text, int caret, int anchor, string fontPath = "Roboto-Regular.ttf")
     {
         // The active Lua editor measures with its own uiStyle font. This is only
         // used to align its caret/selection metrics; the C# fallback renderer uses
         // the same DefaultFont instance as the stable C# menus.
-        const string fontPath = "Roboto-Regular.ttf";
         var textSize = 24f * _projection.ScalePixels(1f);
         if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
         {
@@ -715,6 +714,10 @@ public sealed partial class Playfield
         var previewEndMetrics = _editorPreviewFocusedField == 1
             ? GetEditorTextFieldMetrics(_editorPreviewEndText, _editorPreviewEndCaret, _editorPreviewEndSelectionAnchor)
             : (CaretOffset: 0d, SelectionOffset: 0d, SelectionWidth: 0d, TextWidth: 0d);
+        var visualizerInputMetrics = _editorVisualizerEditingField is not null
+            ? GetEditorTextFieldMetrics(_editorVisualizerEditingText, _editorVisualizerEditingCaret,
+                _editorVisualizerEditingSelectionAnchor, "Roboto-Medium.ttf")
+            : (CaretOffset: 0d, SelectionOffset: 0d, SelectionWidth: 0d, TextWidth: 0d);
 #if TSC_PUBLISH
         const string editorControls = "EDITOR: Ctrl+S TSC  Ctrl+Shift+S ARES. Select a tool and tap a lane to place notes.";
 #else
@@ -808,6 +811,30 @@ public sealed partial class Playfield
             ["meta_music_audio_available"] = _editorOriginalMusicSourceBytes is { Length: > 0 },
             ["meta_music_volume"] = _editorMusicVolumePercent,
             ["meta_music_volume_pending"] = _editorMusicVolumePendingPercent,
+            ["meta_preview_video_export_enabled"] = CanExportEditorPreviewVideo(),
+            ["meta_preview_visualizer_enabled"] = CanPreviewEditorVideoVisualizer(),
+            ["visualizer_settings_open"] = _editorVisualizerSettingsOpen,
+            ["visualizer_export_enabled"] = CanExportEditorPreviewVideo(),
+            ["visualizer_editing_field"] = _editorVisualizerEditingField ?? string.Empty,
+            ["visualizer_editing_text"] = _editorVisualizerEditingText,
+            ["visualizer_editing_caret"] = _editorVisualizerEditingCaret,
+            ["visualizer_editing_selection_start"] = Math.Min(_editorVisualizerEditingCaret, _editorVisualizerEditingSelectionAnchor),
+            ["visualizer_editing_selection_end"] = Math.Max(_editorVisualizerEditingCaret, _editorVisualizerEditingSelectionAnchor),
+            ["visualizer_editing_caret_offset"] = visualizerInputMetrics.CaretOffset,
+            ["visualizer_editing_selection_offset"] = visualizerInputMetrics.SelectionOffset,
+            ["visualizer_editing_selection_width"] = visualizerInputMetrics.SelectionWidth,
+            ["visualizer_editing_text_width"] = visualizerInputMetrics.TextWidth,
+            ["visualizer_preview_ready"] = CanPreviewEditorVideoVisualizer(),
+            ["visualizer_preview_playing"] = _editorVisualizerPreviewPlayer?.IsPlaying == true,
+            ["visualizer_gain"] = GetEditorPreviewVideoVisualizerGain(),
+            ["visualizer_bar_count"] = GetEditorPreviewVideoVisualizerBarCount(),
+            ["visualizer_height"] = GetEditorPreviewVideoVisualizerHeight(),
+            ["visualizer_opacity"] = GetEditorPreviewVideoVisualizerOpacity(),
+            ["visualizer_gap"] = GetEditorPreviewVideoVisualizerGap(),
+            ["visualizer_fft_size"] = GetEditorPreviewVideoVisualizerFftSize(),
+            ["visualizer_preview_bands"] = GetEditorVisualizerSkinPreviewBands(),
+            ["visualizer_preview_color"] = GetEditorVisualizerSkinPreviewColor(),
+            ["visualizer_preview_time"] = FormatEditorProgressTimestamp(GetEditorVisualizerPreviewSourceSeconds()),
             ["meta_visible_rows"] = metaVisibleRows,
             ["meta_scroll"] = _editorMetaScroll.Position,
             ["meta_scroll_max"] = metaScrollMaximum,
@@ -918,6 +945,10 @@ public sealed partial class Playfield
         if (action is null) return false;
         var name = action.Name;
         var value = action.Value;
+        if (_editorVisualizerEditingField is not null &&
+            !(name == "editor.visualizer.edit_value" &&
+              string.Equals(value as string, _editorVisualizerEditingField, StringComparison.Ordinal)))
+            CommitEditorVisualizerValueEdit();
         if (_editorMetaBbCodeStripOpen && name != "editor.meta.bbcode" &&
             name != "editor.meta.bbcode.panel")
         {
@@ -1233,6 +1264,75 @@ public sealed partial class Playfield
                 EditorMediaPickRequested?.Invoke("album"); return true;
             case "editor.meta.media_album_big":
                 if (_editorBundleTemplate != ChartBundleTemplate.Tsts) EditorMediaPickRequested?.Invoke("album_big");
+                return true;
+            case "editor.meta.visualizer_settings":
+                CancelEditorMetaField();
+                OpenEditorVisualizerSettings();
+                return true;
+            case "editor.visualizer.block":
+                return true;
+            case "editor.visualizer.edit_value":
+                BeginEditorVisualizerValueEdit(value as string);
+                return true;
+            case "editor.visualizer.export":
+                if (CanExportEditorPreviewVideo())
+                {
+                    SaveEditorPreviewVideoVisualizerSettings();
+                    CloseEditorVisualizerSettings();
+                    EditorPreviewVideoExportRequested?.Invoke();
+                }
+                else
+                {
+                    _statusMessage = "Import the song audio and album cover, and set a valid preview range before exporting.";
+                }
+                return true;
+            case "editor.visualizer.gain.change":
+                SetEditorPreviewVideoVisualizerSetting("gain", value);
+                return true;
+            case "editor.visualizer.bars.change":
+                SetEditorPreviewVideoVisualizerSetting("bars", value);
+                return true;
+            case "editor.visualizer.height.change":
+                SetEditorPreviewVideoVisualizerSetting("height", value);
+                return true;
+            case "editor.visualizer.opacity.change":
+                SetEditorPreviewVideoVisualizerSetting("opacity", value);
+                return true;
+            case "editor.visualizer.gap.change":
+                SetEditorPreviewVideoVisualizerSetting("gap", value);
+                return true;
+            case "editor.visualizer.save":
+                SaveEditorPreviewVideoVisualizerSettings();
+                return true;
+            case "editor.visualizer.fft":
+                if (Number() is 1024 or 2048 or 4096)
+                {
+                    _skin.GameConfig.PreviewVideoVisualizerFftSize = Number();
+                    SaveEditorPreviewVideoVisualizerSettings();
+                }
+                return true;
+            case "editor.visualizer.reset":
+                ResetEditorPreviewVideoVisualizerSettings();
+                return true;
+            case "editor.visualizer.play":
+                try
+                {
+                    if (_editorVisualizerPreviewPlayer?.IsPlaying == true)
+                        StopEditorVisualizerPreviewPlayback();
+                    else
+                        StartEditorVisualizerPreviewPlayback();
+                }
+                catch (Exception ex)
+                {
+                    _statusMessage = $"Could not play visualizer preview: {ex.Message}";
+                }
+                return true;
+            case "editor.visualizer.close":
+                SaveEditorPreviewVideoVisualizerSettings();
+                CloseEditorVisualizerSettings();
+                return true;
+            case "editor.meta.export_preview_video":
+                EditorPreviewVideoExportRequested?.Invoke();
                 return true;
             case "editor.meta.preview_play":
                 if (_editorPreviewPlayer?.IsPlaying == true)

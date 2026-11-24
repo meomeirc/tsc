@@ -1803,12 +1803,23 @@ local function drawMeta(state, w, h, layer)
 
         if rows[2] then drawMetaRow(rows[2], contentTop + rowPitch + volumeBlockHeight) end
 
+        local exportVideoY = contentTop + 2 * rowPitch + volumeBlockHeight
+        UI.draw_button({ id = "editor_meta_visualizer_settings",
+            x = x + padding, y = exportVideoY,
+            width = innerWidth, height = 34 * scale,
+            label = "VISUALIZER",
+            action = "editor.meta.visualizer_settings",
+            enabled = state.meta_preview_visualizer_enabled == true,
+            variant = "secondary", accent = true,
+            font = F.medium, text_size = fontSize("small"),
+            layer = (layer or 100) + 7 })
+
         local album = rows[3]
         local albumBig = rows[4]
         local hasBigAlbum = albumBig ~= nil
         local cardGap = hasBigAlbum and (16 * scale) or 0
         local cardWidth = hasBigAlbum and math.max(1, (innerWidth - cardGap) / 2) or innerWidth
-        local cardTop = contentTop + 2 * rowPitch + volumeBlockHeight
+        local cardTop = exportVideoY + 42 * scale
         local cardHeight = math.max(1, contentBottom - cardTop)
 
         local function drawAlbumCard(item, cardX, cardW, buttonId, action)
@@ -2638,6 +2649,235 @@ local function drawExportPopup(state, w, h, layer)
     end
 end
 
+local function drawVisualizerSettings(state, w, h, layer)
+    if state.visualizer_settings_open ~= true then return end
+
+    local scale = ACTIVE_SCALE
+    local base = layer or 210
+    local panelW = math.min(1060 * scale, w - 40 * scale)
+    local panelH = math.min(680 * scale, h - 40 * scale)
+    panelW = math.max(1, panelW)
+    panelH = math.max(1, panelH)
+    local x = (w - panelW) * 0.5
+    local y = (h - panelH) * 0.5
+    local padding = 28 * scale
+    local previewSize = math.max(1, math.min(360 * scale, panelH - 176 * scale, panelW * 0.36))
+    local previewX = x + padding
+    local previewY = y + 88 * scale
+    local controlsX = previewX + previewSize + 34 * scale
+    local controlsW = math.max(1, x + panelW - padding - controlsX)
+    local controlTop = y + 82 * scale
+    local rowHeight = 66 * scale
+
+    -- A high-priority full-screen shield keeps clicks away from the chart and
+    -- metadata controls. The modal's own controls are registered above it.
+    ui.button({ id = "editor_visualizer_modal_backdrop", x = 0, y = 0, width = w, height = h,
+        action = "editor.visualizer.block" })
+    draw.rect({ x = 0, y = 0, width = w, height = h,
+        color = { r = 0, g = 0, b = 0, a = 205 }, layer = base })
+    UI.draw_panel({ id = "editor_visualizer_panel", x = x, y = y,
+        width = panelW, height = panelH, color = C.panel, alpha = 0.99, layer = base + 1 })
+    draw.rect({ x = x, y = y, width = panelW, height = 3 * scale,
+        color = C.accent, layer = base + 2 })
+    draw.text("PREVIEW VIDEO VISUALIZER", {
+        x = x + padding, y = y + 25 * scale, size = fontSize("heading"),
+        color = C.text, font = F.medium, anchor = "top-left", layer = base + 3,
+    })
+    draw.text("Changes update the preview immediately and are used by EXPORT VIDEO.", {
+        x = x + padding, y = y + 54 * scale, size = fontSize("small"),
+        color = C.muted, font = F.regular, anchor = "top-left", layer = base + 3,
+    })
+
+    -- Artwork and live spectrum preview. C# supplies the current FFT bands;
+    -- Lua owns the composition, sizing, and skin colors.
+    -- Match the exported video: artwork is shown at full brightness on black
+    -- letterbox/pillarbox space, with no preview-only darkening layer.
+    draw.rect({ x = previewX, y = previewY, width = previewSize, height = previewSize,
+        color = { r = 0, g = 0, b = 0, a = 255 }, layer = base + 3 })
+    local artwork = game.album
+    if artwork ~= nil then
+        local sourceW = math.max(1, num(artwork.width, previewSize))
+        local sourceH = math.max(1, num(artwork.height, previewSize))
+        local fit = math.min(previewSize / sourceW, previewSize / sourceH)
+        local imageW = sourceW * fit
+        local imageH = sourceH * fit
+        draw.sprite(artwork, {
+            x = previewX + (previewSize - imageW) * 0.5,
+            y = previewY + (previewSize - imageH) * 0.5,
+            width = imageW, height = imageH, alpha = 1.0,
+            anchor = "top-left", layer = base + 4,
+        })
+    else
+        draw.text("NO ALBUM ART", { x = previewX + previewSize * 0.5,
+            y = previewY + previewSize * 0.5, size = fontSize("body"),
+            color = C.muted, font = F.medium, anchor = "center", layer = base + 4 })
+    end
+    local bands = state.visualizer_preview_bands or {}
+    local count = math.min(#bands, math.max(0, num(state.visualizer_bar_count, 45)))
+    local previewColor = state.visualizer_preview_color or { r = 248, g = 113, b = 113, a = 255 }
+    if state.visualizer_preview_ready == true and count > 0 then
+        local cellWidth = previewSize / count
+        local gapPx = previewSize * (num(state.visualizer_gap, 2) / 720)
+        local barHeightScale = num(state.visualizer_height, 180) / 720 * previewSize
+        local opacity = clamp(num(state.visualizer_opacity, 60) / 100, 0, 1)
+        -- The skin renderer uses NonPremultiplied blending. Put opacity in the
+        -- color's alpha channel instead of draw.rect's separate alpha option:
+        -- that option scales RGB too, which makes the bars look darker than
+        -- FFmpeg's export (where RGB stays at full strength and only alpha fades).
+        local barColor = {
+            r = clamp(num(previewColor.r, 248), 0, 255),
+            g = clamp(num(previewColor.g, 113), 0, 255),
+            b = clamp(num(previewColor.b, 113), 0, 255),
+            a = math.floor(opacity * 255 + 0.5),
+        }
+        for index = 1, count do
+            local barHeight = clamp(num(bands[index], 0) * barHeightScale, 0, previewSize)
+            if barHeight > 0 then
+                local barX = previewX + (index - 1) * cellWidth
+                local nextX = previewX + index * cellWidth
+                local barW = math.max(1, nextX - barX - gapPx)
+                draw.rect({ x = barX, y = previewY + previewSize - barHeight,
+                    width = barW, height = barHeight, color = barColor, layer = base + 6 })
+            end
+        end
+    else
+        draw.text("IMPORT SONG AUDIO TO PREVIEW", {
+            x = previewX + previewSize * 0.5, y = previewY + previewSize * 0.5,
+            size = fontSize("small"), color = C.muted, font = F.regular,
+            anchor = "center", layer = base + 7,
+        })
+    end
+    UI.draw_button({ id = "editor_visualizer_modal_play_audio", x = previewX,
+        y = previewY + previewSize + 16 * scale, width = previewSize, height = 40 * scale,
+        label = state.visualizer_preview_playing == true and "STOP AUDIO" or "PLAY AUDIO",
+        action = "editor.visualizer.play", enabled = state.visualizer_preview_ready == true,
+        variant = state.visualizer_preview_playing == true and "primary" or "secondary",
+        font = F.medium, text_size = fontSize("small"), hit_test_priority = 700,
+        layer = base + 10 })
+    draw.text(state.visualizer_preview_playing == true
+            and ("LIVE  ·  " .. tostring(state.visualizer_preview_time or ""))
+            or ("SAMPLE  ·  " .. tostring(state.visualizer_preview_time or "")), {
+        x = previewX, y = previewY + previewSize + 62 * scale,
+        size = fontSize("small"), color = C.muted, font = F.regular,
+        anchor = "top-left", layer = base + 10,
+    })
+
+    local function drawVisualizerSlider(id, caption, value, minimum, maximum, suffix, index)
+        local rowY = controlTop + index * rowHeight
+        local editing = tostring(state.visualizer_editing_field or "") == id
+        local fieldText = editing and tostring(state.visualizer_editing_text or "")
+            or (tostring(math.floor(num(value, minimum) + 0.5)) .. suffix)
+        label(caption, controlsX, rowY, fontSize("small"), C.muted, nil, base + 4, F.medium)
+
+        local fieldW = math.min(160 * scale, math.max(112 * scale, controlsW * 0.28))
+        local fieldGap = 12 * scale
+        local trackW = math.max(1, controlsW - fieldW - fieldGap)
+        local fieldX = controlsX + controlsW - fieldW
+        local fieldY = rowY + 9 * scale
+        local fieldH = 34 * scale
+        UI.draw_input({
+            id = "editor_visualizer_modal_" .. id .. "_value",
+            x = fieldX, y = fieldY, width = fieldW, height = fieldH,
+            label = "", text_size = fontSize("small"), text_color = C.text,
+            font = F.medium, background_color = editing and C.selected or C.button,
+            selected = editing, action = "editor.visualizer.edit_value", value = id,
+            hit_test_priority = 820, layer = base + 7,
+        })
+
+        local textSize = fontSize("small")
+        local charWidth = textSize * 0.55
+        local selectionStart = clamp(num(state.visualizer_editing_selection_start, 0), 0, #fieldText)
+        local selectionEnd = clamp(num(state.visualizer_editing_selection_end, selectionStart), selectionStart, #fieldText)
+        local caret = clamp(num(state.visualizer_editing_caret, #fieldText), 0, #fieldText)
+        local textWidth = num(state.visualizer_editing_text_width, 0)
+        local caretOffset = num(state.visualizer_editing_caret_offset, 0)
+        local selectionOffset = num(state.visualizer_editing_selection_offset, 0)
+        local selectionWidth = num(state.visualizer_editing_selection_width, 0)
+        if textWidth <= 0 then
+            textWidth = #fieldText * charWidth
+            caretOffset = caret * charWidth
+            selectionOffset = selectionStart * charWidth
+            selectionWidth = (selectionEnd - selectionStart) * charWidth
+        end
+        textWidth = math.min(math.max(1, fieldW - 14 * scale), textWidth)
+        caretOffset = clamp(caretOffset, 0, textWidth)
+        selectionOffset = clamp(selectionOffset, 0, textWidth)
+        selectionWidth = math.min(math.max(0, textWidth - selectionOffset), math.max(0, selectionWidth))
+        local textLeft = fieldX + (fieldW - textWidth) * 0.5
+        if editing and selectionEnd > selectionStart and selectionWidth > 0 then
+            draw.rect({ x = textLeft + selectionOffset, y = fieldY + 5 * scale,
+                width = math.max(1, selectionWidth), height = fieldH - 10 * scale,
+                color = C.accent_dim, layer = base + 8 })
+        end
+        draw.text(fieldText, { x = fieldX + fieldW * 0.5, y = fieldY + fieldH * 0.5,
+            size = textSize, color = editing and C.text or C.muted, font = F.medium,
+            anchor = "center", layer = base + 9 })
+        if editing then
+            local caretX = math.min(fieldX + fieldW - 7 * scale, textLeft + caretOffset)
+            draw.rect({ x = caretX, y = fieldY + 7 * scale, width = 2 * scale,
+                height = fieldH - 14 * scale, color = C.text, layer = base + 10 })
+        end
+
+        local trackX = controlsX
+        local trackY = rowY + 30 * scale
+        local trackH = 7 * scale
+        local ratio = clamp((num(value, minimum) - minimum) / math.max(1, maximum - minimum), 0, 1)
+        draw.rect({ x = trackX, y = trackY, width = trackW, height = trackH,
+            color = C.hover, layer = base + 5 })
+        if ratio > 0 then
+            draw.rect({ x = trackX, y = trackY, width = trackW * ratio, height = trackH,
+                color = C.accent, layer = base + 6 })
+        end
+        local thumbW = 14 * scale
+        local thumbX = clamp(trackX + trackW * ratio - thumbW * 0.5,
+            trackX, trackX + trackW - thumbW)
+        draw.rect({ x = thumbX, y = trackY - 7 * scale, width = thumbW,
+            height = 21 * scale, color = C.text, layer = base + 7 })
+        ui.slider({ id = "editor_visualizer_modal_" .. id .. "_slider", x = trackX, y = rowY + 20 * scale,
+            width = trackW, height = 28 * scale,
+            min = minimum, max = maximum, step = 1,
+            action = "editor.visualizer." .. id .. ".change",
+            release_action = "editor.visualizer.save" })
+    end
+
+    drawVisualizerSlider("gain", "GAIN", state.visualizer_gain, 1, 48, "x", 0)
+    drawVisualizerSlider("bars", "BAR COUNT", state.visualizer_bar_count, 15, 90, "", 1)
+    drawVisualizerSlider("height", "HEIGHT", state.visualizer_height, 60, 240, " px", 2)
+    drawVisualizerSlider("opacity", "OPACITY", state.visualizer_opacity, 10, 100, "%", 3)
+    drawVisualizerSlider("gap", "BAR GAP", state.visualizer_gap, 0, 6, " px", 4)
+
+    local fftY = controlTop + 5 * rowHeight + 2 * scale
+    label("FFT WINDOW", controlsX, fftY, fontSize("small"), C.muted, nil, base + 4, F.medium)
+    local fftGap = 8 * scale
+    local fftW = math.max(1, (controlsW - fftGap * 2) / 3)
+    for index, fft in ipairs({ 1024, 2048, 4096 }) do
+        local selected = num(state.visualizer_fft_size, 2048) == fft
+        UI.draw_button({ id = "editor_visualizer_modal_fft_" .. tostring(fft),
+            x = controlsX + (index - 1) * (fftW + fftGap), y = fftY + 25 * scale,
+            width = fftW, height = 34 * scale, label = tostring(fft),
+            action = "editor.visualizer.fft", value = fft, selected = selected,
+            variant = selected and "primary" or "secondary", font = F.medium,
+            text_size = fontSize("small"), hit_test_priority = 700, layer = base + 8 })
+    end
+
+    local footerY = y + panelH - 54 * scale
+    local buttonW = 116 * scale
+    local buttonH = 36 * scale
+    UI.draw_button({ id = "editor_visualizer_modal_export", x = x + padding,
+        y = footerY, width = 154 * scale, height = buttonH, label = "EXPORT VIDEO",
+        action = "editor.visualizer.export", enabled = state.visualizer_export_enabled == true,
+        variant = "secondary", accent = true, font = F.medium,
+        text_size = fontSize("small"), hit_test_priority = 700, layer = base + 8 })
+    UI.draw_button({ id = "editor_visualizer_modal_reset", x = x + panelW - padding - buttonW * 2 - 10 * scale,
+        y = footerY, width = buttonW, height = buttonH, label = "RESET",
+        action = "editor.visualizer.reset", variant = "secondary", font = F.medium,
+        text_size = fontSize("small"), hit_test_priority = 700, layer = base + 8 })
+    UI.draw_button({ id = "editor_visualizer_modal_close", x = x + panelW - padding - buttonW,
+        y = footerY, width = buttonW, height = buttonH, label = "CLOSE",
+        action = "editor.visualizer.close", variant = "primary", font = F.medium,
+        text_size = fontSize("small"), hit_test_priority = 700, layer = base + 8 })
+end
+
 function init() end
 
 function render()
@@ -2798,6 +3038,7 @@ function render()
     drawExportPopup(s, w, h, 150)
     drawDeleteDifficultyPopup(s, w, h, 170)
     drawCreateDifficultyPopup(s, w, h, 180)
+    drawVisualizerSettings(s, w, h, 210)
 end
 
 -- Retained only for the built-in C# emergency renderer. Normal chart editor

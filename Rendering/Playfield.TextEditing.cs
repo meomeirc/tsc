@@ -166,6 +166,8 @@ public sealed partial class Playfield
         if (fieldId.StartsWith("stutter:", StringComparison.Ordinal)) return _editorStutterInputText.Length;
         if (fieldId == "preview-start") return _editorPreviewStartText.Length;
         if (fieldId == "preview-end") return _editorPreviewEndText.Length;
+        if (fieldId.StartsWith("visualizer:", StringComparison.Ordinal) && _editorVisualizerEditingField is not null)
+            return _editorVisualizerEditingText.Length;
         return 0;
     }
 
@@ -198,6 +200,13 @@ public sealed partial class Playfield
         if (id == "preview-end" && _editorPreviewFocusedField == 1)
         {
             text = _editorPreviewEndText; anchor = _editorPreviewEndSelectionAnchor; caret = _editorPreviewEndCaret; return true;
+        }
+        if (id.StartsWith("visualizer:", StringComparison.Ordinal) && _editorVisualizerEditingField is not null)
+        {
+            text = _editorVisualizerEditingText;
+            anchor = _editorVisualizerEditingSelectionAnchor;
+            caret = _editorVisualizerEditingCaret;
+            return true;
         }
         return false;
     }
@@ -256,6 +265,17 @@ public sealed partial class Playfield
             _editorPreviewStartCaret = GetEditorPreviewTextCaretIndex(bounds, _editorPreviewStartText, point, unit);
         else if (_editorTextActiveFieldId == "preview-end")
             _editorPreviewEndCaret = GetEditorPreviewTextCaretIndex(bounds, _editorPreviewEndText, point, unit);
+        else if (_editorTextActiveFieldId.StartsWith("visualizer:", StringComparison.Ordinal) &&
+                 _editorVisualizerEditingField is not null)
+        {
+            var controller = GetOrCreateEditorTextController(_editorTextActiveFieldId, _editorVisualizerEditingText);
+            controller.SynchronizeState(_editorVisualizerEditingText, _editorVisualizerEditingCaret,
+                _editorVisualizerEditingSelectionAnchor, _editorVisualizerEditingReplaceOnNextKey);
+            var caret = GetEditorVisualizerTextCaretIndex(bounds, _editorVisualizerEditingText, point.X);
+            controller.SetCaret(caret, extendSelection: true);
+            _editorVisualizerEditingCaret = controller.Caret;
+            _editorVisualizerEditingSelectionAnchor = controller.Anchor;
+        }
         _editorTextMouseSelecting = stillDragging;
     }
 

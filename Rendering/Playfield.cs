@@ -53,6 +53,7 @@ public sealed partial class Playfield
     public event Action? OpenAresRequested;
     public event Action? ImportEditorSongRequested;
     public event Action<string>? EditorMediaPickRequested;
+    public event Action? EditorPreviewVideoExportRequested;
     public event Action? EditorExitRequested;
     public event Action? EditorSettingsRequested;
 
@@ -1201,7 +1202,7 @@ public sealed partial class Playfield
     public bool EditorTextInputActive => _chartEditorMode &&
         (_editorMetaEditingField is not null || _editorBpmInputFocused ||
          _editorDurationInputFocused || _editorStutterInputField != EditorStutterInputField.None ||
-         _editorPreviewFocusedField >= 0);
+         _editorPreviewFocusedField >= 0 || _editorVisualizerEditingField is not null);
     internal long EditorRecoveryRevision => _editorRecoveryRevision;
     public bool HasUnsavedEditorChanges
     {
@@ -1744,11 +1745,12 @@ public sealed partial class Playfield
 
     private void CloseEditorMetaPanel()
     {
-        // The media-tab preview belongs to the INFO panel. Stop and dispose it
-        // whenever that panel closes, regardless of whether it was closed by
-        // Escape, the skin button, or the native fallback controls.
+        // Media-tab audio previews belong to the INFO panel. Stop and dispose
+        // them whenever it closes, regardless of how the panel was dismissed.
         if (_editorMetaPanelOpen)
             StopEditorPreviewPlayback();
+        if (_editorVisualizerSettingsOpen)
+            CloseEditorVisualizerSettings();
         _editorMetaPanelOpen = false;
         InvalidateEditorMediaAssetCaches();
     }
@@ -1861,6 +1863,7 @@ public sealed partial class Playfield
         _holdGameplayIntroUntilTransitionComplete = false;
         _gameplayStartupHiddenDrawFrames = 0;
         StopEditorPreviewPlayback();
+        CloseEditorVisualizerSettings();
         _editorPreviewEditorOpen = false;
         _playing = false;
         _playbackStartPending = false;
@@ -7492,6 +7495,15 @@ public sealed partial class Playfield
 
     private void HandleEditorMetaKeyboard(KeyboardState keyboard, KeyboardState previousKeyboard)
     {
+        if (_editorVisualizerSettingsOpen)
+        {
+            if (KeybindSettings.IsPressed("editor_cancel") || KeybindSettings.IsPressed("menu_back"))
+            {
+                SaveEditorPreviewVideoVisualizerSettings();
+                CloseEditorVisualizerSettings();
+            }
+            return;
+        }
         if (_editorMetaEditingField is null) return;
 
         var id = "meta:" + _editorMetaEditingField;
@@ -7599,6 +7611,39 @@ public sealed partial class Playfield
                 return;
             }
 
+            return;
+        }
+
+        if (_editorVisualizerSettingsOpen)
+        {
+            if (_editorVisualizerEditingField is { } visualizerField)
+            {
+                UpdateEditorTextFieldMouseDrag();
+                if (HandleEditorTextFieldKeyboard("visualizer:" + visualizerField,
+                        ref _editorVisualizerEditingText, ref _editorVisualizerEditingCaret,
+                        ref _editorVisualizerEditingSelectionAnchor,
+                        ref _editorVisualizerEditingReplaceOnNextKey,
+                        keyboard, previousKeyboard,
+                        static (current, character) => char.IsDigit(character) && current.Length < 3))
+                    return;
+
+                if (KeybindSettings.IsPressed("editor_cancel") || KeybindSettings.IsPressed("menu_back"))
+                {
+                    CancelEditorVisualizerValueEdit();
+                    return;
+                }
+                if (KeybindSettings.IsTextFieldCommitPressed() ||
+                    KeybindSettings.IsPressed("editor_field_next") ||
+                    KeybindSettings.IsPressed("editor_field_previous"))
+                    CommitEditorVisualizerValueEdit();
+                return;
+            }
+
+            if (KeybindSettings.IsPressed("editor_cancel") || KeybindSettings.IsPressed("menu_back"))
+            {
+                SaveEditorPreviewVideoVisualizerSettings();
+                CloseEditorVisualizerSettings();
+            }
             return;
         }
 
@@ -13819,6 +13864,7 @@ public sealed partial class Playfield
         _editorOriginalMusicOpusBytes = null;
         StopEditorLanTest();
         StopEditorPreviewPlayback();
+        CloseEditorVisualizerSettings();
         DisposeEditorPreviewSelectionPlayer();
         ReleaseTstsWorkingDirectory();
         _audio.Dispose();

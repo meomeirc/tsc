@@ -29,6 +29,9 @@ public sealed class OpusAudioPlayer : IDisposable
     private Task<byte[]>? _recoveryPcmTask;
     private Task<float[]>? _waveformRmsTask;
     private CancellationTokenSource? _waveformRmsCancellation;
+    private float[]? _spectrumReal;
+    private float[]? _spectrumImaginary;
+    private float[]? _spectrumWindow;
     private int _waveformRmsBucketCount;
     private double _durationSeconds;
     private bool _isLooped;
@@ -56,6 +59,124 @@ public sealed class OpusAudioPlayer : IDisposable
     public double DurationSeconds => _durationSeconds;
     public long PcmBytes => _pcm?.LongLength ?? 0;
     public int SourceGeneration { get; private set; }
+
+    /// <summary>
+    /// Fills logarithmically spaced spectrum bands from the retained 48 kHz PCM.
+    /// This is used by the editor's live preview so it can display the same
+    /// frequency-bar style without first rendering an MP4.
+    /// </summary>
+    public bool TryGetSpectrumBands(double centerSeconds, int fftSize, float gain, Span<float> destination)
+    {
+        if (_pcm is not { Length: >= 4 } pcm || destination.Length == 0 ||
+            !double.IsFinite(centerSeconds) || !float.IsFinite(gain))
+            return false;
+        if (fftSize is not (1024 or 2048 or 4096))
+            fftSize = 2048;
+
+        if (_spectrumReal is not { Length: var realLength } || realLength != fftSize)
+        {
+            _spectrumReal = new float[fftSize];
+            _spectrumImaginary = new float[fftSize];
+            _spectrumWindow = new float[fftSize];
+            for (var index = 0; index < fftSize; index++)
+                _spectrumWindow[index] = 0.5f - 0.5f * MathF.Cos(2f * MathF.PI * index / (fftSize - 1));
+        }
+        var real = _spectrumReal!;
+        var imaginary = _spectrumImaginary!;
+        var windowValues = _spectrumWindow!;
+        Array.Clear(real, 0, real.Length);
+        Array.Clear(imaginary, 0, imaginary.Length);
+
+        var bytesPerFrame = Channels * BytesPerSample;
+        var sourceFrames = pcm.Length / bytesPerFrame;
+        var centerFrame = (long)Math.Round(centerSeconds * SampleRate, MidpointRounding.AwayFromZero);
+        var firstFrame = centerFrame - fftSize / 2L;
+        for (var index = 0; index < fftSize; index++)
+        {
+            var sourceFrame = firstFrame + index;
+            if ((ulong)sourceFrame >= (ulong)sourceFrames)
+                continue;
+
+            var offset = checked((int)(sourceFrame * bytesPerFrame));
+            var left = BinaryPrimitives.ReadInt16LittleEndian(pcm.AsSpan(offset, BytesPerSample));
+            var right = BinaryPrimitives.ReadInt16LittleEndian(pcm.AsSpan(offset + BytesPerSample, BytesPerSample));
+            var mono = (left + right) * (1f / 65536f);
+            real[index] = mono * windowValues[index];
+        }
+
+        // In-place radix-2 Cooley-Tukey FFT. The work arrays are reused between
+        // frames, so the live editor preview does not allocate per frame.
+        var bitReverse = 0;
+        for (var index = 1; index < fftSize; index++)
+        {
+            var bit = fftSize >> 1;
+            while ((bitReverse & bit) != 0)
+            {
+                bitReverse ^= bit;
+                bit >>= 1;
+            }
+            bitReverse ^= bit;
+            if (index < bitReverse)
+            {
+                (real[index], real[bitReverse]) = (real[bitReverse], real[index]);
+                (imaginary[index], imaginary[bitReverse]) = (imaginary[bitReverse], imaginary[index]);
+            }
+        }
+
+        for (var length = 2; length <= fftSize; length <<= 1)
+        {
+            var halfLength = length >> 1;
+            var angle = -2f * MathF.PI / length;
+            var stepReal = MathF.Cos(angle);
+            var stepImaginary = MathF.Sin(angle);
+            for (var block = 0; block < fftSize; block += length)
+            {
+                var twiddleReal = 1f;
+                var twiddleImaginary = 0f;
+                for (var offset = 0; offset < halfLength; offset++)
+                {
+                    var evenIndex = block + offset;
+                    var oddIndex = evenIndex + halfLength;
+                    var oddReal = real[oddIndex] * twiddleReal - imaginary[oddIndex] * twiddleImaginary;
+                    var oddImaginary = real[oddIndex] * twiddleImaginary + imaginary[oddIndex] * twiddleReal;
+                    var evenReal = real[evenIndex];
+                    var evenImaginary = imaginary[evenIndex];
+                    real[evenIndex] = evenReal + oddReal;
+                    imaginary[evenIndex] = evenImaginary + oddImaginary;
+                    real[oddIndex] = evenReal - oddReal;
+                    imaginary[oddIndex] = evenImaginary - oddImaginary;
+
+                    var nextTwiddleReal = twiddleReal * stepReal - twiddleImaginary * stepImaginary;
+                    twiddleImaginary = twiddleReal * stepImaginary + twiddleImaginary * stepReal;
+                    twiddleReal = nextTwiddleReal;
+                }
+            }
+        }
+
+        const float minimumFrequency = 30f;
+        const float maximumFrequency = 20_000f;
+        var nyquistBin = fftSize / 2;
+        var normalization = 4f / fftSize;
+        var safeGain = Math.Clamp(gain, 0f, 64f) * (1f / 12f);
+        for (var band = 0; band < destination.Length; band++)
+        {
+            var bandStart = minimumFrequency * MathF.Pow(maximumFrequency / minimumFrequency,
+                band / (float)destination.Length);
+            var bandEnd = minimumFrequency * MathF.Pow(maximumFrequency / minimumFrequency,
+                (band + 1f) / destination.Length);
+            var firstBin = Math.Clamp((int)MathF.Floor(bandStart * fftSize / SampleRate), 1, nyquistBin);
+            var lastBin = Math.Clamp((int)MathF.Ceiling(bandEnd * fftSize / SampleRate), firstBin, nyquistBin);
+            var peak = 0f;
+            for (var bin = firstBin; bin <= lastBin; bin++)
+            {
+                var magnitude = MathF.Sqrt(real[bin] * real[bin] + imaginary[bin] * imaginary[bin]) * normalization;
+                if (magnitude > peak)
+                    peak = magnitude;
+            }
+            destination[band] = Math.Clamp(peak * safeGain, 0f, 1f);
+        }
+        return true;
+    }
 
     /// <summary>
     /// Builds a compact RMS waveform directly from the retained decoded PCM.

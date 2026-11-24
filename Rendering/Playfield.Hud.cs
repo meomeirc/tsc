@@ -2725,6 +2725,10 @@ public sealed partial class Playfield
         }
         if (_editorCreateDifficultyConfirmOpen)
             DrawEditorCreateDifficultyConfirmation(virtualWidth, virtualHeight);
+        // Normal editor mode lets chartEditorInterface.lua draw this modal. Keep
+        // the native window only for the emergency renderer when Lua is unavailable.
+        if (_editorVisualizerSettingsOpen)
+            DrawEditorVisualizerSettingsModal(virtualWidth, virtualHeight);
     }
 
     private void DrawEditorCreateDifficultyConfirmation(int virtualWidth, int virtualHeight)

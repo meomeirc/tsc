@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.Globalization;
 using Microsoft.Xna.Framework;
 using Microsoft.Xna.Framework.Graphics;
@@ -64,6 +65,24 @@ public sealed partial class Playfield
     private long _editorPreviewPlaybackStartTimestamp;
     private double _editorPreviewPlaybackDurationSeconds;
     private double? _editorSavedPreviewDurationSeconds;
+
+    private bool _editorVisualizerSettingsOpen;
+    private int _editorVisualizerSettingsDragging = -1;
+    private string? _editorVisualizerEditingField;
+    private string _editorVisualizerEditingText = string.Empty;
+    private int _editorVisualizerEditingCaret;
+    private int _editorVisualizerEditingSelectionAnchor;
+    private bool _editorVisualizerEditingReplaceOnNextKey;
+    private OpusAudioPlayer? _editorVisualizerPreviewPlayer;
+    private double _editorVisualizerPreviewStartSeconds;
+    private double _editorVisualizerPreviewDurationSeconds;
+    private long _editorVisualizerPreviewStartTimestamp;
+    private readonly float[] _editorVisualizerPreviewBands = new float[90];
+
+    private enum EditorVisualizerSlider
+    {
+        Gain, BarCount, Height, Opacity, Gap
+    }
 
     private bool _editorPreviewAssetDirectoryCacheValid;
     private string? _editorPreviewAssetDirectoryCacheWorkingDirectory;
@@ -1215,6 +1234,351 @@ public sealed partial class Playfield
         }
     }
 
+    private bool TryReadSavedEditorPreviewVideoRange(out double startSeconds, out double endSeconds,
+        out string message)
+    {
+        startSeconds = 0;
+        endSeconds = 0;
+        message = string.Empty;
+
+        if (_audio.IsLoading)
+        {
+            message = "Music is still being prepared. Preview video export will be available shortly.";
+            return false;
+        }
+
+        var sourceDuration = EditorPreviewSourceDurationSeconds;
+        if (sourceDuration <= 0)
+        {
+            message = "Import the full song audio before exporting a preview video.";
+            return false;
+        }
+
+        // The Media tab can export without opening the preview editor. Do not
+        // read its text boxes here: they may still contain their initial 0–30s
+        // placeholders. The chart metadata is the saved source of truth.
+        if (_chart?.HasPreviewRange == true)
+        {
+            startSeconds = _chart.PreviewStartMilliseconds!.Value / 1000.0;
+            endSeconds = _chart.PreviewEndMilliseconds!.Value / 1000.0;
+        }
+        else
+        {
+            // Keep the familiar default only for charts with no saved range.
+            startSeconds = 0;
+            endSeconds = Math.Min(30.0, sourceDuration);
+        }
+
+        startSeconds = Math.Clamp(startSeconds, 0, sourceDuration);
+        endSeconds = Math.Clamp(endSeconds, 0, sourceDuration);
+        if (endSeconds <= startSeconds)
+        {
+            message = "The saved preview range is invalid for the current song audio. Reopen the preview editor and save a valid range.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool CanExportEditorPreviewVideo()
+    {
+        if (_audio.IsLoading || _audio.PcmBytes <= 0 ||
+            !HasEditorMediaResource("music") || !HasEditorMediaResource("album"))
+            return false;
+        return TryReadSavedEditorPreviewVideoRange(out _, out _, out _);
+    }
+
+    private int GetEditorPreviewVideoVisualizerGain()
+        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerGain, 1, 48);
+
+    private int GetEditorPreviewVideoVisualizerBarCount()
+        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerBarCount, 15, 90);
+
+    private int GetEditorPreviewVideoVisualizerHeight()
+        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerHeight, 60, 240);
+
+    private int GetEditorPreviewVideoVisualizerOpacity()
+        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerOpacity, 10, 100);
+
+    private int GetEditorPreviewVideoVisualizerGap()
+        => Math.Clamp(_skin.GameConfig.PreviewVideoVisualizerGap, 0, 6);
+
+    private int GetEditorPreviewVideoVisualizerFftSize()
+        => _skin.GameConfig.PreviewVideoVisualizerFftSize is 1024 or 2048 or 4096
+            ? _skin.GameConfig.PreviewVideoVisualizerFftSize : 2048;
+
+    private void SaveEditorPreviewVideoVisualizerSettings()
+    {
+        try
+        {
+            _skin.GameConfig.PreviewVideoVisualizerGain = GetEditorPreviewVideoVisualizerGain();
+            _skin.GameConfig.PreviewVideoVisualizerBarCount = GetEditorPreviewVideoVisualizerBarCount();
+            _skin.GameConfig.PreviewVideoVisualizerHeight = GetEditorPreviewVideoVisualizerHeight();
+            _skin.GameConfig.PreviewVideoVisualizerOpacity = GetEditorPreviewVideoVisualizerOpacity();
+            _skin.GameConfig.PreviewVideoVisualizerGap = GetEditorPreviewVideoVisualizerGap();
+            _skin.GameConfig.PreviewVideoVisualizerFftSize = GetEditorPreviewVideoVisualizerFftSize();
+            SkinConfigStore.SaveGameConfig(UserDataPaths.GameConfigPath, _skin.GameConfig);
+            _statusMessage = "Preview visualizer settings saved.";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Text.Json.JsonException)
+        {
+            _statusMessage = $"Could not save visualizer settings: {ex.Message}";
+        }
+    }
+
+    /// <summary>
+    /// Exports the saved preview range as an MP4 with album artwork and a
+    /// non-additive, element-coloured frequency-bar visualizer.
+    /// </summary>
+    public void ExportEditorPreviewVideo(string outputPath)
+    {
+        if (!_chartEditorMode || _chart is null)
+            throw new InvalidOperationException("Open Chart Editor before exporting a preview video.");
+        if (string.IsNullOrWhiteSpace(outputPath))
+            throw new ArgumentException("An output path is required.", nameof(outputPath));
+
+        var ffmpeg = FindTstsFfmpegExecutable();
+        if (ffmpeg is null)
+            throw ExternalDependencyPrompts.CreateFfmpegNotFoundException("export a song preview video");
+
+        var musicBytes = GetEditorPreviewMusicBytes();
+        if (musicBytes is not { Length: > 0 })
+            throw new InvalidOperationException("Import the full song audio before exporting a preview video.");
+
+        var albumBytes = GetEditorPreviewVideoAlbumBytes();
+        if (albumBytes is not { Length: > 0 })
+            throw new InvalidOperationException("Set an album cover in MEDIA before exporting a preview video.");
+
+        if (!TryReadSavedEditorPreviewVideoRange(out var startSeconds, out var endSeconds, out var validationMessage))
+            throw new InvalidOperationException(validationMessage);
+
+        var clipDuration = endSeconds - startSeconds;
+        var fadeSeconds = GetEditorPreviewFadeDurationSeconds(clipDuration);
+        var fadeOutStart = Math.Max(0, clipDuration - fadeSeconds);
+        var volumePercent = Math.Clamp(_editorMusicVolumePendingPercent, 0, 100);
+        var volume = (volumePercent / 100.0).ToString("0.###", CultureInfo.InvariantCulture);
+        var start = startSeconds.ToString("0.######", CultureInfo.InvariantCulture);
+        var duration = clipDuration.ToString("0.######", CultureInfo.InvariantCulture);
+        var fade = fadeSeconds.ToString("0.######", CultureInfo.InvariantCulture);
+        var fadeOut = fadeOutStart.ToString("0.######", CultureInfo.InvariantCulture);
+
+        if (_audio.PcmBytes <= 0)
+            throw new InvalidOperationException("Decoded song audio is not ready for visualizer rendering. Reload the song audio and try again.");
+
+        var visualizerColor = NormalizeEditorElement(_chart.Element) switch
+        {
+            "VOCAL" => new Color(96, 165, 250),
+            "SESSION" => new Color(52, 211, 153),
+            _ => new Color(248, 113, 113)
+        };
+
+        // Build the export bars with the exact FFT, gain normalization, fade,
+        // height, spacing and opacity math used by the on-screen visualizer.
+        // FFmpeg's showfreqs filter has a different magnitude scale and was
+        // making the exported bars much more aggressive than the editor preview.
+        const int outputSize = 720;
+        const int frameRate = 60;
+        var visualizerHeight = GetEditorPreviewVideoVisualizerHeight();
+        var visualizerTop = outputSize - visualizerHeight;
+        var visualizerBarCount = GetEditorPreviewVideoVisualizerBarCount();
+        var visualizerGap = GetEditorPreviewVideoVisualizerGap();
+        var visualizerOpacity = GetEditorPreviewVideoVisualizerOpacity();
+        var visualizerAlpha = (visualizerOpacity / 100.0).ToString("0.###", CultureInfo.InvariantCulture);
+        var visualizerGain = GetEditorPreviewVideoVisualizerGain();
+        var visualizerFftSize = GetEditorPreviewVideoVisualizerFftSize();
+        var filter =
+            $"[1:a:0]asetpts=PTS-STARTPTS," +
+            $"afade=t=in:st=0:d={fade}:curve=tri," +
+            $"afade=t=out:st={fadeOut}:d={fade}:curve=tri," +
+            $"volume={volume}[previewAudio];" +
+            $"[2:v:0]format=rgba,geq=r='{visualizerColor.R}':g='{visualizerColor.G}':b='{visualizerColor.B}':a='r(X,Y)*{visualizerAlpha}'[bars];" +
+            $"[0:v:0]scale={outputSize}:{outputSize}:force_original_aspect_ratio=decrease," +
+            $"pad={outputSize}:{outputSize}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[cover];" +
+            $"[cover][bars]overlay=x=0:y={visualizerTop}:format=auto:shortest=1,format=yuv420p[video]";
+
+        var temporaryDirectory = Path.Combine(Path.GetTempPath(), "TSC-preview-video-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temporaryDirectory);
+        var artworkExtension = DetectEditorArtworkExtension(albumBytes, GetEditorArtworkExtensionHint("album"));
+        var albumPath = Path.Combine(temporaryDirectory, "album" + artworkExtension);
+        var musicExtension = (_editorSharedMusicBytes is { Length: > 0 } || _loadedMusicBytes is { Length: > 0 })
+            ? ".opus"
+            : NormalizeEditorAudioSourceExtension(_chart.MusicPath);
+        var musicPath = Path.Combine(temporaryDirectory, "music" + musicExtension);
+        var renderedPath = Path.Combine(temporaryDirectory, "preview.mp4");
+        try
+        {
+            File.WriteAllBytes(albumPath, albumBytes);
+            File.WriteAllBytes(musicPath, musicBytes);
+
+            RunEditorPreviewFfmpegWithVisualizerFrames(ffmpeg, new[]
+            {
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-loop", "1", "-framerate", frameRate.ToString(CultureInfo.InvariantCulture), "-i", albumPath,
+                // Input-side accurate seeking makes the exported audio begin at
+                // the selected preview timestamp, rather than merely trimming
+                // a decoded stream whose timestamps may start at zero.
+                "-ss", start,
+                "-i", musicPath,
+                "-f", "rawvideo", "-pixel_format", "gray",
+                "-video_size", $"{outputSize}x{visualizerHeight}",
+                "-framerate", frameRate.ToString(CultureInfo.InvariantCulture), "-i", "pipe:0",
+                "-filter_complex", filter,
+                "-map", "[video]", "-map", "[previewAudio]",
+                "-t", duration,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", frameRate.ToString(CultureInfo.InvariantCulture),
+                "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest",
+                renderedPath
+            }, stream => WriteEditorPreviewVideoVisualizerFrames(stream, startSeconds, clipDuration,
+                fadeSeconds, volumePercent, visualizerBarCount, visualizerHeight, visualizerGap,
+                visualizerGain, visualizerFftSize, frameRate));
+
+            if (!File.Exists(renderedPath) || new FileInfo(renderedPath).Length == 0)
+                throw new InvalidDataException("FFmpeg did not produce a preview video.");
+
+            var fullOutputPath = Path.GetFullPath(outputPath);
+            var outputDirectory = Path.GetDirectoryName(fullOutputPath);
+            if (string.IsNullOrWhiteSpace(outputDirectory))
+                throw new InvalidOperationException("The selected output folder is invalid.");
+            Directory.CreateDirectory(outputDirectory);
+            File.Copy(renderedPath, fullOutputPath, overwrite: true);
+            _statusMessage = $"Preview video exported ({FormatEditorPreviewTimestamp(clipDuration)}).";
+        }
+        finally
+        {
+            try { Directory.Delete(temporaryDirectory, recursive: true); } catch { }
+        }
+    }
+
+    private void WriteEditorPreviewVideoVisualizerFrames(Stream destination, double startSeconds,
+        double clipDuration, double fadeSeconds, int musicVolumePercent, int barCount, int visualizerHeight,
+        int gapPixels, int gain, int fftSize, int frameRate)
+    {
+        const int outputWidth = 720;
+        // A grayscale mask keeps the raw pipe small; FFmpeg applies the selected
+        // color and opacity after reading it.
+        var frameBytes = new byte[checked(outputWidth * visualizerHeight)];
+        var bands = new float[barCount];
+        var musicVolume = Math.Clamp(musicVolumePercent, 0, 100) / 100f;
+        var cellWidth = outputWidth / (float)barCount;
+        var frameCount = Math.Max(1, (int)Math.Ceiling(clipDuration * frameRate - 1e-9));
+
+        for (var frameIndex = 0; frameIndex < frameCount; frameIndex++)
+        {
+            Array.Clear(frameBytes);
+            var clipElapsed = Math.Min(frameIndex / (double)frameRate, clipDuration);
+            var sourceSeconds = startSeconds + clipElapsed;
+            if (!_audio.TryGetSpectrumBands(sourceSeconds, fftSize, gain, bands))
+                throw new InvalidOperationException("The decoded song audio became unavailable while rendering the visualizer.");
+
+            var fadeGain = fadeSeconds > 0
+                ? Math.Clamp(Math.Min(clipElapsed / fadeSeconds,
+                    (clipDuration - clipElapsed) / fadeSeconds), 0.0, 1.0)
+                : 1.0;
+            var barScale = musicVolume * (float)fadeGain;
+
+            for (var barIndex = 0; barIndex < barCount; barIndex++)
+            {
+                // This mirrors DrawEditorVisualizerSettingsModal: calculate the
+                // bar height from the same normalized FFT band and music/fade gain.
+                var barHeight = Math.Clamp((int)MathF.Round(bands[barIndex] * barScale * visualizerHeight),
+                    0, visualizerHeight);
+                if (barHeight <= 0)
+                    continue;
+
+                var x = (int)MathF.Round(barIndex * cellWidth);
+                var nextX = (int)MathF.Round((barIndex + 1) * cellWidth);
+                var barWidth = Math.Max(1, (int)MathF.Round(nextX - x - gapPixels));
+                var left = Math.Clamp(x, 0, outputWidth);
+                var right = Math.Clamp(x + barWidth, 0, outputWidth);
+                var top = visualizerHeight - barHeight;
+                for (var y = top; y < visualizerHeight; y++)
+                    frameBytes.AsSpan(y * outputWidth + left, right - left).Fill(byte.MaxValue);
+            }
+
+            destination.Write(frameBytes, 0, frameBytes.Length);
+        }
+    }
+
+    private static void RunEditorPreviewFfmpegWithVisualizerFrames(string executable,
+        IEnumerable<string> arguments, Action<Stream> writeVisualizerFrames)
+    {
+        var start = new ProcessStartInfo
+        {
+            FileName = executable,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        foreach (var argument in arguments)
+            start.ArgumentList.Add(argument);
+
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start FFmpeg.");
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        Exception? frameWriteException = null;
+        try
+        {
+            writeVisualizerFrames(process.StandardInput.BaseStream);
+        }
+        catch (Exception ex)
+        {
+            frameWriteException = ex;
+        }
+        finally
+        {
+            try { process.StandardInput.Close(); } catch { }
+        }
+
+        process.WaitForExit();
+        var stderr = stderrTask.GetAwaiter().GetResult();
+        if (process.ExitCode != 0)
+        {
+            var detail = string.IsNullOrWhiteSpace(stderr) ? "FFmpeg could not process the preview video." : stderr.Trim();
+            if (detail.Length > 1200) detail = detail[..1200];
+            throw new InvalidDataException(detail);
+        }
+        if (frameWriteException is not null)
+            throw new InvalidOperationException("Could not generate the preview visualizer frames.", frameWriteException);
+    }
+
+    private static string DetectEditorArtworkExtension(byte[] imageBytes, string fallbackExtension)
+    {
+        if (imageBytes.Length >= 8 && imageBytes.AsSpan(0, 8).SequenceEqual(new byte[]
+            { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }))
+            return ".png";
+        if (imageBytes.Length >= 3 && imageBytes[0] == 0xFF && imageBytes[1] == 0xD8 && imageBytes[2] == 0xFF)
+            return ".jpg";
+        if (imageBytes.Length >= 12 && imageBytes.AsSpan(0, 4).SequenceEqual("RIFF"u8) &&
+            imageBytes.AsSpan(8, 4).SequenceEqual("WEBP"u8))
+            return ".webp";
+        if (imageBytes.Length >= 6 &&
+            (imageBytes.AsSpan(0, 6).SequenceEqual("GIF87a"u8) || imageBytes.AsSpan(0, 6).SequenceEqual("GIF89a"u8)))
+            return ".gif";
+        if (imageBytes.Length >= 2 && imageBytes[0] == (byte)'B' && imageBytes[1] == (byte)'M')
+            return ".bmp";
+        if (imageBytes.Length >= 4 &&
+            (imageBytes.AsSpan(0, 4).SequenceEqual(new byte[] { 0x49, 0x49, 0x2A, 0x00 }) ||
+             imageBytes.AsSpan(0, 4).SequenceEqual(new byte[] { 0x4D, 0x4D, 0x00, 0x2A })))
+            return ".tif";
+
+        if (string.IsNullOrWhiteSpace(fallbackExtension) || fallbackExtension.Length > 10)
+            return ".img";
+        return fallbackExtension.StartsWith(".", StringComparison.Ordinal)
+            ? fallbackExtension : "." + fallbackExtension;
+    }
+
+    private byte[]? GetEditorPreviewVideoAlbumBytes()
+    {
+        if (_editorSharedAlbumBytes is { Length: > 0 } sharedBytes)
+            return sharedBytes.ToArray();
+
+        var assetPath = GetEditorArtworkAssetPath("album");
+        if (!string.IsNullOrWhiteSpace(assetPath) && File.Exists(assetPath))
+            return File.ReadAllBytes(assetPath);
+
+        return null;
+    }
+
     private bool SaveEditorPreview()
     {
         if (_chart is null || !_chartEditorMode)
@@ -2162,11 +2526,112 @@ public sealed partial class Playfield
         return new Rectangle(play.Right + gap, play.Y, Math.Max(1, content.Right - play.Right - gap), play.Height);
     }
 
+    private Rectangle GetEditorMediaVisualizerSettingsButtonBounds(int virtualWidth, int virtualHeight)
+    {
+        var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        return new Rectangle(content.X, content.Y + (int)MathF.Round(210f * unit), content.Width,
+            Math.Max(1, (int)MathF.Round(34f * unit)));
+    }
+
+    private Rectangle GetEditorVisualizerSettingsPanelBounds(int virtualWidth, int virtualHeight)
+    {
+        var unit = _projection.ScalePixels(1f);
+        var margin = Math.Max(12, (int)MathF.Round(18f * unit));
+        var width = Math.Min((int)MathF.Round(820f * unit), Math.Max(1, virtualWidth - margin * 2));
+        var height = Math.Min((int)MathF.Round(490f * unit), Math.Max(1, virtualHeight - margin * 2));
+        return new Rectangle((virtualWidth - width) / 2, (virtualHeight - height) / 2, width, height);
+    }
+
+    private Rectangle GetEditorVisualizerPreviewBounds(int virtualWidth, int virtualHeight)
+    {
+        var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var padding = Math.Max(10, (int)MathF.Round(24f * unit));
+        var top = panel.Y + (int)MathF.Round(72f * unit);
+        var footer = (int)MathF.Round(60f * unit);
+        var size = Math.Min((int)MathF.Round(290f * unit), Math.Min(panel.Height - (top - panel.Y) - footer,
+            panel.Width * 38 / 100));
+        size = Math.Max(1, size);
+        return new Rectangle(panel.X + padding, top, size, size);
+    }
+
+    private Rectangle GetEditorVisualizerSettingsControlsBounds(int virtualWidth, int virtualHeight)
+    {
+        var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
+        var preview = GetEditorVisualizerPreviewBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var gap = Math.Max(12, (int)MathF.Round(24f * unit));
+        var right = panel.Right - Math.Max(10, (int)MathF.Round(24f * unit));
+        var x = preview.Right + gap;
+        return new Rectangle(x, panel.Y + (int)MathF.Round(70f * unit), Math.Max(1, right - x),
+            Math.Max(1, panel.Height - (int)MathF.Round(140f * unit)));
+    }
+
+    private Rectangle GetEditorVisualizerSliderTrackBounds(EditorVisualizerSlider slider, int virtualWidth, int virtualHeight)
+    {
+        var controls = GetEditorVisualizerSettingsControlsBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var index = (int)slider;
+        var rowHeight = Math.Max(1, (int)MathF.Round(46f * unit));
+        return new Rectangle(controls.X, controls.Y + index * rowHeight + (int)MathF.Round(24f * unit),
+            controls.Width, Math.Max(5, (int)MathF.Round(6f * unit)));
+    }
+
+    private Rectangle GetEditorVisualizerFftButtonBounds(int fftSize, int virtualWidth, int virtualHeight)
+    {
+        var controls = GetEditorVisualizerSettingsControlsBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var y = controls.Y + (int)MathF.Round(5 * 46f * unit + 26f * unit);
+        var gap = Math.Max(4, (int)MathF.Round(8f * unit));
+        var width = Math.Max(1, (controls.Width - gap * 2) / 3);
+        var index = fftSize switch { 1024 => 0, 2048 => 1, 4096 => 2, _ => 1 };
+        return new Rectangle(controls.X + index * (width + gap), y, width, Math.Max(1, (int)MathF.Round(30f * unit)));
+    }
+
+    private Rectangle GetEditorVisualizerPreviewPlayButtonBounds(int virtualWidth, int virtualHeight)
+    {
+        var preview = GetEditorVisualizerPreviewBounds(virtualWidth, virtualHeight);
+        var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        return new Rectangle(preview.X, preview.Bottom + (int)MathF.Round(8f * unit),
+            Math.Max(1, preview.Width), Math.Max(1, (int)MathF.Round(34f * unit)));
+    }
+
+    private Rectangle GetEditorVisualizerResetButtonBounds(int virtualWidth, int virtualHeight)
+    {
+        var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var width = Math.Max(1, (int)MathF.Round(110f * unit));
+        var gap = Math.Max(4, (int)MathF.Round(8f * unit));
+        return new Rectangle(panel.Right - width * 2 - gap - (int)MathF.Round(24f * unit),
+            panel.Bottom - (int)MathF.Round(52f * unit), width, Math.Max(1, (int)MathF.Round(34f * unit)));
+    }
+
+    private Rectangle GetEditorVisualizerCloseButtonBounds(int virtualWidth, int virtualHeight)
+    {
+        var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var width = Math.Max(1, (int)MathF.Round(110f * unit));
+        return new Rectangle(panel.Right - width - (int)MathF.Round(24f * unit),
+            panel.Bottom - (int)MathF.Round(52f * unit), width, Math.Max(1, (int)MathF.Round(34f * unit)));
+    }
+
+    private Rectangle GetEditorVisualizerExportButtonBounds(int virtualWidth, int virtualHeight)
+    {
+        var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
+        var unit = _projection.ScalePixels(1f);
+        var padding = Math.Max(10, (int)MathF.Round(24f * unit));
+        var width = Math.Max(1, (int)MathF.Round(154f * unit));
+        return new Rectangle(panel.X + padding, panel.Bottom - (int)MathF.Round(52f * unit), width,
+            Math.Max(1, (int)MathF.Round(34f * unit)));
+    }
+
     private Rectangle GetEditorMediaArtworkCardBounds(bool albumBig, int virtualWidth, int virtualHeight)
     {
         var content = GetEditorMetaContentBounds(virtualWidth, virtualHeight);
         var unit = _projection.ScalePixels(1f);
-        var top = content.Y + (int)MathF.Round(210f * unit);
+        var top = content.Y + (int)MathF.Round(254f * unit);
         var gap = Math.Max(8, (int)MathF.Round(16f * unit));
         var supportsAlbumBig = _editorBundleTemplate != ChartBundleTemplate.Tsts;
         var cardWidth = supportsAlbumBig
@@ -2230,9 +2695,567 @@ public sealed partial class Playfield
             new Color(28, 28, 30, 250), new Color(52, 211, 153));
         DrawEditorMediaPreviewProgress(GetEditorMediaPreviewProgressBounds(virtualWidth, virtualHeight), unit);
 
+        var canPreviewVisualizer = CanPreviewEditorVideoVisualizer();
+        DrawEditorMetaButton(GetEditorMediaVisualizerSettingsButtonBounds(virtualWidth, virtualHeight),
+            "VISUALIZER", new Color(28, 28, 30, 250),
+            canPreviewVisualizer ? Active : new Color(90, 90, 92));
+
         DrawEditorMediaArtworkCard("album", virtualWidth, virtualHeight, unit);
         if (_editorBundleTemplate != ChartBundleTemplate.Tsts)
             DrawEditorMediaArtworkCard("album_big", virtualWidth, virtualHeight, unit);
+    }
+
+    private bool CanPreviewEditorVideoVisualizer()
+        => !_audio.IsLoading && _audio.IsLoaded && _audio.PcmBytes > 0 &&
+           TryReadSavedEditorPreviewVideoRange(out _, out _, out _);
+
+    private void OpenEditorVisualizerSettings()
+    {
+        if (!CanPreviewEditorVideoVisualizer())
+        {
+            _statusMessage = "Import the full song audio before previewing the visualizer.";
+            return;
+        }
+        if (!TryReadSavedEditorPreviewVideoRange(out var startSeconds, out var endSeconds, out var message))
+        {
+            _statusMessage = message;
+            return;
+        }
+
+        PauseChartPlaybackForPreviewEditor();
+        StopEditorPreviewPlayback();
+        StopEditorPreviewSelectionPlayback(resetPlayhead: false);
+        StopEditorVisualizerPreviewPlayback();
+        _editorVisualizerPreviewStartSeconds = startSeconds;
+        _editorVisualizerPreviewDurationSeconds = endSeconds - startSeconds;
+        _editorVisualizerSettingsDragging = -1;
+        _editorVisualizerSettingsOpen = true;
+    }
+
+    private void CloseEditorVisualizerSettings()
+    {
+        CancelEditorVisualizerValueEdit();
+        _editorVisualizerSettingsOpen = false;
+        _editorVisualizerSettingsDragging = -1;
+        StopEditorVisualizerPreviewPlayback();
+    }
+
+    private void StartEditorVisualizerPreviewPlayback()
+    {
+        if (_editorVisualizerPreviewDurationSeconds <= 0 || _audio.PcmBytes <= 0)
+            throw new InvalidOperationException("The selected song audio is not ready for visualizer preview.");
+
+        var fadeSeconds = GetEditorPreviewFadeDurationSeconds(_editorVisualizerPreviewDurationSeconds);
+        var pcm = _audio.CreateFadedPcmRange(_editorVisualizerPreviewStartSeconds,
+            _editorVisualizerPreviewStartSeconds,
+            _editorVisualizerPreviewStartSeconds + _editorVisualizerPreviewDurationSeconds, fadeSeconds);
+        var player = new OpusAudioPlayer();
+        try
+        {
+            player.LoadPcm(pcm);
+            player.Volume = GetEditorMusicPlaybackVolume();
+            player.IsLooped = true;
+            player.PrepareInitialPlayback(retainPcmForSeeking: true);
+            player.SyncToChartTime(0, 0);
+        }
+        catch
+        {
+            player.Dispose();
+            throw;
+        }
+
+        StopEditorVisualizerPreviewPlayback();
+        _editorVisualizerPreviewPlayer = player;
+        _editorVisualizerPreviewStartTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    private void StopEditorVisualizerPreviewPlayback()
+    {
+        var player = _editorVisualizerPreviewPlayer;
+        _editorVisualizerPreviewPlayer = null;
+        _editorVisualizerPreviewStartTimestamp = 0;
+        try { player?.Stop(); } catch { }
+        try { player?.Dispose(); } catch { }
+    }
+
+    private double GetEditorVisualizerPreviewSourceSeconds()
+    {
+        if (_editorVisualizerPreviewDurationSeconds <= 0)
+            return _editorVisualizerPreviewStartSeconds;
+        if (_editorVisualizerPreviewPlayer?.IsPlaying == true && _editorVisualizerPreviewStartTimestamp > 0)
+        {
+            var elapsed = (Stopwatch.GetTimestamp() - _editorVisualizerPreviewStartTimestamp) /
+                          (double)Stopwatch.Frequency;
+            if (double.IsFinite(elapsed) && elapsed >= 0)
+                return _editorVisualizerPreviewStartSeconds + elapsed % _editorVisualizerPreviewDurationSeconds;
+        }
+        // Show a useful non-silent sample before playback starts, after the fade-in.
+        return Math.Clamp(_editorVisualizerPreviewStartSeconds +
+            Math.Min(0.75, _editorVisualizerPreviewDurationSeconds * 0.2),
+            _editorVisualizerPreviewStartSeconds,
+            _editorVisualizerPreviewStartSeconds + _editorVisualizerPreviewDurationSeconds);
+    }
+
+    // The active Lua skin draws the settings window, including the live bars.
+    // Keep the spectrum calculation here so preview and exported frames continue
+    // to use exactly the same FFT, gain, music-volume, and fade calculations.
+    private float[] GetEditorVisualizerSkinPreviewBands()
+    {
+        if (!_editorVisualizerSettingsOpen || !_audio.IsLoaded || _audio.PcmBytes <= 0)
+            return Array.Empty<float>();
+
+        var count = GetEditorPreviewVideoVisualizerBarCount();
+        var bands = new float[count];
+        var sourceSeconds = GetEditorVisualizerPreviewSourceSeconds();
+        if (!_audio.TryGetSpectrumBands(sourceSeconds, GetEditorPreviewVideoVisualizerFftSize(),
+                GetEditorPreviewVideoVisualizerGain(), bands))
+            return Array.Empty<float>();
+
+        var musicVolume = Math.Clamp(_editorMusicVolumePendingPercent, 0, 100) / 100f;
+        var clipElapsed = Math.Clamp(sourceSeconds - _editorVisualizerPreviewStartSeconds,
+            0, _editorVisualizerPreviewDurationSeconds);
+        var fadeSeconds = GetEditorPreviewFadeDurationSeconds(_editorVisualizerPreviewDurationSeconds);
+        var fadeGain = fadeSeconds > 0
+            ? Math.Clamp(Math.Min(clipElapsed / fadeSeconds,
+                (_editorVisualizerPreviewDurationSeconds - clipElapsed) / fadeSeconds), 0.0, 1.0)
+            : 1.0;
+        var scale = (float)(musicVolume * fadeGain);
+        for (var index = 0; index < bands.Length; index++)
+            bands[index] *= scale;
+        return bands;
+    }
+
+    private Dictionary<string, object?> GetEditorVisualizerSkinPreviewColor()
+    {
+        var (red, green, blue) = NormalizeEditorElement(_chart?.Element) switch
+        {
+            "VOCAL" => ((byte)96, (byte)165, (byte)250),
+            "SESSION" => ((byte)52, (byte)211, (byte)153),
+            _ => ((byte)248, (byte)113, (byte)113)
+        };
+        return new Dictionary<string, object?>
+        {
+            ["r"] = red,
+            ["g"] = green,
+            ["b"] = blue,
+            ["a"] = 255
+        };
+    }
+
+    private void SetEditorPreviewVideoVisualizerSetting(string setting, object? rawValue)
+    {
+        double value = rawValue switch
+        {
+            double number when double.IsFinite(number) => number,
+            float number when float.IsFinite(number) => number,
+            int integer => integer,
+            long integer => integer,
+            string text when double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) => parsed,
+            _ => double.NaN
+        };
+        if (!double.IsFinite(value))
+            return;
+
+        var rounded = (int)Math.Round(value, MidpointRounding.AwayFromZero);
+        switch (setting)
+        {
+            case "gain": _skin.GameConfig.PreviewVideoVisualizerGain = Math.Clamp(rounded, 1, 48); break;
+            case "bars": _skin.GameConfig.PreviewVideoVisualizerBarCount = Math.Clamp(rounded, 15, 90); break;
+            case "height": _skin.GameConfig.PreviewVideoVisualizerHeight = Math.Clamp(rounded, 60, 240); break;
+            case "opacity": _skin.GameConfig.PreviewVideoVisualizerOpacity = Math.Clamp(rounded, 10, 100); break;
+            case "gap": _skin.GameConfig.PreviewVideoVisualizerGap = Math.Clamp(rounded, 0, 6); break;
+        }
+    }
+
+    private static bool IsEditorVisualizerNumericField(string? field)
+        => field is "gain" or "bars" or "height" or "opacity" or "gap";
+
+    private string GetEditorVisualizerNumericFieldValue(string field)
+        => field switch
+        {
+            "gain" => GetEditorPreviewVideoVisualizerGain().ToString(CultureInfo.InvariantCulture),
+            "bars" => GetEditorPreviewVideoVisualizerBarCount().ToString(CultureInfo.InvariantCulture),
+            "height" => GetEditorPreviewVideoVisualizerHeight().ToString(CultureInfo.InvariantCulture),
+            "opacity" => GetEditorPreviewVideoVisualizerOpacity().ToString(CultureInfo.InvariantCulture),
+            "gap" => GetEditorPreviewVideoVisualizerGap().ToString(CultureInfo.InvariantCulture),
+            _ => string.Empty
+        };
+
+    private int GetEditorVisualizerTextCaretIndex(Rectangle bounds, string text, float mouseX)
+    {
+        if (bounds.IsEmpty || text.Length == 0)
+            return text.Length;
+
+        var unit = _projection.ScalePixels(1f);
+        const string fontPath = "Roboto-Medium.ttf";
+        var textSize = 24f * unit;
+        float Measure(string value)
+        {
+            if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null)
+                return _chartEditorInterfaceRuntime.MeasureTextWidthForUi(value, fontPath, textSize);
+            return UnicodeTextRenderer.MeasureString(_font, FontSafeText(_font, value)).X *
+                   GetEditorTextFieldFontScale(bounds.Height, unit);
+        }
+
+        var textWidth = Measure(text);
+        var textLeft = bounds.X + (bounds.Width - textWidth) * 0.5f;
+        var clickX = Math.Max(0f, mouseX - textLeft);
+        var previousWidth = 0f;
+        for (var index = 1; index <= text.Length; index++)
+        {
+            var nextWidth = Measure(text[..index]);
+            if (clickX < (previousWidth + nextWidth) * 0.5f)
+                return index - 1;
+            previousWidth = nextWidth;
+        }
+        return text.Length;
+    }
+
+    private void BeginEditorVisualizerValueEdit(string? field)
+    {
+        if (!IsEditorVisualizerNumericField(field))
+            return;
+
+        var fieldId = "visualizer:" + field;
+        if (!string.Equals(_editorVisualizerEditingField, field, StringComparison.Ordinal))
+        {
+            _editorVisualizerEditingField = field;
+            _editorVisualizerEditingText = GetEditorVisualizerNumericFieldValue(field!);
+            _editorVisualizerEditingCaret = _editorVisualizerEditingText.Length;
+            _editorVisualizerEditingSelectionAnchor = _editorVisualizerEditingCaret;
+            _editorVisualizerEditingReplaceOnNextKey = false;
+            var newController = GetOrCreateEditorTextController(fieldId, _editorVisualizerEditingText);
+            newController.Begin(_editorVisualizerEditingText);
+        }
+
+        var controller = GetOrCreateEditorTextController(fieldId, _editorVisualizerEditingText);
+        controller.SynchronizeState(_editorVisualizerEditingText, _editorVisualizerEditingCaret,
+            _editorVisualizerEditingSelectionAnchor, _editorVisualizerEditingReplaceOnNextKey);
+        var inputId = $"editor_visualizer_modal_{field}_value";
+        if (_chartEditorInterfaceRuntime.TryGetUiInputBounds(inputId, out var bounds) && !bounds.IsEmpty)
+        {
+            var caret = GetEditorVisualizerTextCaretIndex(bounds, _editorVisualizerEditingText,
+                _chartEditorInterfaceRuntime.UiPointerX);
+            controller.SetCaret(caret, extendSelection: false);
+            _editorVisualizerEditingCaret = controller.Caret;
+            _editorVisualizerEditingSelectionAnchor = controller.Anchor;
+            _editorTextActiveFieldId = fieldId;
+            BeginEditorTextFieldMouseSelection(fieldId, bounds, caret,
+                ref _editorVisualizerEditingSelectionAnchor);
+        }
+        else
+        {
+            _editorVisualizerEditingCaret = controller.Caret;
+            _editorVisualizerEditingSelectionAnchor = controller.Anchor;
+            _editorTextActiveFieldId = fieldId;
+            _editorTextActiveBounds = Rectangle.Empty;
+            _editorTextMouseSelecting = false;
+        }
+    }
+
+    private void CancelEditorVisualizerValueEdit()
+    {
+        if (_editorVisualizerEditingField is null)
+            return;
+        _editorVisualizerEditingField = null;
+        _editorVisualizerEditingText = string.Empty;
+        _editorVisualizerEditingCaret = 0;
+        _editorVisualizerEditingSelectionAnchor = 0;
+        _editorVisualizerEditingReplaceOnNextKey = false;
+        EndEditorTextFieldMouseSelection();
+    }
+
+    private void CommitEditorVisualizerValueEdit()
+    {
+        var field = _editorVisualizerEditingField;
+        if (field is null)
+            return;
+
+        if (int.TryParse(_editorVisualizerEditingText.Trim(), NumberStyles.Integer,
+                CultureInfo.InvariantCulture, out var enteredValue))
+        {
+            SetEditorPreviewVideoVisualizerSetting(field, enteredValue);
+            _statusMessage = $"Visualizer {field} set to {GetEditorVisualizerNumericFieldValue(field)}.";
+            SaveEditorPreviewVideoVisualizerSettings();
+        }
+        else
+        {
+            _statusMessage = "Enter a whole number for the visualizer setting.";
+        }
+
+        CancelEditorVisualizerValueEdit();
+    }
+
+    private void ResetEditorPreviewVideoVisualizerSettings()
+    {
+        _skin.GameConfig.PreviewVideoVisualizerGain = 24;
+        _skin.GameConfig.PreviewVideoVisualizerBarCount = 45;
+        _skin.GameConfig.PreviewVideoVisualizerHeight = 180;
+        _skin.GameConfig.PreviewVideoVisualizerOpacity = 60;
+        _skin.GameConfig.PreviewVideoVisualizerGap = 2;
+        _skin.GameConfig.PreviewVideoVisualizerFftSize = 2048;
+        SaveEditorPreviewVideoVisualizerSettings();
+    }
+
+    private void SetEditorVisualizerSliderFromPointer(EditorVisualizerSlider slider,
+        Microsoft.Xna.Framework.Point point, int virtualWidth, int virtualHeight)
+    {
+        var bounds = GetEditorVisualizerSliderTrackBounds(slider, virtualWidth, virtualHeight);
+        if (bounds.Width <= 0)
+            return;
+        var ratio = Math.Clamp((point.X - bounds.X) / (double)bounds.Width, 0.0, 1.0);
+        switch (slider)
+        {
+            case EditorVisualizerSlider.Gain:
+                _skin.GameConfig.PreviewVideoVisualizerGain = 1 + (int)Math.Round(ratio * 47.0);
+                break;
+            case EditorVisualizerSlider.BarCount:
+                _skin.GameConfig.PreviewVideoVisualizerBarCount = 15 + (int)Math.Round(ratio * 75.0);
+                break;
+            case EditorVisualizerSlider.Height:
+                _skin.GameConfig.PreviewVideoVisualizerHeight = 60 + (int)Math.Round(ratio * 180.0);
+                break;
+            case EditorVisualizerSlider.Opacity:
+                _skin.GameConfig.PreviewVideoVisualizerOpacity = 10 + (int)Math.Round(ratio * 90.0);
+                break;
+            case EditorVisualizerSlider.Gap:
+                _skin.GameConfig.PreviewVideoVisualizerGap = (int)Math.Round(ratio * 6.0);
+                break;
+        }
+    }
+
+    private bool HandleEditorVisualizerSettingsPointer(Microsoft.Xna.Framework.Point point,
+        bool leftPressed, bool leftDown, bool leftReleased, int virtualWidth, int virtualHeight)
+    {
+        if (!_editorVisualizerSettingsOpen)
+            return false;
+
+        if (_editorVisualizerSettingsDragging >= 0)
+        {
+            if (leftDown || leftReleased)
+                SetEditorVisualizerSliderFromPointer((EditorVisualizerSlider)_editorVisualizerSettingsDragging,
+                    point, virtualWidth, virtualHeight);
+            if (leftReleased)
+            {
+                _editorVisualizerSettingsDragging = -1;
+                SaveEditorPreviewVideoVisualizerSettings();
+            }
+            return true;
+        }
+
+        if (leftPressed)
+        {
+            if (GetEditorVisualizerExportButtonBounds(virtualWidth, virtualHeight).Contains(point))
+            {
+                if (CanExportEditorPreviewVideo())
+                {
+                    SaveEditorPreviewVideoVisualizerSettings();
+                    CloseEditorVisualizerSettings();
+                    EditorPreviewVideoExportRequested?.Invoke();
+                }
+                return true;
+            }
+            if (GetEditorVisualizerCloseButtonBounds(virtualWidth, virtualHeight).Contains(point))
+            {
+                SaveEditorPreviewVideoVisualizerSettings();
+                CloseEditorVisualizerSettings();
+                return true;
+            }
+            if (GetEditorVisualizerResetButtonBounds(virtualWidth, virtualHeight).Contains(point))
+            {
+                _skin.GameConfig.PreviewVideoVisualizerGain = 24;
+                _skin.GameConfig.PreviewVideoVisualizerBarCount = 45;
+                _skin.GameConfig.PreviewVideoVisualizerHeight = 180;
+                _skin.GameConfig.PreviewVideoVisualizerOpacity = 60;
+                _skin.GameConfig.PreviewVideoVisualizerGap = 2;
+                _skin.GameConfig.PreviewVideoVisualizerFftSize = 2048;
+                SaveEditorPreviewVideoVisualizerSettings();
+                return true;
+            }
+            if (GetEditorVisualizerPreviewPlayButtonBounds(virtualWidth, virtualHeight).Contains(point))
+            {
+                try
+                {
+                    if (_editorVisualizerPreviewPlayer?.IsPlaying == true)
+                        StopEditorVisualizerPreviewPlayback();
+                    else
+                        StartEditorVisualizerPreviewPlayback();
+                }
+                catch (Exception ex)
+                {
+                    _statusMessage = $"Could not play visualizer preview: {ex.Message}";
+                }
+                return true;
+            }
+
+            foreach (var fftSize in new[] { 1024, 2048, 4096 })
+            {
+                if (!GetEditorVisualizerFftButtonBounds(fftSize, virtualWidth, virtualHeight).Contains(point))
+                    continue;
+                _skin.GameConfig.PreviewVideoVisualizerFftSize = fftSize;
+                SaveEditorPreviewVideoVisualizerSettings();
+                return true;
+            }
+
+            foreach (var slider in Enum.GetValues<EditorVisualizerSlider>())
+            {
+                var hitBounds = GetEditorVisualizerSliderTrackBounds(slider, virtualWidth, virtualHeight);
+                hitBounds.Inflate(0, Math.Max(8, (int)MathF.Round(10f * _projection.ScalePixels(1f))));
+                if (!hitBounds.Contains(point))
+                    continue;
+                _editorVisualizerSettingsDragging = (int)slider;
+                SetEditorVisualizerSliderFromPointer(slider, point, virtualWidth, virtualHeight);
+                if (leftReleased)
+                {
+                    _editorVisualizerSettingsDragging = -1;
+                    SaveEditorPreviewVideoVisualizerSettings();
+                }
+                return true;
+            }
+        }
+
+        // The popup owns pointer input until it is closed. Never let clicks leak
+        // through to the chart canvas or the metadata controls underneath it.
+        return true;
+    }
+
+    private void DrawEditorVisualizerSlider(EditorVisualizerSlider slider, string label, string value,
+        int current, int minimum, int maximum, int virtualWidth, int virtualHeight, float unit)
+    {
+        var track = GetEditorVisualizerSliderTrackBounds(slider, virtualWidth, virtualHeight);
+        var controls = GetEditorVisualizerSettingsControlsBounds(virtualWidth, virtualHeight);
+        var rowHeight = Math.Max(1, (int)MathF.Round(46f * unit));
+        var rowY = controls.Y + (int)slider * rowHeight;
+        DrawEditorPreviewLabel(label, new Rectangle(controls.X, rowY, controls.Width / 2,
+            Math.Max(1, (int)MathF.Round(20f * unit))), Muted, unit);
+        DrawEditorPreviewLabel(value, new Rectangle(controls.X + controls.Width / 2, rowY, controls.Width / 2,
+            Math.Max(1, (int)MathF.Round(20f * unit))), Text, unit);
+
+        _spriteBatch.Draw(_pixel, track, new Color(58, 58, 60, 245));
+        var ratio = Math.Clamp((current - minimum) / (float)Math.Max(1, maximum - minimum), 0f, 1f);
+        var fillWidth = Math.Clamp((int)MathF.Round(track.Width * ratio), 0, track.Width);
+        if (fillWidth > 0)
+            _spriteBatch.Draw(_pixel, new Rectangle(track.X, track.Y, fillWidth, track.Height), Active);
+        var thumbWidth = Math.Max(8, (int)MathF.Round(12f * unit));
+        var thumbHeight = Math.Max(12, (int)MathF.Round(18f * unit));
+        var thumbX = Math.Clamp(track.X + fillWidth - thumbWidth / 2, track.X, Math.Max(track.X, track.Right - thumbWidth));
+        _spriteBatch.Draw(_pixel, new Rectangle(thumbX, track.Center.Y - thumbHeight / 2, thumbWidth, thumbHeight), Color.White);
+    }
+
+    private void DrawEditorVisualizerSettingsModal(int virtualWidth, int virtualHeight)
+    {
+        if (!_editorVisualizerSettingsOpen)
+            return;
+
+        var unit = _projection.ScalePixels(1f);
+        var panel = GetEditorVisualizerSettingsPanelBounds(virtualWidth, virtualHeight);
+        var preview = GetEditorVisualizerPreviewBounds(virtualWidth, virtualHeight);
+        var controls = GetEditorVisualizerSettingsControlsBounds(virtualWidth, virtualHeight);
+        _spriteBatch.Draw(_pixel, new Rectangle(0, 0, virtualWidth, virtualHeight), new Color(0, 0, 0, 190));
+        _spriteBatch.Draw(_pixel, panel, _chartEditorInterfaceLayout.PanelColor);
+        var edge = Math.Max(2, (int)MathF.Round(2f * unit));
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Y, panel.Width, edge), Active);
+        _spriteBatch.Draw(_pixel, new Rectangle(panel.X, panel.Bottom - edge, panel.Width, edge), new Color(90, 90, 92, 240));
+        DrawEditorPreviewLabel("PREVIEW VIDEO VISUALIZER",
+            new Rectangle(panel.X + (int)MathF.Round(24f * unit), panel.Y + (int)MathF.Round(20f * unit),
+                panel.Width - (int)MathF.Round(48f * unit), Math.Max(1, (int)MathF.Round(30f * unit))), Text, unit);
+
+        // Match the exported video: keep the cover fully bright and do not add
+        // a preview-only dark overlay. Black remains behind the image as the
+        // same letterbox/pillarbox fill used by the video export.
+        _spriteBatch.Draw(_pixel, preview, Color.Black);
+        var albumTexture = GetEditorArtworkTexture("album");
+        if (albumTexture is not null)
+            _spriteBatch.Draw(albumTexture, preview, Color.White);
+
+        var count = GetEditorPreviewVideoVisualizerBarCount();
+        var bars = _editorVisualizerPreviewBands.AsSpan(0, count);
+        var sourceSeconds = GetEditorVisualizerPreviewSourceSeconds();
+        var hasSpectrum = _audio.TryGetSpectrumBands(sourceSeconds, GetEditorPreviewVideoVisualizerFftSize(),
+            GetEditorPreviewVideoVisualizerGain(), bars);
+        if (hasSpectrum)
+        {
+            var musicVolume = Math.Clamp(_editorMusicVolumePendingPercent, 0, 100) / 100f;
+            var clipElapsed = Math.Clamp(sourceSeconds - _editorVisualizerPreviewStartSeconds,
+                0, _editorVisualizerPreviewDurationSeconds);
+            var fadeSeconds = GetEditorPreviewFadeDurationSeconds(_editorVisualizerPreviewDurationSeconds);
+            var fadeGain = fadeSeconds > 0
+                ? Math.Clamp(Math.Min(clipElapsed / fadeSeconds,
+                    (_editorVisualizerPreviewDurationSeconds - clipElapsed) / fadeSeconds), 0.0, 1.0)
+                : 1.0;
+            for (var index = 0; index < bars.Length; index++)
+                bars[index] *= (float)(musicVolume * fadeGain);
+
+            var elementColor = NormalizeEditorElement(_chart?.Element) switch
+            {
+                "VOCAL" => new Color(96, 165, 250),
+                "SESSION" => new Color(52, 211, 153),
+                _ => new Color(248, 113, 113)
+            };
+            var cellWidth = preview.Width / (float)count;
+            var gap = preview.Width * (GetEditorPreviewVideoVisualizerGap() / 720f);
+            var barHeightScale = GetEditorPreviewVideoVisualizerHeight() / 720f * preview.Height;
+            var opacity = GetEditorPreviewVideoVisualizerOpacity() / 100f;
+            for (var index = 0; index < count; index++)
+            {
+                var height = Math.Clamp((int)MathF.Round(bars[index] * barHeightScale), 0, preview.Height);
+                if (height <= 0)
+                    continue;
+                var x = preview.X + (int)MathF.Round(index * cellWidth);
+                var nextX = preview.X + (int)MathF.Round((index + 1) * cellWidth);
+                var width = Math.Max(1, (int)MathF.Round(nextX - x - gap));
+                var alpha = (byte)Math.Clamp((int)MathF.Round(255f * opacity), 0, 255);
+                // This fallback is drawn with SpriteBatch's premultiplied
+                // AlphaBlend state. Premultiply RGB once here so its final
+                // composite matches both the Lua preview and FFmpeg export.
+                var tint = new Color(
+                    (byte)Math.Clamp((int)MathF.Round(elementColor.R * opacity), 0, 255),
+                    (byte)Math.Clamp((int)MathF.Round(elementColor.G * opacity), 0, 255),
+                    (byte)Math.Clamp((int)MathF.Round(elementColor.B * opacity), 0, 255),
+                    alpha);
+                _spriteBatch.Draw(_pixel, new Rectangle(x, preview.Bottom - height, width, height), tint);
+            }
+        }
+        else
+        {
+            DrawEditorPreviewLabel("IMPORT SONG AUDIO TO PREVIEW", preview, Muted, unit);
+        }
+
+        var playButton = GetEditorVisualizerPreviewPlayButtonBounds(virtualWidth, virtualHeight);
+        DrawEditorMetaButton(playButton, _editorVisualizerPreviewPlayer?.IsPlaying == true ? "STOP AUDIO" : "PLAY AUDIO",
+            new Color(28, 28, 30, 250), new Color(52, 211, 153));
+        DrawEditorPreviewLabel(_editorVisualizerPreviewPlayer?.IsPlaying == true ? "LIVE" : "SAMPLE",
+            new Rectangle(preview.X, playButton.Bottom + (int)MathF.Round(2f * unit), preview.Width, Math.Max(1, (int)MathF.Round(18f * unit))),
+            Muted, unit);
+
+        DrawEditorVisualizerSlider(EditorVisualizerSlider.Gain, "GAIN", $"{GetEditorPreviewVideoVisualizerGain()}x",
+            GetEditorPreviewVideoVisualizerGain(), 1, 48, virtualWidth, virtualHeight, unit);
+        DrawEditorVisualizerSlider(EditorVisualizerSlider.BarCount, "BARS", GetEditorPreviewVideoVisualizerBarCount().ToString(CultureInfo.InvariantCulture),
+            GetEditorPreviewVideoVisualizerBarCount(), 15, 90, virtualWidth, virtualHeight, unit);
+        DrawEditorVisualizerSlider(EditorVisualizerSlider.Height, "HEIGHT", $"{GetEditorPreviewVideoVisualizerHeight()} px",
+            GetEditorPreviewVideoVisualizerHeight(), 60, 240, virtualWidth, virtualHeight, unit);
+        DrawEditorVisualizerSlider(EditorVisualizerSlider.Opacity, "OPACITY", $"{GetEditorPreviewVideoVisualizerOpacity()}%",
+            GetEditorPreviewVideoVisualizerOpacity(), 10, 100, virtualWidth, virtualHeight, unit);
+        DrawEditorVisualizerSlider(EditorVisualizerSlider.Gap, "BAR GAP", $"{GetEditorPreviewVideoVisualizerGap()} px",
+            GetEditorPreviewVideoVisualizerGap(), 0, 6, virtualWidth, virtualHeight, unit);
+
+        DrawEditorPreviewLabel("FFT WINDOW", new Rectangle(controls.X,
+            controls.Y + (int)MathF.Round(5 * 46f * unit), controls.Width / 2, Math.Max(1, (int)MathF.Round(20f * unit))), Muted, unit);
+        foreach (var fftSize in new[] { 1024, 2048, 4096 })
+        {
+            var selected = GetEditorPreviewVideoVisualizerFftSize() == fftSize;
+            DrawEditorMetaButton(GetEditorVisualizerFftButtonBounds(fftSize, virtualWidth, virtualHeight),
+                fftSize.ToString(CultureInfo.InvariantCulture),
+                selected ? new Color(58, 58, 60, 250) : new Color(28, 28, 30, 250),
+                selected ? Active : new Color(100, 100, 102));
+        }
+
+        DrawEditorMetaButton(GetEditorVisualizerExportButtonBounds(virtualWidth, virtualHeight), "EXPORT VIDEO",
+            new Color(28, 28, 30, 250), CanExportEditorPreviewVideo() ? Active : new Color(90, 90, 92));
+        DrawEditorMetaButton(GetEditorVisualizerResetButtonBounds(virtualWidth, virtualHeight), "RESET",
+            new Color(28, 28, 30, 250), new Color(100, 100, 102));
+        DrawEditorMetaButton(GetEditorVisualizerCloseButtonBounds(virtualWidth, virtualHeight), "CLOSE",
+            new Color(28, 28, 30, 250), Active);
     }
 
     private void DrawEditorMediaVolumeSlider(Rectangle bounds, float unit, bool enabled)

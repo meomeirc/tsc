@@ -763,6 +763,11 @@ public sealed partial class Playfield
             _editorMetaBbCodeStripOpen = false;
             _editorMetaBbCodeStripField = null;
         }
+        // The active Lua skin owns the visualizer settings modal and its controls.
+        // Retain the native hit-testing only for the built-in emergency renderer.
+        if (_editorVisualizerSettingsOpen && !editorLuaUiActive && HandleEditorVisualizerSettingsPointer(
+                pointerPixel, leftPressed, leftDown, leftReleased, virtualWidth, virtualHeight))
+            return;
         if (!editorLuaUiActive && HandleEditorMusicVolumeFallbackPointer(
                 pointerPixel, leftPressed, leftDown, leftReleased, virtualWidth, virtualHeight))
             return;
@@ -3774,6 +3779,12 @@ public sealed partial class Playfield
         }
         if (string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
         {
+            if (GetEditorMediaVisualizerSettingsButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
+            {
+                CancelEditorMetaField();
+                OpenEditorVisualizerSettings();
+                return true;
+            }
             if (GetEditorMediaMusicButtonBounds(virtualWidth, virtualHeight).Contains(pixel) ||
                 GetEditorMediaMusicStatusBounds(virtualWidth, virtualHeight).Contains(pixel))
             {

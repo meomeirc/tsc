@@ -479,6 +479,9 @@ public sealed partial class Playfield
                     DrawEditorToolbar();
                 }
             }
+
+            // The active Lua skin owns the visualizer settings modal. The C# modal
+            // remains available only through the emergency/fallback editor renderer.
         }
 
         // The Lua editor draws the formatter at the active text caret using uiStyle.

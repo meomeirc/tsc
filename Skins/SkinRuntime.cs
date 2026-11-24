@@ -9878,6 +9878,7 @@ public sealed class SkinRuntime : IDisposable
         }
 
         SkinUiButton? hitModalControlButton = null;
+        SkinUiSlider? hitModalControlSlider = null;
         string? modalPrefix = null;
         if (hitModalBackdropButton is not null)
         {
@@ -9892,6 +9893,18 @@ public sealed class SkinRuntime : IDisposable
                     break;
                 }
             }
+            // Modal-owned sliders use the same ID prefix as their backdrop. This
+            // keeps them interactive without allowing sliders behind the modal
+            // (for example, the Media music-volume control) to capture the drag.
+            foreach (var slider in _uiSliders.Values)
+            {
+                if (slider.Id.StartsWith(modalPrefix, StringComparison.OrdinalIgnoreCase) &&
+                    slider.Contains(x, y))
+                {
+                    hitModalControlSlider = slider;
+                    break;
+                }
+            }
         }
 
         SkinUiSlider? hitSlider = null;
@@ -9903,10 +9916,10 @@ public sealed class SkinRuntime : IDisposable
 
         if (hitModalBackdropButton is not null)
         {
-            // A modal must never pass clicks through to the underlying song cards,
-            // controls, or sliders. Clicking outside the dialog simply dismisses it.
-            hitButton = hitModalControlButton ?? hitModalBackdropButton;
-            hitSlider = null;
+            // A modal must never pass clicks through to underlying controls. Only
+            // buttons and sliders that share the modal ID prefix remain interactive.
+            hitButton = hitModalControlButton ?? (hitModalControlSlider is null ? hitModalBackdropButton : null);
+            hitSlider = hitModalControlSlider;
         }
         else
         {

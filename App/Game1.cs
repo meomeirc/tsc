@@ -5651,6 +5651,7 @@ public sealed class Game1 : Game
                         _chartEditorLoadPlayfield.OpenAresRequested += HandlePlayfieldOpenAres;
                         _chartEditorLoadPlayfield.ImportEditorSongRequested += HandleImportEditorSongRequested;
                         _chartEditorLoadPlayfield.EditorMediaPickRequested += HandleEditorMediaPickRequested;
+                        _chartEditorLoadPlayfield.EditorPreviewVideoExportRequested += HandleEditorPreviewVideoExportRequested;
                         _chartEditorLoadPlayfield.EditorExitRequested += HandleEditorExitRequested;
                         _chartEditorLoadPlayfield.EditorSettingsRequested += HandleEditorSettingsRequested;
                     }
@@ -6017,6 +6018,46 @@ public sealed class Game1 : Game
         }
         if (!string.IsNullOrWhiteSpace(_errorMessage))
             UnicodeTextRenderer.DrawString(_startupSpriteBatch, _font, _errorMessage, new Vector2(left, top + ChartEditorSourceLabels.Length * 76 + 10), new Color(255, 150, 150));
+    }
+
+    private void HandleEditorPreviewVideoExportRequested()
+    {
+        if (_playfield?.Chart is null || !_chartEditorMode)
+            return;
+
+        try
+        {
+            var songName = string.IsNullOrWhiteSpace(_playfield.Chart.Name) ? "song" : _playfield.Chart.Name;
+            var invalid = Path.GetInvalidFileNameChars();
+            var safeStem = new string(songName!.Select(character => invalid.Contains(character) ? '_' : character).ToArray()).Trim();
+            if (string.IsNullOrWhiteSpace(safeStem))
+                safeStem = "song";
+
+            using var dialog = new System.Windows.Forms.SaveFileDialog
+            {
+                Filter = "MP4 video (*.mp4)|*.mp4|All files (*.*)|*.*",
+                DefaultExt = "mp4",
+                AddExtension = true,
+                OverwritePrompt = true,
+                RestoreDirectory = true,
+                FileName = safeStem + "-preview.mp4",
+                Title = "Export Song Preview Video"
+            };
+            if (ShowNativeDialog(dialog) != System.Windows.Forms.DialogResult.OK || string.IsNullOrWhiteSpace(dialog.FileName))
+                return;
+
+            var outputPath = Path.ChangeExtension(dialog.FileName, ".mp4");
+            _playfield.ExportEditorPreviewVideo(outputPath);
+            _errorMessage = null;
+            _playfield.SetStatusMessage($"Exported preview video: {outputPath}");
+        }
+        catch (Exception ex)
+        {
+            _errorMessage = $"Could not export preview video: {ex.Message}";
+            _playfield?.SetStatusMessage(_errorMessage);
+            ShowNativeMessageBox(_errorMessage, "Preview Video Export", System.Windows.Forms.MessageBoxButtons.OK,
+                System.Windows.Forms.MessageBoxIcon.Error);
+        }
     }
 
     private void HandleEditorMediaPickRequested(string field)
@@ -6540,6 +6581,7 @@ public sealed class Game1 : Game
             _playfield.OpenAresRequested += HandlePlayfieldOpenAres;
             _playfield.ImportEditorSongRequested += HandleImportEditorSongRequested;
             _playfield.EditorMediaPickRequested += HandleEditorMediaPickRequested;
+            _playfield.EditorPreviewVideoExportRequested += HandleEditorPreviewVideoExportRequested;
             _playfield.EditorExitRequested += HandleEditorExitRequested;
             _playfield.EditorSettingsRequested += HandleEditorSettingsRequested;
             if (!string.IsNullOrWhiteSpace(_pendingFpkPath))

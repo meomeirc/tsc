@@ -43,6 +43,15 @@ public sealed class GameConfig
     public float EarlyLateMinimumOffsetMs { get; set; } = 25.0f;
     public float TimingOffsetMinimumOffsetMs { get; set; } = 25.0f;
 
+    // Song preview-video visualizer settings are editor preferences, shared by
+    // the live preview and exported video. Defaults preserve the original look.
+    public int PreviewVideoVisualizerGain { get; set; } = 24;
+    public int PreviewVideoVisualizerBarCount { get; set; } = 45;
+    public int PreviewVideoVisualizerHeight { get; set; } = 180;
+    public int PreviewVideoVisualizerOpacity { get; set; } = 60;
+    public int PreviewVideoVisualizerGap { get; set; } = 2;
+    public int PreviewVideoVisualizerFftSize { get; set; } = 2048;
+
     public static string NormalizeScrollMode(string? value)
         => value?.Trim().ToLowerInvariant() switch
         {
