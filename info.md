@@ -1,5 +1,9 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.61
+
+- added preview visualizer video exporter
+
 # 0.0.60
 
 - excluded my skinSettings.json from the update. oops
