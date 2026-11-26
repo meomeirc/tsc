@@ -7,7 +7,7 @@ public sealed partial class Playfield
 {
     private sealed record EditorTrackSnapshot(ChartTrack Track, List<ChartEvent> Events);
 
-    private sealed record EditorEventSnapshot(
+    private readonly record struct EditorEventSnapshot(
         ChartEvent Event,
         int Tick,
         int Track,
@@ -87,6 +87,14 @@ public sealed partial class Playfield
         public List<NoteGroupDefinition> NoteGroups { get; init; } = new();
         public List<NoteGroupInstance> NoteGroupInstances { get; init; } = new();
         public bool SelectionOnly { get; init; }
+        // Ordinary note edits use event deltas instead of cloning the full chart.
+        // Only the touched event states and affected track identities are retained.
+        public bool EventDeltaOnly { get; init; }
+        public List<int> DeltaTrackIndices { get; init; } = new();
+        public List<(int TrackIndex, ChartTrack? Track)> DeltaTrackStates { get; init; } = new();
+        public HashSet<ChartEvent> DeltaPresentEvents { get; init; } = new();
+        public bool DeltaRebuildTwinPairing { get; set; }
+        public bool DeltaRebuildLinkGraph { get; set; }
         // A panel-note placement is a single-event add/remove. Store that delta
         // instead of cloning the entire panel track for every placement.
         public bool PanelEventOnly { get; init; }
@@ -95,17 +103,17 @@ public sealed partial class Playfield
         public ChartTrack? PanelTrack { get; init; }
         public ChartEvent? PanelEvent { get; init; }
         public bool PanelEventPresent { get; init; }
-        public ChartEvent? SelectedEvent { get; init; }
-        public int? SelectedBeatTick { get; init; }
-        public int? SelectedBeatTrack { get; init; }
-        public ChartEvent? SelectedTempoEvent { get; init; }
-        public ChartEvent? SelectedLinkRoot { get; init; }
-        public bool SelectedHoldEnd { get; init; }
-        public List<ChartEvent> MultiSelectedEvents { get; init; } = new();
-        public List<(int Tick, int Track)> SelectedGridCells { get; init; } = new();
-        public (int Tick, int Track)? PanelsSelectedEmptyCell { get; init; }
-        public int? SelectReferenceLineTick { get; init; }
-        public int? SelectReferenceTickOverride { get; init; }
+        public ChartEvent? SelectedEvent { get; set; }
+        public int? SelectedBeatTick { get; set; }
+        public int? SelectedBeatTrack { get; set; }
+        public ChartEvent? SelectedTempoEvent { get; set; }
+        public ChartEvent? SelectedLinkRoot { get; set; }
+        public bool SelectedHoldEnd { get; set; }
+        public List<ChartEvent> MultiSelectedEvents { get; set; } = new();
+        public List<(int Tick, int Track)> SelectedGridCells { get; set; } = new();
+        public (int Tick, int Track)? PanelsSelectedEmptyCell { get; set; }
+        public int? SelectReferenceLineTick { get; set; }
+        public int? SelectReferenceTickOverride { get; set; }
     }
 
     private sealed record EditorClipboardEntry(
@@ -199,6 +207,450 @@ public sealed partial class Playfield
     private bool _editorDragMovedChainAcrossBanks;
     private readonly List<ChartEvent> _editorDragChainNodes = new();
 
+    private static EditorEventSnapshot CaptureEditorEventSnapshot(ChartEvent ev)
+        => new(
+            ev,
+            ev.Tick,
+            ev.Track,
+            ev.Attr,
+            ev.Duration,
+            ev.RawType,
+            ev.TypeIndex,
+            ev.Kind,
+            ev.NoteType,
+            ev.EventIndex,
+            ev.LinePair,
+            ev.Value,
+            ev.Instrument,
+            ev.Velocity,
+            ev.Pan,
+            ev.TwinPairId,
+            ev.LoopReconstructed,
+            ev.LoopPhase,
+            ev.NoteGroupId,
+            ev.NoteGroupInstanceId,
+            ev.NoteGroupMemberId);
+
+    private static void RestoreEditorEventSnapshot(EditorEventSnapshot state)
+    {
+        state.Event.Tick = state.Tick;
+        state.Event.Track = state.Track;
+        state.Event.Attr = state.Attr;
+        state.Event.Duration = state.Duration;
+        state.Event.RawType = state.RawType;
+        state.Event.TypeIndex = state.TypeIndex;
+        state.Event.Kind = state.Kind;
+        state.Event.NoteType = state.NoteType;
+        state.Event.EventIndex = state.EventIndex;
+        state.Event.LinePair = state.LinePair;
+        state.Event.Value = state.Value;
+        state.Event.Instrument = state.Instrument;
+        state.Event.Velocity = state.Velocity;
+        state.Event.Pan = state.Pan;
+        state.Event.TwinPairId = state.TwinPairId;
+        state.Event.LoopReconstructed = state.LoopReconstructed;
+        state.Event.LoopPhase = state.LoopPhase;
+        state.Event.NoteGroupId = state.NoteGroupId;
+        state.Event.NoteGroupInstanceId = state.NoteGroupInstanceId;
+        state.Event.NoteGroupMemberId = state.NoteGroupMemberId;
+    }
+
+    private bool IsEditorEventInTrackLists(ChartEvent ev)
+        => _chart?.Tracks.Any(track => track.Events.Contains(ev)) == true;
+
+    private EditorChartSnapshot? CaptureEditorEventDeltaSnapshot(
+        IEnumerable<ChartEvent> affectedEvents,
+        IEnumerable<int> affectedTrackIndices,
+        bool rebuildTwinPairing,
+        bool rebuildLinkGraph,
+        EditorChartSnapshot? selectionState = null)
+    {
+        var chart = _chart;
+        if (chart is null)
+            return null;
+
+        var trackIndices = new HashSet<int>(affectedTrackIndices);
+        var eventStates = new List<EditorEventSnapshot>();
+        var presentEvents = new HashSet<ChartEvent>();
+        var seenEvents = new HashSet<ChartEvent>();
+        foreach (var ev in affectedEvents)
+        {
+            if (ev is null || !seenEvents.Add(ev))
+                continue;
+            eventStates.Add(CaptureEditorEventSnapshot(ev));
+            if (chart.Tracks.Any(track => track.Events.Contains(ev)))
+                presentEvents.Add(ev);
+            trackIndices.Add(ev.Track);
+            foreach (var containingTrack in chart.Tracks)
+                if (containingTrack.Events.Contains(ev))
+                    trackIndices.Add(containingTrack.TrackIndex);
+        }
+
+        var sortedTrackIndices = trackIndices.OrderBy(index => index).ToList();
+        var trackStates = new List<(int TrackIndex, ChartTrack? Track)>(sortedTrackIndices.Count);
+        foreach (var trackIndex in sortedTrackIndices)
+            trackStates.Add((trackIndex, chart.FindTrack(trackIndex)));
+
+        var selection = selectionState;
+        return new EditorChartSnapshot
+        {
+            SourceChart = chart,
+            EventDeltaOnly = true,
+            Events = eventStates,
+            DeltaTrackIndices = sortedTrackIndices,
+            DeltaTrackStates = trackStates,
+            DeltaPresentEvents = presentEvents,
+            DeltaRebuildTwinPairing = rebuildTwinPairing,
+            DeltaRebuildLinkGraph = rebuildLinkGraph,
+            SelectedEvent = selection is null ? TryGetEditorEvent(_selectedEventKey) : selection.SelectedEvent,
+            SelectedBeatTick = selection is null ? _selectedBeatTick : selection.SelectedBeatTick,
+            SelectedBeatTrack = selection is null ? _selectedBeatTrack : selection.SelectedBeatTrack,
+            SelectedTempoEvent = selection is null ? _editorSelectedTempoEvent : selection.SelectedTempoEvent,
+            SelectedLinkRoot = selection is null ? _editorSelectedLinkRoot : selection.SelectedLinkRoot,
+            SelectedHoldEnd = selection is null ? _editorSelectedHoldEnd : selection.SelectedHoldEnd,
+            MultiSelectedEvents = selection is null ? _editorMultiSelectedEvents.ToList() : selection.MultiSelectedEvents.ToList(),
+            SelectedGridCells = selection is null ? _editorSelectedGridCells.ToList() : selection.SelectedGridCells.ToList(),
+            PanelsSelectedEmptyCell = selection is null ? _editorPanelsSelectedEmptyCell : selection.PanelsSelectedEmptyCell,
+            SelectReferenceLineTick = selection is null ? _editorSelectReferenceLineTick : selection.SelectReferenceLineTick,
+            SelectReferenceTickOverride = selection is null ? _editorSelectReferenceTickOverride : selection.SelectReferenceTickOverride
+        };
+    }
+
+    private void RegisterEditorEventDeltaAdditions(EditorChartSnapshot? snapshot, params ChartEvent[] addedEvents)
+    {
+        if (snapshot is null || !snapshot.EventDeltaOnly || _chart is null)
+            return;
+
+        var addedSet = new HashSet<ChartEvent>();
+        var addedTicks = new HashSet<int>();
+        snapshot.DeltaRebuildTwinPairing |= addedEvents.Any(EditorEventNeedsTwinPairing);
+        snapshot.DeltaRebuildLinkGraph |= addedEvents.Any(EditorEventNeedsLinkGraph);
+        foreach (var ev in addedEvents)
+        {
+            if (snapshot.Events.Any(state => ReferenceEquals(state.Event, ev)))
+                continue;
+            EnsureEditorAddedEventIndexIsUnique(ev);
+            addedSet.Add(ev);
+            addedTicks.Add(ev.Tick);
+            // The event does not exist in the pre-edit state. Keep its post-create
+            // fields as the redo payload, but leave it absent from DeltaPresentEvents.
+            snapshot.Events.Add(CaptureEditorEventSnapshot(ev));
+            EnsureEditorDeltaTrack(snapshot, ev.Track, trackDidNotExistBefore: true);
+        }
+
+        if (snapshot.DeltaRebuildTwinPairing && addedTicks.Count > 0)
+        {
+            var existingPeers = _chart.Events.Where(ev => !addedSet.Contains(ev) &&
+                addedTicks.Contains(ev.Tick) && EditorEventNeedsTwinPairing(ev)).ToArray();
+            RegisterEditorEventDeltaCurrentEvents(snapshot, existingPeers);
+        }
+    }
+
+    private void EnsureEditorDeltaTrack(EditorChartSnapshot snapshot, int trackIndex, bool trackDidNotExistBefore = false)
+    {
+        if (snapshot.DeltaTrackIndices.Contains(trackIndex))
+            return;
+        snapshot.DeltaTrackIndices.Add(trackIndex);
+        snapshot.DeltaTrackIndices.Sort();
+        snapshot.DeltaTrackStates.Add((trackIndex, trackDidNotExistBefore ? null : _chart?.FindTrack(trackIndex)));
+        snapshot.DeltaTrackStates.Sort((a, b) => a.TrackIndex.CompareTo(b.TrackIndex));
+    }
+
+    private void RegisterEditorEventDeltaCurrentEvents(EditorChartSnapshot? snapshot, IEnumerable<ChartEvent> events)
+    {
+        if (snapshot is null || !snapshot.EventDeltaOnly || _chart is null)
+            return;
+
+        foreach (var ev in events)
+        {
+            if (snapshot.Events.Any(state => ReferenceEquals(state.Event, ev)))
+                continue;
+            snapshot.Events.Add(CaptureEditorEventSnapshot(ev));
+            if (IsEditorEventInTrackLists(ev))
+                snapshot.DeltaPresentEvents.Add(ev);
+            EnsureEditorDeltaTrack(snapshot, ev.Track);
+            if (_chart is not null)
+                foreach (var containingTrack in _chart.Tracks)
+                    if (containingTrack.Events.Contains(ev))
+                        EnsureEditorDeltaTrack(snapshot, containingTrack.TrackIndex);
+        }
+    }
+
+    private EditorChartSnapshot? CaptureCurrentEditorEventDeltaSnapshot(EditorChartSnapshot previous)
+    {
+        if (_chart is null || !previous.EventDeltaOnly || !ReferenceEquals(_chart, previous.SourceChart))
+            return null;
+
+        var eventStates = new List<EditorEventSnapshot>(previous.Events.Count);
+        var presentEvents = new HashSet<ChartEvent>();
+        foreach (var previousState in previous.Events)
+        {
+            var ev = previousState.Event;
+            eventStates.Add(CaptureEditorEventSnapshot(ev));
+            if (IsEditorEventInTrackLists(ev))
+                presentEvents.Add(ev);
+        }
+
+        var trackStates = new List<(int TrackIndex, ChartTrack? Track)>(previous.DeltaTrackIndices.Count);
+        foreach (var trackIndex in previous.DeltaTrackIndices)
+            trackStates.Add((trackIndex, _chart.FindTrack(trackIndex)));
+
+        return new EditorChartSnapshot
+        {
+            SourceChart = _chart,
+            EventDeltaOnly = true,
+            Events = eventStates,
+            DeltaTrackIndices = previous.DeltaTrackIndices.ToList(),
+            DeltaTrackStates = trackStates,
+            DeltaPresentEvents = presentEvents,
+            DeltaRebuildTwinPairing = previous.DeltaRebuildTwinPairing,
+            DeltaRebuildLinkGraph = previous.DeltaRebuildLinkGraph,
+            SelectedEvent = TryGetEditorEvent(_selectedEventKey),
+            SelectedBeatTick = _selectedBeatTick,
+            SelectedBeatTrack = _selectedBeatTrack,
+            SelectedTempoEvent = _editorSelectedTempoEvent,
+            SelectedLinkRoot = _editorSelectedLinkRoot,
+            SelectedHoldEnd = _editorSelectedHoldEnd,
+            MultiSelectedEvents = _editorMultiSelectedEvents.ToList(),
+            SelectedGridCells = _editorSelectedGridCells.ToList(),
+            PanelsSelectedEmptyCell = _editorPanelsSelectedEmptyCell,
+            SelectReferenceLineTick = _editorSelectReferenceLineTick,
+            SelectReferenceTickOverride = _editorSelectReferenceTickOverride
+        };
+    }
+
+    private static bool EditorEventNeedsTwinPairing(ChartEvent ev)
+        => ev.TwinPairId.HasValue || ev.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail;
+
+    private static bool EditorEventNeedsLinkGraph(ChartEvent ev)
+        => ev.NoteType is NoteType.LinkHead or NoteType.LinkTail;
+
+    private EditorChartSnapshot? CaptureEditorNoteEditSnapshot(
+        IEnumerable<ChartEvent> affectedEvents,
+        IEnumerable<int> affectedTrackIndices,
+        bool rebuildTwinPairing = false,
+        bool rebuildLinkGraph = false,
+        EditorChartSnapshot? selectionState = null)
+    {
+        var events = affectedEvents.Distinct().ToList();
+        if (_editorNoteGroupEditMode || events.Any(ev =>
+                ev.NoteGroupId.HasValue || ev.NoteGroupInstanceId.HasValue || ev.NoteGroupMemberId.HasValue))
+            return CaptureEditorChartSnapshot();
+
+        // Several callers conservatively request graph/twin rebuilding before
+        // they know which note type will result. The commit path derives the final
+        // requirement from both the captured state and the post-edit events, so a
+        // plain tap should not trigger a chart-wide twin/link scan.
+        rebuildTwinPairing = events.Any(EditorEventNeedsTwinPairing);
+        rebuildLinkGraph = events.Any(EditorEventNeedsLinkGraph);
+        if (rebuildTwinPairing && _chart is not null)
+        {
+            // ReconstructTwinNotes assigns pair IDs in a chart-wide sequence.
+            // A new/removed early pair can renumber every later pair, so preserve
+            // every twin-capable event when this uncommon path is actually needed.
+            events = events.Concat(_chart.Events.Where(EditorEventNeedsTwinPairing))
+                .Distinct().ToList();
+        }
+        return CaptureEditorEventDeltaSnapshot(events, affectedTrackIndices,
+            rebuildTwinPairing, rebuildLinkGraph, selectionState);
+    }
+
+    private static bool IsEditorSuperFlickAttribute(int attr)
+        => attr is 20 or 40 or 60 or 70 or 80 or 90;
+
+    private bool ShouldRecalculateEditorLastPlayableTick(IEnumerable<EditorEventSnapshot> states)
+    {
+        foreach (var state in states)
+        {
+            if (state.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail ||
+                state.Event.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail)
+                return true;
+
+            // A point note edit below the current endpoint cannot change the chart's
+            // last playable tick. Recompute only when an old or new point touches or
+            // extends beyond that endpoint (including the empty-chart case).
+            if (state.Tick >= _lastPlayableTick || state.Event.Tick >= _lastPlayableTick)
+                return true;
+        }
+        return false;
+    }
+
+    private void NormalizeEditorTrackEventIndicesForDelta(
+        EditorChartSnapshot snapshot,
+        IReadOnlyCollection<int> affectedTrackIndices)
+    {
+        if (_chart is null || !snapshot.EventDeltaOnly)
+            return;
+
+        // ARES may expose one logical lane through multiple physical ChartTrack
+        // containers. Normalize ordinals across the union, not only FindTrack()'s
+        // first result, or hidden events in a secondary container can retain a
+        // colliding render key and later produce ghost copies during a drag.
+        var affectedLaneSet = affectedTrackIndices.ToHashSet();
+        var laneEvents = new Dictionary<int, List<ChartEvent>>();
+        var seenReferencesByLane = new Dictionary<int, HashSet<ChartEvent>>();
+        foreach (var track in _chart.Tracks)
+        {
+            if (!affectedLaneSet.Contains(track.TrackIndex))
+                continue;
+            if (!laneEvents.TryGetValue(track.TrackIndex, out var events))
+                laneEvents[track.TrackIndex] = events = new List<ChartEvent>();
+            if (!seenReferencesByLane.TryGetValue(track.TrackIndex, out var seen))
+                seenReferencesByLane[track.TrackIndex] = seen = new HashSet<ChartEvent>();
+            foreach (var ev in track.Events)
+                if (seen.Add(ev))
+                    events.Add(ev);
+        }
+
+        var duplicateEvents = new List<ChartEvent>();
+        foreach (var events in laneEvents.Values)
+        {
+            var used = new HashSet<int>();
+            foreach (var ev in events)
+                if (!used.Add(ev.EventIndex))
+                    duplicateEvents.Add(ev);
+        }
+
+        if (duplicateEvents.Count == 0)
+            return;
+
+        // Capture malformed peers before repairing them so Undo restores the
+        // original event data, while the persistent cleanup is retained on redo.
+        RegisterEditorEventDeltaCurrentEvents(snapshot, duplicateEvents.Distinct());
+
+        foreach (var events in laneEvents.Values)
+        {
+            if (events.Count < 2)
+                continue;
+            var used = new HashSet<int>();
+            foreach (var ev in events)
+            {
+                if (used.Add(ev.EventIndex))
+                    continue;
+
+                long candidate = (long)events.Max(item => item.EventIndex) + 1L;
+                if (candidate > int.MaxValue)
+                    candidate = 0;
+                while (candidate <= int.MaxValue && used.Contains((int)candidate))
+                    candidate++;
+                if (candidate > int.MaxValue)
+                    return;
+
+                ev.EventIndex = (int)candidate;
+                used.Add(ev.EventIndex);
+            }
+        }
+
+        // EventIndex repair is chart-data hygiene, not the user's placement/move.
+        // Keep the repaired identity through Undo/Redo instead of reintroducing a
+        // malformed duplicate ordinal from the old snapshot.
+        foreach (var ev in duplicateEvents.Distinct())
+        {
+            var snapshotIndex = snapshot.Events.FindIndex(state => ReferenceEquals(state.Event, ev));
+            if (snapshotIndex >= 0)
+                snapshot.Events[snapshotIndex] = snapshot.Events[snapshotIndex] with
+                {
+                    EventIndex = ev.EventIndex
+                };
+        }
+    }
+
+    private void RefreshAfterEditorNoteSnapshot(EditorChartSnapshot? snapshot,
+        bool rebuildTwinPairing = false, bool rebuildLinkGraph = false)
+    {
+        if (snapshot is { EventDeltaOnly: true })
+        {
+            // SuperFlick edits change the authored gear route and therefore still
+            // need a GearTimeline/projection refresh. Keep that uncommon path on
+            // the full refresh; ordinary notes and links use the lightweight path.
+            if (snapshot.Events.Any(state => IsEditorSuperFlickAttribute(state.Attr) ||
+                                             state.Event.IsSuperFlick))
+            {
+                RefreshAfterEditorMutation();
+                return;
+            }
+
+            // A hidden/non-note event can still occupy an EventIndex in the same
+            // track. Repair duplicate per-track ordinals before rebuilding render
+            // indexes; otherwise ChartEventKey collisions can make a visible note
+            // overwrite another event's cache mapping during placement or drag.
+            var initialAffectedTrackIndices = snapshot.Events
+                .SelectMany(state => new[] { state.Track, state.Event.Track })
+                .Distinct()
+                .ToArray();
+            NormalizeEditorTrackEventIndicesForDelta(snapshot, initialAffectedTrackIndices);
+
+            // Recompute dependency flags from both sides of the edit. This avoids
+            // rebuilding twins/links for ordinary taps even when an older caller
+            // conservatively requested those operations before it changed note type.
+            var shouldRebuildTwinPairing = snapshot.Events.Any(state =>
+                state.TwinPairId.HasValue || state.Event.TwinPairId.HasValue ||
+                state.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail ||
+                state.Event.NoteType is NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail);
+            var shouldRebuildLinkGraph = snapshot.Events.Any(state =>
+                state.NoteType is NoteType.LinkHead or NoteType.LinkTail ||
+                state.Event.NoteType is NoteType.LinkHead or NoteType.LinkTail);
+
+            // If a plain tap was converted into a duration note, collect the peer
+            // states immediately before twin reconstruction so Undo can restore
+            // their old pair IDs without a full-chart snapshot.
+            if (shouldRebuildTwinPairing && _chart is not null)
+            {
+                var captured = snapshot.Events.Select(state => state.Event).ToHashSet();
+                var peers = _chart.Events.Where(ev => !captured.Contains(ev) &&
+                    EditorEventNeedsTwinPairing(ev)).ToArray();
+                RegisterEditorEventDeltaCurrentEvents(snapshot, peers);
+            }
+            snapshot.DeltaRebuildTwinPairing = shouldRebuildTwinPairing;
+            snapshot.DeltaRebuildLinkGraph = shouldRebuildLinkGraph;
+
+            // Refresh every event carried by this delta, not only the subset whose
+            // basic ordering fields changed. Render/selection indexes also cache
+            // derived values by event key, and changes such as insertion, attribute,
+            // duration, or same-track edits can otherwise be missed when their
+            // snapshot fields compare equal after an earlier live-drag cache update.
+            // Delta snapshots contain only the touched notes (plus any twin peers
+            // whose pairing may be rebuilt), so this remains proportional to the edit.
+            var changedEvents = snapshot.Events
+                .Select(state => state.Event)
+                .Distinct()
+                .ToArray();
+            var affectedTrackIndices = snapshot.Events
+                .SelectMany(state => new[] { state.Track, state.Event.Track })
+                .Distinct()
+                .ToArray();
+            var recalculateLastPlayableTick = ShouldRecalculateEditorLastPlayableTick(snapshot.Events);
+            var incrementalPointRenderUpdate = !shouldRebuildLinkGraph && snapshot.Events.Count <= 8 &&
+                snapshot.Events.All(state => state.NoteType == NoteType.Single && !IsEditorSuperFlickAttribute(state.Attr) &&
+                    state.Event.NoteType == NoteType.Single && !state.Event.IsSuperFlick);
+            RefreshAfterEditorNoteMutation(shouldRebuildTwinPairing,
+                shouldRebuildLinkGraph, changedEvents, affectedTrackIndices,
+                recalculateLastPlayableTick, incrementalPointRenderUpdate);
+            return;
+        }
+
+        // Group edits and chart-wide operations retain the original full refresh.
+        // They may update shared metadata/routes outside the touched note objects.
+        RefreshAfterEditorMutation();
+    }
+
+    private List<ChartEvent> GetEditorDeleteAffectedEvents(IEnumerable<ChartEvent> selectedEvents)
+    {
+        var affected = new HashSet<ChartEvent>(selectedEvents);
+        if (_editorNoteGroupEditMode)
+            return affected.ToList();
+
+        foreach (var ev in affected.ToArray())
+        {
+            var root = GetEditorLinkRoot(ev);
+            if (root is null || root.NoteType != NoteType.LinkHead)
+                continue;
+            foreach (var node in GetEditorLinkChainNodes(root))
+                affected.Add(node);
+        }
+        return affected.ToList();
+    }
+
     private EditorChartSnapshot? CaptureEditorChartSnapshot(bool selectionOnly = false)
     {
         if (_chart is null)
@@ -224,31 +676,43 @@ public sealed partial class Playfield
             };
         }
 
-        var tracks = _chart.Tracks
-            .Select(track => new EditorTrackSnapshot(track, track.Events.ToList()))
-            .ToList();
-        var events = tracks.SelectMany(track => track.Events).Distinct().Select(ev => new EditorEventSnapshot(
-            ev,
-            ev.Tick,
-            ev.Track,
-            ev.Attr,
-            ev.Duration,
-            ev.RawType,
-            ev.TypeIndex,
-            ev.Kind,
-            ev.NoteType,
-            ev.EventIndex,
-            ev.LinePair,
-            ev.Value,
-            ev.Instrument,
-            ev.Velocity,
-            ev.Pan,
-            ev.TwinPairId,
-            ev.LoopReconstructed,
-            ev.LoopPhase,
-            ev.NoteGroupId,
-            ev.NoteGroupInstanceId,
-            ev.NoteGroupMemberId)).ToList();
+        var tracks = new List<EditorTrackSnapshot>(_chart.Tracks.Count);
+        var events = new List<EditorEventSnapshot>(_chart.Events.Count);
+        var seenEvents = new HashSet<ChartEvent>();
+        foreach (var track in _chart.Tracks)
+        {
+            // Build track and value snapshots together. Keep reference de-duplication
+            // for safety, but avoid a second LINQ pass and one heap object per event.
+            var trackEvents = track.Events.ToList();
+            tracks.Add(new EditorTrackSnapshot(track, trackEvents));
+            foreach (var ev in trackEvents)
+            {
+                if (!seenEvents.Add(ev))
+                    continue;
+                events.Add(new EditorEventSnapshot(
+                    ev,
+                    ev.Tick,
+                    ev.Track,
+                    ev.Attr,
+                    ev.Duration,
+                    ev.RawType,
+                    ev.TypeIndex,
+                    ev.Kind,
+                    ev.NoteType,
+                    ev.EventIndex,
+                    ev.LinePair,
+                    ev.Value,
+                    ev.Instrument,
+                    ev.Velocity,
+                    ev.Pan,
+                    ev.TwinPairId,
+                    ev.LoopReconstructed,
+                    ev.LoopPhase,
+                    ev.NoteGroupId,
+                    ev.NoteGroupInstanceId,
+                    ev.NoteGroupMemberId));
+            }
+        }
         return new EditorChartSnapshot
         {
             SourceChart = _chart,
@@ -304,9 +768,7 @@ public sealed partial class Playfield
             NoteGroups = CloneEditorNoteGroups(_chart.NoteGroups),
             NoteGroupInstances = CloneEditorNoteGroupInstances(_chart.NoteGroupInstances),
             SelectionOnly = false,
-            SelectedEvent = _selectedEventKey.HasValue
-                ? _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value)
-                : null,
+            SelectedEvent = TryGetEditorEvent(_selectedEventKey),
             SelectedBeatTick = _selectedBeatTick,
             SelectedBeatTrack = _selectedBeatTrack,
             SelectedTempoEvent = _editorSelectedTempoEvent,
@@ -455,6 +917,12 @@ public sealed partial class Playfield
         return true;
     }
 
+    private static bool EditorDifficultyIdentityMatches(string? current, string? saved)
+        => string.Equals(
+            GetEditorDifficultyCode(current),
+            GetEditorDifficultyCode(saved),
+            StringComparison.OrdinalIgnoreCase);
+
     private bool EditorChartMatchesSnapshot(EditorChartSnapshot snapshot, AresChart? chartOverride = null)
     {
         var chart = chartOverride ?? _chart;
@@ -483,7 +951,7 @@ public sealed partial class Playfield
             !string.Equals(chart.Element, snapshot.Element, StringComparison.Ordinal) ||
             !string.Equals(chart.Version, snapshot.Version, StringComparison.Ordinal) ||
             !string.Equals(chart.ScPasscode, snapshot.ScPasscode, StringComparison.Ordinal) ||
-            !string.Equals(chart.Difficulty, snapshot.Difficulty, StringComparison.Ordinal) ||
+            !EditorDifficultyIdentityMatches(chart.Difficulty, snapshot.Difficulty) ||
             chart.PerfectPlusWindowMs != snapshot.PerfectPlusWindowMs ||
             chart.PerfectWindowMs != snapshot.PerfectWindowMs ||
             chart.GoodWindowMs != snapshot.GoodWindowMs ||
@@ -635,10 +1103,10 @@ public sealed partial class Playfield
         if (snapshot is null)
             return true;
 
-        // Editor commands mutate per-track event lists. Keep AresChart.Events in
-        // sync before group identity matching, deletion, or instance-anchor math.
-        if (_chart is not null)
-            AresLoader.FinalizeEvents(_chart);
+        // Track lists are the authoritative mutation source. Anchor cleanup and
+        // pruning read them directly; EDIT GROUP synchronization refreshes its
+        // own flattened lookup. The normal edit refresh rebuilds chart-wide event
+        // and render caches once, after the history snapshot is committed.
 
         // A lane click is initially held open as a possible marquee gesture. In
         // EDIT GROUP, synchronize its newly placed note immediately instead of
@@ -647,7 +1115,12 @@ public sealed partial class Playfield
         // into a marquee, RestoreEditorChartSnapshot still rolls the whole edit
         // (including its counterpart notes and member metadata) back atomically.
         var synchronizedGroupChanges = groupChangesAlreadySynchronized;
-        if (_editorNoteGroupEditMode && !groupChangesAlreadySynchronized)
+        if (snapshot.EventDeltaOnly)
+        {
+            // Event deltas are used only for ungrouped note operations. They do not
+            // alter reusable group definitions, instances, or member anchors.
+        }
+        else if (_editorNoteGroupEditMode && !groupChangesAlreadySynchronized)
         {
             if (!SynchronizeEditorNoteGroupChanges(snapshot))
                 return false;
@@ -663,12 +1136,13 @@ public sealed partial class Playfield
             return true;
         }
 
-        if (!_editorNoteGroupEditMode)
-            RefreshEditorNoteGroupInstanceAnchors(snapshot);
+        if (!snapshot.EventDeltaOnly)
+        {
+            if (!_editorNoteGroupEditMode)
+                RefreshEditorNoteGroupInstanceAnchors(snapshot);
 
-        if (_chart is not null)
-            AresLoader.FinalizeEvents(_chart);
-        PruneEmptyEditorNoteGroupInstances(preserveEmptyGroupIds);
+            PruneEmptyEditorNoteGroupInstances(preserveEmptyGroupIds);
+        }
 
         PushEditorUndoSnapshot(snapshot);
         return true;
@@ -677,7 +1151,7 @@ public sealed partial class Playfield
     private void PushEditorUndoSnapshot(EditorChartSnapshot snapshot)
     {
         if (!snapshot.SelectionOnly)
-            MarkEditorDirty();
+            MarkEditorDirty(recomputeSavedBaseline: false);
         _editorUndoStack.Add(snapshot);
         if (_editorUndoStack.Count > EditorHistoryLimit)
             _editorUndoStack.RemoveAt(0);
@@ -771,6 +1245,12 @@ public sealed partial class Playfield
             return;
         }
 
+        if (snapshot.EventDeltaOnly)
+        {
+            RestoreEditorEventDeltaSnapshot(snapshot);
+            return;
+        }
+
         foreach (var state in snapshot.Events)
         {
             state.Event.Tick = state.Tick;
@@ -856,6 +1336,139 @@ public sealed partial class Playfield
         StoreActiveEditorDifficulty();
     }
 
+    private static void CopyEditorSelectionState(
+        EditorChartSnapshot target, EditorChartSnapshot selection)
+    {
+        target.SelectedEvent = selection.SelectedEvent;
+        target.SelectedBeatTick = selection.SelectedBeatTick;
+        target.SelectedBeatTrack = selection.SelectedBeatTrack;
+        target.SelectedTempoEvent = selection.SelectedTempoEvent;
+        target.SelectedLinkRoot = selection.SelectedLinkRoot;
+        target.SelectedHoldEnd = selection.SelectedHoldEnd;
+        target.MultiSelectedEvents = selection.MultiSelectedEvents.ToList();
+        target.SelectedGridCells = selection.SelectedGridCells.ToList();
+        target.PanelsSelectedEmptyCell = selection.PanelsSelectedEmptyCell;
+        target.SelectReferenceLineTick = selection.SelectReferenceLineTick;
+        target.SelectReferenceTickOverride = selection.SelectReferenceTickOverride;
+    }
+
+    private void RestoreEditorEventDeltaSnapshot(EditorChartSnapshot snapshot)
+    {
+        if (_chart is null)
+            return;
+
+        var requiresFullChartRefresh = snapshot.Events.Any(state =>
+            IsEditorSuperFlickAttribute(state.Attr) || state.Event.IsSuperFlick);
+        var recalculateLastPlayableTick = ShouldRecalculateEditorLastPlayableTick(snapshot.Events);
+        var eventsNeedingListRestore = snapshot.Events.Where(state =>
+                state.Tick != state.Event.Tick || state.Track != state.Event.Track ||
+                state.EventIndex != state.Event.EventIndex || state.Kind != state.Event.Kind ||
+                state.RawType != state.Event.RawType ||
+                snapshot.DeltaPresentEvents.Contains(state.Event) !=
+                    _chart.Tracks.Any(track => track.Events.Contains(state.Event)))
+            .Select(state => state.Event).Distinct().ToArray();
+        var affectedEvents = eventsNeedingListRestore.ToHashSet();
+        // Track snapshots may cover every possible destination lane during a drag.
+        // List membership restoration still touches only events that actually
+        // moved/appeared/disappeared, but the subsequent cache refresh must include
+        // every snapshotted event because non-ordering fields (or the live-drag
+        // cache's temporary key) can also have changed.
+        var eventsToRefresh = snapshot.Events
+            .Select(state => state.Event)
+            .Distinct()
+            .ToArray();
+        var affectedTrackIndices = snapshot.Events
+            .SelectMany(state => new[] { state.Track, state.Event.Track })
+            .Distinct().ToArray();
+        foreach (var trackIndex in affectedTrackIndices)
+            _chart.FindTrack(trackIndex)?.Events.RemoveAll(affectedEvents.Contains);
+
+        foreach (var trackState in snapshot.DeltaTrackStates)
+        {
+            var currentTrack = _chart.FindTrack(trackState.TrackIndex);
+            if (trackState.Track is null)
+            {
+                // This track did not exist before the edit. Remove an empty track
+                // created by the edit, but never discard unrelated remaining events.
+                if (currentTrack is not null && currentTrack.Events.Count == 0)
+                    _chart.Tracks.Remove(currentTrack);
+                continue;
+            }
+
+            var savedTrack = trackState.Track;
+            if (currentTrack is not null && !ReferenceEquals(currentTrack, savedTrack))
+            {
+                // Preserve non-delta events if a track object was replaced while
+                // applying the edit, then restore the original track identity.
+                foreach (var ev in currentTrack.Events)
+                    if (!affectedEvents.Contains(ev) && !savedTrack.Events.Contains(ev))
+                        savedTrack.Events.Add(ev);
+                _chart.Tracks.Remove(currentTrack);
+            }
+            if (!_chart.Tracks.Contains(savedTrack))
+            {
+                var insertAt = _chart.Tracks.FindIndex(track => track.TrackIndex > savedTrack.TrackIndex);
+                if (insertAt < 0) _chart.Tracks.Add(savedTrack);
+                else _chart.Tracks.Insert(insertAt, savedTrack);
+            }
+        }
+
+        foreach (var state in snapshot.Events)
+        {
+            RestoreEditorEventSnapshot(state);
+            if (!snapshot.DeltaPresentEvents.Contains(state.Event))
+                continue;
+
+            var targetTrack = _chart.FindTrack(state.Track);
+            if (targetTrack is null)
+            {
+                targetTrack = new ChartTrack { TrackIndex = state.Track };
+                var insertAt = _chart.Tracks.FindIndex(track => track.TrackIndex > state.Track);
+                if (insertAt < 0) _chart.Tracks.Add(targetTrack);
+                else _chart.Tracks.Insert(insertAt, targetTrack);
+            }
+            if (!targetTrack.Events.Contains(state.Event))
+                targetTrack.Events.Add(state.Event);
+        }
+
+        _selectedEventKey = snapshot.SelectedEvent is not null ? KeyOf(snapshot.SelectedEvent) : null;
+        _selectedBeatTick = snapshot.SelectedBeatTick;
+        _selectedBeatTrack = snapshot.SelectedBeatTrack;
+        _editorSelectedTempoEvent = snapshot.SelectedTempoEvent;
+        _editorSelectedLinkRoot = snapshot.SelectedLinkRoot;
+        _editorSelectedHoldEnd = snapshot.SelectedHoldEnd;
+        ClearEditorMultiSelection();
+        foreach (var selected in snapshot.MultiSelectedEvents)
+            AddEditorMultiSelectedEvent(selected);
+        _editorSelectedGridCells.Clear();
+        foreach (var cell in snapshot.SelectedGridCells)
+            _editorSelectedGridCells.Add(cell);
+        _editorPanelsSelectedEmptyCell = snapshot.PanelsSelectedEmptyCell;
+        _editorSelectReferenceLineTick = snapshot.SelectReferenceLineTick;
+        _editorSelectReferenceTickOverride = snapshot.SelectReferenceTickOverride;
+        ClearEditorPendingRectangleUndoSnapshot();
+        _editorSelectionPendingUndoSnapshot = null;
+        _editorRectSelectionArmed = false;
+        _editorRectSelecting = false;
+        _editorDraggedEvent = null;
+        _editorDragUndoSnapshot = null;
+        _editorDragIsHoldEnd = false;
+        _editorDragChanged = false;
+        if (requiresFullChartRefresh)
+            RefreshAfterEditorMutation();
+        else
+        {
+            var incrementalPointRenderUpdate = snapshot.Events.Count <= 8 && snapshot.Events.All(state =>
+                state.NoteType == NoteType.Single && !IsEditorSuperFlickAttribute(state.Attr) &&
+                state.Event.NoteType == NoteType.Single && !state.Event.IsSuperFlick);
+            RefreshAfterEditorNoteMutation(snapshot.DeltaRebuildTwinPairing,
+                snapshot.DeltaRebuildLinkGraph, eventsToRefresh, affectedTrackIndices,
+                recalculateLastPlayableTick, incrementalPointRenderUpdate);
+        }
+        SyncSharedEditorMetadataToDifficultyStates();
+        StoreActiveEditorDifficulty();
+    }
+
     private void RestoreEditorSelectionSnapshot(EditorChartSnapshot snapshot)
     {
         _selectedEventKey = IsEditorEventInCurrentChart(snapshot.SelectedEvent)
@@ -908,7 +1521,9 @@ public sealed partial class Playfield
         var previous = _editorUndoStack[^1];
         var current = previous.PanelEventOnly
             ? CaptureCurrentEditorPanelEventSnapshot(previous)
-            : CaptureEditorChartSnapshot(selectionOnly: previous.SelectionOnly);
+            : previous.EventDeltaOnly
+                ? CaptureCurrentEditorEventDeltaSnapshot(previous)
+                : CaptureEditorChartSnapshot(selectionOnly: previous.SelectionOnly);
         _editorUndoStack.RemoveAt(_editorUndoStack.Count - 1);
         if (current is not null)
             _editorRedoStack.Add(current);
@@ -929,7 +1544,9 @@ public sealed partial class Playfield
         var next = _editorRedoStack[^1];
         var current = next.PanelEventOnly
             ? CaptureCurrentEditorPanelEventSnapshot(next)
-            : CaptureEditorChartSnapshot(selectionOnly: next.SelectionOnly);
+            : next.EventDeltaOnly
+                ? CaptureCurrentEditorEventDeltaSnapshot(next)
+                : CaptureEditorChartSnapshot(selectionOnly: next.SelectionOnly);
         _editorRedoStack.RemoveAt(_editorRedoStack.Count - 1);
         if (current is not null)
             _editorUndoStack.Add(current);
@@ -1231,8 +1848,10 @@ public sealed partial class Playfield
         }
 
         CopySelectedEditorNotes();
-        var snapshot = CaptureEditorChartSnapshot();
         var removed = notes.ToHashSet();
+        var affectedBeforeCut = GetEditorDeleteAffectedEvents(removed);
+        var snapshot = CaptureEditorNoteEditSnapshot(affectedBeforeCut,
+            affectedBeforeCut.Select(ev => ev.Track), rebuildTwinPairing: true, rebuildLinkGraph: true);
         var replacement = DeleteEditorEvents(removed);
         CommitEditorUndoSnapshot(snapshot);
         ClearEditorMultiSelection();
@@ -1240,7 +1859,7 @@ public sealed partial class Playfield
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
         _editorSelectedHoldEnd = false;
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         _editorSelectedLinkRoot = replacement is not null ? GetEditorLinkRoot(replacement) : null;
         _statusMessage = $"Cut {notes.Count} note(s).";
     }
@@ -2009,7 +2628,17 @@ public sealed partial class Playfield
             }
         }
 
-        var snapshot = CaptureEditorChartSnapshot();
+        var affectedBeforePaste = GetEditorDeleteAffectedEvents(fitCollisionRemovals);
+        var targetTrackIndices = targetTracks.Concat(affectedBeforePaste.Select(ev => ev.Track)).Distinct().ToArray();
+        var pasteNeedsTwinPairing = clipboardEntries.Any(entry => entry.NoteType is
+            NoteType.SingleLong or NoteType.Vibrato or NoteType.LinkHead or NoteType.LinkTail) ||
+            affectedBeforePaste.Any(EditorEventNeedsTwinPairing);
+        var pasteNeedsLinkGraph = clipboardEntries.Any(entry => entry.NoteType is NoteType.LinkHead or NoteType.LinkTail) ||
+            affectedBeforePaste.Any(EditorEventNeedsLinkGraph);
+        var snapshot = preserveGroupClipboard
+            ? CaptureEditorChartSnapshot()
+            : CaptureEditorNoteEditSnapshot(affectedBeforePaste, targetTrackIndices,
+                rebuildTwinPairing: pasteNeedsTwinPairing, rebuildLinkGraph: pasteNeedsLinkGraph);
         if (snapshot is null)
         {
             _statusMessage = "Paste cancelled: an undo snapshot could not be created.";
@@ -2095,8 +2724,9 @@ public sealed partial class Playfield
             _editorEditingNoteGroupInstanceId = null;
         }
 
+        RegisterEditorEventDeltaAdditions(snapshot, pasted.ToArray());
         CommitEditorUndoSnapshot(snapshot);
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, pasteNeedsTwinPairing, pasteNeedsLinkGraph);
         ClearEditorMultiSelection();
         _editorSelectedGridCells.Clear();
         _editorPanelsSelectedEmptyCell = null;
@@ -2335,6 +2965,33 @@ public sealed partial class Playfield
         return true;
     }
 
+    // Remove event references only from their source/destination lanes. Scanning all
+    // track lists for a one-note edit turns a small operation into a chart-wide pass.
+    // originalTrackIndices covers live drags where an event's Track field has already
+    // changed but the reference remains in its original track until commit.
+    private void RemoveEditorEventsFromTrackLists(IEnumerable<ChartEvent> events,
+        IEnumerable<int>? originalTrackIndices = null)
+    {
+        if (_chart is null)
+            return;
+
+        var eventSet = events as HashSet<ChartEvent> ?? events.ToHashSet();
+        if (eventSet.Count == 0)
+            return;
+
+        var trackIndices = eventSet.Select(ev => ev.Track)
+            .Concat(originalTrackIndices ?? Array.Empty<int>())
+            .ToHashSet();
+        // ARES can contain more than one physical ChartTrack container with the
+        // same logical TrackIndex. FindTrack() returns only the first one; removing
+        // through it leaves a stale copy in a duplicate container, which can later
+        // be re-indexed as a second render entry. Remove from every container for
+        // the source/destination lanes instead.
+        foreach (var track in _chart.Tracks)
+            if (trackIndices.Contains(track.TrackIndex))
+                track.Events.RemoveAll(eventSet.Contains);
+    }
+
     // Remove selected notes while preserving every unbroken run of a link chain.
     // A run downstream of a deleted point becomes its own chain when it has two
     // or more points; isolated points become ordinary notes/holds.
@@ -2366,8 +3023,7 @@ public sealed partial class Playfield
             }
         }
 
-        foreach (var track in _chart.Tracks)
-            track.Events.RemoveAll(removals.Contains);
+        RemoveEditorEventsFromTrackLists(removals);
 
         ChartEvent? replacement = null;
         foreach (var plan in chainPlans)

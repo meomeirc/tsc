@@ -6870,7 +6870,7 @@ public sealed class SongSelectMenu : IDisposable
 
     private static readonly string[] RegularArtworkFallbackNames =
     {
-        "album.png", "album.jpg", "album.jpeg", "cover.songselect.png", "cover.webp",
+        "album.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp", "cover.songselect.png", "cover.webp",
         "album_big.png", "album_big.jpg", "album_big.jpeg"
     };
 

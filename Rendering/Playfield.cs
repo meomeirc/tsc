@@ -76,6 +76,9 @@ public sealed partial class Playfield
     private static readonly string[] EditorMetaCategories = { "SONG", "MEDIA", "JUDGEMENT", "STATS", "TEST" };
     private readonly Dictionary<string, EditorDifficultyState> _editorDifficultyStates = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<AresChart, double?> _editorLevelEstimateCache = new(ReferenceEqualityComparer.Instance);
+    private AresChart? _editorInitialChartBpmCacheChart;
+    private long _editorInitialChartBpmCacheRevision = -1;
+    private double _editorInitialChartBpmCacheValue = 120.0;
     private readonly HashSet<string> _editorDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _editorCommittedDeletedDifficultyCodes = new(StringComparer.OrdinalIgnoreCase);
     private bool _editorDifficultySessionActive;
@@ -115,8 +118,9 @@ public sealed partial class Playfield
     private readonly TSC.UI.SmoothScrollHandler _editorProblemsScroll = new();
     private bool _editorDiagnosticsDirty = true;
     private AresChart? _editorDiagnosticsChart;
-    private readonly List<EditorChartProblem> _editorProblems = new();
-    private readonly HashSet<ChartEventKey> _editorProblemEventKeys = new();
+    private List<EditorChartProblem> _editorProblems = new();
+    private HashSet<ChartEventKey> _editorProblemEventKeys = new();
+    private List<ChartEvent> _editorProblemMarkerEvents = new();
     private int _editorProblemErrorCount;
     private int _editorProblemWarningCount;
 
@@ -832,6 +836,14 @@ public sealed partial class Playfield
     // actual chain endpoint.
     private List<double> _eventEffectiveEndSeconds = new();
     private List<double> _eventEffectiveEndScrollUnits = new();
+    private List<ChartEventKey> _orderedRenderableEventKeys = new();
+    private Dictionary<ChartEvent, ChartEventKey> _eventKeyByReference = new();
+    // Reference-based lane index for every event in the chart model, including
+    // events that are temporarily absent from the flattened render list. This lets
+    // incremental note refreshes recover stale/missing render entries without
+    // relying on ChartEventKey dictionaries that can collide on malformed charts.
+    private readonly Dictionary<int, HashSet<ChartEvent>> _editorEventsByTrack = new();
+    private readonly Dictionary<ChartEvent, int> _editorEventTrackByReference = new();
     // Long-lived renderables are indexed by effective end distance so old heads do not
     // force DrawNotes to scan every earlier chart event.
     private List<double> _longEventEndScrollUnits = new();
@@ -1078,6 +1090,7 @@ public sealed partial class Playfield
 
     private readonly List<HitDeltaSample> _hitDeltaSamples = new();
     private readonly List<ScoreEntry> _scoreEntries = new();
+    private bool _scoreModelDirty;
     private readonly Dictionary<ChartEventKey, ScoreEntry> _scoreEventEntries = new();
     private readonly Dictionary<SuperFlickVisualKey, ScoreEntry> _scoreSuperFlickEntries = new();
     private readonly Dictionary<ChartEventKey, List<ScoreEntry>> _scoreHoldTickEntries = new();
@@ -1474,6 +1487,24 @@ public sealed partial class Playfield
         }
     }
 
+    // Read-only UI status: never probe the filesystem or parse another difficulty
+    // while building the Info overlay. The action path may still call
+    // HasEditorDifficultyChart when it actually needs to load a sibling chart.
+    private bool HasEditorDifficultyChartKnown(string? difficultyCode)
+    {
+        var code = GetEditorDifficultyCode(difficultyCode);
+        if (_editorDeletedDifficultyCodes.Contains(code) ||
+            _editorCommittedDeletedDifficultyCodes.Contains(code))
+            return false;
+
+        if (_editorDifficultyStates.TryGetValue(code, out var state))
+            return state.HasSourceChart && !string.IsNullOrWhiteSpace(state.SourcePath);
+
+        var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
+        return string.Equals(code, activeCode, StringComparison.OrdinalIgnoreCase) &&
+               !string.IsNullOrWhiteSpace(_loadedSourcePath);
+    }
+
     private bool ShouldIncludeEditorDifficultyInBundleExport(string? difficultyCode, EditorDifficultyState state)
     {
         var code = GetEditorDifficultyCode(difficultyCode, state.SourceName);
@@ -1785,20 +1816,23 @@ public sealed partial class Playfield
         _editorElementDropdownOpen = false;
     }
 
-    private void MarkEditorDirty(bool auxiliaryChange = false)
+    private void MarkEditorDirty(bool auxiliaryChange = false, bool recomputeSavedBaseline = true)
     {
-        _editorMetaStatsCache = null;
-        _editorMetaStatsCacheChart = null;
+        InvalidateEditorMetaStatsCache();
         _editorLevelEstimateCache.Clear();
         if (_chartEditorMode)
         {
             _editorRecoveryRevision++;
             if (auxiliaryChange)
                 _editorHasAuxiliaryUnsavedChanges = true;
-            // A dirty flag should describe the current chart, not whether an edit
-            // happened at some point. Comparing with the saved baseline lets an
-            // undo (or an edit that is later removed) return the editor to clean.
-            RefreshEditorDirtyState();
+            // Forward edits can mark the chart dirty immediately. Deep baseline
+            // comparison is only needed after Undo/Redo, when the user may have
+            // returned the chart exactly to its saved state. Avoid an O(chart size)
+            // comparison after every placement, move, or deletion.
+            if (recomputeSavedBaseline)
+                RefreshEditorDirtyState();
+            else
+                _editorHasUnsavedChanges = true;
             _editorDiagnosticsDirty = true;
             lock (_editorLanTestSync)
             {
@@ -3317,11 +3351,12 @@ public sealed partial class Playfield
 
     private void InitializeEditorDifficultySession()
     {
-        if (!_chartEditorMode || _chart is null)
+        var initializedChart = _chart;
+        if (!_chartEditorMode || initializedChart is null)
             return;
 
         using var loadTiming = new LoadTimingScope("editor_difficulty_session_total");
-        var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
+        var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(initializedChart.Difficulty, _sourceName);
         var extraDifficultyHasDisabledFile = HasDisabledExtraDifficultySibling(
             _loadedSourcePath ?? _editorDifficultyDiscoverySourcePath, _editorBundleTemplate, _loadedFpkPackage);
         // A .disabled chart file is authoritative over stale enabled metadata.
@@ -3376,12 +3411,12 @@ public sealed partial class Playfield
             // If the selected difficulty predates preview-range metadata, adopt
             // the first valid range found in a sibling before treating it as the
             // song-wide value shared by every loaded difficulty.
-            if (!_chart.HasPreviewRange && state.Chart.HasPreviewRange)
+            if (!initializedChart.HasPreviewRange && state.Chart.HasPreviewRange)
             {
-                _chart.PreviewStartMilliseconds = state.Chart.PreviewStartMilliseconds;
-                _chart.PreviewEndMilliseconds = state.Chart.PreviewEndMilliseconds;
+                initializedChart.PreviewStartMilliseconds = state.Chart.PreviewStartMilliseconds;
+                initializedChart.PreviewEndMilliseconds = state.Chart.PreviewEndMilliseconds;
             }
-            CopySharedEditorMetadata(_chart, state.Chart);
+            CopySharedEditorMetadata(initializedChart, state.Chart);
             state.Chart.Difficulty = GetEditorDifficultyName(code);
             // PlayTick is authored independently of PlayTime; preserve each
             // difficulty's stored endpoint while keeping its track-16 marker aligned.
@@ -3398,6 +3433,15 @@ public sealed partial class Playfield
         // adopted value back to every earlier state as well.
         SyncSharedEditorMetadataToDifficultyStates();
         StoreActiveEditorDifficulty();
+
+        // LoadChartObject establishes the initial chart baseline before sibling
+        // discovery. Session initialization can subsequently adopt shared
+        // song-wide metadata (for example, a preview range) from a sibling.
+        // Treat that load-time reconciliation as part of the opened state, not
+        // as a user edit that becomes dirty on the first difficulty switch.
+        if (CaptureEditorChartSnapshot() is { } initializedBaseline)
+            _editorSavedChartBaselines[initializedChart] = initializedBaseline;
+        RefreshEditorDirtyState();
     }
 
     private static bool IsEditorDifficultySourceDisabled(params string?[] paths)
@@ -3422,6 +3466,8 @@ public sealed partial class Playfield
         else if (string.Equals(field, "album", StringComparison.OrdinalIgnoreCase))
         {
             _editorSharedAlbumBytes = assetBytes.ToArray();
+            if (_editorBundleTemplate == ChartBundleTemplate.Tsc)
+                _chart.AlbumPath = GetTscAlbumAssetFileName(assetBytes);
         }
         else
         {
@@ -3437,7 +3483,8 @@ public sealed partial class Playfield
 
     private static void WriteImportedTstsCover(byte[] imageBytes, string outputPath)
     {
-        var temporaryPath = Path.Combine(Path.GetTempPath(), $"tsc_cover_{Guid.NewGuid():N}.png");
+        var sourceExtension = Path.GetExtension(GetTscAlbumAssetFileName(imageBytes));
+        var temporaryPath = Path.Combine(Path.GetTempPath(), $"tsc_cover_{Guid.NewGuid():N}{sourceExtension}");
         try
         {
             File.WriteAllBytes(temporaryPath, imageBytes);
@@ -3456,7 +3503,7 @@ public sealed partial class Playfield
             var fileName = template switch
             {
                 ChartBundleTemplate.Tsts => "cover.webp",
-                ChartBundleTemplate.Tsc => "album.png",
+                ChartBundleTemplate.Tsc => GetTscAlbumAssetFileName(_editorSharedAlbumBytes),
                 _ => "album"
             };
             var destination = Path.Combine(directory, fileName);
@@ -3464,6 +3511,21 @@ public sealed partial class Playfield
                 WriteImportedTstsCover(_editorSharedAlbumBytes, destination);
             else
                 File.WriteAllBytes(destination, _editorSharedAlbumBytes);
+
+            if (template == ChartBundleTemplate.Tsc)
+            {
+                // Do not leave a previous-format cover beside the new one. The
+                // loader searches the conventional names and could otherwise pick
+                // a stale album.png before the newly imported album.jpg.
+                foreach (var oldName in TscRegularAlbumAssetNames)
+                {
+                    if (string.Equals(oldName, fileName, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    var oldPath = Path.Combine(directory, oldName);
+                    if (File.Exists(oldPath))
+                        File.Delete(oldPath);
+                }
+            }
         }
         if (_editorSharedAlbumBigBytes is { Length: > 0 } && template != ChartBundleTemplate.Tsts)
         {
@@ -3818,8 +3880,11 @@ public sealed partial class Playfield
         if (musicRoot is not null)
             return musicRoot;
         static bool HasOtherSongAssets(string directory)
-            => new[] { "preview.opus", "cover.webp", "album.png", "album_big.png", "album", "album_big" }
-                .Any(name => File.Exists(Path.Combine(directory, name)));
+            => new[]
+            {
+                "preview.opus", "cover.webp", "album.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp",
+                "album_big.png", "album", "album_big"
+            }.Any(name => File.Exists(Path.Combine(directory, name)));
         return ancestors.FirstOrDefault(HasOtherSongAssets) ?? chartDirectory;
     }
 
@@ -4326,6 +4391,40 @@ public sealed partial class Playfield
         chart.AlbumBigPath = state.AlbumBigPath;
     }
 
+    private static readonly string[] TscRegularAlbumAssetNames =
+    {
+        "album.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp"
+    };
+
+    private static string GetTscAlbumAssetFileName(byte[] imageBytes)
+    {
+        // Detect the actual encoded format rather than trusting the source filename;
+        // resized non-JPEG images are normalized to PNG by the import path.
+        if (imageBytes.Length >= 3 && imageBytes[0] == 0xFF && imageBytes[1] == 0xD8 && imageBytes[2] == 0xFF)
+            return "album.jpg";
+        if (imageBytes.Length >= 8 && imageBytes[0] == 0x89 && imageBytes[1] == 0x50 &&
+            imageBytes[2] == 0x4E && imageBytes[3] == 0x47 && imageBytes[4] == 0x0D &&
+            imageBytes[5] == 0x0A && imageBytes[6] == 0x1A && imageBytes[7] == 0x0A)
+            return "album.png";
+        if (imageBytes.Length >= 12 && imageBytes[0] == (byte)'R' && imageBytes[1] == (byte)'I' &&
+            imageBytes[2] == (byte)'F' && imageBytes[3] == (byte)'F' && imageBytes[8] == (byte)'W' &&
+            imageBytes[9] == (byte)'E' && imageBytes[10] == (byte)'B' && imageBytes[11] == (byte)'P')
+            return "album.webp";
+        if (imageBytes.Length >= 6 && imageBytes[0] == (byte)'G' && imageBytes[1] == (byte)'I' &&
+            imageBytes[2] == (byte)'F' && imageBytes[3] == (byte)'8')
+            return "album.gif";
+        if (imageBytes.Length >= 2 && imageBytes[0] == (byte)'B' && imageBytes[1] == (byte)'M')
+            return "album.bmp";
+        return "album.png";
+    }
+
+    private static string GetTscAlbumAssetFileName(string? preferredPath)
+    {
+        var candidate = Path.GetFileName(preferredPath ?? string.Empty);
+        return TscRegularAlbumAssetNames.FirstOrDefault(name =>
+            string.Equals(name, candidate, StringComparison.OrdinalIgnoreCase)) ?? "album.png";
+    }
+
     private static void ApplyFixedMediaPaths(AresChart chart, ChartBundleTemplate template)
     {
         chart.MusicPath = template == ChartBundleTemplate.Tsts ? "song.opus" : "music.opus";
@@ -4333,7 +4432,7 @@ public sealed partial class Playfield
         chart.AlbumPath = template switch
         {
             ChartBundleTemplate.Tsts => "cover.webp",
-            ChartBundleTemplate.Tsc => "album.png",
+            ChartBundleTemplate.Tsc => GetTscAlbumAssetFileName(chart.AlbumPath),
             _ => "album"
         };
         chart.AlbumBigPath = template switch
@@ -4734,8 +4833,8 @@ public sealed partial class Playfield
         }
 
         var names = preferBig
-            ? new[] { "album_big.png", "album_big.songselect.png", "album_big.jpg", "album_big.jpeg", "album_big.webp", "album.png", "album.jpg", "album.jpeg", "album.webp", "cover.songselect.png", "cover.webp" }
-            : new[] { "cover.songselect.png", "album.png", "album.songselect.png", "album.jpg", "album.jpeg", "album.webp", "cover.webp", "album_big.png", "album_big.songselect.png", "album_big.jpg", "album_big.jpeg", "album_big.webp" };
+            ? new[] { "album_big.png", "album_big.songselect.png", "album_big.jpg", "album_big.jpeg", "album_big.webp", "album.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp", "cover.songselect.png", "cover.webp" }
+            : new[] { "cover.songselect.png", "album.png", "album.songselect.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp", "cover.webp", "album_big.png", "album_big.songselect.png", "album_big.jpg", "album_big.jpeg", "album_big.webp" };
         foreach (var root in roots)
         {
             foreach (var name in names)
@@ -4951,8 +5050,7 @@ public sealed partial class Playfield
             RebuildRenderEventCache();
         _simultaneousCountsCache.Clear();
         InvalidateLaneMeshCache();
-        _editorMetaStatsCache = null;
-        _editorMetaStatsCacheChart = null;
+        ClearEditorMetaStatsCache();
         _editorLevelEstimateCache.Clear();
         using (new LoadTimingScope("chart_gear_timeline"))
             _gear = new GearTimeline(_chart);
@@ -5088,7 +5186,10 @@ public sealed partial class Playfield
             if (!string.IsNullOrWhiteSpace(sourceDirectory) && Directory.Exists(sourceDirectory) &&
                 !string.Equals(Path.GetFullPath(sourceDirectory), Path.GetFullPath(targetDirectory), StringComparison.OrdinalIgnoreCase))
             {
-                foreach (var assetName in new[] { "preview.opus", "album.png", "album_big.png" })
+                foreach (var assetName in new[]
+                {
+                    "preview.opus", "album.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp", "album_big.png"
+                })
                 {
                     var sourceAsset = Path.Combine(sourceDirectory, assetName);
                     var targetAsset = Path.Combine(targetDirectory, assetName);
@@ -7143,22 +7244,30 @@ public sealed partial class Playfield
 
     private double GetEditorInitialChartBpm()
     {
-        if (_chart is null)
+        var chart = _chart;
+        if (chart is null)
             return 120.0;
+        if (ReferenceEquals(_editorInitialChartBpmCacheChart, chart) &&
+            _editorInitialChartBpmCacheRevision == _editorRecoveryRevision)
+            return _editorInitialChartBpmCacheValue;
 
-        // The tick-0 tempo event is authoritative for the initial BPM shown in INFO.
-        // InitialTempo is kept in sync for serialization and for systems that use it
-        // as a fallback when no usable tempo event exists.
-        var tickZeroTempo = _chart.Tracks.SelectMany(track => track.Events)
-            .Where(ev => ev.RawType == 3 && ev.Tick == 0 && float.IsFinite(ev.Value) && ev.Value > 0f)
-            .OrderBy(ev => ev.Track)
-            .ThenBy(ev => ev.EventIndex)
-            .FirstOrDefault();
-        return tickZeroTempo is not null
-            ? tickZeroTempo.Value
-            : double.IsFinite(_chart.InitialTempo) && _chart.InitialTempo > 0
-                ? _chart.InitialTempo
-                : 120.0;
+        // TempoEvents contains only type-3 tempo rows and preserves source
+        // track/event ordering. Use it instead of walking every note on every track
+        // just to populate one INFO field on first open.
+        double? tickZeroBpm = null;
+        foreach (var tempo in chart.TempoEvents)
+        {
+            if (tempo.Tick != 0 || !double.IsFinite(tempo.Bpm) || tempo.Bpm <= 0.0)
+                continue;
+            tickZeroBpm = tempo.Bpm;
+            break;
+        }
+
+        _editorInitialChartBpmCacheValue = tickZeroBpm ??
+            (double.IsFinite(chart.InitialTempo) && chart.InitialTempo > 0 ? chart.InitialTempo : 120.0);
+        _editorInitialChartBpmCacheChart = chart;
+        _editorInitialChartBpmCacheRevision = _editorRecoveryRevision;
+        return _editorInitialChartBpmCacheValue;
     }
 
     private void SetEditorInitialChartBpm(double bpm)
@@ -10254,9 +10363,7 @@ public sealed partial class Playfield
 
         var snap = GetEditorSnapTicks();
         var currentTick = _tempo.SecondsToTick(_playSeconds);
-        var selectedNoteTick = _selectedEventKey.HasValue
-            ? _chart.Events.FirstOrDefault(e => KeyOf(e) == _selectedEventKey.Value)?.Tick
-            : null;
+        var selectedNoteTick = TryGetEditorEvent(_selectedEventKey)?.Tick;
         var tick = _selectedBeatTick ?? selectedNoteTick ?? (int)(Math.Round(currentTick / snap, MidpointRounding.AwayFromZero) * snap);
         tick = Math.Max(0, tick);
         if (_editorSuperFlickTool == EditorSuperFlickTool.Place)
@@ -10267,7 +10374,11 @@ public sealed partial class Playfield
             return;
         }
         var placementAttr = _editorAttr;
-        var undoSnapshot = CaptureEditorChartSnapshot();
+        var placementNoteType = _editorNoteType;
+        var undoSnapshot = CaptureEditorNoteEditSnapshot(
+            Array.Empty<ChartEvent>(), new[] { _editorTrack },
+            rebuildTwinPairing: placementNoteType is NoteType.SingleLong or NoteType.Vibrato,
+            rebuildLinkGraph: placementNoteType is NoteType.LinkHead or NoteType.LinkTail);
 
         var track = _chart.FindTrack(_editorTrack);
         if (track is null)
@@ -10293,13 +10404,11 @@ public sealed partial class Playfield
             Pan = 64
         };
         track.Events.Add(ev);
+        RegisterEditorEventDeltaAdditions(undoSnapshot, ev);
         CommitEditorUndoSnapshot(undoSnapshot);
-        if (!_chart.Events.Any(candidate => ReferenceEquals(candidate, ev)))
-        {
-            RefreshAfterEditorMutation();
-            return;
-        }
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(undoSnapshot,
+            rebuildTwinPairing: placementNoteType is NoteType.SingleLong or NoteType.Vibrato,
+            rebuildLinkGraph: placementNoteType is NoteType.LinkHead or NoteType.LinkTail);
         _selectedEventKey = KeyOf(ev);
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
@@ -10715,7 +10824,7 @@ public sealed partial class Playfield
             !_hoverTrack.HasValue || _editorDraggedEvent is not null || _editorRectSelecting)
             return false;
 
-        var selected = _chart.Events.FirstOrDefault(ev => KeyOf(ev) == _selectedEventKey.Value);
+        var selected = TryGetEditorEvent(_selectedEventKey);
         if (selected is null)
             return false;
         var root = selected.NoteType switch
@@ -10831,8 +10940,9 @@ public sealed partial class Playfield
             return;
         }
 
-        var source = _chart.Events.FirstOrDefault(e => KeyOf(e) == _selectedEventKey.Value &&
-                                                       e.Kind == "Note" && e.RawType == 1);
+        var source = TryGetEditorEvent(_selectedEventKey);
+        if (source is not { Kind: "Note", RawType: 1 })
+            source = null;
         if (source is null)
         {
             _statusMessage = "Select an editable tap, hold, or link point first.";
@@ -11025,7 +11135,10 @@ public sealed partial class Playfield
                 return;
             }
 
-            var undoSnapshot = CaptureEditorChartSnapshot();
+            var undoSnapshot = CaptureEditorNoteEditSnapshot(
+                existingTarget is null ? new[] { source } : new[] { source, existingTarget },
+                existingTarget is null ? new[] { source.Track } : new[] { source.Track, existingTarget.Track },
+                rebuildTwinPairing: true, rebuildLinkGraph: false);
             if (source.NoteType == NoteType.Single && source.Attr == 0)
             {
                 source.NoteType = NoteType.SingleLong;
@@ -11040,13 +11153,10 @@ public sealed partial class Playfield
 
             source.Duration = duration;
             if (existingTarget is not null)
-            {
-                foreach (var track in _chart.Tracks)
-                    track.Events.RemoveAll(candidate => ReferenceEquals(candidate, existingTarget));
-            }
+                RemoveEditorEventsFromTrackLists(new[] { existingTarget });
             if (!CommitEditorUndoSnapshot(undoSnapshot))
                 return;
-            RefreshAfterEditorMutation();
+            RefreshAfterEditorNoteSnapshot(undoSnapshot, rebuildTwinPairing: true);
             _selectedEventKey = KeyOf(source);
             _selectedBeatTick = null;
             _selectedBeatTrack = source.Track;
@@ -11068,9 +11178,12 @@ public sealed partial class Playfield
         if (!horizontalFirst && existingTarget is null && source.NoteType == NoteType.LinkTail && targetTick == source.Tick)
         {
             var previousTrack = source.Track;
-            var moveUndoSnapshot = CaptureEditorChartSnapshot();
-            foreach (var track in _chart.Tracks)
-                track.Events.RemoveAll(candidate => ReferenceEquals(candidate, source));
+            var moveAffectedEvents = selectedRoot is { NoteType: NoteType.LinkHead }
+                ? GetEditorLinkChainNodes(selectedRoot)
+                : new List<ChartEvent> { source };
+            var moveUndoSnapshot = CaptureEditorNoteEditSnapshot(moveAffectedEvents,
+                new[] { source.Track, targetTrack }, rebuildTwinPairing: true, rebuildLinkGraph: true);
+            RemoveEditorEventsFromTrackLists(new[] { source }, new[] { previousTrack });
 
             var destinationTrack = GetOrCreateEditorTrack(targetTrack);
             source.Track = targetTrack;
@@ -11087,7 +11200,7 @@ public sealed partial class Playfield
                 SyncEditorLinkChainDurations(movedRoot);
             if (!CommitEditorUndoSnapshot(moveUndoSnapshot))
                 return;
-            RefreshAfterEditorMutation();
+            RefreshAfterEditorNoteSnapshot(moveUndoSnapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
             _selectedEventKey = KeyOf(source);
             _selectedBeatTick = null;
             _selectedBeatTrack = targetTrack;
@@ -11144,7 +11257,16 @@ public sealed partial class Playfield
             }
         }
 
-        var connectorUndoSnapshot = CaptureEditorChartSnapshot();
+        var connectorAffectedEvents = sourceChainNodesForPair
+            .Concat(existingTargetChainNodes)
+            .Append(source);
+        if (existingTarget is not null)
+            connectorAffectedEvents = connectorAffectedEvents.Append(existingTarget);
+        var connectorAffectedTrackIndices = sourceChainNodesForPair.Select(node => node.Track)
+            .Concat(existingTargetChainNodes.Select(node => node.Track))
+            .Append(source.Track).Append(targetTrack).Distinct().ToArray();
+        var connectorUndoSnapshot = CaptureEditorNoteEditSnapshot(connectorAffectedEvents,
+            connectorAffectedTrackIndices, rebuildTwinPairing: true, rebuildLinkGraph: true);
         int pair;
         if (source.NoteType == NoteType.Single && source.Attr == 0)
         {
@@ -11502,9 +11624,13 @@ public sealed partial class Playfield
             SyncEditorLinkChainDurations(source.NoteType == NoteType.LinkHead ? source : GetEditorLinkRoot(source));
         }
 
+        if (horizontalTailForGroup is null)
+            RegisterEditorEventDeltaAdditions(connectorUndoSnapshot, newTail);
+        else
+            RegisterEditorEventDeltaAdditions(connectorUndoSnapshot, newTail, horizontalTailForGroup);
         if (!CommitEditorUndoSnapshot(connectorUndoSnapshot))
             return;
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(connectorUndoSnapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         _selectedEventKey = KeyOf(finalSelectedLinkPoint);
         _selectedBeatTick = null;
         _selectedBeatTrack = finalSelectedLinkPoint.Track;
@@ -11584,7 +11710,14 @@ public sealed partial class Playfield
         }
 
         var linkPointCount = selected.Count(ev => GetEditorLinkRoot(ev) is { NoteType: NoteType.LinkHead });
-        var snapshot = CaptureEditorChartSnapshot();
+        var affectedEvents = GetEditorDeleteAffectedEvents(selected);
+        var needsTwinRefresh = affectedEvents.Any(EditorEventNeedsTwinPairing);
+        var needsLinkRefresh = affectedEvents.Any(EditorEventNeedsLinkGraph);
+        var hasPanelEvents = affectedEvents.Any(ev => ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108);
+        var snapshot = hasPanelEvents
+            ? CaptureEditorChartSnapshot()
+            : CaptureEditorNoteEditSnapshot(affectedEvents, affectedEvents.Select(ev => ev.Track),
+                needsTwinRefresh, needsLinkRefresh);
         var replacement = DeleteEditorEvents(selected.ToHashSet());
         CommitEditorUndoSnapshot(snapshot);
         _selectedEventKey = replacement is not null ? KeyOf(replacement) : null;
@@ -11593,7 +11726,10 @@ public sealed partial class Playfield
         _editorSelectedHoldEnd = false;
         ClearEditorMultiSelection();
         _editorSelectedLinkRoot = replacement is not null ? GetEditorLinkRoot(replacement) : null;
-        RefreshAfterEditorMutation();
+        if (hasPanelEvents)
+            RefreshAfterEditorMutation();
+        else
+            RefreshAfterEditorNoteSnapshot(snapshot, needsTwinRefresh, needsLinkRefresh);
         if (replacement is not null && _chart.Events.Any(candidate => ReferenceEquals(candidate, replacement)))
         {
             _selectedEventKey = KeyOf(replacement);
@@ -11666,7 +11802,10 @@ public sealed partial class Playfield
             {
                 if (endpointNote.Duration > 6 || endpointNote.NoteType != NoteType.Single)
                 {
-                    var endpointSnapshot = CaptureEditorChartSnapshot();
+                    var endpointSnapshot = isPanelCue
+                        ? CaptureEditorChartSnapshot()
+                        : CaptureEditorNoteEditSnapshot(new[] { endpointNote }, new[] { endpointNote.Track },
+                            rebuildTwinPairing: true);
                     endpointNote.Duration = 6;
                     endpointNote.NoteType = NoteType.Single;
                     CommitEditorUndoSnapshot(endpointSnapshot);
@@ -11675,7 +11814,10 @@ public sealed partial class Playfield
                     _selectedBeatTrack = null;
                     ClearEditorMultiSelection();
                     _editorSelectedLinkRoot = null;
-                    RefreshAfterEditorMutation();
+                    if (isPanelCue)
+                        RefreshAfterEditorMutation();
+                    else
+                        RefreshAfterEditorNoteSnapshot(endpointSnapshot, rebuildTwinPairing: true);
                     _selectedEventKey = KeyOf(endpointNote);
                 }
                 _editorSelectedHoldEnd = false;
@@ -11684,7 +11826,14 @@ public sealed partial class Playfield
             }
         }
 
-        var snapshot = CaptureEditorChartSnapshot();
+        var affectedEventsForDelete = GetEditorDeleteAffectedEvents(selected);
+        var needsTwinRefreshForDelete = affectedEventsForDelete.Any(EditorEventNeedsTwinPairing);
+        var needsLinkRefreshForDelete = affectedEventsForDelete.Any(EditorEventNeedsLinkGraph);
+        var containsPanelCue = affectedEventsForDelete.Any(ev => ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108);
+        var snapshot = containsPanelCue
+            ? CaptureEditorChartSnapshot()
+            : CaptureEditorNoteEditSnapshot(affectedEventsForDelete, affectedEventsForDelete.Select(ev => ev.Track),
+                needsTwinRefreshForDelete, needsLinkRefreshForDelete);
         var replacement = DeleteEditorEvents(selected.ToHashSet());
         CommitEditorUndoSnapshot(snapshot);
         _selectedEventKey = replacement is not null ? KeyOf(replacement) : null;
@@ -11693,7 +11842,10 @@ public sealed partial class Playfield
         _editorSelectedHoldEnd = false;
         ClearEditorMultiSelection();
         _editorSelectedLinkRoot = replacement is not null ? GetEditorLinkRoot(replacement) : null;
-        RefreshAfterEditorMutation();
+        if (containsPanelCue)
+            RefreshAfterEditorMutation();
+        else
+            RefreshAfterEditorNoteSnapshot(snapshot, needsTwinRefreshForDelete, needsLinkRefreshForDelete);
         if (replacement is not null && _chart.Events.Any(candidate => ReferenceEquals(candidate, replacement)))
         {
             _selectedEventKey = KeyOf(replacement);
@@ -11706,6 +11858,107 @@ public sealed partial class Playfield
             _editorSelectedLinkRoot = null;
             _statusMessage = $"Deleted {selected.Count} note(s).";
         }
+    }
+
+    // Fast path for gameplay-note edits. Note placement/movement/deletion does not
+    // change tempo, gear, panel animation data, or projection geometry, so rebuilding
+    // those chart-wide systems on every note edit only adds avoidable main-thread work.
+    private void RefreshAfterEditorNoteMutation(bool rebuildTwinPairing, bool rebuildLinkGraph,
+        IReadOnlyCollection<ChartEvent>? changedEvents = null,
+        IReadOnlyCollection<int>? affectedTrackIndices = null,
+        bool recalculateLastPlayableTick = true,
+        bool incrementalPointRenderUpdate = false)
+    {
+        if (_chart is null)
+            return;
+
+        InvalidateEditorConnectorSplitPreviewCache();
+        InvalidateEditorNoteGroupMarkerCache();
+        // Refresh the authored route source after this edit, but retain the last
+        // visible route while INFO is open. It will rebuild after the overlay closes.
+        InvalidateEditorTimelineTraceEventCache();
+        // The group-placement preview keeps its own occupancy/event snapshots.
+        // A normal point edit can invalidate those without changing any link graph,
+        // so do not rely on a later LinkTail rebuild to make the preview catch up.
+        InvalidateEditorNoteGroupPlacementPreviewCache();
+        InvalidateEditorSelectionRenderCache();
+        _editorDiagnosticsDirty = true;
+
+        if (rebuildTwinPairing)
+            AresLoader.ReconstructTwinNotes(_chart);
+
+        // Track lists are authoritative. Ordinary note edits update only the
+        // touched event references in the flattened list; chart-wide operations
+        // continue to use the full finalizer.
+        if (changedEvents is not null)
+        {
+            AresLoader.FinalizeEventsIncremental(_chart, changedEvents, affectedTrackIndices);
+            UpdateEditorEventTrackIndex(changedEvents);
+        }
+        else
+            AresLoader.FinalizeEvents(_chart);
+        if (rebuildLinkGraph)
+        {
+            LinkBuilder.Build(_chart);
+            RebuildLinkRootMap();
+            RebuildLinkAdjacencyCache();
+        }
+
+        // Reconcile an inferred chart end only when an edit could have touched
+        // the current endpoint. Rechecking the whole chart after every tap was
+        // another hidden O(chart size) operation.
+        var playRangeAdjusted = _chartEditorMode && recalculateLastPlayableTick &&
+            ReconcilePlayTickAndPlayTime();
+        if (playRangeAdjusted)
+        {
+            MarkEditorDirty(recomputeSavedBaseline: false);
+            StoreActiveEditorDifficulty();
+        }
+
+        InvalidateEditorMetaStatsCache();
+        _editorLevelEstimateCache.Clear();
+        if (_gear is not null)
+            _gameplayState = _gear.Initial;
+
+        // The renderer depends on note events, but panel/SuperFlick lookups do not.
+        // Rebuild link chains only when this edit changed the link graph, and refresh
+        // occupancy only for the affected gameplay tracks where the cache permits it.
+        var renderCacheUpdatedIncrementally = false;
+        if (incrementalPointRenderUpdate && changedEvents is { Count: > 0 })
+        {
+            // Reconcile all point notes on the touched lanes from the authoritative
+            // track lists. Updating only the changed references assumes every older
+            // note on those lanes already has a valid render entry; one missing entry
+            // can otherwise remain invisible and a later move can collide with its
+            // stale key. Track-local reconciliation remains bounded to the lanes
+            // involved in this edit, not the full chart.
+            renderCacheUpdatedIncrementally = RebuildEditorPointNoteRenderCacheForTracks(
+                affectedTrackIndices, changedEvents);
+        }
+
+        if (renderCacheUpdatedIncrementally && changedEvents is not null &&
+            UpdateEditorNoteOccupancyIndexIncremental(changedEvents, affectedTrackIndices))
+        {
+            // Both render and occupancy indexes now reflect only the touched taps.
+        }
+        else if (renderCacheUpdatedIncrementally)
+            RebuildEditorNoteOccupancyIndex(affectedTrackIndices);
+        else
+            RebuildRenderEventCache(rebuildAuxiliaryCaches: false,
+                rebuildLinkCaches: rebuildLinkGraph, occupancyTrackIndices: affectedTrackIndices);
+        _simultaneousCountsCache.Clear();
+        // Lane mesh templates depend on viewport/projection settings, not note
+        // contents. Clearing them here forced all 16 lanes (and their 3D paths) to
+        // be regenerated after every edit despite no geometry change.
+        // Score budgets are chart-wide. While the editor is paused they are not
+        // consumed, so defer that rebuild until preview playback starts. Editing
+        // during active playback still refreshes the model immediately.
+        if (_playing)
+            BuildScoreModel();
+        else
+            _scoreModelDirty = true;
+        if (recalculateLastPlayableTick)
+            _lastPlayableTick = CalculateLastPlayableTick();
     }
 
     private void RefreshAfterEditorMutation()
@@ -11734,8 +11987,7 @@ public sealed partial class Playfield
             MarkEditorDirty();
             StoreActiveEditorDifficulty();
         }
-        _editorMetaStatsCache = null;
-        _editorMetaStatsCacheChart = null;
+        InvalidateEditorMetaStatsCache();
         _editorLevelEstimateCache.Clear();
         _gear = new GearTimeline(_chart);
         _gameplayState = _gear.Initial;
@@ -12880,6 +13132,10 @@ public sealed partial class Playfield
     private void OpenAresDialog() => OpenAresRequested?.Invoke();
     public void Update(GameTime gameTime)
     {
+        // Allows at most one bounded diagnostics-capture step during this update.
+        // Reset before input because panel actions can also request a refresh.
+        _editorDiagnosticsAdvancedThisUpdate = false;
+        _editorDiagnosticsSkipThisUpdate = false;
         // This clock deliberately advances before pause/result early returns. Skin
         // effects and key-release animations must not depend on chart playback time.
         _uiTimeSeconds += Math.Max(0.0, gameTime.ElapsedGameTime.TotalSeconds);
@@ -12945,6 +13201,11 @@ public sealed partial class Playfield
             KeybindSettings.IsPressed("editor_restart_preview");
         if (!_editorStartupWarmupUpdateActive)
             HandleInput(keyboard, gameTime);
+        // Advance lazy chart diagnostics from the update loop, never while the
+        // Lua/C# UI state is being assembled or rendered. One chunk per update
+        // keeps the cost bounded even for large charts.
+        if (_chartEditorMode && _editorProblemsExpanded && !_editorDiagnosticsSkipThisUpdate)
+            RefreshEditorDiagnostics();
         if (_audioLoadFailed && (_playing || _playbackStartPending))
         {
             // A failed asynchronous decode must not silently turn a music-backed
@@ -13327,6 +13588,12 @@ public sealed partial class Playfield
     private bool IsEditorChartPlaybackBlocked => _chartEditorMode &&
         (_audio.IsLoading || (_audioLoadFailed && _loadedMusicBytes is { Length: > 0 }));
 
+    private void EnsureEditorScoreModelCurrent()
+    {
+        if (_scoreModelDirty && _chart is not null)
+            BuildScoreModel();
+    }
+
     private bool CanStartEditorChartPlayback()
     {
         if (!_chartEditorMode)
@@ -13350,6 +13617,7 @@ public sealed partial class Playfield
             return false;
         }
 
+        EnsureEditorScoreModelCurrent();
         return true;
     }
 

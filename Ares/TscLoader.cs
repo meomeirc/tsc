@@ -453,8 +453,21 @@ public static class TscLoader
             File.Exists(Path.Combine(directory, "music.opus")) || File.Exists(Path.Combine(directory, "song.opus")));
         if (musicRoot is not null)
             return musicRoot;
-        return ancestors.FirstOrDefault(directory => new[] { "preview.opus", "cover.webp", "album.png", "album_big.png", "album", "album_big" }
-            .Any(name => File.Exists(Path.Combine(directory, name))));
+        return ancestors.FirstOrDefault(directory => new[]
+        {
+            "preview.opus", "cover.webp", "album.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp",
+            "album_big.png", "album", "album_big"
+        }.Any(name => File.Exists(Path.Combine(directory, name))));
+    }
+
+    private static string FindTscAlbumAssetName(string directory)
+    {
+        foreach (var name in new[] { "album.png", "album.jpg", "album.jpeg", "album.webp", "album.gif", "album.bmp" })
+        {
+            if (File.Exists(Path.Combine(directory, name)))
+                return name;
+        }
+        return "album.png";
     }
 
     private static bool IsTstsBundleChartPath(string chartPath, string metadataDirectory)
@@ -705,7 +718,7 @@ public static class TscLoader
             // names in song.json are ignored so old sidecars cannot redirect loading.
             chart.MusicPath = isTsts ? "song.opus" : "music.opus";
             chart.PreviewPath = "preview.opus";
-            chart.AlbumPath = isTsts ? "cover.webp" : isBold ? "album" : "album.png";
+            chart.AlbumPath = isTsts ? "cover.webp" : isBold ? "album" : FindTscAlbumAssetName(directory);
             // album_big remains a legacy optional field for TSC/BOLD metadata.
             chart.AlbumBigPath = isTsts ? null : GetString("album_big") ?? (isBold ? "album_big" : "album_big.png");
             if (root.TryGetProperty("bpm", out var bpmValue) && bpmValue.ValueKind == JsonValueKind.Number && bpmValue.TryGetDouble(out var bpm) && double.IsFinite(bpm) && bpm > 0)

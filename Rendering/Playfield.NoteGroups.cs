@@ -40,6 +40,8 @@ public sealed partial class Playfield
         public readonly HashSet<ChartEventKey> AmbiguousNextLinkHeadKeys = new();
         public readonly HashSet<ChartEventKey> LinkHeadKeys = new();
         public readonly List<ChartEvent> OrderedRenderableEvents = new();
+        public readonly List<ChartEventKey> OrderedRenderableEventKeys = new();
+        public readonly Dictionary<ChartEvent, ChartEventKey> EventKeyByReference = new();
         public readonly List<double> EventSeconds = new();
         public readonly List<double> EventScrollUnits = new();
         public readonly List<double> EventEffectiveEndSeconds = new();
@@ -49,6 +51,7 @@ public sealed partial class Playfield
         public readonly List<int> RenderEventIndexScratch = new(128);
         public int[] RenderEventMarks = Array.Empty<int>();
         public int RenderEventMarkStamp;
+        public bool EditorLinkHoverChainCacheComplete;
         public readonly Dictionary<ChartEventKey, List<ChartEvent>> LinkChainCache = new();
         public readonly Dictionary<ChartEventKey, int> LinkChainEffectiveEndTickCache = new();
         public readonly Dictionary<ChartEvent, ChartEvent> LinkChainRootByMember = new();
@@ -73,6 +76,8 @@ public sealed partial class Playfield
             playfield._ambiguousNextLinkHeadKeys = AmbiguousNextLinkHeadKeys;
             playfield._linkHeadKeys = LinkHeadKeys;
             playfield._orderedRenderableEvents = OrderedRenderableEvents;
+            playfield._orderedRenderableEventKeys = OrderedRenderableEventKeys;
+            playfield._eventKeyByReference = EventKeyByReference;
             playfield._eventSeconds = EventSeconds;
             playfield._eventScrollUnits = EventScrollUnits;
             playfield._eventEffectiveEndSeconds = EventEffectiveEndSeconds;
@@ -82,6 +87,7 @@ public sealed partial class Playfield
             playfield._renderEventIndexScratch = RenderEventIndexScratch;
             playfield._renderEventMarks = RenderEventMarks;
             playfield._renderEventMarkStamp = RenderEventMarkStamp;
+            playfield._editorLinkHoverChainCacheComplete = EditorLinkHoverChainCacheComplete;
             playfield._linkChainCache = LinkChainCache;
             playfield._linkChainEffectiveEndTickCache = LinkChainEffectiveEndTickCache;
             playfield._linkChainRootByMember = LinkChainRootByMember;
@@ -103,6 +109,7 @@ public sealed partial class Playfield
         {
             RenderEventMarks = playfield._renderEventMarks;
             RenderEventMarkStamp = playfield._renderEventMarkStamp;
+            EditorLinkHoverChainCacheComplete = playfield._editorLinkHoverChainCacheComplete;
             EditorTimelineTraceGear = playfield._editorTimelineTraceGear;
             EditorTimelineTraceTempo = playfield._editorTimelineTraceTempo;
             EditorTimelineTraceChart = playfield._editorTimelineTraceChart;
@@ -1112,6 +1119,8 @@ public sealed partial class Playfield
             AmbiguousNextLinkHeadKeys: _ambiguousNextLinkHeadKeys,
             LinkHeadKeys: _linkHeadKeys,
             OrderedRenderableEvents: _orderedRenderableEvents,
+            OrderedRenderableEventKeys: _orderedRenderableEventKeys,
+            EventKeyByReference: _eventKeyByReference,
             EventSeconds: _eventSeconds,
             EventScrollUnits: _eventScrollUnits,
             EventEffectiveEndSeconds: _eventEffectiveEndSeconds,
@@ -1121,6 +1130,7 @@ public sealed partial class Playfield
             RenderEventIndexScratch: _renderEventIndexScratch,
             RenderEventMarks: _renderEventMarks,
             RenderEventMarkStamp: _renderEventMarkStamp,
+            EditorLinkHoverChainCacheComplete: _editorLinkHoverChainCacheComplete,
             LinkChainCache: _linkChainCache,
             LinkChainEffectiveEndTickCache: _linkChainEffectiveEndTickCache,
             LinkChainRootByMember: _linkChainRootByMember,
@@ -1199,7 +1209,10 @@ public sealed partial class Playfield
                 renderCaches.Apply(this);
                 RebuildLinkAdjacencyCache();
                 RebuildLinkRootMap();
-                RebuildRenderEventCache();
+                // The placement preview has its own render-only indexes. Do not
+                // rebuild the source chart's editor-track or occupancy indexes
+                // while the temporary preview chart is active.
+                RebuildRenderEventCache(rebuildEditorIndexes: false, rebuildOccupancyIndex: false);
                 _simultaneousCountsCache.Clear();
                 renderCaches.SourceChart = sourceChart;
                 renderCaches.ContentHash = contentHash;
@@ -1238,6 +1251,8 @@ public sealed partial class Playfield
                 _ambiguousNextLinkHeadKeys = originalRenderCaches.AmbiguousNextLinkHeadKeys;
                 _linkHeadKeys = originalRenderCaches.LinkHeadKeys;
                 _orderedRenderableEvents = originalRenderCaches.OrderedRenderableEvents;
+                _orderedRenderableEventKeys = originalRenderCaches.OrderedRenderableEventKeys;
+                _eventKeyByReference = originalRenderCaches.EventKeyByReference;
                 _eventSeconds = originalRenderCaches.EventSeconds;
                 _eventScrollUnits = originalRenderCaches.EventScrollUnits;
                 _eventEffectiveEndSeconds = originalRenderCaches.EventEffectiveEndSeconds;
@@ -1247,6 +1262,7 @@ public sealed partial class Playfield
                 _renderEventIndexScratch = originalRenderCaches.RenderEventIndexScratch;
                 _renderEventMarks = originalRenderCaches.RenderEventMarks;
                 _renderEventMarkStamp = originalRenderCaches.RenderEventMarkStamp;
+                _editorLinkHoverChainCacheComplete = originalRenderCaches.EditorLinkHoverChainCacheComplete;
                 _linkChainCache = originalRenderCaches.LinkChainCache;
                 _linkChainEffectiveEndTickCache = originalRenderCaches.LinkChainEffectiveEndTickCache;
                 _linkChainRootByMember = originalRenderCaches.LinkChainRootByMember;
@@ -1605,7 +1621,7 @@ public sealed partial class Playfield
 
         RefreshEditorNoteGroupEventGraph();
         CommitEditorUndoSnapshot(snapshot);
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         _editorSelectedNoteGroupId = groupId;
         ClearEditorMultiSelection();
         foreach (var note in pasted)
@@ -1677,7 +1693,7 @@ public sealed partial class Playfield
             AddEditorMultiSelectedEvent(ev);
         _selectedEventKey = KeyOf(selected[0]);
         CommitEditorUndoSnapshot(snapshot);
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         _statusMessage = $"Created Group {groupId} from {selected.Count} note(s). Select it in NOTE GROUPS to place more instances.";
     }
 
@@ -1707,7 +1723,7 @@ public sealed partial class Playfield
             _editorEditingNoteGroupInstanceId = null;
         }
         CommitEditorUndoSnapshot(snapshot);
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         _statusMessage = $"Ungrouped instance {displayInstanceNumber} of Group {key.GroupId}; its notes were kept.";
     }
 
@@ -1743,7 +1759,7 @@ public sealed partial class Playfield
         _editorNoteGroupsScroll.SetMaximum(GetEditorNoteGroupScrollMaximum());
         _editorNoteGroupsScrollOffset = GetEditorNoteGroupScrollFirstRow();
         CommitEditorUndoSnapshot(snapshot);
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         _statusMessage = $"Removed Group {groupId}; all of its instances are now independent notes.";
     }
 
@@ -2205,7 +2221,7 @@ public sealed partial class Playfield
         AresLoader.FinalizeEvents(_chart);
         PruneEmptyEditorNoteGroupInstances();
         PushEditorUndoSnapshot(snapshot);
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         RefreshEditorNoteGroupLibrarySelectionFromNotes();
         _statusMessage = mergedCount > 0
             ? $"Consolidated {mergedCount} duplicate group(s) and renumbered {newGroups.Count} remaining group(s)."
@@ -2243,7 +2259,7 @@ public sealed partial class Playfield
         _selectedBeatTick = null;
         _selectedBeatTrack = null;
         CommitEditorUndoSnapshot(snapshot);
-        RefreshAfterEditorMutation();
+        RefreshAfterEditorNoteSnapshot(snapshot, rebuildTwinPairing: true, rebuildLinkGraph: true);
         _statusMessage = $"Deleted all {count} note group(s) and their grouped notes.";
     }
 
@@ -2476,21 +2492,23 @@ public sealed partial class Playfield
 
         // Stage IDs through unique negative values first. Directly swapping IDs
         // can merge two instances when their old IDs overlap the new sequence.
+        // Track lists are the mutation source of truth; do not depend on the
+        // flattened Events list being refreshed before this cleanup runs.
+        var groupedEvents = _chart.Tracks.SelectMany(track => track.Events)
+            .Where(ev => ev.NoteGroupId == groupId).ToList();
         for (var index = 0; index < ordered.Count; index++)
         {
             var instance = ordered[index];
             if (oldEditingId == instance.InstanceId)
                 normalizedEditingId = index + 1;
-            foreach (var ev in _chart.Events.Where(ev => ev.NoteGroupId == groupId &&
-                         ev.NoteGroupInstanceId == instance.InstanceId))
+            foreach (var ev in groupedEvents.Where(ev => ev.NoteGroupInstanceId == instance.InstanceId))
                 ev.NoteGroupInstanceId = -(index + 1);
         }
 
         for (var index = 0; index < ordered.Count; index++)
         {
             var nextId = index + 1;
-            foreach (var ev in _chart.Events.Where(ev => ev.NoteGroupId == groupId &&
-                         ev.NoteGroupInstanceId == -(index + 1)))
+            foreach (var ev in groupedEvents.Where(ev => ev.NoteGroupInstanceId == -nextId))
                 ev.NoteGroupInstanceId = nextId;
             ordered[index] = ordered[index] with { InstanceId = nextId };
         }
@@ -2503,25 +2521,55 @@ public sealed partial class Playfield
 
     private void PruneEmptyEditorNoteGroupInstances(ISet<int>? preserveGroupIds = null)
     {
-        if (_chart is null)
+        if (_chart is null || _chart.NoteGroupInstances.Count == 0)
             return;
 
-        var removedGroups = new HashSet<int>();
-        foreach (var instance in _chart.NoteGroupInstances.ToList())
+        // Build occupied group-instance keys once. The old per-instance Any()
+        // scan made pruning O(instance count * chart event count).
+        var populatedInstances = new HashSet<(int GroupId, int InstanceId)>();
+        foreach (var track in _chart.Tracks)
         {
-            if (preserveGroupIds?.Contains(instance.GroupId) == true)
-                continue;
-
-            var hasNotes = _chart.Events.Any(ev => ev.Kind == "Note" && ev.RawType == 1 &&
-                ev.NoteGroupId == instance.GroupId && ev.NoteGroupInstanceId == instance.InstanceId);
-            if (hasNotes) continue;
-            _chart.NoteGroupInstances.Remove(instance);
-            removedGroups.Add(instance.GroupId);
+            foreach (var ev in track.Events)
+            {
+                if (ev.Kind == "Note" && ev.RawType == 1 &&
+                    ev.NoteGroupId is int groupId && ev.NoteGroupInstanceId is int instanceId)
+                    populatedInstances.Add((groupId, instanceId));
+            }
         }
 
-        foreach (var groupId in _chart.NoteGroups.Select(group => group.Id).ToList())
-            if (removedGroups.Contains(groupId) || _chart.NoteGroupInstances.Any(instance => instance.GroupId == groupId))
-                NormalizeEditorNoteGroupInstanceIds(groupId);
+        foreach (var instance in _chart.NoteGroupInstances.ToList())
+        {
+            if (preserveGroupIds?.Contains(instance.GroupId) == true ||
+                populatedInstances.Contains((instance.GroupId, instance.InstanceId)))
+                continue;
+
+            _chart.NoteGroupInstances.Remove(instance);
+        }
+
+        // Keep IDs ordered by instance position, but do not renumber a group
+        // whose IDs are already contiguous and in the right order. Removing the
+        // final instance needs no renumbering; gaps or reordered IDs are detected
+        // directly from the remaining instances.
+        var groupsToNormalize = new HashSet<int>();
+        foreach (var group in _chart.NoteGroupInstances.GroupBy(instance => instance.GroupId))
+        {
+            var ordered = group.OrderBy(instance => instance.StartTick)
+                .ThenBy(instance => instance.StartTrack)
+                .ThenBy(instance => instance.InstanceId);
+            var expectedId = 1;
+            foreach (var instance in ordered)
+            {
+                if (instance.InstanceId != expectedId)
+                {
+                    groupsToNormalize.Add(group.Key);
+                    break;
+                }
+                expectedId++;
+            }
+        }
+
+        foreach (var groupId in groupsToNormalize)
+            NormalizeEditorNoteGroupInstanceIds(groupId);
 
         if (_editorNoteGroupEditMode && _editorEditingNoteGroupId is int editingGroup &&
             !_chart.NoteGroupInstances.Any(instance => instance.GroupId == editingGroup &&
@@ -2656,14 +2704,69 @@ public sealed partial class Playfield
 
     private void RefreshEditorNoteGroupInstanceAnchors(EditorChartSnapshot snapshot)
     {
-        if (_chart is null || _editorNoteGroupEditMode)
+        if (_chart is null || _editorNoteGroupEditMode || _chart.NoteGroupInstances.Count == 0)
             return;
 
-        // Editor mutations are applied to ChartTrack.Events first. Refresh the
-        // flattened lookup before resolving note identities or instance anchors.
-        AresLoader.FinalizeEvents(_chart);
-        var prior = snapshot.Events.Where(state => state.NoteGroupId.HasValue &&
-                state.NoteGroupInstanceId.HasValue && state.NoteGroupMemberId.HasValue)
+        // Only grouped instances containing a moved, replaced, or removed note
+        // can have shifted anchors. Avoid rebuilding/sorting the flattened chart
+        // event list and comparing every instance after an unrelated note edit.
+        var snapshotGroupKeys = snapshot.Events
+            .Where(state => state.NoteGroupId.HasValue && state.NoteGroupInstanceId.HasValue &&
+                            state.NoteGroupMemberId.HasValue)
+            .Select(state => (GroupId: state.NoteGroupId!.Value, InstanceId: state.NoteGroupInstanceId!.Value))
+            .ToHashSet();
+        if (snapshotGroupKeys.Count == 0)
+            return;
+
+        var liveGroupedEvents = new HashSet<ChartEvent>();
+        foreach (var track in _chart.Tracks)
+        {
+            foreach (var ev in track.Events)
+            {
+                if (ev.NoteGroupId is int groupId && ev.NoteGroupInstanceId is int instanceId &&
+                    ev.NoteGroupMemberId.HasValue && snapshotGroupKeys.Contains((groupId, instanceId)))
+                    liveGroupedEvents.Add(ev);
+            }
+        }
+
+        var affectedInstances = new HashSet<(int GroupId, int InstanceId)>();
+        foreach (var state in snapshot.Events)
+        {
+            if (state.NoteGroupId is not int groupId || state.NoteGroupInstanceId is not int instanceId ||
+                !state.NoteGroupMemberId.HasValue)
+                continue;
+
+            if (state.Event.Tick != state.Tick || state.Event.Track != state.Track ||
+                state.Event.NoteGroupId != state.NoteGroupId ||
+                state.Event.NoteGroupInstanceId != state.NoteGroupInstanceId ||
+                state.Event.NoteGroupMemberId != state.NoteGroupMemberId ||
+                !liveGroupedEvents.Contains(state.Event))
+                affectedInstances.Add((groupId, instanceId));
+        }
+
+        if (affectedInstances.Count == 0)
+            return;
+
+        var currentByInstance = new Dictionary<(int GroupId, int InstanceId), Dictionary<int, ChartEvent>>();
+        foreach (var ev in liveGroupedEvents)
+        {
+            if (ev.NoteGroupId is not int groupId || ev.NoteGroupInstanceId is not int instanceId ||
+                ev.NoteGroupMemberId is not int memberId || !affectedInstances.Contains((groupId, instanceId)))
+                continue;
+
+            var key = (groupId, instanceId);
+            if (!currentByInstance.TryGetValue(key, out var members))
+            {
+                members = new Dictionary<int, ChartEvent>();
+                currentByInstance.Add(key, members);
+            }
+            members.TryAdd(memberId, ev);
+        }
+
+        var prior = snapshot.Events
+            .Where(state => state.NoteGroupId.HasValue && state.NoteGroupInstanceId.HasValue &&
+                            state.NoteGroupMemberId.HasValue &&
+                            affectedInstances.Contains((state.NoteGroupId.Value, state.NoteGroupInstanceId.Value)))
             .GroupBy(state => (GroupId: state.NoteGroupId!.Value, InstanceId: state.NoteGroupInstanceId!.Value));
         foreach (var group in prior)
         {
@@ -2674,10 +2777,8 @@ public sealed partial class Playfield
 
             var priorInstance = snapshot.NoteGroupInstances.FirstOrDefault(candidate =>
                 candidate.GroupId == group.Key.GroupId && candidate.InstanceId == group.Key.InstanceId) ?? instance;
-            var currentByMember = _chart.Events.Where(ev => ev.NoteGroupId == group.Key.GroupId &&
-                    ev.NoteGroupInstanceId == group.Key.InstanceId && ev.NoteGroupMemberId.HasValue)
-                .GroupBy(ev => ev.NoteGroupMemberId!.Value)
-                .ToDictionary(items => items.Key, items => items.First());
+            currentByInstance.TryGetValue(group.Key, out var currentByMember);
+            currentByMember ??= new Dictionary<int, ChartEvent>();
             var deltas = group.Select(state => currentByMember.TryGetValue(state.NoteGroupMemberId!.Value, out var current)
                     ? (Tick: current.Tick - state.Tick,
                         Track: GetEditorNoteGroupInstanceTrackDelta(instance, priorInstance, current.Track, state.Track))

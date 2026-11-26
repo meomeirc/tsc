@@ -18,27 +18,220 @@ public sealed partial class Playfield
         public bool IsWarning => ForceWarning || Track is >= 17 and <= 20;
     }
 
+    private sealed record EditorDiagnosticsSnapshot(
+        AresChart SourceChart,
+        long Revision,
+        ChartBundleTemplate BundleTemplate,
+        ChartEvent[][] EventChunks,
+        int EventCount,
+        (int Tick, double Bpm)[] TempoEvents,
+        int TicksPerMeasure,
+        double InitialTempo,
+        int InitialGearAttr);
+
+    private sealed class EditorDiagnosticsCapture
+    {
+        public EditorDiagnosticsCapture(AresChart chart, long revision, ChartBundleTemplate bundleTemplate)
+        {
+            Chart = chart;
+            Revision = revision;
+            BundleTemplate = bundleTemplate;
+            EventCount = chart.Events.Count;
+            TempoEvents = chart.TempoEvents.ToArray();
+            TicksPerMeasure = chart.TicksPerMeasure;
+            InitialTempo = chart.InitialTempo;
+            InitialGearAttr = chart.InitialGearAttr;
+        }
+
+        public AresChart Chart { get; }
+        public long Revision { get; }
+        public ChartBundleTemplate BundleTemplate { get; }
+        public int EventCount { get; }
+        public (int Tick, double Bpm)[] TempoEvents { get; }
+        public int TicksPerMeasure { get; }
+        public double InitialTempo { get; }
+        public int InitialGearAttr { get; }
+        public List<ChartEvent[]> EventChunks { get; } = new();
+        public int NextEventIndex { get; set; }
+    }
+
+    private const int EditorDiagnosticsCaptureChunkSize = 4096;
+
+    private sealed record EditorDiagnosticsResult(
+        List<EditorChartProblem> Problems,
+        HashSet<ChartEventKey> EventKeys,
+        List<ChartEvent> MarkerEvents,
+        int ErrorCount,
+        int WarningCount);
+
+    private Task<EditorDiagnosticsResult>? _editorDiagnosticsTask;
+    private AresChart? _editorDiagnosticsTaskChart;
+    private long _editorDiagnosticsTaskRevision = -1;
+    private EditorDiagnosticsCapture? _editorDiagnosticsCapture;
+    private bool _editorDiagnosticsAdvancedThisUpdate;
+    private bool _editorDiagnosticsSkipThisUpdate;
+
     private void RefreshEditorDiagnostics()
     {
-        if (!_chartEditorMode || _chart is null)
+        // Diagnostics capture is budgeted to one small step per Playfield.Update.
+        // UI-state construction and draw callbacks may also query the report, but
+        // they must never perform a second copy/worker handoff in the render path.
+        if (_editorDiagnosticsAdvancedThisUpdate || _editorDiagnosticsSkipThisUpdate)
+            return;
+        _editorDiagnosticsAdvancedThisUpdate = true;
+        var chart = _chart;
+        if (!_chartEditorMode || chart is null)
         {
             _editorProblems.Clear();
             _editorProblemEventKeys.Clear();
+            _editorProblemMarkerEvents.Clear();
             _editorProblemErrorCount = 0;
             _editorProblemWarningCount = 0;
             _editorDiagnosticsChart = null;
             _editorDiagnosticsDirty = false;
+            _editorDiagnosticsTask = null;
+            _editorDiagnosticsTaskChart = null;
+            _editorDiagnosticsTaskRevision = -1;
+            _editorDiagnosticsCapture = null;
             return;
         }
-        if (!_editorDiagnosticsDirty && ReferenceEquals(_editorDiagnosticsChart, _chart))
+
+        if (!_editorDiagnosticsDirty && ReferenceEquals(_editorDiagnosticsChart, chart))
             return;
 
-        _editorProblems.Clear();
-        _editorProblemEventKeys.Clear();
-        _editorDiagnosticsChart = _chart;
-        _editorDiagnosticsDirty = false;
+        if (_editorDiagnosticsTask is { IsCompleted: true } completedTask)
+        {
+            var taskChart = _editorDiagnosticsTaskChart;
+            var taskRevision = _editorDiagnosticsTaskRevision;
+            _editorDiagnosticsTask = null;
+            _editorDiagnosticsTaskChart = null;
+            _editorDiagnosticsTaskRevision = -1;
 
-        var notes = _chart.Events
+            if (ReferenceEquals(taskChart, chart) && taskRevision == _editorRecoveryRevision)
+            {
+                try
+                {
+                    var result = completedTask.GetAwaiter().GetResult();
+                    // Swap completed results in directly. Copying a large issue list
+                    // and key set on the render thread would move a diagnostics hitch
+                    // back onto the UI even though validation itself ran in a worker.
+                    _editorProblems = result.Problems;
+                    _editorProblemEventKeys = result.EventKeys;
+                    _editorProblemMarkerEvents = result.MarkerEvents;
+                    _editorProblemErrorCount = result.ErrorCount;
+                    _editorProblemWarningCount = result.WarningCount;
+                    _editorDiagnosticsChart = chart;
+                    _editorDiagnosticsDirty = false;
+                }
+                catch (Exception ex)
+                {
+                    _editorProblems.Clear();
+                    _editorProblemEventKeys.Clear();
+                    _editorProblemMarkerEvents.Clear();
+                    _editorProblems.Add(new EditorChartProblem(0, -1,
+                        $"Chart checks could not be completed: {ex.GetBaseException().Message}", null));
+                    _editorProblemErrorCount = 1;
+                    _editorProblemWarningCount = 0;
+                    _editorDiagnosticsChart = chart;
+                    _editorDiagnosticsDirty = false;
+                    Program.LogRuntime(
+                        $"EDITOR_DIAGNOSTICS_FAILED chart={chart.Name ?? "Untitled"} " +
+                        $"error={ex.GetBaseException().GetType().Name}: {ex.GetBaseException().Message}");
+                }
+            }
+        }
+
+        if (!_editorDiagnosticsDirty || _editorDiagnosticsTask is not null)
+            return;
+
+        // Diagnostics are editor tooling, not playback-critical work. Start or
+        // continue the lazy capture only while paused so opening the panel cannot
+        // compete with audio/gameplay timing. The expanded panel remains visible
+        // and reports that checks are waiting for playback to pause.
+        if (_playing)
+            return;
+
+        // Copy chart references over several frames instead of allocating/copying
+        // one chart-sized array on the opening frame. A chart edit changes the
+        // revision and restarts this capture before a worker can consume it.
+        var capture = _editorDiagnosticsCapture;
+        if (capture is null || !ReferenceEquals(capture.Chart, chart) ||
+            capture.Revision != _editorRecoveryRevision || capture.EventCount != chart.Events.Count)
+        {
+            capture = new EditorDiagnosticsCapture(chart, _editorRecoveryRevision, _editorBundleTemplate);
+            _editorDiagnosticsCapture = capture;
+        }
+
+        var remaining = capture.EventCount - capture.NextEventIndex;
+        if (remaining > 0)
+        {
+            var count = Math.Min(EditorDiagnosticsCaptureChunkSize, remaining);
+            var chunk = new ChartEvent[count];
+            chart.Events.CopyTo(capture.NextEventIndex, chunk, 0, count);
+            capture.EventChunks.Add(chunk);
+            capture.NextEventIndex += count;
+        }
+
+        if (capture.NextEventIndex < capture.EventCount)
+            return;
+
+        // The worker consumes a jagged set of small arrays, so even the final
+        // handoff avoids flattening a large chart on the gameplay thread.
+        var snapshot = new EditorDiagnosticsSnapshot(
+            capture.Chart,
+            capture.Revision,
+            capture.BundleTemplate,
+            capture.EventChunks.ToArray(),
+            capture.EventCount,
+            capture.TempoEvents,
+            capture.TicksPerMeasure,
+            capture.InitialTempo,
+            capture.InitialGearAttr);
+        _editorDiagnosticsCapture = null;
+        _editorDiagnosticsTaskChart = chart;
+        _editorDiagnosticsTaskRevision = snapshot.Revision;
+        // Use the shared thread pool instead of LongRunning. The latter creates a
+        // dedicated OS thread synchronously on the UI thread on first use, which
+        // can itself produce a visible first-open hitch. The worker still lowers
+        // its priority while validating so playback/input gets CPU time first.
+        _editorDiagnosticsTask = Task.Run(() =>
+        {
+            var workerThread = Thread.CurrentThread;
+            var previousPriority = workerThread.Priority;
+            try { workerThread.Priority = ThreadPriority.Lowest; }
+            catch (PlatformNotSupportedException) { }
+            catch (System.Security.SecurityException) { }
+            try { return BuildEditorDiagnostics(snapshot); }
+            finally
+            {
+                try { workerThread.Priority = previousPriority; }
+                catch (PlatformNotSupportedException) { }
+                catch (System.Security.SecurityException) { }
+            }
+        });
+    }
+
+    private bool IsEditorDiagnosticsPendingForCurrentChart()
+        => (_editorDiagnosticsTask is { IsCompleted: false } &&
+            ReferenceEquals(_editorDiagnosticsTaskChart, _chart) &&
+            _editorDiagnosticsTaskRevision == _editorRecoveryRevision) ||
+           (_editorDiagnosticsCapture is not null &&
+            ReferenceEquals(_editorDiagnosticsCapture.Chart, _chart) &&
+            _editorDiagnosticsCapture.Revision == _editorRecoveryRevision);
+
+    private bool IsEditorDiagnosticsPreparingForCurrentChart()
+        => _editorDiagnosticsCapture is not null &&
+           ReferenceEquals(_editorDiagnosticsCapture.Chart, _chart) &&
+           _editorDiagnosticsCapture.Revision == _editorRecoveryRevision;
+
+    private static EditorDiagnosticsResult BuildEditorDiagnostics(EditorDiagnosticsSnapshot snapshot)
+    {
+        var chart = CreateEditorDiagnosticsChart(snapshot);
+        var bundleTemplate = snapshot.BundleTemplate;
+        var problems = new List<EditorChartProblem>();
+        var problemEventKeys = new HashSet<ChartEventKey>();
+
+        var notes = chart.Events
             .Where(ev => ev.Kind == "Note" && ev.RawType == 1 && ev.NoteType != NoteType.End)
             .OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).ThenBy(ev => ev.EventIndex)
             .ToList();
@@ -48,10 +241,10 @@ public sealed partial class Playfield
         {
             var first = group.First();
             var members = group.ToList();
-            _editorProblems.Add(new EditorChartProblem(first.Tick, first.Track,
+            problems.Add(new EditorChartProblem(first.Tick, first.Track,
                 $"Overlapping notes on track {first.Track} at tick {first.Tick} ({members.Count} notes).", first));
             foreach (var ev in members)
-                _editorProblemEventKeys.Add(KeyOf(ev));
+                problemEventKeys.Add(KeyOf(ev));
         }
 
         // SuperFlicks are bank-wide strips, not lane-local notes. Two different
@@ -68,15 +261,15 @@ public sealed partial class Playfield
             var first = members[0];
             var position = GearState.Position(first.Track)!.Value;
             var message = $"Multiple SuperFlicks occupy the {position.Side} {BankModeLabel(position.Bank)} bank at tick {first.Tick}; only one is allowed per bank at a tick.";
-            _editorProblems.Add(new EditorChartProblem(first.Tick, first.Track, message, first));
+            problems.Add(new EditorChartProblem(first.Tick, first.Track, message, first));
             foreach (var ev in members)
-                _editorProblemEventKeys.Add(KeyOf(ev));
+                problemEventKeys.Add(KeyOf(ev));
         }
 
         // TSTS bundles may not support the distinct outer 2K->3K SuperFlick
         // paths (attrs 80/90) in ReSONANCE. Keep these as compatibility warnings:
         // the chart remains editable/exportable, but the mapper should be aware.
-        if (_editorBundleTemplate == ChartBundleTemplate.Tsts)
+        if (bundleTemplate == ChartBundleTemplate.Tsts)
         {
             foreach (var ev in playableNotes.Where(ev => ev.Track is >= 0 and <= 15 &&
                          ev.IsSuperFlick && (ev.Attr is 80 or 90)))
@@ -84,32 +277,40 @@ public sealed partial class Playfield
                 var side = ev.Attr == 80 ? "left" : "right";
                 var message = $"2K-to-3K {side} SuperFlick may not work in ReSONANCE with a TSTS bundle.";
                 // Keep compatibility warnings out of the red gameplay-note marker overlay.
-                _editorProblems.Add(new EditorChartProblem(ev.Tick, ev.Track, message, ev, ForceWarning: true));
+                problems.Add(new EditorChartProblem(ev.Tick, ev.Track, message, ev, ForceWarning: true));
             }
         }
 
-        // Build link adjacency before hold-overlap checks so a link's actual next
-        // point is not mistaken for an unrelated note sitting inside its duration.
-        // In particular, a same-track endpoint is drawn on top of that next point;
-        // the generic overlap warning used to hide the real consecutive-vertical
-        // connection problem and made the tail difficult to select for recovery.
+        // Build link adjacency only when the chart actually contains link points.
+        // Most charts do not; skipping LinkBuilder's grouping/sorting passes makes
+        // the common empty-problems check substantially lighter.
+        // Keep malformed link points in the diagnostic path too: negative or
+        // missing pair IDs are themselves useful errors (orphan/invalid link
+        // paths), even though LinkBuilder cannot connect them.
+        var hasLinkCandidates = notes.Any(ev =>
+            ev.NoteType is NoteType.LinkHead or NoteType.LinkTail);
         string? linkBuildFailure = null;
-        try
+        if (hasLinkCandidates)
         {
-            LinkBuilder.Build(_chart);
+            try
+            {
+                LinkBuilder.Build(chart);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                linkBuildFailure = ex.Message;
+            }
         }
-        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
-        {
-            linkBuildFailure = ex.Message;
-        }
-        var builtLinks = _chart.Links.ToArray();
+        var builtLinks = chart.Links.ToArray();
         var expectedLinkEndpoints = builtLinks
             .Select(link => (Head: link.Head, Tail: link.Tail))
             .ToHashSet();
 
         // A chain may use only one horizontal connector at any endpoint tick.
         // LinkSegment's connector is at Tail.Tick, even if Head.Tick is earlier.
-        var editorChains = linkBuildFailure is null ? GetEditorLinkChainInfos() : new List<EditorLinkChainInfo>();
+        var editorChains = linkBuildFailure is null && hasLinkCandidates
+            ? GetEditorLinkChainInfosForDiagnostics(chart)
+            : new List<EditorLinkChainInfo>();
         var chainMembershipCounts = editorChains
             .SelectMany(chain => chain.Nodes.Select(node => (Node: node, Chain: chain)))
             .GroupBy(item => item.Node)
@@ -126,15 +327,15 @@ public sealed partial class Playfield
             {
                 var sameTickNodes = chain.Nodes.Where(node => node.Tick == group.Key).ToList();
                 var message = $"Link chain from tick {chain.Root.Tick}/track {chain.Root.Track} has {group.Count()} horizontal connections at tick {group.Key}; only one is allowed at a tick.";
-                if (!_editorProblems.Any(problem => string.Equals(problem.Message, message, StringComparison.Ordinal)))
-                    _editorProblems.Add(new EditorChartProblem(group.Key, sameTickNodes.FirstOrDefault()?.Track ?? chain.Root.Track,
+                if (!problems.Any(problem => string.Equals(problem.Message, message, StringComparison.Ordinal)))
+                    problems.Add(new EditorChartProblem(group.Key, sameTickNodes.FirstOrDefault()?.Track ?? chain.Root.Track,
                         message, sameTickNodes.FirstOrDefault() ?? chain.Root));
                 foreach (var node in sameTickNodes)
-                    _editorProblemEventKeys.Add(KeyOf(node));
+                    problemEventKeys.Add(KeyOf(node));
                 foreach (var link in group)
                 {
-                    _editorProblemEventKeys.Add(KeyOf(link.Head));
-                    _editorProblemEventKeys.Add(KeyOf(link.Tail));
+                    problemEventKeys.Add(KeyOf(link.Head));
+                    problemEventKeys.Add(KeyOf(link.Tail));
                 }
             }
         }
@@ -215,10 +416,10 @@ public sealed partial class Playfield
                             continue;
 
                         var message = $"Link crossover: connector at tick {connectionTick} from track {connector.Head.Track} to track {connector.Tail.Track} crosses a note/body at tick {ev.Tick}/track {ev.Track}.";
-                        _editorProblems.Add(new EditorChartProblem(ev.Tick, ev.Track, message, ev));
-                        _editorProblemEventKeys.Add(KeyOf(connector.Head));
-                        _editorProblemEventKeys.Add(KeyOf(connector.Tail));
-                        _editorProblemEventKeys.Add(KeyOf(ev));
+                        problems.Add(new EditorChartProblem(ev.Tick, ev.Track, message, ev));
+                        problemEventKeys.Add(KeyOf(connector.Head));
+                        problemEventKeys.Add(KeyOf(connector.Tail));
+                        problemEventKeys.Add(KeyOf(ev));
                     }
                 }
             }
@@ -228,22 +429,45 @@ public sealed partial class Playfield
         // inside that interval is an overlap even when the notes start on
         // different ticks. Panel animation notes may hand off exactly at the
         // hold end tick. Connected link endpoints are diagnosed below instead.
+        var notesByTrack = playableNotes
+            .GroupBy(ev => ev.Track)
+            .ToDictionary(group => group.Key, group => group
+                .OrderBy(ev => ev.Tick).ThenBy(ev => ev.EventIndex).ToArray());
         foreach (var hold in playableNotes
                      .Where(ev => ev.Tick >= 0 && ev.EndTick > ev.Tick &&
                                   (ev.IsHoldNote || ev.Duration > 6))
                      .OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).ThenBy(ev => ev.EventIndex))
         {
-            foreach (var next in playableNotes.Where(ev => ev.Track == hold.Track && ev.Tick > hold.Tick && ev.Tick <= hold.EndTick))
+            if (!notesByTrack.TryGetValue(hold.Track, out var laneNotes))
+                continue;
+
+            // Locate the first note strictly after the hold's start in O(log N),
+            // then scan only the notes that could fall within this hold's interval.
+            var low = 0;
+            var high = laneNotes.Length;
+            while (low < high)
             {
+                var middle = low + ((high - low) >> 1);
+                if (laneNotes[middle].Tick <= hold.Tick)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+
+            for (var i = low; i < laneNotes.Length; i++)
+            {
+                var next = laneNotes[i];
+                if (next.Tick > hold.EndTick)
+                    break;
                 if (hold.Track is >= 17 and <= 20 && next.Tick == hold.EndTick)
                     continue;
                 if (expectedLinkEndpoints.Contains((Head: hold, Tail: next)))
                     continue;
 
-                _editorProblems.Add(new EditorChartProblem(next.Tick, next.Track,
+                problems.Add(new EditorChartProblem(next.Tick, next.Track,
                     $"Overlapping note on track {hold.Track}: note at tick {next.Tick} falls inside the hold from tick {hold.Tick} to {hold.EndTick}.", next));
-                _editorProblemEventKeys.Add(KeyOf(hold));
-                _editorProblemEventKeys.Add(KeyOf(next));
+                problemEventKeys.Add(KeyOf(hold));
+                problemEventKeys.Add(KeyOf(next));
             }
         }
 
@@ -262,7 +486,7 @@ public sealed partial class Playfield
                     $"Vertical link connection on track {tail.Track} " +
                     $"(ticks {link.Head.Tick}–{tail.Tick}) stays on the same track. " +
                     "Move the LinkTail to another track.");
-                _editorProblemEventKeys.Add(KeyOf(link.Head));
+                problemEventKeys.Add(KeyOf(link.Head));
             }
         }
 
@@ -295,50 +519,243 @@ public sealed partial class Playfield
             // The full path validator is part of the automatic error report. This
             // includes invalid/reused IDs, bad attrs, orphan tails and orphan heads;
             // no separate Tools action is needed.
-            foreach (var issue in GetEditorLinkPathIssues(GetEditorLinkChainInfos()))
+            if (hasLinkCandidates)
             {
-                _editorProblems.Add(new EditorChartProblem(issue.Tick, issue.Track,
-                    $"Link path: {issue.Message}", issue.Event));
-                if (issue.Event is not null)
-                    _editorProblemEventKeys.Add(KeyOf(issue.Event));
+                foreach (var issue in GetEditorLinkPathIssuesForDiagnostics(chart, editorChains))
+                {
+                    problems.Add(new EditorChartProblem(issue.Tick, issue.Track,
+                        $"Link path: {issue.Message}", issue.Event));
+                    if (issue.Event is not null)
+                        problemEventKeys.Add(KeyOf(issue.Event));
+                }
             }
         }
         else
         {
-            _editorProblems.Add(new EditorChartProblem(0, -1, $"Could not validate link paths: {linkBuildFailure}", null));
+            problems.Add(new EditorChartProblem(0, -1, $"Could not validate link paths: {linkBuildFailure}", null));
         }
 
-        foreach (var tempo in _chart.TempoEvents)
+        foreach (var tempo in chart.TempoEvents)
         {
             if (tempo.Tick < 0)
-                _editorProblems.Add(new EditorChartProblem(tempo.Tick, -1, $"Tempo change has a negative tick ({tempo.Tick}).", null));
+                problems.Add(new EditorChartProblem(tempo.Tick, -1, $"Tempo change has a negative tick ({tempo.Tick}).", null));
             if (!double.IsFinite(tempo.Bpm) || tempo.Bpm <= 0)
-                _editorProblems.Add(new EditorChartProblem(tempo.Tick, -1, $"Tempo change has an invalid BPM value ({tempo.Bpm}).", null));
+                problems.Add(new EditorChartProblem(tempo.Tick, -1, $"Tempo change has an invalid BPM value ({tempo.Bpm}).", null));
         }
-        foreach (var group in _chart.TempoEvents.GroupBy(tempo => tempo.Tick).Where(group => group.Count() > 1))
+        foreach (var group in chart.TempoEvents.GroupBy(tempo => tempo.Tick).Where(group => group.Count() > 1))
         {
             var values = string.Join(", ", group.Select(tempo => tempo.Bpm.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)));
-            _editorProblems.Add(new EditorChartProblem(group.Key, -1,
+            problems.Add(new EditorChartProblem(group.Key, -1,
                 $"Multiple tempo changes share tick {group.Key} (BPM values: {values}).", null));
         }
 
-        _editorProblems.Sort((a, b) =>
+        problems.Sort((a, b) =>
         {
             var tickComparison = a.Tick.CompareTo(b.Tick);
             if (tickComparison != 0) return tickComparison;
             var trackComparison = a.Track.CompareTo(b.Track);
             return trackComparison != 0 ? trackComparison : string.Compare(a.Message, b.Message, StringComparison.Ordinal);
         });
-        _editorProblemErrorCount = _editorProblems.Count(problem => !problem.IsWarning);
-        _editorProblemWarningCount = _editorProblems.Count(problem => problem.IsWarning);
+        var errorCount = problems.Count(problem => !problem.IsWarning);
+        var warningCount = problems.Count(problem => problem.IsWarning);
+        // The render loop needs only the notes that actually receive a marker.
+        // Resolve these once on the diagnostics worker instead of scanning the
+        // entire chart on every gameplay frame while the Problems report is open.
+        var markerEvents = new List<ChartEvent>();
+        var markerEventReferences = new HashSet<ChartEvent>(ReferenceEqualityComparer.Instance);
+        foreach (var ev in chart.Events)
+        {
+            if (ev.Track is >= 0 and <= 15 && problemEventKeys.Contains(KeyOf(ev)) &&
+                markerEventReferences.Add(ev))
+                markerEvents.Add(ev);
+        }
 
         void AddProblem(ChartEvent ev, string message)
         {
-            _editorProblems.Add(new EditorChartProblem(ev.Tick, ev.Track, message, ev));
-            _editorProblemEventKeys.Add(KeyOf(ev));
+            problems.Add(new EditorChartProblem(ev.Tick, ev.Track, message, ev));
+            problemEventKeys.Add(KeyOf(ev));
         }
+
+        return new EditorDiagnosticsResult(problems, problemEventKeys, markerEvents, errorCount, warningCount);
     }
 
+    private static AresChart CreateEditorDiagnosticsChart(EditorDiagnosticsSnapshot snapshot)
+    {
+        var chart = new AresChart
+        {
+            TicksPerMeasure = snapshot.TicksPerMeasure,
+            InitialTempo = snapshot.InitialTempo,
+            InitialGearAttr = snapshot.InitialGearAttr
+        };
+        chart.Events.EnsureCapacity(snapshot.EventCount);
+        foreach (var chunk in snapshot.EventChunks)
+            chart.Events.AddRange(chunk);
+        chart.TempoEvents.AddRange(snapshot.TempoEvents);
+        return chart;
+    }
+
+    private static List<EditorLinkChainInfo> GetEditorLinkChainInfosForDiagnostics(AresChart chart)
+    {
+        var nextByHeadKey = new Dictionary<ChartEventKey, LinkSegment>();
+        var ambiguousHeads = new HashSet<ChartEventKey>();
+        foreach (var link in chart.Links)
+        {
+            var key = KeyOf(link.Head);
+            if (!nextByHeadKey.TryGetValue(key, out var existing) || link.Tail.Tick < existing.Tail.Tick)
+            {
+                nextByHeadKey[key] = link;
+                ambiguousHeads.Remove(key);
+            }
+            else if (link.Tail.Tick == existing.Tail.Tick)
+            {
+                ambiguousHeads.Add(key);
+                if (link.Tail.Track < existing.Tail.Track)
+                    nextByHeadKey[key] = link;
+            }
+        }
+
+        var result = new List<EditorLinkChainInfo>();
+        var roots = chart.Events
+            .Where(ev => ev.Kind == "Note" && ev.RawType == 1 && IsPlayableEditorTrack(ev.Track) &&
+                         ev.NoteType == NoteType.LinkHead)
+            .OrderBy(ev => ev.Tick).ThenBy(ev => ev.Track).ThenBy(ev => ev.EventIndex);
+        foreach (var root in roots)
+        {
+            var nodes = new List<ChartEvent> { root };
+            var visited = new HashSet<ChartEvent>(ReferenceEqualityComparer.Instance) { root };
+            var current = root;
+            for (var guard = 0; guard < 256; guard++)
+            {
+                var key = KeyOf(current);
+                if (ambiguousHeads.Contains(key) || !nextByHeadKey.TryGetValue(key, out var nextLink))
+                    break;
+                if (!visited.Add(nextLink.Tail))
+                    break;
+                nodes.Add(nextLink.Tail);
+                current = nextLink.Tail;
+            }
+            // `visited` already guarantees reference uniqueness as each node is
+            // appended. Avoid LINQ Distinct here: the framework reference comparer
+            // can widen type inference to object on this target framework.
+            nodes = nodes.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
+                    IsPlayableEditorTrack(ev.Track) && ev.NoteType is NoteType.LinkHead or NoteType.LinkTail)
+                .ToList();
+            if (nodes.Count == 0)
+                nodes.Add(root);
+            result.Add(new EditorLinkChainInfo(root, nodes, LinkBuilder.Family(root.Track),
+                root.Tick, nodes.Max(ev => (long)ev.EndTick), root.LinePair));
+        }
+        return result;
+    }
+
+    private static List<EditorLinkPathIssue> GetEditorLinkPathIssuesForDiagnostics(
+        AresChart chart, List<EditorLinkChainInfo> chains)
+    {
+        var issues = new List<EditorLinkPathIssue>();
+        if (chart is null)
+            return issues;
+
+        void Add(ChartEvent ev, string message)
+            => issues.Add(new EditorLinkPathIssue(ev.Tick, ev.Track, message, ev));
+
+        var routeTimeline = new GearTimeline(chart);
+        var claimed = new HashSet<ChartEvent>(ReferenceEqualityComparer.Instance);
+        var headsWithoutConnectedTail = new HashSet<ChartEvent>(ReferenceEqualityComparer.Instance);
+        foreach (var chain in chains)
+        {
+            var root = chain.Root;
+            var pairValid = chain.Pair is 1 or 3 or 5 or 7;
+            if (!pairValid)
+                Add(root, $"head tick {root.Tick}/track {root.Track} has invalid pair ID {chain.Pair}");
+            if (chain.Nodes.Count < 2)
+            {
+                Add(root, $"head tick {root.Tick}/track {root.Track} has no connected tail");
+                headsWithoutConnectedTail.Add(root);
+            }
+
+            foreach (var node in chain.Nodes)
+            {
+                if (!claimed.Add(node))
+                    Add(node, $"tick {node.Tick}/track {node.Track} is shared by multiple chain paths");
+                if (!string.Equals(LinkBuilder.Family(node.Track), chain.Family, StringComparison.Ordinal))
+                    Add(node, $"chain at tick {root.Tick} crosses banks");
+                if (node.LinePair != chain.Pair)
+                    Add(node, $"tick {node.Tick}/track {node.Track} has pair {node.LinePair}, expected {chain.Pair}");
+                if (pairValid)
+                {
+                    var expectedAttr = node.NoteType == NoteType.LinkHead ? chain.Pair : chain.Pair + 1;
+                    if (node.Attr != expectedAttr)
+                        Add(node, $"tick {node.Tick}/track {node.Track} has attr {node.Attr}, expected {expectedAttr}");
+                }
+            }
+        }
+
+        var linkPoints = chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
+            IsPlayableEditorTrack(ev.Track) &&
+            ev.NoteType is NoteType.LinkHead or NoteType.LinkTail).ToList();
+        foreach (var tail in linkPoints.Where(ev => ev.NoteType == NoteType.LinkTail && !claimed.Contains(ev)))
+            Add(tail, $"orphan tail at tick {tail.Tick}/track {tail.Track} has no link-head path");
+
+        // Build the linked-head set once. The previous Any() nested in the
+        // LinkHead loop rescanned every link for every head (O(heads * links)).
+        var linkedHeads = new HashSet<ChartEvent>(
+            chart.Links.Select(link => link.Head), ReferenceEqualityComparer.Instance);
+        foreach (var head in linkPoints.Where(ev => ev.NoteType == NoteType.LinkHead && !linkedHeads.Contains(ev)))
+        {
+            if (!headsWithoutConnectedTail.Contains(head))
+                Add(head, $"orphan LinkHead at tick {head.Tick}/track {head.Track} has no outgoing connector");
+        }
+
+        // Pair IDs are reused by non-overlapping chains. Sort each pair group by
+        // start tick and stop once later chains are beyond the current interval;
+        // this avoids comparing every chain with every other chain in the chart.
+        foreach (var pairGroup in chains
+                     .Where(chain => chain.Pair is 1 or 3 or 5 or 7)
+                     .GroupBy(chain => chain.Pair))
+        {
+            var ordered = pairGroup.OrderBy(chain => chain.StartTick)
+                .ThenBy(chain => chain.EndTick)
+                .ToArray();
+            for (var i = 0; i < ordered.Length; i++)
+            {
+                var a = ordered[i];
+                for (var j = i + 1; j < ordered.Length; j++)
+                {
+                    var b = ordered[j];
+                    if (b.StartTick > a.EndTick)
+                        break;
+
+                    var overlaps = a.StartTick < b.EndTick && b.StartTick < a.EndTick;
+                    // Reuse is blocked only when the two banks can be visible
+                    // simultaneously during the overlapping part of the chains.
+                    if (overlaps && EditorLinkChainsConflictInTime(routeTimeline, a, b))
+                    {
+                        Add(b.Root, $"pair {a.Pair}/{a.Pair + 1} is reused by a possible route combination ({LinkBuilder.FamilyLabel(a.Family)} and {LinkBuilder.FamilyLabel(b.Family)}) between ticks {a.StartTick} and {b.StartTick}");
+                        continue;
+                    }
+
+                    var boundaryTail = GetEditorLinkBoundaryTailConflict(a, b) ??
+                                       GetEditorLinkBoundaryTailConflict(b, a);
+                    if (boundaryTail is not null &&
+                        !EditorLinkFamiliesCanSharePair(routeTimeline, a.Family, b.Family,
+                            boundaryTail.Tick, boundaryTail.Tick < int.MaxValue ? boundaryTail.Tick + 1 : boundaryTail.Tick))
+                    {
+                        boundaryTail = null;
+                    }
+                    if (boundaryTail is not null)
+                    {
+                        Add(boundaryTail,
+                            $"pair {a.Pair}/{a.Pair + 1} cannot be reused at tick {boundaryTail.Tick}: a same-bank LinkTail at the hand-off tick is ambiguous; use a different ID");
+                    }
+                }
+            }
+        }
+
+        return issues
+            .GroupBy(issue => issue.Message, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToList();
+    }
     private Rectangle GetEditorProblemsPanelBounds(int virtualWidth, int virtualHeight)
     {
         var unit = _projection.ScalePixels(1f);
@@ -464,7 +881,6 @@ public sealed partial class Playfield
     {
         if (!_chartEditorMode || _chart is null || _tempo is null)
             return;
-        RefreshEditorDiagnostics();
         var interfaceUi = _chartEditorInterfaceLayout;
         var labelFont = _font;
         var unit = _projection.ScalePixels(1f);
@@ -489,16 +905,22 @@ public sealed partial class Playfield
         _spriteBatch.Draw(_pixel, new Rectangle(header.X, header.Y, edge + (int)MathF.Round(2f * unit), header.Height),
             statusColor);
 
-        var summary = (errorCount, warningCount) switch
-        {
-            (0, 0) => interfaceUi.Label("problems_none", "No problems found in this chart."),
-            (0, 1) => "1 warning.",
-            (0, _) => $"{warningCount} warnings.",
-            (1, 0) => "1 gameplay error needs to be fixed.",
-            (_, 0) => $"{errorCount} gameplay errors need to be fixed.",
-            (1, _) => $"1 gameplay error · {warningCount} warning(s)",
-            _ => $"{errorCount} gameplay errors · {warningCount} warning(s)"
-        };
+        var diagnosticsReady = !_editorDiagnosticsDirty && ReferenceEquals(_editorDiagnosticsChart, _chart);
+        var diagnosticsPending = IsEditorDiagnosticsPendingForCurrentChart();
+        var diagnosticsPreparing = IsEditorDiagnosticsPreparingForCurrentChart();
+        var summary = !diagnosticsReady
+            ? _playing && _editorDiagnosticsTask is null ? "Chart checks will run when playback pauses…" :
+                diagnosticsPreparing ? "Preparing chart checks…" : diagnosticsPending ? "Checking chart…" : "Open to refresh chart checks."
+            : (errorCount, warningCount) switch
+            {
+                (0, 0) => interfaceUi.Label("problems_none", "No problems found in this chart."),
+                (0, 1) => "1 warning.",
+                (0, _) => $"{warningCount} warnings.",
+                (1, 0) => "1 gameplay error needs to be fixed.",
+                (_, 0) => $"{errorCount} gameplay errors need to be fixed.",
+                (1, _) => $"1 gameplay error · {warningCount} warning(s)",
+                _ => $"{errorCount} gameplay errors · {warningCount} warning(s)"
+            };
         var quickFixButton = GetEditorProblemsQuickFixButtonBounds(virtualWidth, virtualHeight);
         var summaryMax = Math.Max(1f, quickFixButton.X - header.X - 20f * unit);
         summary = FitHudText(labelFont, FontSafeText(labelFont, summary), summaryMax / textScale);
@@ -592,19 +1014,32 @@ public sealed partial class Playfield
         var panel = GetEditorProblemsPanelBounds(virtualWidth, virtualHeight);
         if (!panel.Contains(pixel))
             return false;
-        RefreshEditorDiagnostics();
         if (GetEditorProblemsQuickFixButtonBounds(virtualWidth, virtualHeight).Contains(pixel))
         {
+            RefreshEditorDiagnostics();
+            if (_editorDiagnosticsDirty || !ReferenceEquals(_editorDiagnosticsChart, _chart))
+            {
+                _statusMessage = _playing
+                    ? "Chart checks will start after playback pauses. Try QUICK FIX again afterward."
+                    : "Chart checks are still running. Try QUICK FIX again when they finish.";
+                return true;
+            }
             QuickFixEditorLinks();
             return true;
         }
         if (GetEditorProblemsHeaderBounds(virtualWidth, virtualHeight).Contains(pixel))
         {
             _editorProblemsExpanded = !_editorProblemsExpanded;
+            if (_editorProblemsExpanded)
+                _editorDiagnosticsSkipThisUpdate = true;
+            // Keep the panel-opening frame free of chart scanning/capture.
             ClampEditorProblemsScroll(virtualWidth, virtualHeight);
             return true;
         }
         if (!_editorProblemsExpanded)
+            return true;
+        RefreshEditorDiagnostics();
+        if (_editorDiagnosticsDirty)
             return true;
         var list = GetEditorProblemsListBounds(virtualWidth, virtualHeight);
         if (!list.Contains(pixel))
@@ -634,23 +1069,23 @@ public sealed partial class Playfield
 
     private void DrawEditorProblemNoteMarkers(double currentTick, GearState currentState)
     {
-        if (!_chartEditorMode || _chart is null)
+        // Diagnostics are deliberately refreshed only when the mapper opens or
+        // interacts with the Problems panel. Never run the full-chart checker
+        // from the normal note-render pass after every edit.
+        if (!_chartEditorMode || _chart is null || _editorDiagnosticsDirty ||
+            !ReferenceEquals(_editorDiagnosticsChart, _chart))
             return;
-        RefreshEditorDiagnostics();
-        if (_editorProblemEventKeys.Count == 0)
+        if (_editorProblemMarkerEvents.Count == 0)
             return;
 
         var width = _graphics.Viewport.Width;
         var height = _graphics.Viewport.Height;
         var red = new Color(255, 48, 64, 245);
         _spriteBatch.Begin(samplerState: SamplerState.LinearClamp, blendState: BlendState.AlphaBlend);
-        foreach (var ev in _chart.Events)
+        foreach (var ev in _editorProblemMarkerEvents)
         {
-            // This overlay is projected onto the gameplay lanes. Auxiliary
-            // tracks are shown only by their dedicated editor view, never here.
-            if (!_editorProblemEventKeys.Contains(KeyOf(ev)) || ev.Track is < 0 or > 15)
-                continue;
-
+            // The worker has already filtered this list to unique gameplay-lane
+            // event references that require markers; do not rescan every chart event.
             // Match the projected size of the real note selection marker instead
             // of drawing a fixed-size square that can dwarf notes at a distance.
             var radius = GetEditorMarkerRadius(ev.Track, ev.Tick, currentTick, currentState,

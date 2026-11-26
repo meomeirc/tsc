@@ -899,13 +899,6 @@ local function drawTimeline(state, x, y, width, height, layer)
             end
         end
     end
-    local function routeStateAt(route, seconds)
-        local result = route and route[1]
-        for _, point in ipairs(route or {}) do
-            if num(point.seconds, 0) <= seconds + 0.0001 then result = point else break end
-        end
-        return result or { left = 1, right = 4 }
-    end
     local function sameSide(a, b, side)
         return a ~= nil and b ~= nil and num(a[side], -1) == num(b[side], -2)
     end
@@ -926,47 +919,105 @@ local function drawTimeline(state, x, y, width, height, layer)
     local intendedFutureColor = "#F59E0B"
     routeRange(intended, 0, currentSeconds, progressColor, nil)
 
-    local currentActual = routeStateAt(actual, currentSeconds)
-    local currentIntended = routeStateAt(intended, currentSeconds)
-    local boundaries = { 0, currentSeconds }
-    for _, route in ipairs({ actual, intended }) do
-        for _, point in ipairs(route) do
-            local seconds = num(point.seconds, -1)
-            if seconds > 0 and seconds < currentSeconds then
-                table.insert(boundaries, seconds)
-            end
+    -- Actual and intended routes are already time-sorted. Merge their transition
+    -- points once, then advance two cursors to sample both states at each boundary.
+    -- The previous implementation sorted all boundaries and called a linear
+    -- routeStateAt() search repeatedly for every boundary (quadratic in route size).
+    local epsilon = 0.0001
+    local boundaries = { 0 }
+    local actualCursor = 1
+    local intendedCursor = 1
+    local lastBoundary = 0
+    while true do
+        local actualPoint = actual[actualCursor]
+        local intendedPoint = intended[intendedCursor]
+        local actualSeconds = actualPoint and num(actualPoint.seconds, math.huge) or math.huge
+        local intendedSeconds = intendedPoint and num(intendedPoint.seconds, math.huge) or math.huge
+        local nextSeconds = math.min(actualSeconds, intendedSeconds)
+        if nextSeconds == math.huge or nextSeconds >= currentSeconds then
+            break
+        end
+        if nextSeconds > lastBoundary + epsilon then
+            boundaries[#boundaries + 1] = nextSeconds
+            lastBoundary = nextSeconds
+        end
+        -- Consume only the points that the last accepted boundary would see.
+        -- Using nextSeconds + epsilon here would incorrectly collapse a chain of
+        -- close transitions whose total span exceeds the old de-duplication limit.
+        local consumeThrough = lastBoundary + epsilon
+        while actualCursor <= #actual and num(actual[actualCursor].seconds, math.huge) <= consumeThrough do
+            actualCursor = actualCursor + 1
+        end
+        while intendedCursor <= #intended and num(intended[intendedCursor].seconds, math.huge) <= consumeThrough do
+            intendedCursor = intendedCursor + 1
         end
     end
-    table.sort(boundaries)
-    local uniqueBoundaries = {}
-    for _, seconds in ipairs(boundaries) do
-        if #uniqueBoundaries == 0 or math.abs(seconds - uniqueBoundaries[#uniqueBoundaries]) > 0.0001 then
-            table.insert(uniqueBoundaries, seconds)
+    if currentSeconds > lastBoundary + epsilon then
+        boundaries[#boundaries + 1] = currentSeconds
+    end
+
+    local sampleActual = {}
+    local sampleIntended = {}
+    actualCursor = 1
+    intendedCursor = 1
+    local fallbackState = { left = 1, right = 4 }
+    local lastMatches = { left = 0, right = 0 }
+    for sampleIndex, seconds in ipairs(boundaries) do
+        while actualCursor < #actual and
+            num(actual[actualCursor + 1].seconds, 0) <= seconds + epsilon do
+            actualCursor = actualCursor + 1
+        end
+        while intendedCursor < #intended and
+            num(intended[intendedCursor + 1].seconds, 0) <= seconds + epsilon do
+            intendedCursor = intendedCursor + 1
+        end
+        local actualState = actual[actualCursor] or fallbackState
+        local intendedState = intended[intendedCursor] or fallbackState
+        sampleActual[sampleIndex] = actualState
+        sampleIntended[sampleIndex] = intendedState
+        if sameSide(actualState, intendedState, "left") then
+            lastMatches.left = seconds
+        end
+        if sameSide(actualState, intendedState, "right") then
+            lastMatches.right = seconds
         end
     end
+
+    -- The current playhead lookup is kept separate from the final unique
+    -- boundary: the old boundary de-duplication intentionally omits a playhead
+    -- marker when it is within epsilon of the preceding transition.
+    local currentActualCursor = 1
+    local currentIntendedCursor = 1
+    while currentActualCursor < #actual and
+        num(actual[currentActualCursor + 1].seconds, 0) <= currentSeconds + epsilon do
+        currentActualCursor = currentActualCursor + 1
+    end
+    while currentIntendedCursor < #intended and
+        num(intended[currentIntendedCursor + 1].seconds, 0) <= currentSeconds + epsilon do
+        currentIntendedCursor = currentIntendedCursor + 1
+    end
+    local currentActual = actual[currentActualCursor] or fallbackState
+    local currentIntended = intended[currentIntendedCursor] or fallbackState
+
     for _, side in ipairs({ "left", "right" }) do
         if not sameSide(currentActual, currentIntended, side) then
-            local lastMatch = 0
-            for _, seconds in ipairs(uniqueBoundaries) do
-                if sameSide(routeStateAt(actual, seconds), routeStateAt(intended, seconds), side) then
-                    lastMatch = seconds
-                end
-            end
-            for i = 1, #uniqueBoundaries - 1 do
-                local startSeconds = uniqueBoundaries[i]
-                local endSeconds = uniqueBoundaries[i + 1]
-                local actualAtStart = routeStateAt(actual, startSeconds)
-                local intendedAtStart = routeStateAt(intended, startSeconds)
-                if endSeconds > lastMatch + 0.0001 and endSeconds > startSeconds and
+            local lastMatch = lastMatches[side]
+            for i = 1, #boundaries - 1 do
+                local startSeconds = boundaries[i]
+                local endSeconds = boundaries[i + 1]
+                local actualAtStart = sampleActual[i]
+                local intendedAtStart = sampleIntended[i]
+                if endSeconds > lastMatch + epsilon and endSeconds > startSeconds and
                     not sameSide(actualAtStart, intendedAtStart, side) then
                     segment(traceX(actualAtStart[side]), math.max(startSeconds, lastMatch),
                         traceX(actualAtStart[side]), endSeconds, alternateColor)
                 end
-                local actualAtEnd = routeStateAt(actual, endSeconds)
-                if endSeconds > lastMatch + 0.0001 and
+                local actualAtEnd = sampleActual[i + 1]
+                if endSeconds > lastMatch + epsilon and
                     (not sameSide(actualAtStart, intendedAtStart, side) or
-                     not sameSide(actualAtEnd, routeStateAt(intended, endSeconds), side)) then
-                    segment(traceX(actualAtStart[side]), endSeconds, traceX(actualAtEnd[side]), endSeconds, alternateColor)
+                     not sameSide(actualAtEnd, sampleIntended[i + 1], side)) then
+                    segment(traceX(actualAtStart[side]), endSeconds,
+                        traceX(actualAtEnd[side]), endSeconds, alternateColor)
                 end
             end
             routeRange(intended, currentSeconds, duration, intendedFutureColor, side)
@@ -1261,6 +1312,7 @@ local function textField(item, x, y, width, height, layer, wrapValue, screenWidt
 end
 
 local metaRowLayoutCache = {}
+local metaRowLayoutComputeBudget = math.huge
 
 local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
     local trailing = item.label == "PREVIEW" and (132 * scale) or
@@ -1278,6 +1330,20 @@ local function getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabe
         cached.rowGap == rowGap and cached.textSize == textSize and cached.font == F.regular then
         return cached.layout
     end
+    -- First-open layout can involve wrapping long mapper descriptions. Spread
+    -- cache misses across frames so opening INFO never measures every field in
+    -- one playback frame. Unmeasured rows use the base height until their turn.
+    if metaRowLayoutComputeBudget <= 0 then
+        local fieldH = item.stats_kind == "combo" and (128 * scale)
+            or item.stats_kind == "bank_header" and (36 * scale)
+            or (46 * scale)
+        return {
+            fieldW = fieldW, fieldH = fieldH, labelH = rowLabelH,
+            labelGap = rowLabelGap, rowGap = rowGap,
+            pitch = rowLabelH + rowLabelGap + fieldH + rowGap,
+        }
+    end
+    metaRowLayoutComputeBudget = metaRowLayoutComputeBudget - 1
     -- The bank labels live in one shared header row; each data row only needs
     -- enough height for its single centered value line.
     local fieldH = item.stats_kind == "combo" and (128 * scale)
@@ -1330,6 +1396,10 @@ local metaLayoutsScratch = {}
 
 local function buildMetaRowLayouts(rows, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
     local layouts = metaLayoutsScratch
+    -- Compute at most one uncached row per frame. Cached rows are free and do not
+    -- consume the budget, so the full list warms progressively without a long
+    -- first-open measurement burst.
+    metaRowLayoutComputeBudget = 1
     local totalHeight = 0
     for index, item in ipairs(rows) do
         local layout = getMetaRowLayout(item, panelW, padding, scale, rowLabelH, rowLabelGap, rowGap)
@@ -1424,7 +1494,11 @@ local function drawMeta(state, w, h, layer)
     -- SmoothScrollHandler. Variable-height rows are positioned from their prefix
     -- heights, allowing the viewport to show partial rows at either edge.
     local computedMaximum = math.max(0, totalRowsHeight - contentHeight)
-    local maxScrollStart = clamp(num(state.meta_scroll_max, computedMaximum), 0, computedMaximum)
+    -- The Lua layout is authoritative for variable-height metadata rows. C# may
+    -- skip its duplicate text-measurement pass while this renderer is active.
+    -- MEDIA/TEST seed totalRowsHeight from the C# fixed-page extent above, so the
+    -- same computed value remains correct for those categories too.
+    local maxScrollStart = computedMaximum
     local scrollPosition = clamp(num(state.meta_scroll, 0), 0, maxScrollStart)
     local currentScrollHeight = scrollPosition
 

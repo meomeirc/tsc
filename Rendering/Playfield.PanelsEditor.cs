@@ -1626,7 +1626,9 @@ public sealed partial class Playfield
             }
         }
 
-        RefreshEditorDiagnostics();
+        // Do not start chart diagnostics from the panel-note render pass.
+        // The Problems panel owns refresh scheduling; stale markers are hidden
+        // until the background result for the current chart revision is ready.
         var visibleRect = new Rectangle(area.X, area.Y, area.Width, area.Height);
         foreach (var ev in _chart.Events.Where(ev => ev.Kind == "Note" && ev.RawType == 1 &&
                      ev.Track is >= 17 and <= 20 && ev.Attr is >= 101 and <= 108)

@@ -2052,6 +2052,66 @@ public sealed partial class Playfield
 
     private EditorMetaStatsData? _editorMetaStatsCache;
     private AresChart? _editorMetaStatsCacheChart;
+    private bool _editorMetaStatsCacheDirty;
+
+    // While preview playback is running, keep showing the last completed stats
+    // snapshot after edits. If this chart has never produced a snapshot, calculate
+    // it on the first Stats request instead of returning an empty page. The result
+    // is cached by chart/revision and is not recomputed on subsequent render frames.
+    private EditorMetaStatsData? GetCachedEditorMetaStatsData()
+        => _chart is not null && ReferenceEquals(_editorMetaStatsCacheChart, _chart)
+            ? _editorMetaStatsCache
+            : null;
+
+    private EditorMetaStatsData? GetEditorMetaStatsDataForUi()
+    {
+        if (_chart is null)
+            return null;
+
+        if (_playing && GetCachedEditorMetaStatsData() is { } cached)
+            return cached;
+
+        // First-open playback case: there is no prior paused snapshot to reuse.
+        // Build once now and let GetEditorMetaStatsData cache the result so this
+        // route-aware scan never repeats every frame.
+        return GetEditorMetaStatsData();
+    }
+
+    private void InvalidateEditorMetaStatsCache()
+    {
+        if (_editorMetaStatsCache is not null)
+            _editorMetaStatsCacheDirty = true;
+    }
+
+    private void ClearEditorMetaStatsCache()
+    {
+        _editorMetaStatsCache = null;
+        _editorMetaStatsCacheChart = null;
+        _editorMetaStatsCacheDirty = false;
+    }
+
+    private readonly record struct EditorMetaRowsCacheKey(
+        AresChart Chart,
+        long Revision,
+        string Category,
+        string DifficultyCode,
+        bool DifficultyHasChart,
+        bool JudgementEnabled,
+        ChartBundleTemplate BundleTemplate,
+        EditorMetaStatsData? Stats,
+        string? SourcePath,
+        string? SourceName,
+        string? LastLoadedSourceName,
+        bool PanelOpen,
+        int? PreviewStartMilliseconds,
+        int? PreviewEndMilliseconds,
+        int SharedMusicLength,
+        int LoadedMusicLength,
+        int SharedAlbumLength,
+        int SharedAlbumBigLength);
+
+    private EditorMetaRowsCacheKey? _editorMetaRowsCacheKey;
+    private List<(string Label, string Value)>? _editorMetaRowsCache;
 
     private static int GetEditorMetaBankIndex(int track) => track switch
     {
@@ -2070,7 +2130,8 @@ public sealed partial class Playfield
         if (chart is null)
             return new EditorMetaStatsData(0, 0, 0, default, default, default, default,
                 default, default, default, default, 0, 0, 0, 0, 0, 0);
-        if (ReferenceEquals(_editorMetaStatsCacheChart, chart) && _editorMetaStatsCache is not null)
+        if (ReferenceEquals(_editorMetaStatsCacheChart, chart) &&
+            _editorMetaStatsCache is not null && !_editorMetaStatsCacheDirty)
             return _editorMetaStatsCache;
 
         var events = chart.Events;
@@ -2173,6 +2234,7 @@ public sealed partial class Playfield
             comboTaps, comboFlicks, comboSuperFlicks, comboHolds, comboVibratos, comboLinks);
         _editorMetaStatsCacheChart = chart;
         _editorMetaStatsCache = data;
+        _editorMetaStatsCacheDirty = false;
         return data;
     }
 
@@ -2251,19 +2313,48 @@ public sealed partial class Playfield
 
     private List<(string Label, string Value)> GetEditorMetaRows(double currentTick)
         => GetEditorMetaRows(currentTick,
-            string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase) && _chart is not null
-                ? GetEditorMetaStatsData()
+            string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase)
+                ? GetEditorMetaStatsDataForUi()
                 : null);
 
     private List<(string Label, string Value)> GetEditorMetaRows(double currentTick,
         EditorMetaStatsData? statsData, bool? activeDifficultyHasChart = null)
     {
-        if (_chart is null)
+        var chart = _chart;
+        if (chart is null)
             return new List<(string Label, string Value)> { ("CHART", "No chart loaded") };
+
+        var category = _editorMetaCategory ?? "SONG";
+        var difficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(chart.Difficulty, _sourceName);
+        var difficultyHasChart = activeDifficultyHasChart ?? HasEditorDifficultyChartKnown(difficultyCode);
+        var effectiveStatsData = string.Equals(category, "STATS", StringComparison.OrdinalIgnoreCase)
+            ? statsData ?? GetEditorMetaStatsData()
+            : statsData;
+        var cacheKey = new EditorMetaRowsCacheKey(
+            chart,
+            _editorRecoveryRevision,
+            category,
+            difficultyCode,
+            difficultyHasChart,
+            _editorCustomJudgementWindowsEnabled,
+            _editorBundleTemplate,
+            effectiveStatsData,
+            _loadedSourcePath,
+            _sourceName,
+            _lastLoadedSourceName,
+            _editorMetaPanelOpen,
+            chart.PreviewStartMilliseconds,
+            chart.PreviewEndMilliseconds,
+            _editorSharedMusicBytes?.Length ?? 0,
+            _loadedMusicBytes?.Length ?? 0,
+            _editorSharedAlbumBytes?.Length ?? 0,
+            _editorSharedAlbumBigBytes?.Length ?? 0);
+        if (_editorMetaRowsCacheKey == cacheKey && _editorMetaRowsCache is not null)
+            return _editorMetaRowsCache;
 
         string Show(string? value) => string.IsNullOrWhiteSpace(value) ? "Not set" : value;
         var source = _loadedSourcePath ?? _sourceName ?? _lastLoadedSourceName;
-        var initialMode = _chart.InitialGearAttr switch { 0 or 2 => "1K", 4 => "2K", _ => "3K" };
+        var initialMode = chart.InitialGearAttr switch { 0 or 2 => "1K", 4 => "2K", _ => "3K" };
         var templateLabel = _editorBundleTemplate switch
         {
             ChartBundleTemplate.Tsc => "TSC",
@@ -2271,51 +2362,53 @@ public sealed partial class Playfield
             ChartBundleTemplate.Tsts => "TSTS",
             _ => "TSC"
         };
-        var seriesValue = _editorBundleTemplate == ChartBundleTemplate.Tsts ? "Unsupported by TSTS" : Show(_chart.Series);
+        var seriesValue = _editorBundleTemplate == ChartBundleTemplate.Tsts ? "Unsupported by TSTS" : Show(chart.Series);
         var judgementPrefix = _editorCustomJudgementWindowsEnabled;
-        var difficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart.Difficulty, _sourceName);
-        var levelLabel = string.Equals(_editorMetaCategory, "SONG", StringComparison.OrdinalIgnoreCase) &&
-                         GetEditorEstimatedLevel(_chart) is { } estimatedLevel
-            ? $"LEVEL (ESTIMATED ~{estimatedLevel.ToString("F1", CultureInfo.InvariantCulture)})"
-            : "LEVEL";
+        var hasCachedLevelEstimate = _editorLevelEstimateCache.TryGetValue(chart, out var cachedLevelEstimate) &&
+            cachedLevelEstimate.HasValue;
+        var levelLabel = chart.Level.HasValue || !hasCachedLevelEstimate
+            ? "LEVEL"
+            : $"LEVEL (ESTIMATED ~{cachedLevelEstimate!.Value.ToString("F1", CultureInfo.InvariantCulture)})";
+        var levelValue = chart.Level?.ToString(CultureInfo.InvariantCulture) ??
+            (hasCachedLevelEstimate ? cachedLevelEstimate!.Value.ToString("F1", CultureInfo.InvariantCulture) : "Not set");
 
         var rows = _editorMetaCategory switch
         {
             "SONG" => new List<(string Label, string Value)>
             {
                 ("BUNDLE TEMPLATE", templateLabel),
-                ("VERSION", Show(_chart.Version)),
-                ("SONG", Show(_chart.Name)),
-                ("ARTIST", Show(_chart.Artist)),
-                ("MAPPER", Show(_chart.Mapper)),
-                ("DESCRIPTION", Show(_chart.Description)),
-                ("ELEMENT", Show(_chart.Element)),
+                ("VERSION", Show(chart.Version)),
+                ("SONG", Show(chart.Name)),
+                ("ARTIST", Show(chart.Artist)),
+                ("MAPPER", Show(chart.Mapper)),
+                ("DESCRIPTION", Show(chart.Description)),
+                ("ELEMENT", Show(chart.Element)),
                 ("SERIES", seriesValue),
-                (levelLabel, _chart.Level?.ToString(CultureInfo.InvariantCulture) ?? "Not set"),
-                ("BPM", _chart.MetadataBpm.ToString("0.###", CultureInfo.InvariantCulture)),
+                (levelLabel, levelValue),
+                ("BPM", chart.MetadataBpm.ToString("0.###", CultureInfo.InvariantCulture)),
                 ("INITIAL CHART BPM", GetEditorInitialChartBpm().ToString("0.###", CultureInfo.InvariantCulture)),
-                ("START GEAR", $"{initialMode} (attr {_chart.InitialGearAttr})"),
-                ("PLAYABLE TICK LENGTH", _chart.PlayTick.ToString(CultureInfo.InvariantCulture)),
-                ("CHART DURATION", $"{_chart.PlayTime:0.###} s"),
-                ("AUDIO ORIGIN TICK", _chart.AudioOriginTick.ToString(CultureInfo.InvariantCulture)),
+                ("START GEAR", $"{initialMode} (attr {chart.InitialGearAttr})"),
+                ("PLAYABLE TICK LENGTH", chart.PlayTick.ToString(CultureInfo.InvariantCulture)),
+                ("CHART DURATION", $"{chart.PlayTime:0.###} s"),
+                ("AUDIO ORIGIN TICK", chart.AudioOriginTick.ToString(CultureInfo.InvariantCulture)),
             },
             "MEDIA" => new List<(string Label, string Value)>
             {
                 ("MUSIC", GetEditorMediaButtonText("music")),
                 ("PREVIEW", _editorMetaPanelOpen
                     ? GetEditorSavedPreviewPositionLabel()
-                    : Show(_chart.PreviewPath)),
+                    : Show(chart.PreviewPath)),
                 ("ALBUM", GetEditorMediaButtonText("album")),
                 ("ALBUM BIG", _editorBundleTemplate == ChartBundleTemplate.Tsts ? "Unsupported by TSTS" : GetEditorMediaButtonText("album_big"))
             },
             "JUDGEMENT" => new List<(string Label, string Value)>
             {
                 ("CUSTOM JUDGEMENT WINDOWS", _editorCustomJudgementWindowsEnabled ? "Enabled" : "Disabled"),
-                ("PERFECT+ MS", judgementPrefix ? _chart.PerfectPlusWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled"),
-                ("PERFECT MS", judgementPrefix ? _chart.PerfectWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled"),
-                ("GOOD MS", judgementPrefix ? _chart.GoodWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled")
+                ("PERFECT+ MS", judgementPrefix ? chart.PerfectPlusWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled"),
+                ("PERFECT MS", judgementPrefix ? chart.PerfectWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled"),
+                ("GOOD MS", judgementPrefix ? chart.GoodWindowMs.ToString("0.###", CultureInfo.InvariantCulture) : "Disabled")
             },
-            "STATS" => BuildEditorMetaStatsRows(Show(source), statsData ?? GetEditorMetaStatsData()),
+            "STATS" => BuildEditorMetaStatsRows(Show(source), effectiveStatsData ?? GetEditorMetaStatsData()),
             "TEST" => new List<(string Label, string Value)>(),
             _ => new List<(string Label, string Value)>()
         };
@@ -2324,11 +2417,14 @@ public sealed partial class Playfield
         if (string.Equals(_editorMetaCategory, "SONG", StringComparison.OrdinalIgnoreCase))
         {
             if (string.Equals(difficultyCode, "xt", StringComparison.OrdinalIgnoreCase))
-                rows.Insert(2, ("SC PASSCODE", Show(_chart.ScPasscode)));
-            rows.Add(("DELETE DIFFICULTY", (activeDifficultyHasChart ?? HasEditorDifficultyChart(difficultyCode))
+                rows.Insert(2, ("SC PASSCODE", Show(chart.ScPasscode)));
+            rows.Add(("DELETE DIFFICULTY", difficultyHasChart
                 ? "Delete this difficulty chart" : "No chart file supplied"));
         }
-        return rows.Where(row => !row.Value.StartsWith("Unsupported by ", StringComparison.OrdinalIgnoreCase)).ToList();
+        var result = rows.Where(row => !row.Value.StartsWith("Unsupported by ", StringComparison.OrdinalIgnoreCase)).ToList();
+        _editorMetaRowsCacheKey = cacheKey;
+        _editorMetaRowsCache = result;
+        return result;
     }
 
     private static List<(string Label, string Value)> BuildEditorMetaStatsRows(
@@ -2352,6 +2448,26 @@ public sealed partial class Playfield
 
     private bool HasEditorMediaResource(string field)
     {
+        if (_playing)
+        {
+            if (field == "music")
+            {
+                if (_editorSharedMusicBytes is { Length: > 0 } || _loadedMusicBytes is { Length: > 0 })
+                    return true;
+                var playingSourceDirectory = GetEditorMediaResourceDirectory();
+                if (string.IsNullOrWhiteSpace(playingSourceDirectory))
+                    return false;
+                var cachedKey = new EditorMediaResourceCacheKey(
+                    "music", playingSourceDirectory, _editorBundleTemplate);
+                return _editorMediaResourceCache.TryGetValue(cachedKey, out var knownExists) && knownExists;
+            }
+            if (field == "album")
+                return _editorSharedAlbumBytes is { Length: > 0 } || !string.IsNullOrWhiteSpace(_chart?.AlbumPath);
+            if (field == "album_big")
+                return _editorSharedAlbumBigBytes is { Length: > 0 } || !string.IsNullOrWhiteSpace(_chart?.AlbumBigPath);
+            return false;
+        }
+
         if (field == "music" && (_editorSharedMusicBytes is { Length: > 0 } || _loadedMusicBytes is { Length: > 0 }))
             return true;
         if (field == "album" && _editorSharedAlbumBytes is { Length: > 0 }) return true;
@@ -2570,7 +2686,7 @@ public sealed partial class Playfield
             new Color(90, 90, 92, 240));
 
         var statsData = string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase)
-            ? GetEditorMetaStatsData()
+            ? GetEditorMetaStatsDataForUi()
             : null;
         var rows = GetEditorMetaRows(_tempo?.SecondsToTick(_playSeconds) ?? 0.0, statsData);
         var difficultyLabel = FontSafeText(labelFont, "DIFFICULTY");
@@ -2663,7 +2779,7 @@ public sealed partial class Playfield
                     DrawEditorMetaSelectField(bounds, value, accent);
                 else if (deleteDifficulty)
                     DrawEditorMetaButton(bounds, "DELETE DIFFICULTY", new Color(55, 30, 35, 245),
-                        HasEditorDifficultyChart(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName))
+                        HasEditorDifficultyChartKnown(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName))
                             ? interfaceUi.DangerColor : new Color(100, 100, 102));
                 else if (statsData is not null && IsEditorMetaStatsComboRow(label))
                     DrawEditorMetaComboDistributionField(bounds, statsData);
@@ -2709,7 +2825,7 @@ public sealed partial class Playfield
         if (!string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase))
         {
             var activeCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
-            var activeDifficultyEnabled = HasEditorDifficultyChart(activeCode) && IsEditorDifficultyEnabled(activeCode);
+            var activeDifficultyEnabled = HasEditorDifficultyChartKnown(activeCode) && IsEditorDifficultyEnabled(activeCode);
             var difficultyToggleBounds = GetEditorMetaDifficultyToggleBounds(virtualWidth, virtualHeight);
             DrawEditorMetaButton(difficultyToggleBounds,
                 $"{GetEditorDifficultyName(activeCode).ToUpperInvariant()} DIFFICULTY  {(activeDifficultyEnabled ? "ENABLED" : "DISABLED")}",

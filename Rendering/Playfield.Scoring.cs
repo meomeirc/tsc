@@ -18,8 +18,26 @@ public sealed partial class Playfield
 {
     // Score model and score/judgement point accounting.
 
+    private readonly record struct ScoreRouteKey(string Side, int Segment, string Bank);
+
+    private sealed class ScoreRouteKeyComparer : IEqualityComparer<ScoreRouteKey>
+    {
+        public static readonly ScoreRouteKeyComparer Instance = new();
+
+        public bool Equals(ScoreRouteKey x, ScoreRouteKey y) =>
+            x.Segment == y.Segment &&
+            string.Equals(x.Side, y.Side, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(x.Bank, y.Bank, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode(ScoreRouteKey value) => HashCode.Combine(
+            StringComparer.OrdinalIgnoreCase.GetHashCode(value.Side),
+            value.Segment,
+            StringComparer.OrdinalIgnoreCase.GetHashCode(value.Bank));
+    }
+
     private void BuildScoreModel()
     {
+        _scoreModelDirty = false;
         _scoreEntries.Clear();
         _scoreEventEntries.Clear();
         _scoreSuperFlickEntries.Clear();
@@ -113,82 +131,79 @@ public sealed partial class Playfield
         _scoreBoundaries["left"].AddRange(boundaries["left"]);
         _scoreBoundaries["right"].AddRange(boundaries["right"]);
 
-        var routeGroups = rawEntries
-            .Where(e => e.Kind != ScoreEntryKind.SuperFlick)
-            .GroupBy(e => (e.Side, Segment: FindScoreSegment(boundaries, e.Side, e.Tick), e.Bank))
-            .ToList();
+        // Build route weights in one pass. The previous implementation grouped the
+        // same entries twice (for score and accuracy), then repeatedly searched and
+        // summed those groups for every segment and every note. On large charts with
+        // many bank-switch segments this became quadratic and caused a long pause
+        // when preview playback rebuilt a deferred score model.
+        var routeWeights = new Dictionary<ScoreRouteKey, double>(ScoreRouteKeyComparer.Instance);
+        var accuracyRouteWeights = new Dictionary<ScoreRouteKey, double>(ScoreRouteKeyComparer.Instance);
+        var entrySegments = new int[rawEntries.Count];
+        var scoreSegments = new HashSet<(string Side, int Segment)>();
+        var authoredSuperFlickCount = 0;
+        var allSuperFlickCount = 0;
+        var authoredSuperFlickRawWeight = 0.0;
+        var allSuperFlickRawWeight = 0.0;
 
-        // Accuracy uses the same route segments as scoring. Normal notes and
-        // SuperFlicks have full judgement weight, while every hold tick —
-        // including the terminal/end checkpoint — uses the reduced hold-tick
-        // weight.
-        var accuracyRouteGroups = rawEntries
-            .Where(e => e.Kind != ScoreEntryKind.SuperFlick)
-            .GroupBy(e => (e.Side, Segment: FindScoreSegment(boundaries, e.Side, e.Tick), e.Bank))
-            .ToList();
-
-        // Every route inside a segment shares the same score budget. The budget
-        // is based on the chart's intended route, not whichever route happens to
-        // contain the most notes. That prevents the intended 1K path from losing
-        // score simply because the 3K fallback contains more note objects.
-        var segmentBudgets = new Dictionary<(string Side, int Segment), double>();
-        foreach (var group in routeGroups)
+        for (var i = 0; i < rawEntries.Count; i++)
         {
-            var key = (group.Key.Side, group.Key.Segment);
-            if (segmentBudgets.ContainsKey(key))
+            var entry = rawEntries[i];
+            if (entry.Kind == ScoreEntryKind.SuperFlick)
+            {
+                allSuperFlickCount++;
+                allSuperFlickRawWeight += entry.RawWeight;
+                if (entry.IsAuthoredRoute)
+                {
+                    authoredSuperFlickCount++;
+                    authoredSuperFlickRawWeight += entry.RawWeight;
+                }
                 continue;
+            }
 
-            var intendedBank = GetIntendedBankForScoreSegment(boundaries, group.Key.Side, group.Key.Segment);
-            var intendedGroup = routeGroups.FirstOrDefault(g =>
-                g.Key.Side.Equals(group.Key.Side, StringComparison.OrdinalIgnoreCase) &&
-                g.Key.Segment == group.Key.Segment &&
-                g.Key.Bank.Equals(intendedBank, StringComparison.OrdinalIgnoreCase));
-            segmentBudgets[key] = intendedGroup?.Sum(e => e.RawWeight) ?? 0.0;
+            var segment = FindScoreSegment(boundaries, entry.Side, entry.Tick);
+            entrySegments[i] = segment;
+            scoreSegments.Add((entry.Side, segment));
+
+            var routeKey = new ScoreRouteKey(entry.Side, segment, entry.Bank);
+            routeWeights[routeKey] = routeWeights.GetValueOrDefault(routeKey) + entry.RawWeight;
+            accuracyRouteWeights[routeKey] = accuracyRouteWeights.GetValueOrDefault(routeKey) +
+                GetRawAccuracyWeight(entry);
+        }
+
+        // Each side/segment has one intended bank. Resolve it once, then read the
+        // intended route's accumulated score and accuracy weights in O(1).
+        var segmentBudgets = new Dictionary<(string Side, int Segment), double>();
+        var accuracySegmentBudgets = new Dictionary<(string Side, int Segment), double>();
+        var intendedBanks = new Dictionary<(string Side, int Segment), string>();
+        foreach (var segmentKey in scoreSegments)
+        {
+            var intendedBank = GetIntendedBankForScoreSegment(
+                boundaries, segmentKey.Side, segmentKey.Segment);
+            intendedBanks[segmentKey] = intendedBank;
+            var intendedRouteKey = new ScoreRouteKey(
+                segmentKey.Side, segmentKey.Segment, intendedBank);
+            segmentBudgets[segmentKey] = routeWeights.GetValueOrDefault(intendedRouteKey);
+            accuracySegmentBudgets[segmentKey] = accuracyRouteWeights.GetValueOrDefault(intendedRouteKey);
         }
 
         _scoreSegmentBudgets.Clear();
         foreach (var pair in segmentBudgets)
             _scoreSegmentBudgets[pair.Key] = pair.Value;
 
-        // The intended route defines the fixed accuracy budget for each segment.
-        // Alternate routes are normalized into that same budget, exactly like
-        // score entries are normalized into the intended route's score budget.
-        var accuracySegmentBudgets = new Dictionary<(string Side, int Segment), double>();
-        foreach (var group in accuracyRouteGroups)
-        {
-            var key = (group.Key.Side, group.Key.Segment);
-            if (accuracySegmentBudgets.ContainsKey(key))
-                continue;
-
-            var intendedBank = GetIntendedBankForScoreSegment(boundaries, group.Key.Side, group.Key.Segment);
-            var intendedGroup = accuracyRouteGroups.FirstOrDefault(g =>
-                g.Key.Side.Equals(group.Key.Side, StringComparison.OrdinalIgnoreCase) &&
-                g.Key.Segment == group.Key.Segment &&
-                g.Key.Bank.Equals(intendedBank, StringComparison.OrdinalIgnoreCase));
-            accuracySegmentBudgets[key] = intendedGroup?.Sum(GetRawAccuracyWeight) ?? 0.0;
-        }
-
         // Alternative-bank SuperFlick entries exist so the editor can test those
         // paths, but they must not inflate the chart's intended-route score or
-        // accuracy budget. The selected preview route decides which one is hit.
-        _accuracyBudget = rawEntries.Count(e => e.Kind == ScoreEntryKind.SuperFlick && e.IsAuthoredRoute) +
-                          accuracySegmentBudgets.Values.Sum();
-
-        double totalRawBudget = rawEntries
-            .Where(e => e.Kind == ScoreEntryKind.SuperFlick && e.IsAuthoredRoute)
-            .Sum(e => e.RawWeight);
-        totalRawBudget += segmentBudgets.Values.Sum();
+        // accuracy budget.
+        _accuracyBudget = authoredSuperFlickCount + accuracySegmentBudgets.Values.Sum();
+        var totalRawBudget = authoredSuperFlickRawWeight + segmentBudgets.Values.Sum();
 
         // A chart made only of alternate-bank SuperFlicks can have no entries on
         // its default route. Keep those editor-only tests playable even in that
         // edge case by using their own weight as a temporary preview budget.
         if (_chartEditorMode && totalRawBudget <= 0.0)
         {
-            totalRawBudget = rawEntries
-                .Where(e => e.Kind == ScoreEntryKind.SuperFlick)
-                .Sum(e => e.RawWeight);
+            totalRawBudget = allSuperFlickRawWeight;
             if (_accuracyBudget <= 0.0)
-                _accuracyBudget = rawEntries.Count(e => e.Kind == ScoreEntryKind.SuperFlick);
+                _accuracyBudget = allSuperFlickCount;
         }
 
         if (totalRawBudget <= 0.0)
@@ -196,8 +211,9 @@ public sealed partial class Playfield
 
         var scorePerRawUnit = BaseScoreTarget / totalRawBudget;
 
-        foreach (var entry in rawEntries)
+        for (var i = 0; i < rawEntries.Count; i++)
         {
+            var entry = rawEntries[i];
             if (entry.Kind == ScoreEntryKind.SuperFlick)
             {
                 entry.BasePoints = entry.RawWeight * scorePerRawUnit;
@@ -207,22 +223,18 @@ public sealed partial class Playfield
                 continue;
             }
 
-            var segment = FindScoreSegment(boundaries, entry.Side, entry.Tick);
-            var budget = segmentBudgets.GetValueOrDefault((entry.Side, segment), 0.0);
-            var routeWeight = routeGroups
-                .FirstOrDefault(g => g.Key.Side == entry.Side && g.Key.Segment == segment &&
-                                     string.Equals(g.Key.Bank, entry.Bank, StringComparison.OrdinalIgnoreCase))?
-                .Sum(e => e.RawWeight) ?? 0.0;
+            var segment = entrySegments[i];
+            var segmentKey = (entry.Side, segment);
+            var routeKey = new ScoreRouteKey(entry.Side, segment, entry.Bank);
+            var budget = segmentBudgets.GetValueOrDefault(segmentKey);
+            var routeWeight = routeWeights.GetValueOrDefault(routeKey);
             if (budget > 0.0 && routeWeight > 0.0)
                 entry.BasePoints = entry.RawWeight * (budget / routeWeight) * scorePerRawUnit;
 
             if (entry.Kind is ScoreEntryKind.Event or ScoreEntryKind.HoldTick)
             {
-                var accuracyBudget = accuracySegmentBudgets.GetValueOrDefault((entry.Side, segment), 0.0);
-                var accuracyRouteWeight = accuracyRouteGroups
-                    .FirstOrDefault(g => g.Key.Side == entry.Side && g.Key.Segment == segment &&
-                                         string.Equals(g.Key.Bank, entry.Bank, StringComparison.OrdinalIgnoreCase))?
-                    .Sum(GetRawAccuracyWeight) ?? 0.0;
+                var accuracyBudget = accuracySegmentBudgets.GetValueOrDefault(segmentKey);
+                var accuracyRouteWeight = accuracyRouteWeights.GetValueOrDefault(routeKey);
                 if (accuracyBudget > 0.0 && accuracyRouteWeight > 0.0)
                 {
                     var normalization = accuracyBudget / accuracyRouteWeight;
@@ -230,7 +242,7 @@ public sealed partial class Playfield
                     // used by both the start and reserved completion of a long
                     // note, so keep it at the route normalization factor. A hold
                     // tick is a single weighted checkpoint and therefore carries
-                    // its reduced raw weight here.
+                    // the reduced raw weight here.
                     entry.AccuracyWeight = entry.Kind == ScoreEntryKind.HoldTick
                         ? HoldTickAccuracyWeight * normalization
                         : normalization;
@@ -256,8 +268,10 @@ public sealed partial class Playfield
                 continue;
             }
 
-            var segment = FindScoreSegment(boundaries, entry.Side, entry.Tick);
-            var intendedBank = GetIntendedBankForScoreSegment(boundaries, entry.Side, segment);
+            // ScoreEntry.Id is assigned from the rawEntries insertion index, so
+            // the segment computed during aggregation is still available here.
+            var segment = entrySegments[entry.Id];
+            var intendedBank = intendedBanks.GetValueOrDefault((entry.Side, segment), "Inactive");
             if (!string.Equals(entry.Bank, intendedBank, StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -390,33 +404,54 @@ public sealed partial class Playfield
         if (_chart is null || _gear is null)
             return result;
 
+        // AresLoader keeps chart.Events ordered by tick, track, and event index.
+        // Walk same-tick groups directly instead of allocating a filtered LINQ
+        // pipeline, sorting the list again, and grouping it a second time.
+        var events = _chart.Events;
         var state = _gear.Initial;
-        foreach (var tickGroup in _chart.Events
-                     .Where(e => e.IsSuperFlick && !(_chart.PlayTick > 0 && e.Tick > _chart.PlayTick))
-                     .OrderBy(e => e.Tick)
-                     .ThenBy(e => e.Track)
-                     .ThenBy(e => e.EventIndex)
-                     .GroupBy(e => e.Tick))
+        var index = 0;
+        while (index < events.Count)
         {
-            var before = state.Copy();
-            var applied = GearTimeline.ApplySuperFlickChangesForTick(state, tickGroup, tickGroup);
-            if (applied.Count == 0)
-                continue;
+            var tick = events[index].Tick;
+            var end = index + 1;
+            while (end < events.Count && events[end].Tick == tick)
+                end++;
 
-            foreach (var ev in applied)
+            List<ChartEvent>? tickSuperFlicks = null;
+            if (_chart.PlayTick <= 0 || tick <= _chart.PlayTick)
             {
-                var side = ev.GetSuperFlickSide();
-                if (side is null)
-                    continue;
-                var beforeBank = GearTimeline.ActiveBankForSide(before, side);
-                var afterBank = GearTimeline.ActiveBankForSide(state, side);
-                if (!string.Equals(beforeBank, afterBank, StringComparison.OrdinalIgnoreCase))
-                    result[side].Add(tickGroup.Key);
+                for (var i = index; i < end; i++)
+                {
+                    var ev = events[i];
+                    if (!ev.IsSuperFlick)
+                        continue;
+                    (tickSuperFlicks ??= new List<ChartEvent>()).Add(ev);
+                }
             }
-        }
 
-        foreach (var side in new[] { "left", "right" })
-            result[side] = result[side].Distinct().OrderBy(t => t).ToList();
+            if (tickSuperFlicks is { Count: > 0 })
+            {
+                var before = state.Copy();
+                var applied = GearTimeline.ApplySuperFlickChangesForTick(
+                    state, tickSuperFlicks, tickSuperFlicks);
+                foreach (var ev in applied)
+                {
+                    var side = ev.GetSuperFlickSide();
+                    if (side is null)
+                        continue;
+                    var beforeBank = GearTimeline.ActiveBankForSide(before, side);
+                    var afterBank = GearTimeline.ActiveBankForSide(state, side);
+                    if (!string.Equals(beforeBank, afterBank, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var sideBoundaries = result[side];
+                        if (sideBoundaries.Count == 0 || sideBoundaries[^1] != tick)
+                            sideBoundaries.Add(tick);
+                    }
+                }
+            }
+
+            index = end;
+        }
 
         return result;
     }

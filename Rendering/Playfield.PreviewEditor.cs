@@ -3780,8 +3780,8 @@ public sealed partial class Playfield
                 var names = normalizedField switch
                 {
                     "album" when _editorBundleTemplate == ChartBundleTemplate.Tsts => new[] { "cover.webp", "album.webp", "album.png", "album.jpg", "album.jpeg" },
-                    "album" when _editorBundleTemplate == ChartBundleTemplate.Tsc => new[] { "album.png", "album.webp", "album.jpg", "album.jpeg" },
-                    "album" => new[] { "album", "album.png", "album.webp", "album.jpg", "album.jpeg" },
+                    "album" when _editorBundleTemplate == ChartBundleTemplate.Tsc => new[] { "album.png", "album.webp", "album.jpg", "album.jpeg", "album.gif", "album.bmp" },
+                    "album" => new[] { "album", "album.png", "album.webp", "album.jpg", "album.jpeg", "album.gif", "album.bmp" },
                     "album_big" when _editorBundleTemplate == ChartBundleTemplate.Tsc => new[] { "album_big.png", "album_big.webp", "album_big.jpg", "album_big.jpeg" },
                     "album_big" => new[] { "album_big", "album_big.png", "album_big.webp", "album_big.jpg", "album_big.jpeg" },
                     _ => Array.Empty<string>()

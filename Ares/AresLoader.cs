@@ -923,6 +923,161 @@ public sealed class AresLoader
             track.Events.Sort((a, b) => a.Tick != b.Tick ? a.Tick.CompareTo(b.Tick) : a.EventIndex.CompareTo(b.EventIndex));
             chart.Events.AddRange(track.Events);
         }
-        chart.Events.Sort((a, b) => a.Tick != b.Tick ? a.Tick.CompareTo(b.Tick) : a.Track.CompareTo(b.Track));
+        chart.Events.Sort(CompareChartEvents);
+    }
+
+    // Normal editor note operations touch only a few events. Re-sorting every
+    // track and then sorting the flattened chart list is unnecessary in that
+    // case. Keep the track lists sorted, remove the changed references from the
+    // flat list in one pass, and insert their current versions with binary search.
+    internal static void FinalizeEventsIncremental(AresChart chart,
+        IReadOnlyCollection<ChartEvent> changedEvents,
+        IReadOnlyCollection<int>? affectedTrackIndices = null)
+    {
+        if (changedEvents.Count == 0)
+            return;
+
+        var changed = new HashSet<ChartEvent>(changedEvents);
+        var affectedLanes = affectedTrackIndices is null
+            ? chart.Tracks.Select(track => track.TrackIndex).ToHashSet()
+            : affectedTrackIndices.ToHashSet();
+        foreach (var ev in changed)
+            affectedLanes.Add(ev.Track);
+
+        var presentEvents = new HashSet<ChartEvent>();
+
+        // TrackIndex is a logical lane identifier, not a unique ChartTrack object
+        // identity. Some imported/legacy charts can contain multiple physical track
+        // containers with the same TrackIndex. FindTrack() sees only the first one;
+        // using it here can leave a stale copy in another container or miss a note
+        // stored there. Inspect all containers, record only membership in the event's
+        // current logical lane (so a deleted event cannot be resurrected from a stale
+        // foreign lane), and remove every changed reference from every container.
+        foreach (var track in chart.Tracks)
+        {
+            var containsChanged = false;
+            foreach (var ev in track.Events)
+            {
+                if (!changed.Contains(ev))
+                    continue;
+                containsChanged = true;
+                if (track.TrackIndex == ev.Track)
+                    presentEvents.Add(ev);
+            }
+
+            if (containsChanged)
+                affectedLanes.Add(track.TrackIndex);
+            track.Events.RemoveAll(changed.Contains);
+        }
+
+        // Merge duplicate physical containers only on lanes touched by this edit.
+        // This repairs legacy lanes where an event could be held by a secondary
+        // ChartTrack object that FindTrack() never returned. Keep event identity by
+        // reference so two distinct notes with identical values remain distinct.
+        var mergedLaneIndices = new HashSet<int>();
+        var mergedLaneEvents = new HashSet<ChartEvent>();
+        foreach (var laneIndex in affectedLanes)
+        {
+            var laneTracks = chart.Tracks.Where(track => track.TrackIndex == laneIndex).ToArray();
+            if (laneTracks.Length <= 1)
+                continue;
+
+            var canonical = laneTracks[0];
+            var laneEvents = new HashSet<ChartEvent>();
+            foreach (var laneTrack in laneTracks)
+                foreach (var ev in laneTrack.Events)
+                    if (laneEvents.Add(ev) && !canonical.Events.Contains(ev))
+                        canonical.Events.Add(ev);
+
+            for (var trackIndex = chart.Tracks.Count - 1; trackIndex >= 0; trackIndex--)
+            {
+                var candidate = chart.Tracks[trackIndex];
+                if (candidate.TrackIndex == laneIndex && !ReferenceEquals(candidate, canonical))
+                    chart.Tracks.RemoveAt(trackIndex);
+            }
+
+            canonical.Events.Sort(CompareTrackEvents);
+            mergedLaneIndices.Add(laneIndex);
+            foreach (var ev in laneEvents)
+                mergedLaneEvents.Add(ev);
+        }
+
+        // Reinsert each surviving changed event exactly once into its canonical
+        // destination container. A missing lane is created in lane order.
+        foreach (var ev in presentEvents)
+        {
+            var destination = chart.FindTrack(ev.Track);
+            if (destination is null)
+            {
+                destination = new ChartTrack { TrackIndex = ev.Track };
+                var trackInsertAt = chart.Tracks.FindIndex(track => track.TrackIndex > ev.Track);
+                if (trackInsertAt < 0) chart.Tracks.Add(destination);
+                else chart.Tracks.Insert(trackInsertAt, destination);
+            }
+
+            var low = 0;
+            var high = destination.Events.Count;
+            while (low < high)
+            {
+                var middle = low + ((high - low) / 2);
+                if (CompareTrackEvents(destination.Events[middle], ev) <= 0)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            destination.Events.Insert(low, ev);
+        }
+
+        // Keep the flattened chart list globally ordered without sorting the whole
+        // chart. Normally only changed references are replaced. If a touched lane
+        // had duplicate physical containers, rebuild just those lane entries too so
+        // events that were stranded in a secondary container become renderable.
+        if (mergedLaneIndices.Count == 0)
+        {
+            chart.Events.RemoveAll(changed.Contains);
+            foreach (var ev in presentEvents)
+                InsertChartEventSorted(chart.Events, ev);
+            return;
+        }
+
+        chart.Events.RemoveAll(ev => changed.Contains(ev) ||
+            mergedLaneIndices.Contains(ev.Track) || mergedLaneEvents.Contains(ev));
+        var flattenedEvents = new HashSet<ChartEvent>(mergedLaneEvents);
+        foreach (var ev in presentEvents)
+            flattenedEvents.Add(ev);
+        var sortedFlattenedEvents = flattenedEvents.ToList();
+        sortedFlattenedEvents.Sort(CompareChartEvents);
+        foreach (var ev in sortedFlattenedEvents)
+            InsertChartEventSorted(chart.Events, ev);
+    }
+
+    private static void InsertChartEventSorted(List<ChartEvent> events, ChartEvent ev)
+    {
+        var low = 0;
+        var high = events.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) / 2);
+            if (CompareChartEvents(events[middle], ev) <= 0)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+        events.Insert(low, ev);
+    }
+
+    private static int CompareTrackEvents(ChartEvent a, ChartEvent b)
+    {
+        var tick = a.Tick.CompareTo(b.Tick);
+        return tick != 0 ? tick : a.EventIndex.CompareTo(b.EventIndex);
+    }
+
+    private static int CompareChartEvents(ChartEvent a, ChartEvent b)
+    {
+        var tick = a.Tick.CompareTo(b.Tick);
+        if (tick != 0)
+            return tick;
+        var track = a.Track.CompareTo(b.Track);
+        return track != 0 ? track : a.EventIndex.CompareTo(b.EventIndex);
     }
 }

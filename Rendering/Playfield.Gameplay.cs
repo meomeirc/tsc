@@ -111,6 +111,7 @@ public sealed partial class Playfield
     private void ResetEditorTimelineRouteHistory(GearState? initialState)
     {
         _editorTimelineRouteHistory.Clear();
+        InvalidateEditorTimelineTraceEventCache();
         if (initialState is not null)
             _editorTimelineRouteHistory.Add((0.0, initialState.Copy()));
     }
@@ -135,6 +136,10 @@ public sealed partial class Playfield
         _editorTimelineTraceGear = _gear;
         _editorTimelineTraceTempo = _tempo;
         _editorTimelineTraceChart = _chart;
+        // The source list and its derived routes must advance together. The
+        // Info overlay displays this same preview, so never retain a stale route
+        // solely because the overlay is open.
+        _editorTimelineTraceUiCacheRoutes = null;
     }
 
     // When the editor playhead is moved, continue from the actual route at the
@@ -568,7 +573,69 @@ public sealed partial class Playfield
         return _tempo?.ScrollUnitsAtTick(tick) ?? tick;
     }
 
-    private void RebuildRenderEventCache()
+    private void AddEditorEventToTrackIndex(ChartEvent ev)
+    {
+        if (_editorEventTrackByReference.TryGetValue(ev, out var previousTrack))
+        {
+            if (previousTrack == ev.Track)
+                return;
+            if (_editorEventsByTrack.TryGetValue(previousTrack, out var previousEvents))
+            {
+                previousEvents.Remove(ev);
+                if (previousEvents.Count == 0)
+                    _editorEventsByTrack.Remove(previousTrack);
+            }
+        }
+
+        if (!_editorEventsByTrack.TryGetValue(ev.Track, out var events))
+            _editorEventsByTrack[ev.Track] = events = new HashSet<ChartEvent>();
+        events.Add(ev);
+        _editorEventTrackByReference[ev] = ev.Track;
+    }
+
+    private void RemoveEditorEventFromTrackIndex(ChartEvent ev)
+    {
+        if (!_editorEventTrackByReference.Remove(ev, out var previousTrack))
+            return;
+        if (!_editorEventsByTrack.TryGetValue(previousTrack, out var events))
+            return;
+        events.Remove(ev);
+        if (events.Count == 0)
+            _editorEventsByTrack.Remove(previousTrack);
+    }
+
+    private void RebuildEditorEventTrackIndex()
+    {
+        _editorEventsByTrack.Clear();
+        _editorEventTrackByReference.Clear();
+        if (_chart is null)
+            return;
+
+        // Track lists are authoritative for editor edits, while Chart.Events is
+        // the flattened render source. Index their union by object identity so a
+        // stale entry in either representation cannot make a note disappear.
+        foreach (var track in _chart.Tracks)
+            foreach (var ev in track.Events)
+                AddEditorEventToTrackIndex(ev);
+        foreach (var ev in _chart.Events)
+            AddEditorEventToTrackIndex(ev);
+    }
+
+    private void UpdateEditorEventTrackIndex(IEnumerable<ChartEvent> changedEvents)
+    {
+        if (_chart is null)
+            return;
+        foreach (var ev in changedEvents)
+        {
+            RemoveEditorEventFromTrackIndex(ev);
+            if (_chart.Tracks.Any(track => track.Events.Contains(ev)))
+                AddEditorEventToTrackIndex(ev);
+        }
+    }
+
+    private void RebuildRenderEventCache(bool rebuildAuxiliaryCaches = true,
+        bool rebuildLinkCaches = true, IReadOnlyCollection<int>? occupancyTrackIndices = null,
+        bool rebuildEditorIndexes = true, bool rebuildOccupancyIndex = true)
     {
         if (!_editorNoteGroupPlacementPreviewRendering)
             InvalidateEditorNoteGroupPlacementPreviewCache();
@@ -578,6 +645,8 @@ public sealed partial class Playfield
         _eventScrollUnits.Clear();
         _eventEffectiveEndSeconds.Clear();
         _eventEffectiveEndScrollUnits.Clear();
+        _orderedRenderableEventKeys.Clear();
+        _eventKeyByReference.Clear();
         _longEventEndScrollUnits.Clear();
         _longRenderableEventIndicesByEnd.Clear();
         _renderEventIndexScratch.Clear();
@@ -585,111 +654,134 @@ public sealed partial class Playfield
         _renderEventMarkStamp = 0;
         _eventSecondsByKey.Clear();
         _eventsByKey.Clear();
-        _editorPanelEventsByKey.Clear();
-        _editorPanelEventsByCell.Clear();
-        _editorPanelsNextEventIndexByTrack.Clear();
-        foreach (var occupancyBucket in _editorNoteOccupancyByTrack)
-            occupancyBucket.Clear();
-        _editorNoteOccupancyCacheChart = null;
-        _editorNoteOccupancyCacheValid = false;
-        _editorNoteOccupancyCacheGroupEditMode = false;
-        _editorNoteOccupancyCacheGroupId = null;
-        _editorNoteOccupancyCacheInstanceId = null;
+        if (rebuildEditorIndexes)
+        {
+            _editorPanelEventsByKey.Clear();
+            _editorPanelEventsByCell.Clear();
+            _editorPanelsNextEventIndexByTrack.Clear();
+        }
+        if (rebuildAuxiliaryCaches)
+        {
+            _bankChangingSuperFlicks.Clear();
+            _bankChangingSuperFlickTicks.Clear();
+            _editorTimelineTraceSuperFlicks.Clear();
+            _editorTimelineTraceGear = null;
+            _editorTimelineTraceTempo = null;
+            InvalidateEditorTimelineTraceEventCache();
+        }
+        if (rebuildOccupancyIndex && occupancyTrackIndices is null)
+        {
+            foreach (var occupancyBucket in _editorNoteOccupancyByTrack)
+                occupancyBucket.Clear();
+            _editorNoteOccupancyCacheChart = null;
+            _editorNoteOccupancyCacheValid = false;
+            _editorNoteOccupancyCacheGroupEditMode = false;
+            _editorNoteOccupancyCacheGroupId = null;
+            _editorNoteOccupancyCacheInstanceId = null;
+        }
         _cachedRenderRangeTick = double.NaN;
         _cachedRenderRangeFirst = 0;
         _cachedRenderRangeLast = 0;
 
-        _bankChangingSuperFlicks.Clear();
-        _bankChangingSuperFlickTicks.Clear();
-        _editorTimelineTraceSuperFlicks.Clear();
-        _editorTimelineTraceGear = null;
-        _editorTimelineTraceTempo = null;
-        _editorTimelineTraceChart = null;
-        _linkChainCache.Clear();
-        _linkChainEffectiveEndTickCache.Clear();
-        _linkChainRootByMember.Clear();
-        _editorLinkHoverChainCacheComplete = false;
+        if (rebuildLinkCaches)
+        {
+            _linkChainCache.Clear();
+            _linkChainEffectiveEndTickCache.Clear();
+            _linkChainRootByMember.Clear();
+            _editorLinkHoverChainCacheComplete = false;
+        }
 
         if (_chart is null || _tempo is null)
+        {
+            if (rebuildEditorIndexes)
+            {
+                _editorEventsByTrack.Clear();
+                _editorEventTrackByReference.Clear();
+            }
             return;
+        }
+
+        if (rebuildEditorIndexes)
+            RebuildEditorEventTrackIndex();
 
         // Panels view animation events are editor-authored notes on tracks 17–20.
         // Keep them out of the gameplay render list, while indexing them separately
         // so selection, copy, undo snapshots, and other editor actions recognize
         // that their references still belong to the open chart.
-        foreach (var panelEvent in _chart.Events)
+        if (rebuildEditorIndexes)
         {
-            if (IsEditorPanelAnimationEvent(panelEvent))
+            foreach (var panelEvent in _chart.Events)
             {
-                _editorPanelEventsByKey[KeyOf(panelEvent)] = panelEvent;
-                var cell = (panelEvent.Tick, panelEvent.Track);
-                if (!_editorPanelEventsByCell.ContainsKey(cell))
-                    _editorPanelEventsByCell[cell] = panelEvent;
+                if (IsEditorPanelAnimationEvent(panelEvent))
+                {
+                    _editorPanelEventsByKey[KeyOf(panelEvent)] = panelEvent;
+                    var cell = (panelEvent.Tick, panelEvent.Track);
+                    if (!_editorPanelEventsByCell.ContainsKey(cell))
+                        _editorPanelEventsByCell[cell] = panelEvent;
+                }
+            }
+
+            for (var panelTrackIndex = 17; panelTrackIndex <= 20; panelTrackIndex++)
+            {
+                var panelTrack = _chart.FindTrack(panelTrackIndex);
+                _editorPanelsNextEventIndexByTrack[panelTrackIndex] =
+                    (panelTrack?.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() ?? -1) + 1;
             }
         }
+        if (rebuildAuxiliaryCaches)
+            RebuildBankChangingSuperFlickCache();
 
-        for (var panelTrackIndex = 17; panelTrackIndex <= 20; panelTrackIndex++)
-        {
-            var panelTrack = _chart.FindTrack(panelTrackIndex);
-            _editorPanelsNextEventIndexByTrack[panelTrackIndex] =
-                (panelTrack?.Events.Select(ev => ev.EventIndex).DefaultIfEmpty(-1).Max() ?? -1) + 1;
-        }
-
-        RebuildBankChangingSuperFlickCache();
-
-        _orderedRenderableEvents.AddRange(_chart.Events
-            .Where(IsRenderableNoteEvent)
-            .OrderBy(e => e.Tick)
-            .ThenBy(e => e.Track)
-            .ThenBy(e => e.EventIndex));
+        var seenRenderableEvents = new HashSet<ChartEvent>();
+        foreach (var ev in _chart.Events)
+            if (IsRenderableNoteEvent(ev) && seenRenderableEvents.Add(ev))
+                _orderedRenderableEvents.Add(ev);
 
         if (_renderEventMarks.Length != _orderedRenderableEvents.Count)
             _renderEventMarks = new int[_orderedRenderableEvents.Count];
 
-        // Link adjacency is already rebuilt by LoadChartObject. Build the immutable
-        // chain lists once so DrawNotes/DrawLinkChainUnified never allocate a new
-        // List<ChartEvent> while a chart is playing.
-        foreach (var ev in _orderedRenderableEvents)
+        if (rebuildLinkCaches)
         {
-            if (ev.NoteType != NoteType.LinkHead)
-                continue;
-
-            var nodes = new List<ChartEvent>(8) { ev };
-            var visited = new HashSet<ChartEventKey> { KeyOf(ev) };
-            var current = ev;
-            var guard = 0;
-            while (guard++ < 256 && _nextLinkByHeadKey.TryGetValue(KeyOf(current), out var next))
+            // Build immutable chain lists only when the link graph changed.
+            foreach (var ev in _orderedRenderableEvents)
             {
-                var tail = next.Tail;
-                var tailKey = KeyOf(tail);
-                if (!visited.Add(tailKey))
-                    break;
-                nodes.Add(tail);
-                current = tail;
+                if (ev.NoteType != NoteType.LinkHead)
+                    continue;
+
+                var nodes = new List<ChartEvent>(8) { ev };
+                var visited = new HashSet<ChartEventKey> { KeyOf(ev) };
+                var current = ev;
+                var guard = 0;
+                while (guard++ < 256 && _nextLinkByHeadKey.TryGetValue(KeyOf(current), out var next))
+                {
+                    var tail = next.Tail;
+                    var tailKey = KeyOf(tail);
+                    if (!visited.Add(tailKey))
+                        break;
+                    nodes.Add(tail);
+                    current = tail;
+                }
+
+                var key = KeyOf(ev);
+                _linkChainCache[key] = nodes;
+                foreach (var node in nodes)
+                    _linkChainRootByMember[node] = ev;
+                var terminal = nodes[^1];
+                _linkChainEffectiveEndTickCache[key] = nodes.Count > 1
+                    ? (terminal.Duration > 6 ? terminal.EndTick : terminal.Tick)
+                    : (ev.Duration > 6 ? ev.EndTick : ev.Tick);
             }
 
-            var key = KeyOf(ev);
-            _linkChainCache[key] = nodes;
-            foreach (var node in nodes)
-                _linkChainRootByMember[node] = ev;
-            var terminal = nodes[^1];
-            _linkChainEffectiveEndTickCache[key] = nodes.Count > 1
-                ? (terminal.Duration > 6 ? terminal.EndTick : terminal.Tick)
-                : (ev.Duration > 6 ? ev.EndTick : ev.Tick);
+            var cachedLinkEdgeCount = 0;
+            foreach (var chain in _linkChainCache.Values)
+                cachedLinkEdgeCount += Math.Max(0, chain.Count - 1);
+            _editorLinkHoverChainCacheComplete =
+                cachedLinkEdgeCount == _chart.Links.Count && _ambiguousNextLinkHeadKeys.Count == 0;
         }
 
-        // The fast hover path can use cached root-to-tail chains only when they
-        // represent every authored link edge. Keep the full-edge fallback for
-        // branching, ambiguous, or orphaned link graphs.
-        var cachedLinkEdgeCount = 0;
-        foreach (var chain in _linkChainCache.Values)
-            cachedLinkEdgeCount += Math.Max(0, chain.Count - 1);
-        _editorLinkHoverChainCacheComplete =
-            cachedLinkEdgeCount == _chart.Links.Count && _ambiguousNextLinkHeadKeys.Count == 0;
-
-        // Build the per-track occupancy lookup after link adjacency and chain
-        // caches are ready, so link bodies receive their true connected endpoint.
-        RebuildEditorNoteOccupancyIndex();
+        // Rebuild only changed lane buckets for an ordinary note edit. All-track
+        // rebuilds remain the fallback for loads and chart-wide mutations.
+        if (rebuildOccupancyIndex)
+            RebuildEditorNoteOccupancyIndex(occupancyTrackIndices);
 
         for (var eventIndex = 0; eventIndex < _orderedRenderableEvents.Count; eventIndex++)
         {
@@ -698,8 +790,11 @@ public sealed partial class Playfield
             var startScrollUnits = GetEditorAwareScrollCoordinate(ev.Tick);
             _eventSeconds.Add(seconds);
             _eventScrollUnits.Add(startScrollUnits);
-            _eventSecondsByKey[KeyOf(ev)] = seconds;
-            _eventsByKey[KeyOf(ev)] = ev;
+            var eventKey = KeyOf(ev);
+            _orderedRenderableEventKeys.Add(eventKey);
+            _eventKeyByReference[ev] = eventKey;
+            _eventSecondsByKey[eventKey] = seconds;
+            _eventsByKey[eventKey] = ev;
 
             var effectiveEndTick = ev.Tick;
             if (ev.NoteType is NoteType.SingleLong or NoteType.Vibrato)
@@ -749,6 +844,455 @@ public sealed partial class Playfield
                 _longEventEndScrollUnits.Add(pair.EndScrollUnits);
             }
         }
+    }
+
+    private static int CompareRenderEventKeys(ChartEventKey left, ChartEventKey right)
+    {
+        var tick = left.Tick.CompareTo(right.Tick);
+        if (tick != 0)
+            return tick;
+        var track = left.Track.CompareTo(right.Track);
+        return track != 0 ? track : left.EventIndex.CompareTo(right.EventIndex);
+    }
+
+    private void EnsureEditorAddedEventIndexIsUnique(ChartEvent ev)
+    {
+        if (_chart is null)
+            return;
+
+        var track = _chart.FindTrack(ev.Track);
+        var hasCollision = (_editorEventsByTrack.TryGetValue(ev.Track, out var indexedEvents) &&
+            indexedEvents.Any(candidate => !ReferenceEquals(candidate, ev) && candidate.EventIndex == ev.EventIndex)) ||
+            (track?.Events.Any(candidate => !ReferenceEquals(candidate, ev) && candidate.EventIndex == ev.EventIndex) == true);
+        if (!hasCollision)
+            return;
+
+        var used = new HashSet<int>();
+        if (indexedEvents is not null)
+            foreach (var candidate in indexedEvents)
+                if (!ReferenceEquals(candidate, ev))
+                    used.Add(candidate.EventIndex);
+        if (track is not null)
+            foreach (var candidate in track.Events)
+                if (!ReferenceEquals(candidate, ev))
+                    used.Add(candidate.EventIndex);
+
+        var nextIndex = used.Count == 0 ? 0 : used.Max();
+        if (nextIndex < int.MaxValue)
+            nextIndex++;
+        else
+        {
+            nextIndex = 0;
+            while (used.Contains(nextIndex) && nextIndex < int.MaxValue)
+                nextIndex++;
+        }
+        while (used.Contains(nextIndex) ||
+               _eventsByKey.ContainsKey(new ChartEventKey(ev.Tick, ev.Track, nextIndex)))
+        {
+            if (nextIndex == int.MaxValue)
+                return;
+            nextIndex++;
+        }
+
+        ev.EventIndex = nextIndex;
+    }
+
+    // Point-note updates touch only one ordered render entry. The same helper is
+    // used by live dragging and by committed single-note edits; holds, links, and
+    // SuperFlicks keep the full specialized rebuild because their end/route data
+    // can affect other render entries.
+    private bool EnsureEditorPointNoteRenderKeyIsUnique(ChartEvent ev, bool forceFreshOrdinal = false)
+    {
+        if (_chart is null)
+            return false;
+
+        var track = _chart.FindTrack(ev.Track);
+        var hasTrackCollision = track?.Events.Any(candidate =>
+            !ReferenceEquals(candidate, ev) && candidate.EventIndex == ev.EventIndex) == true;
+        var hasIndexedTrackCollision = _editorEventsByTrack.TryGetValue(ev.Track, out var indexedTrackEvents) &&
+            indexedTrackEvents.Any(candidate =>
+                !ReferenceEquals(candidate, ev) && candidate.EventIndex == ev.EventIndex);
+        var hasPreviousTrackCollision = _editorEventTrackByReference.TryGetValue(ev, out var previousTrack) &&
+            _editorEventsByTrack.TryGetValue(previousTrack, out var previousTrackEvents) &&
+            previousTrackEvents.Any(candidate =>
+                !ReferenceEquals(candidate, ev) && candidate.EventIndex == ev.EventIndex);
+        var key = KeyOf(ev);
+        var hasCacheCollision = _eventsByKey.TryGetValue(key, out var cachedEvent) &&
+                                !ReferenceEquals(cachedEvent, ev);
+        var requiresChartWideOrdinal = forceFreshOrdinal || hasIndexedTrackCollision ||
+                                       hasPreviousTrackCollision || hasCacheCollision;
+        if (!requiresChartWideOrdinal && !hasTrackCollision)
+            return true;
+
+        // EventIndex is the per-track event identity used by ChartEventKey. A
+        // malformed/partially repaired track can contain a non-rendering event
+        // with the same index as a visible tap. Moving the visible tap would then
+        // overwrite the hidden event's dictionary entry and leave stale render
+        // slots behind. Give the moving event a fresh track-local index before
+        // it enters the cache. The edit snapshot still carries its original index
+        // for Undo.
+        // Use a chart-wide fresh ordinal only on the collision-repair path. This
+        // also avoids restoring the same corrupt old key if the drag is undone
+        // after leaving the source lane.
+        var usedIndices = new HashSet<int>();
+        if (requiresChartWideOrdinal)
+        {
+            foreach (var events in _editorEventsByTrack.Values)
+                foreach (var candidate in events)
+                    if (!ReferenceEquals(candidate, ev))
+                        usedIndices.Add(candidate.EventIndex);
+            foreach (var sourceTrack in _chart.Tracks)
+                foreach (var candidate in sourceTrack.Events)
+                    if (!ReferenceEquals(candidate, ev))
+                        usedIndices.Add(candidate.EventIndex);
+        }
+        else
+        {
+            if (_editorEventsByTrack.TryGetValue(ev.Track, out var indexedEvents))
+                foreach (var candidate in indexedEvents)
+                    if (!ReferenceEquals(candidate, ev))
+                        usedIndices.Add(candidate.EventIndex);
+            if (track is not null)
+                foreach (var candidate in track.Events)
+                    if (!ReferenceEquals(candidate, ev))
+                        usedIndices.Add(candidate.EventIndex);
+        }
+        var nextIndex = usedIndices.Count == 0 ? 0 : usedIndices.Max();
+        if (nextIndex < int.MaxValue)
+            nextIndex++;
+        else
+        {
+            nextIndex = 0;
+            while (usedIndices.Contains(nextIndex) && nextIndex < int.MaxValue)
+                nextIndex++;
+        }
+
+        while (usedIndices.Contains(nextIndex) ||
+               _eventsByKey.ContainsKey(new ChartEventKey(ev.Tick, ev.Track, nextIndex)))
+        {
+            if (nextIndex == int.MaxValue)
+                return false;
+            nextIndex++;
+        }
+
+        ev.EventIndex = nextIndex;
+        if (track?.Events.Contains(ev) == true)
+            track.Events.Sort((left, right) =>
+            {
+                var tick = left.Tick.CompareTo(right.Tick);
+                return tick != 0 ? tick : left.EventIndex.CompareTo(right.EventIndex);
+            });
+
+        // Keep the non-identity portion of the drag's pre-edit snapshot, but
+        // persist the repaired ordinal so Undo cannot resurrect the key collision.
+        if (_editorDragUndoSnapshot is { EventDeltaOnly: true } dragSnapshot)
+        {
+            var snapshotIndex = dragSnapshot.Events.FindIndex(state => ReferenceEquals(state.Event, ev));
+            if (snapshotIndex >= 0)
+                dragSnapshot.Events[snapshotIndex] = dragSnapshot.Events[snapshotIndex] with
+                {
+                    EventIndex = ev.EventIndex
+                };
+        }
+        return true;
+    }
+
+    private void RemoveEditorPointNoteRenderCacheEntryAt(int index)
+    {
+        var ev = _orderedRenderableEvents[index];
+        var key = _orderedRenderableEventKeys[index];
+        if (_eventsByKey.TryGetValue(key, out var mappedEvent) && ReferenceEquals(mappedEvent, ev))
+        {
+            _eventsByKey.Remove(key);
+            _eventSecondsByKey.Remove(key);
+        }
+        if (_eventKeyByReference.TryGetValue(ev, out var indexedKey) && indexedKey == key)
+            _eventKeyByReference.Remove(ev);
+
+        _orderedRenderableEvents.RemoveAt(index);
+        _orderedRenderableEventKeys.RemoveAt(index);
+        _eventSeconds.RemoveAt(index);
+        _eventScrollUnits.RemoveAt(index);
+        _eventEffectiveEndSeconds.RemoveAt(index);
+        _eventEffectiveEndScrollUnits.RemoveAt(index);
+
+        // Point notes are not in the long-body index. Keep the indexes of
+        // existing long notes aligned with the shifted render-event list.
+        for (var i = 0; i < _longRenderableEventIndicesByEnd.Count; i++)
+            if (_longRenderableEventIndicesByEnd[i] > index)
+                _longRenderableEventIndicesByEnd[i]--;
+    }
+
+    private void InsertEditorPointNoteRenderCacheEntry(ChartEvent ev)
+    {
+        var newKey = KeyOf(ev);
+        var low = 0;
+        var high = _orderedRenderableEventKeys.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) / 2);
+            if (CompareRenderEventKeys(_orderedRenderableEventKeys[middle], newKey) <= 0)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        var newIndex = low;
+        var seconds = _tempo!.TickToSeconds(ev.Tick);
+        var scrollUnits = GetEditorAwareScrollCoordinate(ev.Tick);
+        _orderedRenderableEvents.Insert(newIndex, ev);
+        _orderedRenderableEventKeys.Insert(newIndex, newKey);
+        _eventSeconds.Insert(newIndex, seconds);
+        _eventScrollUnits.Insert(newIndex, scrollUnits);
+        _eventEffectiveEndSeconds.Insert(newIndex, seconds);
+        _eventEffectiveEndScrollUnits.Insert(newIndex, scrollUnits);
+        _eventSecondsByKey[newKey] = seconds;
+        _eventsByKey[newKey] = ev;
+        _eventKeyByReference[ev] = newKey;
+        for (var i = 0; i < _longRenderableEventIndicesByEnd.Count; i++)
+            if (_longRenderableEventIndicesByEnd[i] >= newIndex)
+                _longRenderableEventIndicesByEnd[i]++;
+    }
+
+    // The render cache is stored in parallel arrays. Preview rendering and
+    // incremental edits must never index them unless every array is aligned.
+    // A mismatch is recoverable through RebuildRenderEventCache; return false
+    // before mutating any list so the caller can take that canonical path.
+    private bool AreEditorRenderEventCacheListsAligned()
+        => _orderedRenderableEvents.Count == _orderedRenderableEventKeys.Count &&
+           _orderedRenderableEvents.Count == _eventSeconds.Count &&
+           _orderedRenderableEvents.Count == _eventScrollUnits.Count &&
+           _orderedRenderableEvents.Count == _eventEffectiveEndSeconds.Count &&
+           _orderedRenderableEvents.Count == _eventEffectiveEndScrollUnits.Count &&
+           _longRenderableEventIndicesByEnd.Count == _longEventEndScrollUnits.Count;
+
+    // Reconcile every point note on the lanes touched by a committed edit from
+    // the authoritative track lists. This catches notes that were missing from
+    // the render cache before the edit, and removes duplicate/stale cache slots
+    // instead of trusting the old per-event key map to be complete.
+    private bool RebuildEditorPointNoteRenderCacheForTracks(
+        IReadOnlyCollection<int>? trackIndices,
+        IReadOnlyCollection<ChartEvent>? changedEvents = null)
+    {
+        if (_chart is null || _tempo is null || !AreEditorRenderEventCacheListsAligned())
+            return false;
+
+        var tracks = trackIndices is null
+            ? new HashSet<int>()
+            : trackIndices.ToHashSet();
+        if (changedEvents is not null)
+        {
+            foreach (var ev in changedEvents)
+            {
+                tracks.Add(ev.Track);
+                if (_eventKeyByReference.TryGetValue(ev, out var oldKey))
+                    tracks.Add(oldKey.Track);
+            }
+        }
+        if (tracks.Count == 0)
+            return false;
+
+        var expectedEvents = new HashSet<ChartEvent>();
+        foreach (var trackIndex in tracks)
+        {
+            if (!_editorEventsByTrack.TryGetValue(trackIndex, out var trackEvents))
+                continue;
+            foreach (var ev in trackEvents)
+            {
+                if (ev.Track == trackIndex && ev.NoteType == NoteType.Single && IsRenderableNoteEvent(ev))
+                    expectedEvents.Add(ev);
+            }
+        }
+
+        // Remove all old point-note cache entries on touched lanes, including
+        // duplicate references and references that no longer belong to the lane.
+        for (var index = _orderedRenderableEvents.Count - 1; index >= 0; index--)
+        {
+            var ev = _orderedRenderableEvents[index];
+            var cachedTrack = _orderedRenderableEventKeys[index].Track;
+            if (ev.NoteType == NoteType.Single &&
+                (tracks.Contains(ev.Track) || tracks.Contains(cachedTrack)))
+                RemoveEditorPointNoteRenderCacheEntryAt(index);
+        }
+
+        // A changed/deleted/moved event can have a stale map entry even when its
+        // render-list slot was already lost. Remove that mapping conditionally so
+        // another event that shares a corrupt key is never accidentally erased.
+        if (changedEvents is not null)
+        {
+            foreach (var ev in changedEvents)
+            {
+                if (!_eventKeyByReference.TryGetValue(ev, out var oldKey))
+                    continue;
+                if (_eventsByKey.TryGetValue(oldKey, out var mappedEvent) && ReferenceEquals(mappedEvent, ev))
+                {
+                    _eventsByKey.Remove(oldKey);
+                    _eventSecondsByKey.Remove(oldKey);
+                }
+                _eventKeyByReference.Remove(ev);
+            }
+        }
+
+        var sortedExpectedEvents = expectedEvents.ToList();
+        sortedExpectedEvents.Sort((left, right) =>
+            CompareRenderEventKeys(KeyOf(left), KeyOf(right)));
+        foreach (var ev in sortedExpectedEvents)
+        {
+            // If an unaffected event already owns this key, the track has a
+            // malformed EventIndex. Avoid silently overwriting that event's map.
+            if (_eventsByKey.TryGetValue(KeyOf(ev), out var collision) && !ReferenceEquals(collision, ev))
+                return false;
+            InsertEditorPointNoteRenderCacheEntry(ev);
+        }
+
+        foreach (var ev in expectedEvents)
+            if (!_eventKeyByReference.TryGetValue(ev, out var indexedKey) || indexedKey != KeyOf(ev) ||
+                !_eventsByKey.TryGetValue(indexedKey, out var indexedEvent) || !ReferenceEquals(indexedEvent, ev))
+                return false;
+
+        if (_renderEventMarks.Length != _orderedRenderableEvents.Count)
+        {
+            _renderEventMarks = new int[_orderedRenderableEvents.Count];
+            _renderEventMarkStamp = 0;
+        }
+        _cachedRenderRangeTick = double.NaN;
+        _cachedRenderRangeFirst = 0;
+        _cachedRenderRangeLast = 0;
+        return true;
+    }
+
+    // Point-note updates touch only one ordered render entry during live drag.
+    // Remove by object identity (not just the mutable key), so a stale/duplicate
+    // key cannot make us remove a neighbouring invisible event or leave clones.
+    private bool UpdateEditorPointNoteRenderCacheEntry(ChartEvent ev, bool shouldBePresent,
+        bool invalidateOccupancy)
+    {
+        if (_chart is null || _tempo is null || ev.NoteType != NoteType.Single || ev.IsSuperFlick ||
+            !AreEditorRenderEventCacheListsAligned())
+            return false;
+
+        var keysToSearch = new HashSet<ChartEventKey>();
+        if (_eventKeyByReference.TryGetValue(ev, out var oldKey))
+            keysToSearch.Add(oldKey);
+        keysToSearch.Add(KeyOf(ev));
+        var indexesToRemove = new List<int>();
+        var keyCollisionDetected = false;
+        foreach (var searchKey in keysToSearch)
+        {
+            var low = 0;
+            var high = _orderedRenderableEventKeys.Count;
+            while (low < high)
+            {
+                var middle = low + ((high - low) / 2);
+                if (CompareRenderEventKeys(_orderedRenderableEventKeys[middle], searchKey) < 0)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            var first = low;
+            low = first;
+            high = _orderedRenderableEventKeys.Count;
+            while (low < high)
+            {
+                var middle = low + ((high - low) / 2);
+                if (CompareRenderEventKeys(_orderedRenderableEventKeys[middle], searchKey) <= 0)
+                    low = middle + 1;
+                else
+                    high = middle;
+            }
+            for (var index = first; index < low; index++)
+            {
+                if (ReferenceEquals(_orderedRenderableEvents[index], ev))
+                    indexesToRemove.Add(index);
+                else
+                    keyCollisionDetected = true;
+            }
+        }
+
+        // A stale map can point at a key that no longer matches the mutable event,
+        // and an equal-key neighbour can be the invisible event that previously
+        // occupied this ordinal. In either case, scan by reference once to remove
+        // every copy of this exact object without touching the neighbouring note.
+        if (indexesToRemove.Count == 0 || indexesToRemove.Count > 1 || keyCollisionDetected)
+        {
+            indexesToRemove.Clear();
+            for (var index = 0; index < _orderedRenderableEvents.Count; index++)
+                if (ReferenceEquals(_orderedRenderableEvents[index], ev))
+                    indexesToRemove.Add(index);
+        }
+
+        indexesToRemove.Sort();
+        for (var i = indexesToRemove.Count - 1; i >= 0; i--)
+            RemoveEditorPointNoteRenderCacheEntryAt(indexesToRemove[i]);
+        _eventKeyByReference.Remove(ev);
+
+        if (shouldBePresent)
+        {
+            if (!IsRenderableNoteEvent(ev) ||
+                !EnsureEditorPointNoteRenderKeyIsUnique(ev, forceFreshOrdinal: keyCollisionDetected))
+                return false;
+
+            var newKey = KeyOf(ev);
+            if (_eventsByKey.TryGetValue(newKey, out var existing) && !ReferenceEquals(existing, ev))
+                return false;
+            InsertEditorPointNoteRenderCacheEntry(ev);
+        }
+
+        // The next BuildRenderEventIndexScratch call advances its stamp before
+        // reading marks and clears its scratch list itself. Resetting either array
+        // here made every live drag O(chart size) for no correctness benefit.
+        if (_renderEventMarks.Length != _orderedRenderableEvents.Count)
+        {
+            _renderEventMarks = new int[_orderedRenderableEvents.Count];
+            _renderEventMarkStamp = 0;
+        }
+        _cachedRenderRangeTick = double.NaN;
+        _cachedRenderRangeFirst = 0;
+        _cachedRenderRangeLast = 0;
+        if (invalidateOccupancy)
+            _editorNoteOccupancyCacheValid = false;
+        return true;
+    }
+
+    private bool IsEditorPointNoteRenderCacheEntryCurrent(ChartEvent ev, bool shouldBePresent)
+    {
+        if (!AreEditorRenderEventCacheListsAligned())
+            return false;
+        if (!shouldBePresent || !IsRenderableNoteEvent(ev))
+            return !_eventKeyByReference.ContainsKey(ev);
+
+        var key = KeyOf(ev);
+        if (!_eventKeyByReference.TryGetValue(ev, out var indexedKey) || indexedKey != key ||
+            !_eventsByKey.TryGetValue(key, out var indexedEvent) || !ReferenceEquals(indexedEvent, ev))
+            return false;
+
+        var low = 0;
+        var high = _orderedRenderableEventKeys.Count;
+        while (low < high)
+        {
+            var middle = low + ((high - low) / 2);
+            if (CompareRenderEventKeys(_orderedRenderableEventKeys[middle], key) < 0)
+                low = middle + 1;
+            else
+                high = middle;
+        }
+
+        return low < _orderedRenderableEventKeys.Count &&
+            _orderedRenderableEventKeys[low] == key &&
+            ReferenceEquals(_orderedRenderableEvents[low], ev);
+    }
+
+    private bool UpdateEditorDraggedPointNoteRenderCache(ChartEvent ev)
+    {
+        // Occupancy lookups are not used while the pointer is actively dragging.
+        // Keep the pre-drag buckets intact so the commit can patch the source and
+        // destination lanes once, instead of forcing a 16-lane rebuild on release.
+        var requestedKey = KeyOf(ev);
+        var updated = UpdateEditorPointNoteRenderCacheEntry(
+            ev, shouldBePresent: true, invalidateOccupancy: false);
+        if (updated && _selectedEventKey == requestedKey)
+            _selectedEventKey = KeyOf(ev);
+        return updated;
     }
 
     private void RebuildBankChangingSuperFlickCache()

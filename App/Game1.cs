@@ -6095,10 +6095,73 @@ public sealed class Game1 : Game
             if (!isBold)
             {
                 using var source = System.Drawing.Image.FromFile(dialog.FileName);
-                using var bitmap = new System.Drawing.Bitmap(source);
-                using var stream = new MemoryStream();
-                bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
-                bytes = stream.ToArray();
+                if (!isAlbumBig && source.Width > 0 && source.Height > 0 &&
+                    (source.Width > 1000 || source.Height > 1000))
+                {
+                    // Only resize the small album cover. Keep the source encoding:
+                    // converting a photographic JPEG to PNG can make it several
+                    // times larger even after reducing its pixel dimensions.
+                    var scale = Math.Min(1000.0 / source.Width, 1000.0 / source.Height);
+                    var targetWidth = Math.Clamp((int)Math.Round(source.Width * scale), 1, 1000);
+                    var targetHeight = Math.Clamp((int)Math.Round(source.Height * scale), 1, 1000);
+                    using var bitmap = new System.Drawing.Bitmap(targetWidth, targetHeight,
+                        System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                    using (var graphics = System.Drawing.Graphics.FromImage(bitmap))
+                    {
+                        graphics.CompositingMode = System.Drawing.Drawing2D.CompositingMode.SourceCopy;
+                        graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                        graphics.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                        graphics.DrawImage(source,
+                            new System.Drawing.Rectangle(0, 0, targetWidth, targetHeight),
+                            new System.Drawing.Rectangle(0, 0, source.Width, source.Height),
+                            System.Drawing.GraphicsUnit.Pixel);
+                    }
+
+                    using var stream = new MemoryStream();
+                    if (source.RawFormat.Guid == System.Drawing.Imaging.ImageFormat.Jpeg.Guid)
+                    {
+                        // Start at high quality, lowering it only if the resized
+                        // JPEG would still be larger than the original source file.
+                        var jpegEncoder = System.Drawing.Imaging.ImageCodecInfo.GetImageEncoders()
+                            .FirstOrDefault(codec => codec.FormatID == System.Drawing.Imaging.ImageFormat.Jpeg.Guid);
+                        if (jpegEncoder is null)
+                        {
+                            bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Jpeg);
+                        }
+                        else
+                        {
+                            foreach (var quality in new long[] { 90, 85, 80, 75, 70, 65 })
+                            {
+                                stream.SetLength(0);
+                                stream.Position = 0;
+                                using var encoderParameters = new System.Drawing.Imaging.EncoderParameters(1);
+                                encoderParameters.Param[0] = new System.Drawing.Imaging.EncoderParameter(
+                                    System.Drawing.Imaging.Encoder.Quality, quality);
+                                bitmap.Save(stream, jpegEncoder, encoderParameters);
+                                if (stream.Length < bytes.Length || quality == 65)
+                                    break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // PNG keeps alpha. Other large source formats are normalized
+                        // to PNG after resizing; small images are left byte-for-byte
+                        // untouched below.
+                        bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+                    }
+                    bytes = stream.ToArray();
+                }
+                else if (isAlbumBig)
+                {
+                    // Album Big retains its existing PNG conversion and full size.
+                    using var bitmap = new System.Drawing.Bitmap(source);
+                    using var stream = new MemoryStream();
+                    bitmap.Save(stream, System.Drawing.Imaging.ImageFormat.Png);
+                    bytes = stream.ToArray();
+                }
+                // A small regular album image is already within the limit. Keep its
+                // original bytes and encoding instead of needlessly re-encoding it.
             }
             _playfield.SetEditorAlbumArt(field, bytes, dialog.FileName);
             _errorMessage = null;

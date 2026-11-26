@@ -7,6 +7,39 @@ namespace TSC.Rendering;
 
 public sealed partial class Playfield
 {
+    private AresChart? _editorTimelineTraceUiCacheChart;
+    private GearTimeline? _editorTimelineTraceUiCacheGear;
+    private TempoMap? _editorTimelineTraceUiCacheTempo;
+    private long _editorTimelineTraceUiCacheRevision = -1;
+    private long _editorTimelineTraceUiCacheTimeKey = long.MinValue;
+    private int _editorTimelineTraceUiCacheHistoryCount = -1;
+    private int _editorTimelineTraceUiCacheHitCount = -1;
+    private int _editorTimelineTraceUiCacheMissCount = -1;
+    private int _editorTimelineTraceUiCacheResolvedCount = -1;
+    private int _editorTimelineTraceUiCacheScoredCount = -1;
+    private bool _editorTimelineTraceUiCacheLeftLocked;
+    private bool _editorTimelineTraceUiCacheRightLocked;
+    private GearState? _editorTimelineTraceUiCacheActiveState;
+    private (object Actual, object Intended, object Forecast)? _editorTimelineTraceUiCacheRoutes;
+    private readonly record struct EditorMetaUiRowsCacheKey(
+        AresChart Chart,
+        long Revision,
+        string Category,
+        IReadOnlyList<(string Label, string Value)> SourceRows,
+        string DifficultyCode,
+        bool DifficultyEnabled,
+        bool JudgementEnabled,
+        bool ElementDropdownOpen,
+        string Element);
+
+    private EditorMetaUiRowsCacheKey? _editorMetaUiRowsCacheKey;
+    private IReadOnlyList<object?>? _editorMetaUiRowsCache;
+
+    private static bool EditorTimelineTraceStatesEqual(GearState? left, GearState? right)
+        => left is not null && right is not null &&
+           left.Left == right.Left && left.Right == right.Right &&
+           left.CenterLeft == right.CenterLeft && left.CenterRight == right.CenterRight;
+
     private static Dictionary<string, object?> EditorUiItem(string id, string label, string action,
         object? value = null, bool selected = false, bool enabled = true, string kind = "button", bool toggle = false)
         => new()
@@ -37,15 +70,55 @@ public sealed partial class Playfield
             ["right"] = GetEditorTimelineTraceIndex(point.State, "right")
         }).ToList();
 
+    // Invalidate the chart's SuperFlick source list and its derived UI routes
+    // together. The Info overlay uses the same live timeline preview as the rest
+    // of the editor, so edits and route-state changes must be visible immediately
+    // (subject only to the normal playback refresh throttle).
+    private void InvalidateEditorTimelineTraceEventCache()
+    {
+        _editorTimelineTraceChart = null;
+        _editorTimelineTraceUiCacheRoutes = null;
+    }
+
     private (object Actual, object Intended, object Forecast) BuildEditorTimelineTraceRoutes(double playSeconds)
     {
         var duration = Math.Max(0, ChartDuration());
         playSeconds = Math.Clamp(double.IsFinite(playSeconds) ? playSeconds : 0, 0, duration);
         var activeState = _editorPreviewGearState?.Copy() ?? _gear?.AtTick(0) ?? new GearState();
-        var historyCount = 0;
-        while (historyCount < _editorTimelineRouteHistory.Count &&
-               _editorTimelineRouteHistory[historyCount].Seconds <= playSeconds + 0.0001)
-            historyCount++;
+        EnsureEditorTimelineTraceCache();
+        var historyLow = 0;
+        var historyHigh = _editorTimelineRouteHistory.Count;
+        while (historyLow < historyHigh)
+        {
+            var middle = historyLow + ((historyHigh - historyLow) >> 1);
+            if (_editorTimelineRouteHistory[middle].Seconds <= playSeconds + 0.0001)
+                historyLow = middle + 1;
+            else
+                historyHigh = middle;
+        }
+        var historyCount = historyLow;
+        // Timeline route overlays are visual guidance, not gameplay state. Refresh
+        // them at 30 Hz during playback instead of rebuilding/copying every route
+        // for every render frame. While paused, the exact playhead position remains
+        // part of the key so scrubbing is reflected immediately.
+        var timeKey = _playing
+            ? (long)Math.Floor(playSeconds * 30.0)
+            : BitConverter.DoubleToInt64Bits(playSeconds);
+        if (_editorTimelineTraceUiCacheRoutes is { } cachedRoutes &&
+            ReferenceEquals(_editorTimelineTraceUiCacheChart, _chart) &&
+            ReferenceEquals(_editorTimelineTraceUiCacheGear, _gear) &&
+            ReferenceEquals(_editorTimelineTraceUiCacheTempo, _tempo) &&
+            _editorTimelineTraceUiCacheRevision == _editorRecoveryRevision &&
+            _editorTimelineTraceUiCacheTimeKey == timeKey &&
+            _editorTimelineTraceUiCacheHistoryCount == historyCount &&
+            _editorTimelineTraceUiCacheHitCount == _hitEvents.Count &&
+            _editorTimelineTraceUiCacheMissCount == _missedEvents.Count &&
+            _editorTimelineTraceUiCacheResolvedCount == _resolvedSuperFlicks.Count &&
+            _editorTimelineTraceUiCacheScoredCount == _scoredEntryIds.Count &&
+            _editorTimelineTraceUiCacheLeftLocked == _editorPreviewLeftBankLocked &&
+            _editorTimelineTraceUiCacheRightLocked == _editorPreviewRightBankLocked &&
+            EditorTimelineTraceStatesEqual(_editorTimelineTraceUiCacheActiveState, activeState))
+            return cachedRoutes;
 
         var actualRoute = _editorTimelineRouteHistory.Take(historyCount)
             .Select(point => (Seconds: point.Seconds, State: point.State.Copy())).ToList();
@@ -59,7 +132,6 @@ public sealed partial class Playfield
         var intendedRoute = new List<(double Seconds, GearState State)>();
         var intendedState = _gear?.Initial.Copy() ?? activeState.Copy();
         intendedRoute.Add((0.0, intendedState.Copy()));
-        EnsureEditorTimelineTraceCache();
         if (_gear is not null && _tempo is not null)
         {
             foreach (var group in _editorTimelineTraceSuperFlicks.GroupBy(ev => ev.Tick))
@@ -77,7 +149,20 @@ public sealed partial class Playfield
         if (_gear is not null && _tempo is not null)
         {
             var forecastState = activeState.Copy();
-            var eventIndex = 0;
+            // SuperFlicks are sorted by tick. Skip the already-passed prefix with
+            // a binary search rather than walking the whole chart on every frame.
+            var eventLow = 0;
+            var eventHigh = _editorTimelineTraceSuperFlicks.Count;
+            while (eventLow < eventHigh)
+            {
+                var middle = eventLow + ((eventHigh - eventLow) >> 1);
+                var transitionSeconds = _tempo.TickToSeconds(_editorTimelineTraceSuperFlicks[middle].Tick);
+                if (transitionSeconds <= playSeconds + 0.0001)
+                    eventLow = middle + 1;
+                else
+                    eventHigh = middle;
+            }
+            var eventIndex = eventLow;
             while (eventIndex < _editorTimelineTraceSuperFlicks.Count)
             {
                 var tick = _editorTimelineTraceSuperFlicks[eventIndex].Tick;
@@ -115,8 +200,24 @@ public sealed partial class Playfield
             }
         }
 
-        return (ToEditorTimelineTraceData(actualRoute), ToEditorTimelineTraceData(intendedRoute),
-            ToEditorTimelineTraceData(forecastRoute));
+        var routes = (Actual: ToEditorTimelineTraceData(actualRoute),
+            Intended: ToEditorTimelineTraceData(intendedRoute),
+            Forecast: ToEditorTimelineTraceData(forecastRoute));
+        _editorTimelineTraceUiCacheRoutes = routes;
+        _editorTimelineTraceUiCacheChart = _chart;
+        _editorTimelineTraceUiCacheGear = _gear;
+        _editorTimelineTraceUiCacheTempo = _tempo;
+        _editorTimelineTraceUiCacheRevision = _editorRecoveryRevision;
+        _editorTimelineTraceUiCacheTimeKey = timeKey;
+        _editorTimelineTraceUiCacheHistoryCount = historyCount;
+        _editorTimelineTraceUiCacheHitCount = _hitEvents.Count;
+        _editorTimelineTraceUiCacheMissCount = _missedEvents.Count;
+        _editorTimelineTraceUiCacheResolvedCount = _resolvedSuperFlicks.Count;
+        _editorTimelineTraceUiCacheScoredCount = _scoredEntryIds.Count;
+        _editorTimelineTraceUiCacheLeftLocked = _editorPreviewLeftBankLocked;
+        _editorTimelineTraceUiCacheRightLocked = _editorPreviewRightBankLocked;
+        _editorTimelineTraceUiCacheActiveState = activeState.Copy();
+        return routes;
     }
 
     private (double CaretOffset, double SelectionOffset, double SelectionWidth, double TextWidth) GetEditorTextFieldMetrics(
@@ -224,7 +325,6 @@ public sealed partial class Playfield
 
     private Dictionary<string, object?> BuildChartEditorInterfaceState(int width, int height)
     {
-        RefreshEditorDiagnostics();
         var rightActions = new List<object?>();
         foreach (var id in GetVisibleEditorActionIds())
         {
@@ -383,14 +483,18 @@ public sealed partial class Playfield
             (object?)EditorUiItem($"metro_{index}", GetEditorMetronomeLabel(divisor), "editor.metronome", divisor, divisor == _editorMetronomeDivisor)).ToList();
 
         var problems = new List<object?>();
-        var errorCount = _editorProblemErrorCount;
-        var warningCount = _editorProblemWarningCount;
+        var diagnosticsReady = !_editorDiagnosticsDirty && ReferenceEquals(_editorDiagnosticsChart, _chart);
+        var errorCount = diagnosticsReady ? _editorProblemErrorCount : 0;
+        var warningCount = diagnosticsReady ? _editorProblemWarningCount : 0;
+        var problemCount = diagnosticsReady ? _editorProblems.Count : 0;
         var problemWindowRows = GetEditorProblemsScrollWindowRows(width, height);
-        var problemStart = _editorProblemsExpanded
+        var problemStart = diagnosticsReady && _editorProblemsExpanded
             ? Math.Clamp(GetEditorProblemsScrollFirstRow(width, height), 0,
-                Math.Max(0, _editorProblems.Count - problemWindowRows))
+                Math.Max(0, problemCount - problemWindowRows))
             : 0;
-        var problemEnd = Math.Min(_editorProblems.Count, problemStart + problemWindowRows + 1);
+        var problemEnd = diagnosticsReady && _editorProblemsExpanded
+            ? Math.Min(problemCount, problemStart + problemWindowRows + 1)
+            : 0;
         for (var i = problemStart; i < problemEnd; i++)
         {
             var issue = _editorProblems[i];
@@ -408,10 +512,15 @@ public sealed partial class Playfield
         // Do not build any of it while the panel is closed.
         var metaPanelOpen = _editorMetaPanelOpen;
         var activeDifficultyCode = _editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName);
-        var metaDifficultyHasChart = metaPanelOpen && HasEditorDifficultyChart(activeDifficultyCode);
+        var metaDifficultyHasChart = metaPanelOpen && HasEditorDifficultyChartKnown(activeDifficultyCode);
+        // STATS performs a chart-wide, route-aware analysis. Reuse its last
+        // completed snapshot during playback, including after edits. If this
+        // chart has never had Stats opened, the first request builds one snapshot
+        // so the tab is never replaced by an empty/paused-only placeholder; later
+        // frames reuse the cached result rather than repeating route lookups.
         var metaStats = metaPanelOpen &&
                         string.Equals(_editorMetaCategory, "STATS", StringComparison.OrdinalIgnoreCase) && _chart is not null
-            ? GetEditorMetaStatsData()
+            ? GetEditorMetaStatsDataForUi()
             : null;
         IReadOnlyList<(string Label, string Value)> rows = metaPanelOpen
             ? GetEditorMetaRows(currentTick, metaStats, metaDifficultyHasChart)
@@ -430,150 +539,187 @@ public sealed partial class Playfield
             EditorStutterInputField.FastTimeBeats => 6,
             _ => -1
         };
-        IReadOnlyList<EditorMetaRowLayout> metaRowLayouts = metaPanelOpen
+        // The Lua renderer owns variable-height text layout for normal metadata
+        // categories and already caches those layouts per row. Recomputing the same
+        // wraps/measured line counts in C# on the first INFO frame duplicated the
+        // most expensive part of opening the panel. Keep C# layout only for the
+        // fixed MEDIA/TEST pages and the native fallback renderer.
+        var luaOwnsMetaLayout = _chartEditorInterfaceRuntime.IsLoaded &&
+            _chartEditorInterfaceRuntime.LastError is null &&
+            !string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(_editorMetaCategory, "TEST", StringComparison.OrdinalIgnoreCase);
+        IReadOnlyList<EditorMetaRowLayout> metaRowLayouts = metaPanelOpen && !luaOwnsMetaLayout
             ? GetEditorMetaRowLayouts(rows, width, height)
             : Array.Empty<EditorMetaRowLayout>();
-        var metaVisibleRows = metaPanelOpen
+        var metaVisibleRows = metaPanelOpen && metaRowLayouts.Count > 0
             ? GetEditorMetaVisibleRowCount(metaRowLayouts, width, height)
             : 0;
-        var metaScrollMaximum = metaPanelOpen
+        var metaScrollMaximum = metaPanelOpen && !luaOwnsMetaLayout
             ? GetEditorMetaMaxScrollOffset(metaRowLayouts, width, height)
             : 0.0;
-        IReadOnlyList<object?> metaRows = rows.Select((row, index) =>
+        var canCacheMetaUiRows = metaPanelOpen &&
+            _editorMetaEditingField is null && !_editorMetaBbCodeStripOpen && _chart is not null;
+        var metaUiRowsCacheKey = canCacheMetaUiRows
+            ? new EditorMetaUiRowsCacheKey(
+                _chart!, _editorRecoveryRevision, _editorMetaCategory, rows,
+                activeDifficultyCode, IsEditorDifficultyEnabled(activeDifficultyCode),
+                _editorCustomJudgementWindowsEnabled, _editorElementDropdownOpen,
+                _chart!.Element ?? string.Empty)
+            : (EditorMetaUiRowsCacheKey?)null;
+        IReadOnlyList<object?> metaRows;
+        if (canCacheMetaUiRows && _editorMetaUiRowsCacheKey == metaUiRowsCacheKey &&
+            _editorMetaUiRowsCache is not null)
         {
-            var fieldKey = GetEditorMetaFieldKey(row.Label);
-            var editing = fieldKey is not null &&
-                string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase);
-            var value = editing ? _editorMetaInputText : row.Value;
-            var kind = fieldKey is not null ? "text" : row.Label switch
+            metaRows = _editorMetaUiRowsCache;
+        }
+        else
+        {
+            metaRows = rows.Select((row, index) =>
             {
-                "ELEMENT" or "CUSTOM JUDGEMENT WINDOWS" => "toggle",
-                "DELETE DIFFICULTY" => "danger",
-                "MUSIC" => "picker",
-                _ => "readonly"
-            };
-            var selected = row.Label switch
-            {
-                "ELEMENT" => _editorElementDropdownOpen,
-                "DIFFICULTY" => IsEditorDifficultyEnabled(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)),
-                "CUSTOM JUDGEMENT WINDOWS" => _editorCustomJudgementWindowsEnabled,
-                _ => false
-            };
-            var item = new Dictionary<string, object?>
-            {
-                ["label"] = row.Label,
-                ["value"] = value,
-                ["index"] = index,
-                ["kind"] = kind,
-                ["editable"] = fieldKey is not null,
-                ["editing"] = editing,
-                ["selected"] = selected,
-                ["user_text"] = BbCodeTextRenderer.IsSupportedMetadataField(fieldKey),
-                ["bbcode_strip_open"] = editing &&
-                    _editorMetaBbCodeStripOpen &&
-                    BbCodeTextRenderer.IsSupportedMetadataField(fieldKey) &&
-                    string.Equals(_editorMetaBbCodeStripField, fieldKey, StringComparison.OrdinalIgnoreCase)
-            };
-            if (metaStats is not null && IsEditorMetaStatsBankHeaderRow(row.Label))
-            {
-                item["stats_kind"] = "bank_header";
-                item["stats_columns"] = new object?[]
+                var fieldKey = GetEditorMetaFieldKey(row.Label);
+                var editing = fieldKey is not null &&
+                    string.Equals(fieldKey, _editorMetaEditingField, StringComparison.OrdinalIgnoreCase);
+                var value = editing ? _editorMetaInputText : row.Value;
+                var kind = fieldKey is not null ? "text" : row.Label switch
                 {
-                    new Dictionary<string, object?> { ["label"] = "1K" },
-                    new Dictionary<string, object?> { ["label"] = "2K" },
-                    new Dictionary<string, object?> { ["label"] = "3K" }
+                    "ELEMENT" or "CUSTOM JUDGEMENT WINDOWS" => "toggle",
+                    "DELETE DIFFICULTY" => "danger",
+                    "MUSIC" => "picker",
+                    _ => "readonly"
                 };
-            }
-            else if (metaStats is not null && IsEditorMetaStatsBankRow(row.Label))
-            {
-                string[] statsValues = row.Label switch
+                var selected = row.Label switch
                 {
-                    "NOTES" => new[] { metaStats.Notes.OneK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Notes.TwoK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Notes.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
-                    "TAP" => new[] { metaStats.Taps.OneK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Taps.TwoK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Taps.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
-                    "HOLD" => new[] { metaStats.Holds.OneK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Holds.TwoK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Holds.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
-                    "VIBRATO" => new[] { metaStats.Vibratos.OneK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Vibratos.TwoK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Vibratos.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
-                    "LINK SEGMENTS / POINTS" => new[]
+                    "ELEMENT" => _editorElementDropdownOpen,
+                    "DIFFICULTY" => IsEditorDifficultyEnabled(_editorActiveDifficultyCode ?? GetEditorDifficultyCode(_chart?.Difficulty, _sourceName)),
+                    "CUSTOM JUDGEMENT WINDOWS" => _editorCustomJudgementWindowsEnabled,
+                    _ => false
+                };
+                var item = new Dictionary<string, object?>
+                {
+                    ["label"] = row.Label,
+                    ["value"] = value,
+                    ["index"] = index,
+                    ["kind"] = kind,
+                    ["editable"] = fieldKey is not null,
+                    ["editing"] = editing,
+                    ["selected"] = selected,
+                    ["user_text"] = BbCodeTextRenderer.IsSupportedMetadataField(fieldKey),
+                    ["bbcode_strip_open"] = editing &&
+                        _editorMetaBbCodeStripOpen &&
+                        BbCodeTextRenderer.IsSupportedMetadataField(fieldKey) &&
+                        string.Equals(_editorMetaBbCodeStripField, fieldKey, StringComparison.OrdinalIgnoreCase)
+                };
+                if (metaStats is not null && IsEditorMetaStatsBankHeaderRow(row.Label))
+                {
+                    item["stats_kind"] = "bank_header";
+                    item["stats_columns"] = new object?[]
                     {
-                        $"{metaStats.LinkSegments.OneK:N0} / {metaStats.LinkPoints.OneK:N0}",
-                        $"{metaStats.LinkSegments.TwoK:N0} / {metaStats.LinkPoints.TwoK:N0}",
-                        $"{metaStats.LinkSegments.ThreeK:N0} / {metaStats.LinkPoints.ThreeK:N0}"
-                    },
-                    "FLICK" => new[] { metaStats.Flicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Flicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.Flicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
-                    "SUPERFLICK" => new[] { metaStats.SuperFlicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.SuperFlicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
-                        metaStats.SuperFlicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
-                    _ => new[] { "0", "0", "0" }
-                };
-                item["stats_kind"] = "bank";
-                item["stats_columns"] = new object?[]
+                        new Dictionary<string, object?> { ["label"] = "1K" },
+                        new Dictionary<string, object?> { ["label"] = "2K" },
+                        new Dictionary<string, object?> { ["label"] = "3K" }
+                    };
+                }
+                else if (metaStats is not null && IsEditorMetaStatsBankRow(row.Label))
                 {
-                    new Dictionary<string, object?> { ["value"] = statsValues[0] },
-                    new Dictionary<string, object?> { ["value"] = statsValues[1] },
-                    new Dictionary<string, object?> { ["value"] = statsValues[2] }
-                };
-            }
-            else if (metaStats is not null && IsEditorMetaStatsComboRow(row.Label))
+                    string[] statsValues = row.Label switch
+                    {
+                        "NOTES" => new[] { metaStats.Notes.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Notes.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Notes.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                        "TAP" => new[] { metaStats.Taps.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Taps.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Taps.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                        "HOLD" => new[] { metaStats.Holds.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Holds.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Holds.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                        "VIBRATO" => new[] { metaStats.Vibratos.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Vibratos.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Vibratos.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                        "LINK SEGMENTS / POINTS" => new[]
+                        {
+                            $"{metaStats.LinkSegments.OneK:N0} / {metaStats.LinkPoints.OneK:N0}",
+                            $"{metaStats.LinkSegments.TwoK:N0} / {metaStats.LinkPoints.TwoK:N0}",
+                            $"{metaStats.LinkSegments.ThreeK:N0} / {metaStats.LinkPoints.ThreeK:N0}"
+                        },
+                        "FLICK" => new[] { metaStats.Flicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Flicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.Flicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                        "SUPERFLICK" => new[] { metaStats.SuperFlicks.OneK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.SuperFlicks.TwoK.ToString("N0", CultureInfo.InvariantCulture),
+                            metaStats.SuperFlicks.ThreeK.ToString("N0", CultureInfo.InvariantCulture) },
+                        _ => new[] { "0", "0", "0" }
+                    };
+                    item["stats_kind"] = "bank";
+                    item["stats_columns"] = new object?[]
+                    {
+                        new Dictionary<string, object?> { ["value"] = statsValues[0] },
+                        new Dictionary<string, object?> { ["value"] = statsValues[1] },
+                        new Dictionary<string, object?> { ["value"] = statsValues[2] }
+                    };
+                }
+                else if (metaStats is not null && IsEditorMetaStatsComboRow(row.Label))
+                {
+                    item["stats_kind"] = "combo";
+                    item["combo_total"] = metaStats.ComboTotal;
+                    item["combo_items"] = new object?[]
+                    {
+                        new Dictionary<string, object?> { ["label"] = "TAP", ["count"] = metaStats.ComboTaps },
+                        new Dictionary<string, object?> { ["label"] = "HOLD", ["count"] = metaStats.ComboHolds },
+                        new Dictionary<string, object?> { ["label"] = "VIBRATO", ["count"] = metaStats.ComboVibratos },
+                        new Dictionary<string, object?> { ["label"] = "LINK", ["count"] = metaStats.ComboLinks },
+                        new Dictionary<string, object?> { ["label"] = "FLICK", ["count"] = metaStats.ComboFlicks },
+                        new Dictionary<string, object?> { ["label"] = "SUPERFLICK", ["count"] = metaStats.ComboSuperFlicks }
+                    };
+                }
+                if (row.Label == "ELEMENT")
+                {
+                    // The element picker is a neutral control; show the current element
+                    // color only as its side accent, including while the list is open.
+                    var element = (_chart?.Element ?? string.Empty).Trim().ToUpperInvariant();
+                    item["variant"] = "secondary";
+                    item["element_color"] = element switch
+                    {
+                        "DANCER" => "#F87171",
+                        "VOCAL" => "#60A5FA",
+                        "SESSION" => "#34D399",
+                        _ => "#6B7280"
+                    };
+                    item["element_hover_color"] = element switch
+                    {
+                        "DANCER" => "#FDA4AF",
+                        "VOCAL" => "#93C5FD",
+                        "SESSION" => "#6EE7B7",
+                        _ => "#9CA3AF"
+                    };
+                }
+                if (editing)
+                {
+                    var caretIndex = Math.Clamp(_editorMetaInputCaretIndex, 0, value.Length);
+                    var anchorIndex = Math.Clamp(_editorMetaSelectionAnchor, 0, value.Length);
+                    var metrics = GetEditorTextFieldMetrics(value, caretIndex, anchorIndex);
+                    item["caret_offset"] = metrics.CaretOffset;
+                    item["selection_offset"] = metrics.SelectionOffset;
+                    item["selection_width"] = metrics.SelectionWidth;
+                    item["text_width"] = metrics.TextWidth;
+                    // Lua works with UTF-8 byte offsets. Providing byte indices lets a
+                    // wrapped active field place its caret and selection on the correct
+                    // line rather than treating the whole value as one horizontal line.
+                    item["caret_byte_index"] = System.Text.Encoding.UTF8.GetByteCount(value[..caretIndex]);
+                    item["anchor_byte_index"] = System.Text.Encoding.UTF8.GetByteCount(value[..anchorIndex]);
+                }
+                return (object?)item;
+            }).ToList();
+            if (canCacheMetaUiRows)
             {
-                item["stats_kind"] = "combo";
-                item["combo_total"] = metaStats.ComboTotal;
-                item["combo_items"] = new object?[]
-                {
-                    new Dictionary<string, object?> { ["label"] = "TAP", ["count"] = metaStats.ComboTaps },
-                    new Dictionary<string, object?> { ["label"] = "HOLD", ["count"] = metaStats.ComboHolds },
-                    new Dictionary<string, object?> { ["label"] = "VIBRATO", ["count"] = metaStats.ComboVibratos },
-                    new Dictionary<string, object?> { ["label"] = "LINK", ["count"] = metaStats.ComboLinks },
-                    new Dictionary<string, object?> { ["label"] = "FLICK", ["count"] = metaStats.ComboFlicks },
-                    new Dictionary<string, object?> { ["label"] = "SUPERFLICK", ["count"] = metaStats.ComboSuperFlicks }
-                };
+                _editorMetaUiRowsCacheKey = metaUiRowsCacheKey;
+                _editorMetaUiRowsCache = metaRows;
             }
-            if (row.Label == "ELEMENT")
+            else
             {
-                // The element picker is a neutral control; show the current element
-                // color only as its side accent, including while the list is open.
-                var element = (_chart?.Element ?? string.Empty).Trim().ToUpperInvariant();
-                item["variant"] = "secondary";
-                item["element_color"] = element switch
-                {
-                    "DANCER" => "#F87171",
-                    "VOCAL" => "#60A5FA",
-                    "SESSION" => "#34D399",
-                    _ => "#6B7280"
-                };
-                item["element_hover_color"] = element switch
-                {
-                    "DANCER" => "#FDA4AF",
-                    "VOCAL" => "#93C5FD",
-                    "SESSION" => "#6EE7B7",
-                    _ => "#9CA3AF"
-                };
+                _editorMetaUiRowsCacheKey = null;
+                _editorMetaUiRowsCache = null;
             }
-            if (editing)
-            {
-                var caretIndex = Math.Clamp(_editorMetaInputCaretIndex, 0, value.Length);
-                var anchorIndex = Math.Clamp(_editorMetaSelectionAnchor, 0, value.Length);
-                var metrics = GetEditorTextFieldMetrics(value, caretIndex, anchorIndex);
-                item["caret_offset"] = metrics.CaretOffset;
-                item["selection_offset"] = metrics.SelectionOffset;
-                item["selection_width"] = metrics.SelectionWidth;
-                item["text_width"] = metrics.TextWidth;
-                // Lua works with UTF-8 byte offsets. Providing byte indices lets a
-                // wrapped active field place its caret and selection on the correct
-                // line rather than treating the whole value as one horizontal line.
-                item["caret_byte_index"] = System.Text.Encoding.UTF8.GetByteCount(value[..caretIndex]);
-                item["anchor_byte_index"] = System.Text.Encoding.UTF8.GetByteCount(value[..anchorIndex]);
-            }
-            return (object?)item;
-        }).ToList();
+        }
         IReadOnlyList<object?> metaCategories = metaPanelOpen
             ? EditorMetaCategories.Select((category, index) =>
                 (object?)EditorUiItem($"meta_category_{index}", category, "editor.meta.category", index,
@@ -650,16 +796,21 @@ public sealed partial class Playfield
         }
         var timelineRoutes = BuildEditorTimelineTraceRoutes(_playSeconds);
 
-        var summary = (errorCount, warningCount) switch
-        {
-            (0, 0) => "No problems found in this chart.",
-            (0, 1) => "1 warning.",
-            (0, _) => $"{warningCount} warnings.",
-            (1, 0) => "1 gameplay error needs to be fixed.",
-            (_, 0) => $"{errorCount} gameplay errors need to be fixed.",
-            (1, _) => $"1 gameplay error · {warningCount} warning(s)",
-            _ => $"{errorCount} gameplay errors · {warningCount} warning(s)"
-        };
+        var diagnosticsPending = IsEditorDiagnosticsPendingForCurrentChart();
+        var diagnosticsPreparing = IsEditorDiagnosticsPreparingForCurrentChart();
+        var summary = !diagnosticsReady
+            ? _playing && _editorDiagnosticsTask is null ? "Chart checks will run when playback pauses…" :
+                diagnosticsPreparing ? "Preparing chart checks…" : diagnosticsPending ? "Checking chart…" : "Open to refresh chart checks."
+            : (errorCount, warningCount) switch
+            {
+                (0, 0) => "No problems found in this chart.",
+                (0, 1) => "1 warning.",
+                (0, _) => $"{warningCount} warnings.",
+                (1, 0) => "1 gameplay error needs to be fixed.",
+                (_, 0) => $"{errorCount} gameplay errors need to be fixed.",
+                (1, _) => $"1 gameplay error · {warningCount} warning(s)",
+                _ => $"{errorCount} gameplay errors · {warningCount} warning(s)"
+            };
         var hudTick = _tempo?.SecondsToTick(_playSeconds) ?? 0.0;
         var hudGear = _gear?.AtTick((int)Math.Floor(hudTick), includeTickChanges: true) ?? new GearState();
         var hudBpm = _tempo?.BpmAt(hudTick) ?? 0.0;
@@ -908,9 +1059,10 @@ public sealed partial class Playfield
                 }
                 : Array.Empty<object?>(),
             ["problems_summary"] = summary,
-            ["problems_count"] = _editorProblems.Count,
+            ["problems_count"] = problemCount,
             ["problems_errors"] = errorCount,
             ["problems_warnings"] = warningCount,
+            ["problems_dirty"] = !diagnosticsReady,
             ["problems_expanded"] = _editorProblemsExpanded,
             ["problems_scroll"] = _editorProblemsScroll.Position,
             ["problems_scroll_max"] = GetEditorProblemsScrollMaximum(width, height),
@@ -1081,12 +1233,19 @@ public sealed partial class Playfield
                 SetEditorNoteGroupScrollPosition(Number(), immediate: true);
                 return true;
             case "editor.problems.toggle":
-                _editorProblemsExpanded = !_editorProblemsExpanded; ClampEditorProblemsScroll(width, height); return true;
+                _editorProblemsExpanded = !_editorProblemsExpanded;
+                if (_editorProblemsExpanded)
+                    _editorDiagnosticsSkipThisUpdate = true;
+                // Keep the panel-opening frame free of chart scanning/capture.
+                ClampEditorProblemsScroll(width, height);
+                return true;
             case "editor.problems.quick_fix":
                 QuickFixEditorLinks(); return true;
             case "editor.problems.row":
                 var problemIndex = Number();
                 RefreshEditorDiagnostics();
+                if (_editorDiagnosticsDirty || !ReferenceEquals(_editorDiagnosticsChart, _chart))
+                    return true;
                 if (problemIndex >= 0 && problemIndex < _editorProblems.Count)
                 {
                     var issue = _editorProblems[problemIndex];

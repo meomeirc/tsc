@@ -437,7 +437,7 @@ public sealed partial class Playfield
                 // Artwork is data supplied by the editor; chartEditorInterface.lua
                 // owns where/how it is rendered and registers the matching hitboxes.
                 if (_chartEditorInterfaceRuntime.IsLoaded && _chartEditorInterfaceRuntime.LastError is null &&
-                    _editorMetaPanelOpen &&
+                    _editorMetaPanelOpen && !_playing &&
                     string.Equals(_editorMetaCategory, "MEDIA", StringComparison.OrdinalIgnoreCase))
                 {
                     _chartEditorInterfaceRuntime.SetEditorMediaArtwork(
