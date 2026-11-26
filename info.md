@@ -1,5 +1,9 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.63
+
+- added manual update check in the settings
+
 # 0.0.62
 
 - added image pulse option to preview visualizer
