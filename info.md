@@ -1,5 +1,11 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.62
+
+- added image pulse option to preview visualizer
+- optimized editor performance: opening the info overlay shouldnt lag now because it no longer updates the intended combo prediction on every frame. snapshots no longer perform a full rebuild of the chart, so no more hitch after every single edit
+- other stuff
+
 # 0.0.61
 
 - added preview visualizer video exporter
