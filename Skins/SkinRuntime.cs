@@ -4304,7 +4304,21 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("keybind_category", DynValue.NewString(string.Equals(keybindCategory, "gameplay", StringComparison.OrdinalIgnoreCase) ? "gameplay" : string.Equals(keybindCategory, "editor", StringComparison.OrdinalIgnoreCase) ? "editor" : "navigation"));
         _mainMenu.Set("keybind_editor_subcategory", DynValue.NewString(keybindEditorSubcategory ?? "file"));
         _mainMenu.Set("keybind_capture_preview", DynValue.NewString(keybindCapturePreview ?? string.Empty));
-        _mainMenu.Set("settings_tab", DynValue.NewString(settingsTab is "audio" or "display" or "skin" ? settingsTab : "general"));
+        _mainMenu.Set("settings_tab", DynValue.NewString(settingsTab is "audio" or "display" or "skin" or "updates" ? settingsTab : "general"));
+        _mainMenu.Set("update_checking", DynValue.NewBoolean(UpdateCheckService.IsChecking));
+        _mainMenu.Set("update_available", DynValue.NewBoolean(UpdateCheckService.UpdateAvailable));
+        _mainMenu.Set("update_latest_tag", DynValue.NewString(UpdateCheckService.LatestTag ?? string.Empty));
+        _mainMenu.Set("update_summary", DynValue.NewString(UpdateCheckService.SummaryText));
+        var updateLog = new Table(_script);
+        var updateEntries = UpdateCheckService.GetRecentLogEntries();
+        for (var i = 0; i < updateEntries.Count; i++)
+            updateLog.Set(i + 1, DynValue.NewString(updateEntries[i]));
+        _mainMenu.Set("update_log_lines", DynValue.NewTable(updateLog));
+#if TSC_ANDROID
+        _mainMenu.Set("update_supported", DynValue.NewBoolean(false));
+#else
+        _mainMenu.Set("update_supported", DynValue.NewBoolean(true));
+#endif
         _mainMenu.Set("skin_settings_scroll", DynValue.NewNumber(Math.Max(0, skinSettingsScroll)));
         _mainMenu.Set("skin_settings_groups", DynValue.NewTable(_game.skin_display.CreateLuaGroupsTable(_script)));
         _mainMenu.Set("graphics_api_relaunch_confirm_open", DynValue.NewBoolean(graphicsApiRelaunchConfirmOpen));

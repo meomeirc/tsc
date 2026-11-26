@@ -634,7 +634,7 @@ local function render_settings_menu()
     local row_height = tonumber(style.row_height or 66) or 66
     local row_gap = tonumber(style.row_gap or 7) or 7
     local tab = tostring(menu.settings_tab or "general")
-    if tab ~= "audio" and tab ~= "display" and tab ~= "skin" then tab = "general" end
+    if tab ~= "audio" and tab ~= "display" and tab ~= "skin" and not (tab == "updates" and menu.update_supported == true) then tab = "general" end
 
     local settings = game.settings
     local speed = tonumber(settings.scroll_speed or 1.0) or 1.0
@@ -663,7 +663,8 @@ local function render_settings_menu()
         skin_column_rows[column] = skin_column_rows[column] + 1 + #(group.settings or {})
     end
     local skin_content_rows = math.max(skin_column_rows.left, skin_column_rows.right)
-    local row_count = tab == "general" and 6 or (tab == "skin" and 10 or 5)
+    local updates_row_count = menu.update_available == true and 7 or 6
+    local row_count = tab == "general" and 6 or (tab == "skin" and 10 or (tab == "updates" and updates_row_count or 5))
     local available_panel_height = math.max(1, height - panel_top - (tonumber(style.panel_bottom_padding or 115) or 115))
     row_height = math.min(row_height, math.max(24, (available_panel_height - padding * 2 - row_gap * (row_count - 1)) / row_count))
     -- The skin page grows to fit the declared settings when possible. On shorter
@@ -691,6 +692,9 @@ local function render_settings_menu()
         { id = "display", label = "DISPLAY" },
         { id = "skin", label = "SKIN" },
     }
+    if menu.update_supported == true then
+        table.insert(tabs, { id = "updates", label = "UPDATES" })
+    end
     local tab_gap = 10
     local tab_width = math.min(220, (panel_width - tab_gap * (#tabs - 1)) / #tabs)
     local tabs_width = tab_width * #tabs + tab_gap * (#tabs - 1)
@@ -857,6 +861,62 @@ local function render_settings_menu()
                 minimum_thumb = 28, track_color = UI.colors.panel,
                 thumb_color = UI.colors.accent, layer = 16,
             })
+        end
+    elseif tab == "updates" then
+        draw_plain_row({ parent = "settings_panel", id = "setting_check_updates_row", control_id = "setting_check_updates",
+            x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+            label = "CHECK GITHUB FOR A NEW STABLE RELEASE", button_width = math.min(300, math.max(170, row_width * 0.38)),
+            button_height = math.min(48, row_height - 4),
+            button_label = menu.update_checking == true and "CHECKING..." or "CHECK FOR UPDATES",
+            action = "check_for_updates", selected = menu.update_checking == true })
+        next_row()
+
+        if menu.update_available == true then
+            draw_plain_row({ parent = "settings_panel", id = "setting_install_update_row", control_id = "setting_install_update",
+                x = row_x, y = row_y, width = row_width, height = row_height, padding = padding,
+                label = "NEW STABLE VERSION: " .. tostring(menu.update_latest_tag or "UNKNOWN"),
+                button_width = math.min(300, math.max(170, row_width * 0.38)),
+                button_height = math.min(48, row_height - 4),
+                button_label = "UPDATE NOW", action = "install_update", selected = true, variant = "primary" })
+            next_row()
+        end
+
+        draw.text(menu.update_summary or "No update check has been run yet.", {
+            parent = "settings_panel", x = row_x, y = row_y + 8,
+            size = UI.sizes.small, color = UI.colors.text, font = UI.fonts.medium,
+            anchor = "left", layer = 12,
+        })
+        row_y = row_y + 42
+        draw.text("RECENT UPDATE CHECK LOG", {
+            parent = "settings_panel", x = row_x, y = row_y,
+            size = UI.sizes.small, color = UI.colors.accent, font = UI.fonts.bold,
+            anchor = "left", layer = 12,
+        })
+        row_y = row_y + 24
+
+        local log_height = math.max(52, panel_height - padding - row_y - padding)
+        UI.draw_panel({
+            id = "settings_update_log_panel", parent = "settings_panel",
+            x = row_x, y = row_y, width = row_width, height = log_height,
+            color = UI.colors.panel, alpha = 0.9, layer = 10,
+        })
+        local log_lines = menu.update_log_lines or {}
+        local visible_log_count = math.max(1, math.floor((log_height - 18) / 22))
+        local first_log = math.max(1, #log_lines - visible_log_count + 1)
+        if #log_lines == 0 then
+            draw.text("No update checks yet. Press CHECK FOR UPDATES to contact GitHub.", {
+                parent = "settings_update_log_panel", x = 12, y = 14,
+                size = UI.sizes.small, color = UI.colors.muted, font = UI.fonts.regular,
+                anchor = "left", layer = 12,
+            })
+        else
+            for index = first_log, #log_lines do
+                draw.text(tostring(log_lines[index]), {
+                    parent = "settings_update_log_panel", x = 12, y = 10 + (index - first_log) * 22,
+                    size = UI.sizes.small, color = UI.colors.muted, font = UI.fonts.regular,
+                    anchor = "left", layer = 12,
+                })
+            end
         end
     else
         draw_slider_row({ parent = "settings_panel", id = "setting_max_frame_rate_row", control_id = "setting_max_frame_rate",

@@ -125,12 +125,35 @@ public sealed class Game1 : Game
     private readonly SmoothScrollHandler _settingsSkinScrollState = new();
     private IReadOnlyList<string> _availableSettingsSkins = Array.Empty<string>();
     private int _fallbackSettingsSelectedIndex;
+#if TSC_ANDROID
     private static readonly string[] FallbackSettingsLabels =
     {
         "Chart scroll speed", "Scroll mode", "Music volume", "Tap volume", "Link volume", "Lane switch volume",
         "Metronome volume", "Frame rate limit", "VSync", "Gauge", "Display mode", "Graphics API", "Skin", "Back"
     };
+#else
+    private static readonly string[] FallbackSettingsLabels =
+    {
+        "Chart scroll speed", "Scroll mode", "Music volume", "Tap volume", "Link volume", "Lane switch volume",
+        "Metronome volume", "Frame rate limit", "VSync", "Gauge", "Display mode", "Graphics API", "Skin", "Check for updates", "Back"
+    };
+    private static readonly string[] FallbackSettingsLabelsWithUpdate =
+    {
+        "Chart scroll speed", "Scroll mode", "Music volume", "Tap volume", "Link volume", "Lane switch volume",
+        "Metronome volume", "Frame rate limit", "VSync", "Gauge", "Display mode", "Graphics API", "Skin",
+        "Check for updates", "Install update", "Back"
+    };
+#endif
     private static readonly int[] FallbackFrameRateOptions = { 0, 30, 60, 120, 144, 165, 240, 360, 500, 1000 };
+
+    private static string[] GetFallbackSettingsLabels()
+    {
+#if TSC_ANDROID
+        return FallbackSettingsLabels;
+#else
+        return UpdateCheckService.UpdateAvailable ? FallbackSettingsLabelsWithUpdate : FallbackSettingsLabels;
+#endif
+    }
 
     private enum TransitionPhase
     {
@@ -2464,7 +2487,7 @@ public sealed class Game1 : Game
 
     private void TryPromptForUpdate()
     {
-        if (_updatePromptShown || !UpdateCheckService.UpdateAvailable)
+        if (_updatePromptShown || !UpdateCheckService.ShouldPromptAutomatically)
             return;
 
         // Allow one frame for the main-menu footer to render "Update available"
@@ -2473,6 +2496,14 @@ public sealed class Game1 : Game
             return;
 
         _updatePromptShown = true;
+        PromptToInstallUpdate();
+    }
+
+    private void PromptToInstallUpdate()
+    {
+        if (!UpdateCheckService.UpdateAvailable)
+            return;
+
         var latestTag = UpdateCheckService.LatestTag ?? "a newer version";
         var result = ShowNativeMessageBox(
             $"A new TSC version ({latestTag}) is available.\n\nUpdate now? The game will close while the updater downloads and installs the update.",
@@ -2481,10 +2512,14 @@ public sealed class Game1 : Game
             System.Windows.Forms.MessageBoxIcon.Information);
 
         if (result != System.Windows.Forms.DialogResult.Yes)
+        {
+            Program.LogRuntime($"UPDATE_INSTALL declined latest={latestTag}");
             return;
+        }
 
         try
         {
+            Program.LogRuntime($"UPDATE_INSTALL requested current={GameVersion.Current} latest={latestTag}");
             var installRoot = UserDataPaths.GameRootDirectory;
             _ = UpdateRunnerLauncher.StartTemporaryHost(
                 AppContext.BaseDirectory,
@@ -2492,10 +2527,12 @@ public sealed class Game1 : Game
                 UpdateCheckService.RepositoryName,
                 GameVersion.Current,
                 Environment.ProcessId);
+            Program.LogRuntime("UPDATE_INSTALL updater_started");
             Exit();
         }
         catch (Exception ex)
         {
+            Program.LogRuntime($"UPDATE_INSTALL failed: {ex}");
             ShowNativeMessageBox(
                 $"Could not start the updater: {ex.Message}",
                 "TSC updater error",
@@ -2921,7 +2958,8 @@ public sealed class Game1 : Game
         var gap = Math.Clamp((int)(height * 0.005f), 3, 6);
         var rowWidth = Math.Min(850, panelWidth - 40);
         var rowLeft = (width - rowWidth) / 2;
-        var totalRowsHeight = FallbackSettingsLabels.Length * rowHeight + (FallbackSettingsLabels.Length - 1) * gap;
+        var labels = GetFallbackSettingsLabels();
+        var totalRowsHeight = labels.Length * rowHeight + (labels.Length - 1) * gap;
         var titleY = Math.Max(24, (int)(height * 0.055f));
         var listTop = Math.Max(titleY + 70, (height - totalRowsHeight) / 2 + 20);
         if (listTop + totalRowsHeight > height - 60)
@@ -2937,7 +2975,7 @@ public sealed class Game1 : Game
 
         var mouse = GlobalInput.Mouse;
         var config = _skin.GameConfig;
-        for (var i = 0; i < FallbackSettingsLabels.Length; i++)
+        for (var i = 0; i < labels.Length; i++)
         {
             var row = new Rectangle(rowLeft, listTop + i * (rowHeight + gap), rowWidth, rowHeight);
             var hovered = row.Contains(mouse.Position);
@@ -2947,7 +2985,7 @@ public sealed class Game1 : Game
             if (selected || hovered)
                 _startupSpriteBatch.Draw(_startupPixel!, new Rectangle(row.X, row.Y, 4, row.Height), new Color(244, 197, 27));
 
-            var label = FallbackSettingsLabels[i];
+            var label = labels[i];
             var value = GetFallbackSettingsValue(i, config);
             var color = selected || hovered ? Color.White : new Color(187, 195, 208);
             var labelSize = UnicodeTextRenderer.MeasureString(_font, label);
@@ -3009,6 +3047,10 @@ public sealed class Game1 : Game
                 _ => "OPENGL"
             },
             12 => string.IsNullOrWhiteSpace(config.Skin) ? "Default" : config.Skin,
+#if !TSC_ANDROID
+            13 => UpdateCheckService.IsChecking ? "CHECKING..." : "CHECK NOW",
+            14 when UpdateCheckService.UpdateAvailable => "UPDATE NOW",
+#endif
             _ => "OPEN"
         };
 
@@ -3032,10 +3074,12 @@ public sealed class Game1 : Game
             return;
         }
 
+        var labels = GetFallbackSettingsLabels();
+        _fallbackSettingsSelectedIndex = Math.Clamp(_fallbackSettingsSelectedIndex, 0, labels.Length - 1);
         if (KeybindSettings.IsPressed("menu_up"))
-            _fallbackSettingsSelectedIndex = (_fallbackSettingsSelectedIndex + FallbackSettingsLabels.Length - 1) % FallbackSettingsLabels.Length;
+            _fallbackSettingsSelectedIndex = (_fallbackSettingsSelectedIndex + labels.Length - 1) % labels.Length;
         else if (KeybindSettings.IsPressed("menu_down"))
-            _fallbackSettingsSelectedIndex = (_fallbackSettingsSelectedIndex + 1) % FallbackSettingsLabels.Length;
+            _fallbackSettingsSelectedIndex = (_fallbackSettingsSelectedIndex + 1) % labels.Length;
 
         if (mousePressed)
         {
@@ -3045,18 +3089,24 @@ public sealed class Game1 : Game
             var gap = Math.Clamp((int)(height * 0.005f), 3, 6);
             var rowWidth = Math.Min(850, Math.Max(280, width - 88));
             var rowLeft = (width - rowWidth) / 2;
-            var totalRowsHeight = FallbackSettingsLabels.Length * rowHeight + (FallbackSettingsLabels.Length - 1) * gap;
+            var totalRowsHeight = labels.Length * rowHeight + (labels.Length - 1) * gap;
             var titleY = Math.Max(24, (int)(height * 0.055f));
             var listTop = Math.Max(titleY + 70, (height - totalRowsHeight) / 2 + 20);
             if (listTop + totalRowsHeight > height - 60)
                 listTop = Math.Max(titleY + 62, height - 60 - totalRowsHeight);
-            for (var i = 0; i < FallbackSettingsLabels.Length; i++)
+            for (var i = 0; i < labels.Length; i++)
             {
                 var bounds = new Rectangle(rowLeft, listTop + i * (rowHeight + gap), rowWidth, rowHeight);
                 if (!bounds.Contains(mouse.Position)) continue;
                 _fallbackSettingsSelectedIndex = i;
-                if (i == FallbackSettingsLabels.Length - 1)
+                if (i == labels.Length - 1)
                     ReturnToMainMenuFromSettings();
+#if !TSC_ANDROID
+                else if (UpdateCheckService.UpdateAvailable && i == labels.Length - 2)
+                    PromptToInstallUpdate();
+                else if (i == 13)
+                    UpdateCheckService.CheckNow();
+#endif
                 else
                     AdjustFallbackSettings(mouse.Position.X < bounds.Center.X ? -1 : 1);
                 return;
@@ -3139,6 +3189,14 @@ public sealed class Game1 : Game
                 }
                 return;
             }
+#if !TSC_ANDROID
+            case 13:
+                UpdateCheckService.CheckNow();
+                return;
+            case 14 when UpdateCheckService.UpdateAvailable:
+                PromptToInstallUpdate();
+                return;
+#endif
             case 12:
             {
                 var skins = GetAvailableSkinNames();
@@ -3151,7 +3209,12 @@ public sealed class Game1 : Game
                 ReloadActiveSkinFromSettings();
                 return;
             }
+#if TSC_ANDROID
             case 13:
+#else
+            case 14 when !UpdateCheckService.UpdateAvailable:
+            case 15:
+#endif
                 ReturnToMainMenuFromSettings();
                 return;
             default:
@@ -3356,6 +3419,21 @@ public sealed class Game1 : Game
         if (_settingsMenuRuntime.HandleSettingsMenuScreenAction(action))
             return;
 
+#if !TSC_ANDROID
+        if (name == "check_for_updates")
+        {
+            UpdateCheckService.CheckNow();
+            _settingsTab = "updates";
+            return;
+        }
+
+        if (name == "install_update")
+        {
+            PromptToInstallUpdate();
+            return;
+        }
+#endif
+
         CommitSettingsValueEdit();
         _settingsMouseSelecting = false;
 
@@ -3366,7 +3444,7 @@ public sealed class Game1 : Game
         }
 
         if (name == "set_settings_tab" && action.Value is string settingsTab &&
-            settingsTab is "general" or "audio" or "display" or "skin")
+            settingsTab is "general" or "audio" or "display" or "skin" or "updates")
         {
             _settingsTab = settingsTab;
             _settingsSkinDropdownOpen = false;
