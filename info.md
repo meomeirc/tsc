@@ -1,5 +1,11 @@
 hi hello for bugs and feedbacks ping me (@phigos)
 
+# 0.0.64
+
+- added note style setting example
+- added native rendering path for skins
+- other stuff
+
 # 0.0.63
 
 - added manual update check in the settings
