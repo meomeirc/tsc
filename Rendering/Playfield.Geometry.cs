@@ -83,6 +83,46 @@ public sealed partial class Playfield
         return basis;
     }
 
+    // Match the ordinary-note path: use the chart's baked per-track motion
+    // samples whenever the lane is not inside an animated bank-switch
+    // transition. Link chains are built outside the ordinary event path, so
+    // they must explicitly opt into the same fast projection path.
+    private StandingNoteBasis GetTrackNoteBasis(
+        int track,
+        string side,
+        string? bank,
+        float normalizedX,
+        float travelPixels,
+        out StandingNoteBasis judgeBasis,
+        BankSurface? surfaceOverride = null)
+    {
+        if (!surfaceOverride.HasValue &&
+            _projection.TryGetPrecomputedNoteMotionPath(track, side, bank, out var precomputedPath))
+        {
+            judgeBasis = precomputedPath.JudgeBasis;
+            return precomputedPath.SampleBasis(travelPixels);
+        }
+
+        var surface = surfaceOverride ?? GetNoteSurface(side, bank);
+        var travelContext = _projection.BuildStandingNoteTravelContext(
+            surface, normalizedX, side, bank);
+        judgeBasis = _projection.BuildStandingNoteBasis(travelContext, 0f);
+        return _projection.BuildStandingNoteBasis(travelContext, travelPixels);
+    }
+
+    private ProjectedPoint GetTrackNotePoint(
+        int track,
+        string side,
+        string? bank,
+        float travelPixels,
+        GearState currentState)
+    {
+        if (_projection.TryGetPrecomputedNoteMotionPath(track, side, bank, out var precomputedPath))
+            return precomputedPath.SamplePoint(travelPixels);
+
+        return _projection.ProjectAtTravel(track, travelPixels, currentState);
+    }
+
     private void AddNoteOverlayCommands(
         List<TexturedQuadCommand> commands,
         ProjectedPoint point,
@@ -116,10 +156,28 @@ public sealed partial class Playfield
             return;
 
         var surface = surfaceOverride ?? GetNoteSurface(side, bank);
-        var noteBasis = basisOverride ?? GetNoteBasis(
-            surface, normalizedX, travelPixels, side, bank);
-        var bankJudgeBasis = bankJudgeBasisOverride ?? GetBankJudgeBasis(
-            surface, side, bank);
+        StandingNoteBasis noteBasis;
+        StandingNoteBasis bankJudgeBasis;
+        if (basisOverride is { } suppliedBasis)
+        {
+            noteBasis = suppliedBasis;
+            bankJudgeBasis = bankJudgeBasisOverride ?? GetBankJudgeBasis(
+                surface, side, bank);
+        }
+        else if (surfaceOverride.HasValue)
+        {
+            // Preserve explicit caller-supplied surfaces exactly; only the
+            // default physical-bank path may use the baked motion samples.
+            noteBasis = GetNoteBasis(surface, normalizedX, travelPixels, side, bank);
+            bankJudgeBasis = bankJudgeBasisOverride ?? GetBankJudgeBasis(surface, side, bank);
+        }
+        else
+        {
+            noteBasis = GetTrackNoteBasis(
+                track, side, bank, normalizedX, travelPixels,
+                out var projectedJudgeBasis);
+            bankJudgeBasis = bankJudgeBasisOverride ?? projectedJudgeBasis;
+        }
 
         var bankOpacity = _chartEditorMode
             ? GetEditorBankOpacity(side, bank ?? "Forward", RenderGearState(currentTick))
@@ -413,6 +471,19 @@ public sealed partial class Playfield
         var bank = bankOverride ?? position?.Bank;
         var effectiveFlipU = ResolveFlipU(side, flipU);
         var noteContext = _skinNoteGeometryContext;
+        StandingNoteBasis? laneBasis = null;
+        if (noteContext is not null)
+        {
+            laneBasis = noteBasisOverride;
+            if (laneBasis is null && !float.IsNaN(travelPixels))
+            {
+                var resolvedSurface = surface ?? GetNoteSurface(side, bank);
+                var resolvedNormalizedX = float.IsNaN(normalizedXOverride)
+                    ? _projection.LaneNormalizedX(track)
+                    : normalizedXOverride;
+                laneBasis = GetNoteBasis(resolvedSurface, resolvedNormalizedX, travelPixels, side, bank);
+            }
+        }
         return new Textured3DQuadCommand(
             texture,
             vertices,
@@ -430,7 +501,8 @@ public sealed partial class Playfield
             componentOverride ?? (layer == 0 ? "head" : layer == 1 ? "indicator" : "overlay"),
             _skinNoteSimultaneousContext,
             track,
-            _skinNoteMissedContext);
+            _skinNoteMissedContext,
+            laneBasis);
     }
 
     private VertexPositionColorTexture[] BuildFlatCardVerticesFromBasis(
@@ -510,6 +582,13 @@ public sealed partial class Playfield
         float rotationRadians = 0f,
         bool flipU = false)
     {
+        var position = GearState.Position(track);
+        var side = position?.Side ?? (point.Position.X < _projection.JudgeX ? "left" : "right");
+        var bank = position?.Bank;
+        var normalizedX = _projection.LaneNormalizedX(track);
+        var surface = GetNoteSurface(side, bank);
+        var currentBasis = GetTrackNoteBasis(
+            track, side, bank, normalizedX, travelPixels, out var judgeBasis);
         var vertices = BuildCardVertices(
             texture,
             point,
@@ -519,16 +598,20 @@ public sealed partial class Playfield
             0f,
             rotationRadians,
             flipU,
-            out var depth);
+            out var depth,
+            surface,
+            currentBasis,
+            judgeBasis,
+            side,
+            bank,
+            normalizedX);
         if (tint is not null)
         {
             for (var i = 0; i < vertices.Length; i++)
                 vertices[i].Color = tint.Value;
         }
-        var position = GearState.Position(track);
-        var side = position?.Side ?? (point.Position.X < _projection.JudgeX ? "left" : "right");
-        var bank = position?.Bank;
         var noteContext = _skinNoteGeometryContext;
+        StandingNoteBasis? laneBasis = noteContext is null ? null : currentBasis;
         return new Textured3DQuadCommand(
             texture,
             vertices,
@@ -546,7 +629,8 @@ public sealed partial class Playfield
             "endpoint",
             _skinNoteSimultaneousContext,
             track,
-            _skinNoteMissedContext);
+            _skinNoteMissedContext,
+            laneBasis);
     }
 
     private Textured3DQuadCommand BuildBodyCommand(
@@ -586,6 +670,10 @@ public sealed partial class Playfield
         if (clampedEndTravel <= clampedStartTravel + 0.01f)
             return default;
 
+        var measureLinkBody = _performanceDebugInstrumentFrame &&
+            _skinNoteGeometryContext?.NoteType == NoteType.LinkHead;
+        var linkBodyStartTimestamp = measureLinkBody ? Stopwatch.GetTimestamp() : 0L;
+        var linkBodyStartAllocatedBytes = measureLinkBody ? GC.GetAllocatedBytesForCurrentThread() : 0L;
         var surface = GetNoteSurface(side, bank);
         var travelContext = _projection.BuildStandingNoteTravelContext(
             surface, normalizedX, side, bank);
@@ -653,7 +741,7 @@ public sealed partial class Playfield
         }
 
         var noteContext = _skinNoteGeometryContext;
-        return new Textured3DQuadCommand(
+        var bodyCommand = new Textured3DQuadCommand(
             texture,
             vertices,
             maxDepth,
@@ -671,6 +759,13 @@ public sealed partial class Playfield
             _skinNoteSimultaneousContext,
             noteContext?.Track ?? -1,
             _skinNoteMissedContext);
+        if (measureLinkBody)
+        {
+            _debugLinkBodyBuildMs += (Stopwatch.GetTimestamp() - linkBodyStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+            _debugLinkBodyAllocatedBytes += Math.Max(0L,
+                GC.GetAllocatedBytesForCurrentThread() - linkBodyStartAllocatedBytes);
+        }
+        return bodyCommand;
     }
 
 
@@ -861,9 +956,15 @@ public sealed partial class Playfield
         float nearWidth,
         float farWidth)
     {
-        var key = new LaneMeshTemplateKey(texture, side, bank, centerNormalized, halfNormalizedWidth, nearDepth);
+        var key = new LaneMeshTemplateKey(
+            texture, side, bank, centerNormalized, halfNormalizedWidth, nearDepth, nearWidth, farWidth);
         if (!_laneLineMeshTemplates.TryGetValue(key, out var template))
         {
+            // Custom skins may animate line offsets or near/far widths. Bound the
+            // template cache so continuously changing line placements cannot grow
+            // memory without limit; stable/default positions still reuse entries.
+            if (_laneLineMeshTemplates.Count >= 512)
+                _laneLineMeshTemplates.Clear();
             template = BuildLaneLineMeshTemplate(
                 texture,
                 side,

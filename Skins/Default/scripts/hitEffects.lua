@@ -145,6 +145,15 @@ function on_hit_effect(note, judgement, offset_ms, real_time, chart_time, view)
     local position = note.hit_position or note.position
     local x = type(position) == "userdata" and tonumber(position.x) or 0
     local y = type(position) == "userdata" and tonumber(position.y) or 0
+    local rotate_with_lane = type(section) == "table" and section.rotateWithLane == true
+    local rotation_mode = type(section) == "table" and tostring(section.rotationMode or "") or ""
+    if rotation_mode ~= "fixed" and rotation_mode ~= "snapshot" and rotation_mode ~= "follow_lane" then
+        rotation_mode = rotate_with_lane and "snapshot" or "fixed"
+    end
+    local position_mode = type(section) == "table" and tostring(section.positionMode or "lane") or "lane"
+    if position_mode ~= "screen" and position_mode ~= "lane" then
+        position_mode = "lane"
+    end
     effects[#effects + 1] = {
         variant = variant,
         judgement = tostring(judgement or "perfect_plus"),
@@ -168,6 +177,8 @@ function on_hit_effect(note, judgement, offset_ms, real_time, chart_time, view)
         width = math.max(1, tonumber(note.hit_width) or read_number(section, "width", 100) * (tonumber(note.scale) or 1)),
         configured_width = read_number(section, "width", tonumber(note.hit_width) or 100),
         rotation = tonumber(note.hit_rotation) or 0,
+        rotation_mode = rotation_mode,
+        position_mode = position_mode,
     }
 end
 
@@ -216,8 +227,8 @@ function on_view_changed(view, projections)
             local scale = tonumber(projection.scale) or 1
             local depth_scale = tonumber(projection.lane_rotation_depth_scale) or 1
             effect.width = math.max(1, base_width * scale * depth_scale)
-            effect.rotation = type(section) == "table" and section.rotateWithLane == true
-                and (tonumber(projection.rotation) or 0) or 0
+            effect.rotation = effect.rotation_mode == "snapshot"
+                and (tonumber(projection.rotation) or effect.rotation or 0) or 0
         end
     end
 end
@@ -283,16 +294,54 @@ function render(frame)
         else
             local asset = texture_for(effect.variant, frame_number)
             if asset ~= nil then
-                draw.sprite(asset, {
-                    x = effect.x,
-                    y = effect.y,
-                    width = effect.width,
-                    rotation = effect.rotation,
-                    anchor = "center",
-                    alpha = 1,
-                    blend = "normal",
-                    layer = 0,
-                })
+                local anchor = type(frame.anchors) == "table"
+                    and frame.anchors[effect.note_track + 1]
+                    or nil
+                if effect.position_mode == "screen" or anchor == nil then
+                    -- Screen placement preserves the original hit-time position
+                    -- through bank switches. If a follow-lane angle is requested
+                    -- but no current anchor exists (startup warmup), fall back to
+                    -- the last captured angle instead of failing the callback.
+                    local sprite_rotation_mode = effect.rotation_mode
+                    if sprite_rotation_mode == "follow_lane" and anchor == nil then
+                        sprite_rotation_mode = "snapshot"
+                    end
+                    draw.sprite(asset, {
+                        x = effect.x,
+                        y = effect.y,
+                        width = effect.width,
+                        rotation = effect.rotation,
+                        rotation_mode = sprite_rotation_mode,
+                        lane_anchor = anchor,
+                        anchor = "center",
+                        alpha = 1,
+                        blend = "normal",
+                        layer = 0,
+                    })
+                else
+                    -- Lane placement keeps the origin attached to the original
+                    -- 3D track. The billboard remains square and its orientation
+                    -- is independently fixed, snapshotted, or lane-following.
+                    local projected_width = math.max(0.001, tonumber(anchor.projected_width) or 0.001)
+                    local pixel_width = math.max(1, tonumber(effect.width) or 1)
+                    local pixel_height = pixel_width * (asset.height / math.max(1, asset.width))
+                    local width_units = clamp(pixel_width / projected_width, 0.0002, 10)
+                    local height_units = clamp(pixel_height / projected_width, 0.0002, 10)
+                    draw.lane_quad(asset, {
+                        anchor = anchor,
+                        x = 0,
+                        y = 0,
+                        width = width_units,
+                        height = height_units,
+                        space = "billboard",
+                        rotation_mode = effect.rotation_mode,
+                        rotation = effect.rotation,
+                        normal_offset = 0.002,
+                        alpha = tonumber(anchor.opacity) or 1,
+                        blend = "normal",
+                        layer = 0,
+                    })
+                end
             end
         end
     end

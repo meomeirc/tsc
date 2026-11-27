@@ -486,8 +486,8 @@ public sealed class RenderLaneConfig
 public sealed class RenderEditorConfig
 {
     // Opacity multiplier for banks that are not currently active on their side.
-    // This setting is provided by get_playfield_config("editor"); older skins
-    // may still supply it through editorRenderConfig.lua.
+    // This setting is provided by get_playfield_config("editor") or inherited
+    // from the bundled Default playfield configuration module.
     public float InactiveBankOpacity { get; set; } = 0.35f;
 }
 
@@ -574,7 +574,7 @@ public static class SkinConfigStore
         Directory.CreateDirectory(textureDirectory);
         Directory.CreateDirectory(audioDirectory);
 
-        var renderConfig = LoadOrCreateRenderConfig(skinDirectory, outputWidth, outputHeight);
+        var initialPlayfieldConfig = PlayfieldConfigLoader.LoadBuiltInDefault(outputWidth, outputHeight);
 
         return new SkinContext
         {
@@ -584,63 +584,15 @@ public static class SkinConfigStore
             TextureDirectory = textureDirectory,
             AudioDirectory = audioDirectory,
             GameConfig = gameConfig,
-            RenderConfig = renderConfig,
+            RenderConfig = initialPlayfieldConfig,
             // UI layout is supplied by skin.lua. This default model is replaced
             // by SkinRuntime after the Lua UI script loads.
             UIConfig = SkinUIConfig.CreateDefault()
         };
     }
 
-    public static bool ReloadRenderConfig(
-        SkinContext skin,
-        int outputWidth,
-        int outputHeight,
-        out string? error)
-    {
-        var primaryPath = SkinScriptPathResolver.Preferred(skin.SkinDirectory, "renderConfig.lua");
-        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(skin.RootDirectory);
-        var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "renderConfig.lua");
-        if (!File.Exists(primaryPath) && !File.Exists(defaultPath))
-        {
-            skin.RenderConfig = RenderConfigLuaLoader.LoadBuiltInDefault(outputWidth, outputHeight);
-            error = null;
-            return true;
-        }
-        if (!RenderConfigLuaLoader.TryLoadWithFallback(
-                primaryPath, defaultPath, outputWidth, outputHeight, out var config, out error))
-        {
-            skin.RenderConfig = config;
-            return false;
-        }
-
-        skin.RenderConfig = config;
-        return true;
-    }
-
     private static string FindRootDirectory()
         => UserDataPaths.GameRootDirectory;
-
-    private static RenderConfig LoadOrCreateRenderConfig(
-        string skinDirectory,
-        int outputWidth,
-        int outputHeight)
-    {
-        var primaryPath = SkinScriptPathResolver.Preferred(skinDirectory, "renderConfig.lua");
-        var skinParentDirectory = Directory.GetParent(Path.GetFullPath(skinDirectory))?.FullName
-                                  ?? UserDataPaths.GameRootDirectory;
-        var defaultSkinDirectory = Path.Combine(skinParentDirectory, "Default");
-        var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "renderConfig.lua");
-        // New skins provide playfield settings through get_playfield_config() in
-        // skin.lua. Do not generate obsolete config files when neither the selected
-        // skin nor Default has a legacy file to load. The gameplay SkinRuntime will
-        // apply the new API as soon as its script is initialized.
-        if (!File.Exists(primaryPath) && !File.Exists(defaultPath))
-            return RenderConfigLuaLoader.LoadBuiltInDefault(outputWidth, outputHeight);
-
-        _ = RenderConfigLuaLoader.TryLoadWithFallback(
-            primaryPath, defaultPath, outputWidth, outputHeight, out var config, out _);
-        return config;
-    }
 
     private static GameConfig LoadOrCreateGameConfig(string path)
     {

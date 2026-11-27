@@ -375,8 +375,20 @@ public sealed class Game1 : Game
         var updateCompleted = false;
         try
         {
-            UpdateFrameCore(gameTime);
-            updateCompleted = true;
+#if DEBUG
+            FrameLoopDiagnostics.BeginUpdateCore();
+#endif
+            try
+            {
+                UpdateFrameCore(gameTime);
+                updateCompleted = true;
+            }
+            finally
+            {
+#if DEBUG
+                FrameLoopDiagnostics.EndUpdateCore();
+#endif
+            }
         }
         finally
         {
@@ -663,6 +675,9 @@ public sealed class Game1 : Game
 
     private void UpdateFrameCore(GameTime gameTime)
     {
+#if DEBUG
+        var inputAndPlatformStart = FrameLoopDiagnostics.BeginStage();
+#endif
         ApplyMaxFrameRateConfig();
         ProcessPendingNativeWindowCloseRequest();
 #if TSC_ANDROID
@@ -695,9 +710,15 @@ public sealed class Game1 : Game
         if (_startupScreen != StartupScreen.Gameplay || _transitionPhase != TransitionPhase.None)
             KeybindSettings.UpdateTouchGameplayActions(Array.Empty<string>(), suppressPressEdges: true);
         KeybindSettings.UpdateRepeat(gameTime.ElapsedGameTime.TotalSeconds);
+#if DEBUG
+        FrameLoopDiagnostics.EndUpdateStage(FrameLoopDiagnostics.UpdateStage.InputAndPlatform, inputAndPlatformStart);
+#endif
 
         if (_transitionPhase != TransitionPhase.None)
         {
+#if DEBUG
+            var transitionUpdateStart = FrameLoopDiagnostics.BeginStage();
+#endif
             var gameplayFadeWasActive =
                 _transitionPhase == TransitionPhase.In &&
                 _transitionToScreen == StartupScreen.Gameplay &&
@@ -740,6 +761,9 @@ public sealed class Game1 : Game
 
             _previousKeyboard = inputActive ? keyboard : Keyboard.GetState();
             base.Update(gameTime);
+#if DEBUG
+            FrameLoopDiagnostics.EndUpdateStage(FrameLoopDiagnostics.UpdateStage.Transition, transitionUpdateStart);
+#endif
             return;
         }
 
@@ -877,7 +901,13 @@ public sealed class Game1 : Game
 
         if (_startupScreen == StartupScreen.Gameplay)
         {
+#if DEBUG
+            var gameplayUpdateStart = FrameLoopDiagnostics.BeginStage();
+#endif
             _playfield?.Update(gameTime);
+#if DEBUG
+            FrameLoopDiagnostics.EndUpdateStage(FrameLoopDiagnostics.UpdateStage.Gameplay, gameplayUpdateStart);
+#endif
             if (_startupScreen != StartupScreen.Gameplay)
             {
                 // The editor may open Settings directly while its Playfield is updated.
@@ -910,7 +940,13 @@ public sealed class Game1 : Game
         }
         else if (_startupScreen == StartupScreen.GameplayResult)
         {
+#if DEBUG
+            var resultUpdateStart = FrameLoopDiagnostics.BeginStage();
+#endif
             _playfield?.UpdateResultScreen(gameTime);
+#if DEBUG
+            FrameLoopDiagnostics.EndUpdateStage(FrameLoopDiagnostics.UpdateStage.Result, resultUpdateStart);
+#endif
             if (_playfield?.ConsumeGameplayRetryTransitionRequest() == true)
             {
                 BeginGameplayRetryTransition(StartupScreen.GameplayResult);
@@ -938,7 +974,13 @@ public sealed class Game1 : Game
         }
         else
         {
+#if DEBUG
+            var startupUpdateStart = FrameLoopDiagnostics.BeginStage();
+#endif
             UpdateStartup(gameTime, keyboard);
+#if DEBUG
+            FrameLoopDiagnostics.EndUpdateStage(FrameLoopDiagnostics.UpdateStage.Startup, startupUpdateStart);
+#endif
         }
 
         _previousKeyboard = inputActive ? keyboard : Keyboard.GetState();
@@ -3522,6 +3564,13 @@ public sealed class Game1 : Game
         if (name == "toggle_skin_display" && action.Value is string skinDisplaySetting)
         {
             _settingsMenuRuntime.ToggleSkinDisplaySetting(skinDisplaySetting);
+            return;
+        }
+
+        if (name == "cycle_skin_choice" && action.Value is string skinChoiceSetting)
+        {
+            if (_settingsMenuRuntime.CycleSkinDisplayChoice(skinChoiceSetting))
+                ReloadActiveSkinFromSettings();
             return;
         }
 

@@ -26,33 +26,40 @@ public sealed class GearState
         CenterRight = CenterRight
     };
 
-    public string LeftMode => Left switch
-    {
-        GearSide.LeftForward => "1K",
-        GearSide.LeftBackward => "3K",
-        _ => "inactive"
-    };
+    // Each physical side owns its own key-count gear. Forward/Center/Backward
+    // are internal regions used by the chart mapping, not additional physical
+    // sides. A Center region indicates that its physical side is in 2K.
+    public string LeftMode => CenterLeft == GearSide.CenterLeft
+        ? "2K"
+        : Left switch
+        {
+            GearSide.LeftForward => "1K",
+            GearSide.LeftBackward => "3K",
+            _ => "inactive"
+        };
 
-    public string RightMode => Right switch
-    {
-        GearSide.RightForward => "1K",
-        GearSide.RightBackward => "3K",
-        _ => "inactive"
-    };
+    public string RightMode => CenterRight == GearSide.CenterRight
+        ? "2K"
+        : Right switch
+        {
+            GearSide.RightForward => "1K",
+            GearSide.RightBackward => "3K",
+            _ => "inactive"
+        };
 
     public bool HasCenter => CenterLeft == GearSide.CenterLeft || CenterRight == GearSide.CenterRight;
 
-    public string GlobalMode
-    {
-        get
-        {
-            if (HasCenter)
-                return "2K";
-            if (LeftMode == RightMode && (LeftMode == "1K" || LeftMode == "3K"))
-                return LeftMode;
-            return "mixed";
-        }
-    }
+    public string GlobalMode =>
+        LeftMode == RightMode && (LeftMode is "1K" or "2K" or "3K")
+            ? LeftMode
+            : "mixed";
+
+    public string SideMode(string side) =>
+        string.Equals(side, "left", StringComparison.OrdinalIgnoreCase)
+            ? LeftMode
+            : string.Equals(side, "right", StringComparison.OrdinalIgnoreCase)
+                ? RightMode
+                : "inactive";
 
     public static GearState FromStartAttribute(int attr) => attr switch
     {

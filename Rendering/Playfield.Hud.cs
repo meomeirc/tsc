@@ -3637,7 +3637,11 @@ public sealed partial class Playfield
                 commands.Add(command);
         }
 
-        if (commands.Count == 0)
+        var hitEffectLaneQuadRequests = hitEffectsOnly
+            ? runtime.HitEffectLaneQuadDrawRequests
+            : Array.Empty<SkinLaneQuadDrawRequest>();
+        var hasHitEffectLaneQuads = hitEffectLaneQuadRequests.Count > 0;
+        if (commands.Count == 0 && !hasHitEffectLaneQuads)
             return;
 
         var batchOpen = false;
@@ -3701,11 +3705,47 @@ public sealed partial class Playfield
             _graphics.ScissorRectangle = originalScissor;
         }
 
+        var nextHitEffectQuadLayer = -32;
+        void FlushHitEffectLaneQuadsBefore(int layerExclusive)
+        {
+            if (!hasHitEffectLaneQuads)
+                return;
+
+            // Skin sprite commands are already sorted by layer. Flush lower
+            // lane-relative hit-effect quads immediately before the next higher
+            // sprite layer, so both 2D and 3D effect requests share one Z-index.
+            while (nextHitEffectQuadLayer < layerExclusive && nextHitEffectQuadLayer <= 32)
+            {
+                var layer = nextHitEffectQuadLayer++;
+                var hasLayer = false;
+                for (var requestIndex = 0; requestIndex < hitEffectLaneQuadRequests.Count; requestIndex++)
+                {
+                    if (hitEffectLaneQuadRequests[requestIndex].Layer == layer)
+                    {
+                        hasLayer = true;
+                        break;
+                    }
+                }
+                if (!hasLayer)
+                    continue;
+
+                EndBatch();
+                EndQuad3DRun();
+                DrawSkinLaneQuadRequestsAtLayer(
+                    layer,
+                    "hit_effect",
+                    "skin_hit_effect_lane_quad",
+                    hitEffectLaneQuadRequests);
+            }
+        }
+
         try
         {
             for (var commandIndex = 0; commandIndex < commands.Count; commandIndex++)
             {
                 var command = commands[commandIndex];
+                if (hitEffectsOnly)
+                    FlushHitEffectLaneQuadsBefore(command.Layer);
 
                 if (command.Kind == SkinDrawCommandKind.Quad3D ||
                     command.Kind == SkinDrawCommandKind.Sparkles)
@@ -4037,12 +4077,19 @@ public sealed partial class Playfield
                     }
                 }
             }
+
+            // Include layers that have no 2D sprite command, and draw the final
+            // same-layer 3D requests after their sprite commands.
+            if (hitEffectsOnly)
+                FlushHitEffectLaneQuadsBefore(33);
         }
         finally
         {
             EndQuad3DRun();
             EndBatch();
             _graphics.ScissorRectangle = originalScissor;
+            if (hitEffectsOnly)
+                runtime.ClearHitEffectLaneQuadDrawRequests();
         }
     }
 

@@ -78,11 +78,22 @@ public sealed partial class Playfield
         _debugDrawNotesMs = 0;
         _debugAutoLinkBuildMs = 0;
         _debugGameplayLinkBuildMs = 0;
+        _debugLinkBodyBuildMs = 0;
+        _debugLinkConnectorBuildMs = 0;
+        _debugLinkTailBuildMs = 0;
+        _debugLinkBodyAllocatedBytes = 0;
+        _debugLinkConnectorAllocatedBytes = 0;
+        _debugLinkTailAllocatedBytes = 0;
+        _debugLinkTailPlaneCount = 0;
         _debugTexturedDrawMs = 0;
         _debugTexturedSortMs = 0;
         _debugTexturedSubmitMs = 0;
         _debugSkinNoteBridgeMs = 0;
         _debugSkinNoteBridgeAllocatedBytes = 0;
+        _debugSkinNoteSnapshotMs = 0;
+        _debugSkinNoteSnapshotAllocatedBytes = 0;
+        _debugSkinNoteApplyMs = 0;
+        _debugSkinNoteApplyAllocatedBytes = 0;
         _debugAllocSkinBuildBytes = 0;
         _debugAllocSkinDrawBytes = 0;
         _debugAllocLaneBytes = 0;
@@ -188,7 +199,6 @@ public sealed partial class Playfield
         // Keep F8 focused on memory/frame pacing, while exposing the already
         // sampled playfield build/draw/sort/submit timings needed to separate
         // skin command generation from native note rendering.
-        var cpuBoundFps = _debugFrameMs > 0.001 ? 1000.0 / _debugFrameMs : 0.0;
         var instantCadenceFps = _debugDrawIntervalMs > 0.001 ? 1000.0 / _debugDrawIntervalMs : 0.0;
         var averageCadenceFps = _debugDrawFpsAverage > 0.001
             ? _debugDrawFpsAverage
@@ -206,6 +216,10 @@ public sealed partial class Playfield
         var spriteApiCalls = _skinRuntime.DebugLastSpriteApiCalls;
         var spriteApiKb = _skinRuntime.DebugLastSpriteApiAllocatedBytes / 1024.0;
         var spriteApiMs = _skinRuntime.DebugLastSpriteApiMilliseconds;
+        var updateCalls = FrameLoopDiagnostics.UpdateCallsSinceLastDraw;
+        var averageUpdateAllocKb = updateCalls > 0
+            ? FrameLoopDiagnostics.UpdateAllocatedBytesSinceLastDraw / 1024.0 / updateCalls
+            : 0.0;
         const double bytesToMb = 1.0 / (1024.0 * 1024.0);
         var lines = new[]
         {
@@ -215,16 +229,27 @@ public sealed partial class Playfield
             $"GPU     Textures {native.TextureCount} / {native.TextureBytes * bytesToMb:0.0} MB   skin {native.SkinTextureBytes * bytesToMb:0.0}   font {native.FontTextureBytes * bytesToMb:0.0}   game {native.GameplayTextureBytes * bytesToMb:0.0}   editor {native.EditorTextureBytes * bytesToMb:0.0}",
             $"GPU     Render targets {native.RenderTargetCount} / {native.RenderTargetBytes * bytesToMb:0.0} MB   menu textures {native.MenuTextureBytes * bytesToMb:0.0} MB",
             $"AUDIO   Buffers {native.AudioBufferCount} / {native.AudioBufferBytes * bytesToMb:0.0} MB   music {native.MusicBufferBytes * bytesToMb:0.0}   SFX {native.SoundEffectBufferBytes * bytesToMb:0.0}   instances {native.AudioInstanceCount} (music {native.MusicInstanceCount} / SFX {native.SoundEffectInstanceCount})",
-            $"PERF    FPS {instantCadenceFps:0.0} now / {averageCadenceFps:0.0} avg   CPU-only {cpuBoundFps:0} FPS   draw {_debugFrameMs:0.00} ms   max gap {maxInterval:0.00} ms   late {lateIntervals}",
+            $"PERF    FPS {instantCadenceFps:0.0} now / {averageCadenceFps:0.0} avg   playfield {_debugFrameMs:0.00} ms   max gap {maxInterval:0.00} ms   late {lateIntervals}",
+            $"LOOP    Update {FrameLoopDiagnostics.UpdateCpuMsSinceLastDraw:0.00} ms ({updateCalls} calls, max {FrameLoopDiagnostics.MaxUpdateCpuMsSinceLastDraw:0.00})   core {FrameLoopDiagnostics.UpdateCoreCpuMsSinceLastDraw:0.00}   recovery/hooks {FrameLoopDiagnostics.UpdateNonCoreCpuMsSinceLastDraw:0.00}   Game1.Draw {FrameLoopDiagnostics.LastDrawCpuMs:0.00} ms (max {FrameLoopDiagnostics.MaxDrawCpuMsOneSecond:0.00})",
+            $"PACE    interval {FrameLoopDiagnostics.LastDrawIntervalMs:0.00} ms   prior Draw {FrameLoopDiagnostics.PreviousDrawCpuMsInLastInterval:0.00}   Updates {FrameLoopDiagnostics.UpdateCpuMsSinceLastDraw:0.00}   outside ~{FrameLoopDiagnostics.UnaccountedDrawIntervalMs:0.00} ms   GC pause {FrameLoopDiagnostics.GcPauseMsSinceLastDraw:0.00} ms   slow {((FrameLoopDiagnostics.RunningSlowlySinceLastDraw) ? "yes" : "no")}",
+            $"UPDATE  input/platform {FrameLoopDiagnostics.UpdateInputAndPlatformCpuMsSinceLastDraw:0.00}   gameplay {FrameLoopDiagnostics.UpdateGameplayCpuMsSinceLastDraw:0.00}   result {FrameLoopDiagnostics.UpdateResultCpuMsSinceLastDraw:0.00}   startup {FrameLoopDiagnostics.UpdateStartupCpuMsSinceLastDraw:0.00}   transition {FrameLoopDiagnostics.UpdateTransitionCpuMsSinceLastDraw:0.00}",
+            $"UPDATE2 other core {FrameLoopDiagnostics.UpdateOtherCoreCpuMsSinceLastDraw:0.00} ms",
+            $"ALLOC   game-thread Update {FrameLoopDiagnostics.UpdateAllocatedBytesSinceLastDraw / 1024.0:0.0} KB ({averageUpdateAllocKb:0.0} KB/call)   Draw {FrameLoopDiagnostics.LastDrawAllocatedBytes / 1024.0:0.0} KB",
+            $"GC FRAME Update {FrameLoopDiagnostics.UpdateGc0SinceLastDraw}/{FrameLoopDiagnostics.UpdateGc1SinceLastDraw}/{FrameLoopDiagnostics.UpdateGc2SinceLastDraw}   Draw {FrameLoopDiagnostics.LastDrawGc0}/{FrameLoopDiagnostics.LastDrawGc1}/{FrameLoopDiagnostics.LastDrawGc2} (Gen0/1/2 collections)",
             $"BG      Lua render {backgroundLuaRenderMs:0.000} ms / {backgroundLuaRenderKb:0.0} KB   draw {_debugBackgroundDrawMs:0.000} ms   cmds {_debugBackgroundDrawCommandCount}",
             $"SKIN    build {_debugSkinBuildMs:0.00} ms   Lua {_skinRuntime.DebugLastRenderCallMilliseconds:0.00}   layout {_skinRuntime.DebugLastResolveLayoutMilliseconds:0.00}   sort {_skinRuntime.DebugLastRenderSortMilliseconds:0.00}   draw {_debugSkinDrawMs:0.00} ms",
             $"SKIN API sprite {spriteApiCalls} / {spriteApiMs:0.000} ms / {spriteApiKb:0.0} KB   text {_skinRuntime.DebugLastTextApiMilliseconds:0.000} ms   rect {_skinRuntime.DebugLastRectApiMilliseconds:0.000} ms   shadow {_skinRuntime.DebugLastShadowApiMilliseconds:0.000} ms",
             $"SKIN PARTS bg {backgroundLuaRenderMs:0.000}   panels {_skinRuntime.GetDebugSkinSectionMilliseconds(2):0.000}   stage {_skinRuntime.GetDebugSkinSectionMilliseconds(3):0.000}   rank {_skinRuntime.GetDebugSkinSectionMilliseconds(4):0.000}   clear {_skinRuntime.GetDebugSkinSectionMilliseconds(5):0.000}   score/gauge {_skinRuntime.GetDebugSkinSectionMilliseconds(6):0.000}   combo {_skinRuntime.GetDebugSkinSectionMilliseconds(7):0.000}",
             $"SKIN FX  timing {_skinRuntime.GetDebugSkinSectionMilliseconds(8):0.000}   timing text {_skinRuntime.GetDebugSkinSectionMilliseconds(13):0.000}   hit bar {_skinRuntime.GetDebugSkinSectionMilliseconds(14):0.000}   panel events {_skinRuntime.GetDebugSkinSectionMilliseconds(9):0.000}   panel queue {_skinRuntime.GetDebugSkinSectionMilliseconds(12):0.000}   lights {_skinRuntime.GetDebugSkinSectionMilliseconds(10):0.000}   characters {_skinRuntime.GetDebugSkinSectionMilliseconds(11):0.000}   panel submit {_skinRuntime.GetDebugSkinSectionMilliseconds(15):0.000}",
             $"PLAYFIELD notes {_debugDrawNotesMs:0.00} ms / {_debugAllocNotesBytes / 1024.0:0.0} KB   textured draw {_debugTexturedDrawMs:0.00} ms   sort {_debugTexturedSortMs:0.00} ms   submit {_debugTexturedSubmitMs:0.00} ms",
-            $"PLAYFIELD skin bridge {_debugSkinNoteBridgeMs:0.00} ms / {_debugSkinNoteBridgeAllocatedBytes / 1024.0:0.0} KB",
+            $"PLAYFIELD bridge total {_debugSkinNoteBridgeMs:0.00} ms / {_debugSkinNoteBridgeAllocatedBytes / 1024.0:0.0} KB   snapshot {_debugSkinNoteSnapshotMs:0.00} / {_debugSkinNoteSnapshotAllocatedBytes / 1024.0:0.0} KB   apply {_debugSkinNoteApplyMs:0.00} / {_debugSkinNoteApplyAllocatedBytes / 1024.0:0.0} KB",
+            $"BRIDGE  tables {_skinRuntime.DebugLastPlayfieldNoteDataMilliseconds:0.00} ms / {_skinRuntime.DebugLastPlayfieldNoteDataAllocatedBytes / 1024.0:0.0} KB   Lua {_skinRuntime.DebugLastPlayfieldCallbackMilliseconds:0.00} ms / {_skinRuntime.DebugLastPlayfieldCallbackAllocatedBytes / 1024.0:0.0} KB",
+            $"BRIDGE API quad {_skinRuntime.DebugLastPlayfieldCallbackQuadApiCalls} / {_skinRuntime.DebugLastPlayfieldCallbackQuadApiMilliseconds:0.000} ms / {_skinRuntime.DebugLastPlayfieldCallbackQuadApiAllocatedBytes / 1024.0:0.0} KB   sprite {_skinRuntime.DebugLastPlayfieldCallbackSpriteApiCalls} / {_skinRuntime.DebugLastPlayfieldCallbackSpriteApiMilliseconds:0.000} ms / {_skinRuntime.DebugLastPlayfieldCallbackSpriteApiAllocatedBytes / 1024.0:0.0} KB   instances {_skinRuntime.DebugLastPlayfieldCallbackSpriteInstancesCalls} / {_skinRuntime.DebugLastPlayfieldCallbackSpriteInstancesMilliseconds:0.000} ms / {_skinRuntime.DebugLastPlayfieldCallbackSpriteInstancesAllocatedBytes / 1024.0:0.0} KB",
+            $"BRIDGE FAST native {_skinRuntime.DebugLastNativeNoteGeometryCount} / {_skinRuntime.DebugLastNativeNoteMilliseconds:0.000} ms / {_skinRuntime.DebugLastNativeNoteAllocatedBytes / 1024.0:0.0} KB",
             $"GEOMETRY cmds {_debugTexturedCommands}   note draw calls {_debugTexturedNoteDrawCalls}   vertices {_debugTexturedNoteVertices}   visible notes {_debugVisibleRenderableNotes}   holds {_debugVisibleHolds}",
-            $"LINKS    build {_debugGameplayLinkBuildMs:0.00} ms   chains {_debugVisibleGameplayChains}   segments {_debugGameplayLinkSegments}   body quads {_debugLinkBodyQuads}   connector quads {_debugLinkConnectorQuads}",
+            $"LINKS    build auto {_debugAutoLinkBuildMs:0.00} / gameplay {_debugGameplayLinkBuildMs:0.00} ms   chains {_debugVisibleGameplayChains}   segments {_debugGameplayLinkSegments}   body quads {_debugLinkBodyQuads}   connector quads {_debugLinkConnectorQuads}",
+            $"LINK PARTS body {_debugLinkBodyBuildMs:0.000} ms / {_debugLinkBodyAllocatedBytes / 1024.0:0.0} KB   connector {_debugLinkConnectorBuildMs:0.000} / {_debugLinkConnectorAllocatedBytes / 1024.0:0.0} KB   tail planes {_debugLinkTailBuildMs:0.000} / {_debugLinkTailAllocatedBytes / 1024.0:0.0} KB ({_debugLinkTailPlaneCount})",
+            "*PACE outside is the Draw-to-Draw residual after prior Game1.Draw and measured Update CPU; it is not a GPU timer. GC pause is runtime-reported process-wide pause time.",
             "*GPU/audio are TSC-owned estimates; GPU uses width×height×4, audio uses PCM bytes; internal driver allocations are excluded.",
             "*Managed used is an estimate; GC heap/fragmentation/LOH are last-GC snapshots.",
             "Ctrl+Shift+F8 copy   Ctrl+F8 compacting full GC   F8 hide",

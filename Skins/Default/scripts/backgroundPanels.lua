@@ -413,7 +413,7 @@ local function window_from_position(base_uv, position_x, position_y, scale, padd
 
     local base_width = base_uv.right - base_uv.left
     local base_height = base_uv.bottom - base_uv.top
-    if not (type(padding) == "table" and padding._tsc_normalized) then
+    if not (type(padding) == "table" and padding._normalized) then
         scale = clamp(tonumber(scale) or 1.0, 0.001, 1.0)
         padding = type(padding) == "table" and padding or {}
     end
@@ -430,7 +430,7 @@ local function window_from_position(base_uv, position_x, position_y, scale, padd
     local max_vertical_padding = available_y * 0.5
 
     local left_padding, right_padding, top_padding, bottom_padding
-    if padding._tsc_normalized then
+    if padding._normalized then
         left_padding = padding.left * max_horizontal_padding
         right_padding = padding.right * max_horizontal_padding
         top_padding = padding.top * max_vertical_padding
@@ -865,14 +865,14 @@ local function get_character_view(track, base_uv, event, current_time, cfg)
             local padding = cfg.padding
             if type(padding) == "table" then
                 runtime.padding = {
-                    _tsc_normalized = true,
+                    _normalized = true,
                     left = clamp(tonumber(padding.left) or 0, 0, 1),
                     right = clamp(tonumber(padding.right) or 0, 0, 1),
                     top = clamp(tonumber(padding.top) or 0, 0, 1),
                     bottom = clamp(tonumber(padding.bottom) or 0, 0, 1),
                 }
             else
-                runtime.padding = { _tsc_normalized = true, left = 0, right = 0, top = 0, bottom = 0 }
+                runtime.padding = { _normalized = true, left = 0, right = 0, top = 0, bottom = 0 }
             end
         elseif attr == 105 or attr == 106 then
             runtime.duration = math.max(0.001, tonumber(cfg.duration) or 5.0)
@@ -884,14 +884,14 @@ local function get_character_view(track, base_uv, event, current_time, cfg)
             local padding = cfg.padding
             if type(padding) == "table" then
                 runtime.padding = {
-                    _tsc_normalized = true,
+                    _normalized = true,
                     left = clamp(tonumber(padding.left) or 0, 0, 1),
                     right = clamp(tonumber(padding.right) or 0, 0, 1),
                     top = clamp(tonumber(padding.top) or 0, 0, 1),
                     bottom = clamp(tonumber(padding.bottom) or 0, 0, 1),
                 }
             else
-                runtime.padding = { _tsc_normalized = true, left = 0, right = 0, top = 0, bottom = 0 }
+                runtime.padding = { _normalized = true, left = 0, right = 0, top = 0, bottom = 0 }
             end
         elseif attr == 107 then
             runtime.flash_duration = get_flash_duration(cfg)
@@ -995,6 +995,19 @@ local PRESENTATION_LIGHT_OUTRO_WIDEN_DURATION = math.max(
     0.001, tonumber(PRESENTATION_LIGHT_CONFIG.outroWidenDuration) or 1.0)
 local PRESENTATION_LIGHT_OUTRO_FADE_DURATION = math.max(
     0.001, tonumber(PRESENTATION_LIGHT_CONFIG.outroFadeDuration) or 0.25)
+
+local function intro_duration()
+    return math.max(
+        PRESENTATION_PANEL_TIME + PRESENTATION_FLASH_DURATION,
+        PRESENTATION_LIGHT_INTRO_DURATION)
+end
+
+local function outro_duration()
+    return math.max(
+        PRESENTATION_OUTRO_CHARACTER_FADE + PRESENTATION_OUTRO_PANEL_TIME,
+        PRESENTATION_LIGHT_OUTRO_WIDEN_DURATION + PRESENTATION_LIGHT_OUTRO_FADE_DURATION)
+end
+
 local presentation_clip_rect = { left = 0, top = 0, right = 0, bottom = 0 }
 
 local function set_light_geometry(
@@ -1125,16 +1138,7 @@ local function update_presentation(dt)
 
     if presentation_mode == "intro" or presentation_mode == "outro" then
         presentation_elapsed = presentation_elapsed + frame_dt
-        local total
-        if presentation_mode == "intro" then
-            total = math.max(
-                PRESENTATION_PANEL_TIME + PRESENTATION_FLASH_DURATION,
-                PRESENTATION_LIGHT_INTRO_DURATION)
-        else
-            total = math.max(
-                PRESENTATION_OUTRO_CHARACTER_FADE + PRESENTATION_OUTRO_PANEL_TIME,
-                PRESENTATION_LIGHT_OUTRO_WIDEN_DURATION + PRESENTATION_LIGHT_OUTRO_FADE_DURATION)
-        end
+        local total = presentation_mode == "intro" and intro_duration() or outro_duration()
         if presentation_elapsed >= total then
             local completed_mode = presentation_mode
             presentation_mode = completed_mode == "outro" and "waiting" or "idle"
@@ -1537,6 +1541,8 @@ return {
     cancel_presentation = cancel_presentation,
     is_waiting_for_intro = is_waiting_for_intro,
     update_presentation = update_presentation,
+    intro_duration = intro_duration,
+    outro_duration = outro_duration,
     preload_assets_step = preload_assets_step,
     are_assets_loaded = are_assets_loaded,
     is_prewarm_render_complete = is_prewarm_render_complete,

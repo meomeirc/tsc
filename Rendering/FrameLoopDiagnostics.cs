@@ -10,6 +10,15 @@ namespace TSC.Rendering;
 /// </summary>
 internal static class FrameLoopDiagnostics
 {
+    internal enum UpdateStage
+    {
+        InputAndPlatform,
+        Transition,
+        Gameplay,
+        Result,
+        Startup
+    }
+
     // Keep late-frame reporting aligned with TSC's configured fixed-step rate.
     // A fixed 20 ms threshold silently misses missed frames at the default 60 FPS.
     public static double TargetFrameIntervalMs { get; private set; } = 1000.0 / 60.0;
@@ -28,6 +37,14 @@ internal static class FrameLoopDiagnostics
     private static int _updateStartGc2;
     private static double _updateElapsedGameMs;
     private static bool _updateWasRunningSlowly;
+    private static long _updateCoreStartTimestamp;
+    private static double _updateCpuMsSinceDraw;
+    private static double _updateCoreCpuMsSinceDraw;
+    private static double _updateInputAndPlatformCpuMsSinceDraw;
+    private static double _updateTransitionCpuMsSinceDraw;
+    private static double _updateGameplayCpuMsSinceDraw;
+    private static double _updateResultCpuMsSinceDraw;
+    private static double _updateStartupCpuMsSinceDraw;
 
     private static long _drawStartTimestamp;
     private static long _drawStartAllocatedBytes;
@@ -35,6 +52,8 @@ internal static class FrameLoopDiagnostics
     private static int _drawStartGc1;
     private static int _drawStartGc2;
     private static long _previousDrawStartTimestamp;
+    private static double _drawCpuMsIncludedInCurrentInterval;
+    private static TimeSpan _previousDrawTotalGcPauseDuration;
 
     private static long _updateWindowStartTimestamp;
     private static double _updateMaxMsInWindow;
@@ -52,6 +71,7 @@ internal static class FrameLoopDiagnostics
     private static int _updateGc2SinceDraw;
 
     public static double LastUpdateCpuMs { get; private set; }
+    public static double LastUpdateCoreCpuMs { get; private set; }
     public static double MaxUpdateCpuMsOneSecond => Math.Max(_completedUpdateMaxMs, _updateMaxMsInWindow);
     public static double LastUpdateElapsedGameMs { get; private set; }
     public static double MaxUpdateCpuMsSinceLastDraw { get; private set; }
@@ -61,10 +81,32 @@ internal static class FrameLoopDiagnostics
     public static int UpdateGc0SinceLastDraw { get; private set; }
     public static int UpdateGc1SinceLastDraw { get; private set; }
     public static int UpdateGc2SinceLastDraw { get; private set; }
+    public static double UpdateCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateCoreCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateNonCoreCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateInputAndPlatformCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateTransitionCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateGameplayCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateResultCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateStartupCpuMsSinceLastDraw { get; private set; }
+    public static double UpdateOtherCoreCpuMsSinceLastDraw { get; private set; }
 
     public static double LastDrawCpuMs { get; private set; }
     public static double MaxDrawCpuMsOneSecond => Math.Max(_completedDrawMaxMs, _drawMaxMsInWindow);
     public static double LastDrawIntervalMs { get; private set; }
+    public static double PreviousDrawCpuMsInLastInterval { get; private set; }
+    /// <summary>
+    /// Estimated time between Game1 callbacks that was not spent inside the
+    /// preceding Draw or the Update calls between two Draw starts. This can
+    /// include platform presentation, VSync waits, framework scheduling and
+    /// other work outside Game1.Update/Game1.Draw; it is not GPU execution time.
+    /// </summary>
+    public static double UnaccountedDrawIntervalMs { get; private set; }
+    /// <summary>
+    /// Runtime-reported GC pause accumulated between consecutive Draw starts.
+    /// This is process-wide pause time, not only collections initiated by the game thread.
+    /// </summary>
+    public static double GcPauseMsSinceLastDraw { get; private set; }
     public static long LastDrawAllocatedBytes { get; private set; }
     public static int LastDrawGc0 { get; private set; }
     public static int LastDrawGc1 { get; private set; }
@@ -84,6 +126,49 @@ internal static class FrameLoopDiagnostics
         _runningSlowlySinceDraw |= gameTime.IsRunningSlowly;
     }
 
+    public static void BeginUpdateCore()
+    {
+        _updateCoreStartTimestamp = Stopwatch.GetTimestamp();
+    }
+
+    public static void EndUpdateCore()
+    {
+        if (_updateCoreStartTimestamp == 0)
+            return;
+
+        LastUpdateCoreCpuMs = ElapsedMilliseconds(_updateCoreStartTimestamp, Stopwatch.GetTimestamp());
+        _updateCoreCpuMsSinceDraw += LastUpdateCoreCpuMs;
+        _updateCoreStartTimestamp = 0;
+    }
+
+    public static long BeginStage() => Stopwatch.GetTimestamp();
+
+    public static void EndUpdateStage(UpdateStage stage, long startTimestamp)
+    {
+        if (startTimestamp == 0)
+            return;
+
+        var elapsedMs = ElapsedMilliseconds(startTimestamp, Stopwatch.GetTimestamp());
+        switch (stage)
+        {
+            case UpdateStage.InputAndPlatform:
+                _updateInputAndPlatformCpuMsSinceDraw += elapsedMs;
+                break;
+            case UpdateStage.Transition:
+                _updateTransitionCpuMsSinceDraw += elapsedMs;
+                break;
+            case UpdateStage.Gameplay:
+                _updateGameplayCpuMsSinceDraw += elapsedMs;
+                break;
+            case UpdateStage.Result:
+                _updateResultCpuMsSinceDraw += elapsedMs;
+                break;
+            case UpdateStage.Startup:
+                _updateStartupCpuMsSinceDraw += elapsedMs;
+                break;
+        }
+    }
+
     public static void EndUpdate()
     {
         var now = Stopwatch.GetTimestamp();
@@ -94,6 +179,7 @@ internal static class FrameLoopDiagnostics
         var gc2 = Math.Max(0, GC.CollectionCount(2) - _updateStartGc2);
 
         LastUpdateCpuMs = cpuMs;
+        _updateCpuMsSinceDraw += cpuMs;
         LastUpdateElapsedGameMs = _updateElapsedGameMs;
         _maxUpdateMsSinceDraw = Math.Max(_maxUpdateMsSinceDraw, cpuMs);
         _updateAllocatedBytesSinceDraw += allocatedBytes;
@@ -116,9 +202,25 @@ internal static class FrameLoopDiagnostics
         _drawStartGc1 = GC.CollectionCount(1);
         _drawStartGc2 = GC.CollectionCount(2);
 
+        var totalGcPauseDuration = GC.GetTotalPauseDuration();
         if (_previousDrawStartTimestamp != 0)
+        {
             LastDrawIntervalMs = ElapsedMilliseconds(_previousDrawStartTimestamp, _drawStartTimestamp);
+            GcPauseMsSinceLastDraw = Math.Max(0.0, (totalGcPauseDuration - _previousDrawTotalGcPauseDuration).TotalMilliseconds);
+            // The draw that began at the previous timestamp is part of this
+            // draw-to-draw interval. Capture it before LastDrawCpuMs is replaced
+            // by the current Draw measurement in EndDraw().
+            _drawCpuMsIncludedInCurrentInterval = LastDrawCpuMs;
+        }
+        else
+        {
+            LastDrawIntervalMs = 0.0;
+            GcPauseMsSinceLastDraw = 0.0;
+            _drawCpuMsIncludedInCurrentInterval = 0.0;
+        }
+        _previousDrawTotalGcPauseDuration = totalGcPauseDuration;
         _previousDrawStartTimestamp = _drawStartTimestamp;
+        PublishUpdateWindowMeasurements();
         _ = gameTime;
     }
 
@@ -138,6 +240,10 @@ internal static class FrameLoopDiagnostics
             ref _completedDrawMaxMs,
             LastDrawCpuMs);
 
+    }
+
+    private static void PublishUpdateWindowMeasurements()
+    {
         MaxUpdateCpuMsSinceLastDraw = _maxUpdateMsSinceDraw;
         UpdateCallsSinceLastDraw = _updatesSinceDraw;
         RunningSlowlySinceLastDraw = _runningSlowlySinceDraw;
@@ -145,6 +251,24 @@ internal static class FrameLoopDiagnostics
         UpdateGc0SinceLastDraw = _updateGc0SinceDraw;
         UpdateGc1SinceLastDraw = _updateGc1SinceDraw;
         UpdateGc2SinceLastDraw = _updateGc2SinceDraw;
+        UpdateCpuMsSinceLastDraw = _updateCpuMsSinceDraw;
+        UpdateCoreCpuMsSinceLastDraw = _updateCoreCpuMsSinceDraw;
+        UpdateNonCoreCpuMsSinceLastDraw = Math.Max(0.0, _updateCpuMsSinceDraw - _updateCoreCpuMsSinceDraw);
+        UpdateInputAndPlatformCpuMsSinceLastDraw = _updateInputAndPlatformCpuMsSinceDraw;
+        UpdateTransitionCpuMsSinceLastDraw = _updateTransitionCpuMsSinceDraw;
+        UpdateGameplayCpuMsSinceLastDraw = _updateGameplayCpuMsSinceDraw;
+        UpdateResultCpuMsSinceLastDraw = _updateResultCpuMsSinceDraw;
+        UpdateStartupCpuMsSinceLastDraw = _updateStartupCpuMsSinceDraw;
+        var classifiedUpdateCoreMs = _updateInputAndPlatformCpuMsSinceDraw
+            + _updateTransitionCpuMsSinceDraw
+            + _updateGameplayCpuMsSinceDraw
+            + _updateResultCpuMsSinceDraw
+            + _updateStartupCpuMsSinceDraw;
+        UpdateOtherCoreCpuMsSinceLastDraw = Math.Max(0.0, _updateCoreCpuMsSinceDraw - classifiedUpdateCoreMs);
+        PreviousDrawCpuMsInLastInterval = _drawCpuMsIncludedInCurrentInterval;
+        UnaccountedDrawIntervalMs = LastDrawIntervalMs > 0.0
+            ? Math.Max(0.0, LastDrawIntervalMs - PreviousDrawCpuMsInLastInterval - UpdateCpuMsSinceLastDraw)
+            : 0.0;
 
         _updatesSinceDraw = 0;
         _runningSlowlySinceDraw = false;
@@ -153,6 +277,13 @@ internal static class FrameLoopDiagnostics
         _updateGc0SinceDraw = 0;
         _updateGc1SinceDraw = 0;
         _updateGc2SinceDraw = 0;
+        _updateCpuMsSinceDraw = 0.0;
+        _updateCoreCpuMsSinceDraw = 0.0;
+        _updateInputAndPlatformCpuMsSinceDraw = 0.0;
+        _updateTransitionCpuMsSinceDraw = 0.0;
+        _updateGameplayCpuMsSinceDraw = 0.0;
+        _updateResultCpuMsSinceDraw = 0.0;
+        _updateStartupCpuMsSinceDraw = 0.0;
     }
 
     private static double ElapsedMilliseconds(long startTimestamp, long endTimestamp)

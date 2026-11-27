@@ -34,13 +34,15 @@ local function get(view)
         (350 * 4 + farCameraDistance)
 
     -- Shared hit animation configuration.
-    local function makeHitAnimation(rotate, long)
+    local function makeHitAnimation(rotate, long, positionMode)
         local animation = {
             enabled = true,
             frameCount = 17,
             totalDurationSeconds = hitAnimationDuration,
             width = hitAnimationWidth,
             rotateWithLane = rotate,
+            rotationMode = rotate and "snapshot" or "fixed",
+            positionMode = positionMode or "lane",
         }
 
         if long then
@@ -233,8 +235,8 @@ local function get(view)
             long = makeHitAnimation(false, true),
 
             superFlick = {
-                outer = makeHitAnimation(not isEditor, false),
-                inner = makeHitAnimation(not isEditor, false),
+                outer = makeHitAnimation(not isEditor, false, "screen"),
+                inner = makeHitAnimation(not isEditor, false, "screen"),
             },
         },
     }

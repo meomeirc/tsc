@@ -33,6 +33,8 @@ public sealed class SkinDisplaySettingsView
         public required string Type { get; init; }
         public bool DefaultBoolean { get; init; }
         public double DefaultNumber { get; init; }
+        public string DefaultChoice { get; init; } = string.Empty;
+        public List<string> Choices { get; init; } = new();
         public double Minimum { get; init; }
         public double Maximum { get; init; }
         public double Step { get; init; }
@@ -55,6 +57,7 @@ public sealed class SkinDisplaySettingsView
     private readonly Dictionary<string, SettingDefinition> _definitions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, bool> _values = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, double> _numberValues = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _choiceValues = new(StringComparer.OrdinalIgnoreCase);
     private long _revision;
 
     public long revision => _revision;
@@ -83,8 +86,10 @@ public sealed class SkinDisplaySettingsView
                 _definitions[definition.Id] = definition;
                 if (definition.Type == "toggle")
                     _values[definition.Id] = definition.DefaultBoolean;
-                else
+                else if (definition.Type == "slider")
                     _numberValues[definition.Id] = NormalizeNumber(definition, definition.DefaultNumber);
+                else if (definition.Type == "choice")
+                    _choiceValues[definition.Id] = definition.DefaultChoice;
             }
         }
         Load();
@@ -125,6 +130,43 @@ public sealed class SkinDisplaySettingsView
         => !string.IsNullOrWhiteSpace(name) && _numberValues.TryGetValue(name.Trim(), out var value)
             ? value
             : 0.0;
+
+    /// <summary>Reads a choice setting declared by this skin's scripts/settings.lua.</summary>
+    public string GetChoice(string name)
+        => !string.IsNullOrWhiteSpace(name) && _choiceValues.TryGetValue(name.Trim(), out var value)
+            ? value
+            : string.Empty;
+
+    /// <summary>Sets a choice setting to one of its declared options.</summary>
+    public bool SetChoice(string name, string value)
+    {
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(value)) return false;
+        var key = name.Trim();
+        if (!_choiceValues.TryGetValue(key, out var current) || !_definitions.TryGetValue(key, out var definition))
+            return false;
+
+        var normalized = definition.Choices.FirstOrDefault(option =>
+            string.Equals(option, value.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (normalized is null) return false;
+        if (string.Equals(current, normalized, StringComparison.Ordinal)) return true;
+        _choiceValues[key] = normalized;
+        _revision++;
+        Save();
+        return true;
+    }
+
+    /// <summary>Moves a choice setting to its next declared option.</summary>
+    public bool CycleChoice(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        var key = name.Trim();
+        if (!_choiceValues.TryGetValue(key, out var current) || !_definitions.TryGetValue(key, out var definition) || definition.Choices.Count == 0)
+            return false;
+        var currentIndex = definition.Choices.FindIndex(option =>
+            string.Equals(option, current, StringComparison.OrdinalIgnoreCase));
+        var nextIndex = (currentIndex + 1) % definition.Choices.Count;
+        return SetChoice(key, definition.Choices[nextIndex]);
+    }
 
     public bool SetNumber(string name, double value)
     {
@@ -187,12 +229,20 @@ public sealed class SkinDisplaySettingsView
                 {
                     settingTable.Set("value", DynValue.NewBoolean(Get(definition.Id)));
                 }
-                else
+                else if (definition.Type == "slider")
                 {
                     settingTable.Set("value", DynValue.NewNumber(GetNumber(definition.Id)));
                     settingTable.Set("minimum", DynValue.NewNumber(definition.Minimum));
                     settingTable.Set("maximum", DynValue.NewNumber(definition.Maximum));
                     settingTable.Set("step", DynValue.NewNumber(definition.Step));
+                }
+                else if (definition.Type == "choice")
+                {
+                    settingTable.Set("value", DynValue.NewString(GetChoice(definition.Id)));
+                    var options = new Table(script);
+                    for (var optionIndex = 0; optionIndex < definition.Choices.Count; optionIndex++)
+                        options.Set(optionIndex + 1, DynValue.NewString(definition.Choices[optionIndex]));
+                    settingTable.Set("options", DynValue.NewTable(options));
                 }
                 settings.Set(settingIndex + 1, DynValue.NewTable(settingTable));
             }
@@ -260,7 +310,7 @@ public sealed class SkinDisplaySettingsView
                             var type = ReadString(settingValue.Table, "type", "toggle").ToLowerInvariant();
                             if (type == "boolean") type = "toggle";
                             if (type == "number") type = "slider";
-                            if (type is not ("toggle" or "slider"))
+                            if (type is not ("toggle" or "slider" or "choice"))
                                 continue;
 
                             if (type == "toggle")
@@ -273,6 +323,45 @@ public sealed class SkinDisplaySettingsView
                                     Type = type,
                                     DefaultBoolean = defaultValue.Type == DataType.Boolean && defaultValue.Boolean,
                                     Format = ReadString(settingValue.Table, "format", "%.0f")
+                                });
+                            }
+                            else if (type == "choice")
+                            {
+                                var optionsValue = settingValue.Table.Get("options");
+                                if (optionsValue.Type != DataType.Table || optionsValue.Table is null)
+                                    continue;
+                                var choices = new List<string>();
+                                var uniqueChoices = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                                for (var optionIndex = 1; optionIndex <= 64; optionIndex++)
+                                {
+                                    var optionValue = optionsValue.Table.Get(optionIndex);
+                                    if (optionValue.IsNil()) break;
+                                    var rawOption = optionValue.String;
+                                    if (optionValue.Type != DataType.String || string.IsNullOrWhiteSpace(rawOption))
+                                    {
+                                        choices.Clear();
+                                        break;
+                                    }
+                                    var option = rawOption.Trim();
+                                    if (!uniqueChoices.Add(option))
+                                    {
+                                        choices.Clear();
+                                        break;
+                                    }
+                                    choices.Add(option);
+                                }
+                                if (choices.Count < 2) continue;
+                                var requestedDefault = ReadString(settingValue.Table, "default", choices[0]);
+                                var defaultChoice = choices.FirstOrDefault(option =>
+                                    string.Equals(option, requestedDefault, StringComparison.OrdinalIgnoreCase)) ?? choices[0];
+                                settings.Add(new SettingDefinition
+                                {
+                                    Id = id,
+                                    Label = label,
+                                    Type = type,
+                                    DefaultChoice = defaultChoice,
+                                    Choices = choices,
+                                    Format = ReadString(settingValue.Table, "format", "")
                                 });
                             }
                             else
@@ -376,6 +465,14 @@ public sealed class SkinDisplaySettingsView
                 {
                     _numberValues[definition.Id] = NormalizeNumber(definition, number);
                 }
+                else if (definition.Type == "choice" && property.Value.ValueKind == JsonValueKind.String)
+                {
+                    var selected = property.Value.GetString();
+                    var normalized = definition.Choices.FirstOrDefault(option =>
+                        string.Equals(option, selected, StringComparison.OrdinalIgnoreCase));
+                    if (normalized is not null)
+                        _choiceValues[definition.Id] = normalized;
+                }
             }
 
             // Older files used SKY to control both the scrolling sky and WINDOW.
@@ -413,6 +510,7 @@ public sealed class SkinDisplaySettingsView
             var combined = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
             foreach (var pair in _values) combined[pair.Key] = pair.Value;
             foreach (var pair in _numberValues) combined[pair.Key] = pair.Value;
+            foreach (var pair in _choiceValues) combined[pair.Key] = pair.Value;
             File.WriteAllText(temporaryPath, JsonSerializer.Serialize(combined, new JsonSerializerOptions
             {
                 WriteIndented = true
@@ -854,36 +952,41 @@ internal readonly record struct SkinPlayfieldGeometrySnapshot(
     bool Hit,
     bool Missed,
     bool Simultaneous,
-    int GeometryTrack);
+    int GeometryTrack,
+    StandingNoteBasis? LaneBasis = null,
+    string Gear = "mixed",
+    string SideGear = "inactive");
 
-public sealed class SkinPlayfieldGeometryHandle
+internal readonly record struct SkinPlayfieldGeometryTransform(
+    float ScaleX,
+    float ScaleY,
+    Vector3 Offset,
+    Vector3 RotationAxis,
+    float RotationDegrees,
+    Vector2 RotationPivot)
 {
-    private readonly SkinPlayfieldGeometrySnapshot _snapshot;
-    internal SkinPlayfieldGeometrySnapshot Snapshot => _snapshot;
-    internal long FrameId { get; }
-    internal VertexPositionColorTexture[] Vertices => _snapshot.Vertices;
-    public float depth => _snapshot.Depth;
-    public int layer => _snapshot.Layer;
-    public int track => _snapshot.Track;
-    public int geometry_track => _snapshot.GeometryTrack;
-    public int tick => _snapshot.Tick;
-    public int event_index => _snapshot.EventIndex;
-    public int attr => _snapshot.Attr;
-    public int duration_ticks => _snapshot.DurationTicks;
-    public int vertex_count => _snapshot.Vertices.Length;
-    public string note_type => _snapshot.NoteType;
-    public string role => _snapshot.Component;
-    public string side => _snapshot.Side;
-    public string bank => _snapshot.Bank;
-    public bool hit => _snapshot.Hit;
-    public bool missed => _snapshot.Missed;
-    public bool simultaneous => _snapshot.Simultaneous;
+    public bool IsIdentity =>
+        MathF.Abs(ScaleX - 1f) < 0.0001f &&
+        MathF.Abs(ScaleY - 1f) < 0.0001f &&
+        Offset.LengthSquared() < 0.0000001f &&
+        MathF.Abs(RotationDegrees) < 0.0001f;
 
-    internal SkinPlayfieldGeometryHandle(SkinPlayfieldGeometrySnapshot snapshot, long frameId)
-    {
-        _snapshot = snapshot;
-        FrameId = frameId;
-    }
+    public static SkinPlayfieldGeometryTransform Identity =>
+        new(1f, 1f, Vector3.Zero, Vector3.UnitZ, 0f, new Vector2(0.5f, 0.5f));
+}
+
+internal enum SkinPlayfieldGeometrySpace
+{
+    NoteSurface,
+    LaneSurface,
+    Billboard
+}
+
+internal enum SkinLaneQuadRotationMode
+{
+    Fixed,
+    Snapshot,
+    FollowLane
 }
 
 internal readonly record struct SkinPlayfieldGeometryDrawRequest(
@@ -892,8 +995,35 @@ internal readonly record struct SkinPlayfieldGeometryDrawRequest(
     XnaColor Tint,
     float Alpha,
     int Layer,
-    float ScaleX,
-    float ScaleY);
+    SkinPlayfieldGeometryTransform Transform,
+    bool IsIndependentGeometry = false,
+    float GeometryScaleX = 1f,
+    float GeometryScaleY = 1f,
+    SkinPlayfieldGeometrySpace GeometrySpace = SkinPlayfieldGeometrySpace.NoteSurface,
+    bool FlipU = false,
+    bool FlipV = false,
+    bool IsNativeComponent = false,
+    bool RebuildGeometryPlane = false);
+
+internal readonly record struct SkinPlayfieldSpriteSpanSnapshot(
+    float StartNormalized,
+    float EndNormalized,
+    float TravelPixels,
+    float AxisLengthPixels,
+    float CenterPerspectiveScale,
+    float StripHeightPixels,
+    float HighlightHeightPixels,
+    float StripReferenceHeightPixels,
+    float HighlightReferenceHeightPixels,
+    float ScrollSpeed,
+    float ScrollGap,
+    float HighlightSpeed,
+    float HighlightOpacity,
+    float BankOpacity,
+    float DirectionSign,
+    float ElapsedSeconds,
+    Vector2 ScreenStart,
+    Vector2 ScreenEnd);
 
 internal readonly record struct SkinPlayfieldSpriteGeometrySnapshot(
     int Track,
@@ -918,7 +1048,10 @@ internal readonly record struct SkinPlayfieldSpriteGeometrySnapshot(
     bool FlipU = false,
     bool FlipV = false,
     int Layer = 0,
-    float Opacity = 1f);
+    float Opacity = 1f,
+    SkinPlayfieldSpriteSpanSnapshot? Span = null,
+    string Gear = "mixed",
+    string SideGear = "inactive");
 
 public sealed class SkinPlayfieldSpriteGeometryHandle
 {
@@ -940,6 +1073,8 @@ public sealed class SkinPlayfieldSpriteGeometryHandle
     public bool hit => _snapshot.Hit;
     public bool missed => _snapshot.Missed;
     public bool simultaneous => _snapshot.Simultaneous;
+    public string gear => _snapshot.Gear;
+    public string side_gear => _snapshot.SideGear;
     public bool has_screen_quad => _snapshot.HasScreenQuad;
     public float opacity => _snapshot.Opacity;
 
@@ -950,6 +1085,225 @@ public sealed class SkinPlayfieldSpriteGeometryHandle
     }
 }
 
+/// <summary>
+/// One bank-level judge anchor. Geometry is expressed in the same camera-space
+/// frame as the playfield's 3D lane and note geometry.
+/// </summary>
+internal readonly record struct SkinJudgeAnchorSnapshot(
+    string Side,
+    string Bank,
+    string Gear,
+    string SideGear,
+    bool Active,
+    float Opacity,
+    float JudgeOpacity,
+    float DefaultHeight,
+    float DefaultBillboardWidth,
+    float DefaultBillboardHeight,
+    StandingNoteBasis Basis,
+    float WorldBankWidth,
+    float ProjectedBankWidth,
+    Vector2 ScreenPosition,
+    float LaneRotationRadians);
+
+/// <summary>
+/// Controls which built-in playfield elements are replaced by the unified
+/// render_playfield callback. A table return opts into this contract; boolean
+/// returns retain the legacy surface-only replacement behavior.
+/// </summary>
+internal readonly record struct SkinPlayfieldRendererControl(
+    bool Unified,
+    bool ReplaceSurfaces,
+    bool ReplaceLaneLines,
+    bool ReplaceJudgementLine);
+
+/// <summary>
+/// One physical track position relative to its bank anchor. X follows the bank's
+/// 3D across direction toward its right-hand edge; X/Width use bank-width units.
+/// TSC supplies these values so skins do not need to duplicate track mapping.
+/// </summary>
+internal readonly record struct SkinJudgeLaneSnapshot(
+    int JudgeIndex,
+    int Track,
+    int Column,
+    float X,
+    float Width,
+    bool Active);
+
+/// <summary>
+/// Anchor supplied to render_playfield() and the legacy render_lane_lines().
+/// It retains the canonical lane projection coordinates required by LaneLine.fx,
+/// while exposing a convenient bank- or track-relative position to Lua.
+/// </summary>
+internal readonly record struct SkinLaneLineAnchorSnapshot(
+    string Side,
+    string Bank,
+    string Gear,
+    string SideGear,
+    bool BankActive,
+    bool Active,
+    int Track,
+    int Column,
+    float X,
+    float Width,
+    float CenterNormalized,
+    float NormalizedWidth,
+    float BankLeftNormalized,
+    float BankRightNormalized,
+    float NearDepth,
+    float DefaultNearWidth,
+    float DefaultFarWidth,
+    float Opacity);
+
+/// <summary>
+/// Frame-scoped bank or physical-column anchor accepted by draw.lane_line().
+/// </summary>
+public sealed class SkinLaneLineAnchorHandle
+{
+    private readonly SkinLaneLineAnchorSnapshot _snapshot;
+    internal SkinLaneLineAnchorSnapshot Snapshot => _snapshot;
+    internal long FrameId { get; }
+
+    public string kind => _snapshot.Column < 0 ? "bank" : "lane";
+    public string side => _snapshot.Side;
+    public string bank => _snapshot.Bank;
+    public string gear => _snapshot.Gear;
+    public string side_gear => _snapshot.SideGear;
+    public bool bank_active => _snapshot.BankActive;
+    public bool active => _snapshot.Active;
+    public int track => _snapshot.Track;
+    public int column => _snapshot.Column;
+    public float x => _snapshot.X;
+    public float width => _snapshot.Width;
+    public float opacity => _snapshot.Opacity;
+    public float default_near_width => _snapshot.DefaultNearWidth;
+    public float default_far_width => _snapshot.DefaultFarWidth;
+
+    internal SkinLaneLineAnchorHandle(SkinLaneLineAnchorSnapshot snapshot, long frameId)
+    {
+        _snapshot = snapshot;
+        FrameId = frameId;
+    }
+}
+
+internal readonly record struct SkinLaneLineDrawRequest(
+    SkinAssetHandle? Asset,
+    string Side,
+    string Bank,
+    float CenterNormalized,
+    float HalfNormalizedWidth,
+    float NearDepth,
+    float NearWidth,
+    float FarWidth,
+    XnaColor Tint,
+    float Alpha,
+    int Layer);
+
+/// <summary>
+/// Read-only bank anchor passed to render_playfield() and
+/// render_judgement_line(). The world-space position and screen projection are
+/// informational; draw.lane_quad() uses this frame-scoped anchor to build
+/// geometry in lane-relative coordinates.
+/// </summary>
+public sealed class SkinJudgeAnchorHandle
+{
+    private readonly SkinJudgeAnchorSnapshot _snapshot;
+    internal SkinJudgeAnchorSnapshot Snapshot => _snapshot;
+    internal long FrameId { get; }
+
+    public string side => _snapshot.Side;
+    public string bank => _snapshot.Bank;
+    public string gear => _snapshot.Gear;
+    public string side_gear => _snapshot.SideGear;
+    public bool active => _snapshot.Active;
+    public float opacity => _snapshot.Opacity;
+    public float judge_opacity => _snapshot.JudgeOpacity;
+    public float default_height => _snapshot.DefaultHeight;
+    public float default_billboard_width => _snapshot.DefaultBillboardWidth;
+    public float default_billboard_height => _snapshot.DefaultBillboardHeight;
+    public float width => _snapshot.WorldBankWidth;
+    public float bank_width => _snapshot.WorldBankWidth;
+    public float projected_width => _snapshot.ProjectedBankWidth;
+    public float depth => _snapshot.Basis.CameraDistance;
+    public float screen_x => _snapshot.ScreenPosition.X;
+    public float screen_y => _snapshot.ScreenPosition.Y;
+    public float world_x => _snapshot.Basis.Center.X;
+    public float world_y => _snapshot.Basis.Center.Y;
+    public float world_z => _snapshot.Basis.Center.Z;
+    /// <summary>Current projected across-lane angle in screen-space radians.</summary>
+    public float lane_rotation => _snapshot.LaneRotationRadians;
+
+    internal SkinJudgeAnchorHandle(SkinJudgeAnchorSnapshot snapshot, long frameId)
+    {
+        _snapshot = snapshot;
+        FrameId = frameId;
+    }
+}
+
+/// <summary>
+/// Track-specific hit-effect anchor for the current render frame. Its origin is
+/// the physical track's actual 3D judge position; its local width unit spans that
+/// track rather than the entire bank.
+/// </summary>
+internal readonly record struct SkinHitEffectAnchorSnapshot(
+    int Track,
+    int Column,
+    bool Active,
+    float ProjectedAlongWidth,
+    SkinJudgeAnchorSnapshot Judge);
+
+/// <summary>
+/// Frame-scoped anchor exposed only while render_hit_effects() is running.
+/// The handle is rebuilt every frame so effects follow the current view and
+/// playfield projection without storing stale camera-space coordinates in Lua.
+/// </summary>
+public sealed class SkinHitEffectAnchorHandle
+{
+    private readonly SkinHitEffectAnchorSnapshot _snapshot;
+    internal SkinHitEffectAnchorSnapshot Snapshot => _snapshot;
+    internal long FrameId { get; }
+
+    public int track => _snapshot.Track;
+    public int column => _snapshot.Column;
+    public bool active => _snapshot.Active;
+    public string side => _snapshot.Judge.Side;
+    public string bank => _snapshot.Judge.Bank;
+    public string gear => _snapshot.Judge.Gear;
+    public string side_gear => _snapshot.Judge.SideGear;
+    public float opacity => _snapshot.Judge.Opacity;
+    public float width => _snapshot.Judge.WorldBankWidth;
+    public float projected_width => _snapshot.Judge.ProjectedBankWidth;
+    public float projected_along_width => _snapshot.ProjectedAlongWidth;
+    public float screen_x => _snapshot.Judge.ScreenPosition.X;
+    public float screen_y => _snapshot.Judge.ScreenPosition.Y;
+    public float depth => _snapshot.Judge.Basis.CameraDistance;
+    /// <summary>Current projected across-lane angle in screen-space radians.</summary>
+    public float lane_rotation => _snapshot.Judge.LaneRotationRadians;
+
+    internal SkinHitEffectAnchorHandle(SkinHitEffectAnchorSnapshot snapshot, long frameId)
+    {
+        _snapshot = snapshot;
+        FrameId = frameId;
+    }
+}
+
+internal readonly record struct SkinLaneQuadDrawRequest(
+    SkinAssetHandle? Asset,
+    SkinJudgeAnchorSnapshot Judge,
+    float X,
+    float Y,
+    float NormalOffset,
+    float Width,
+    float Height,
+    XnaColor Tint,
+    float Alpha,
+    int Layer,
+    SkinPlayfieldGeometrySpace Space,
+    SkinLaneQuadRotationMode RotationMode,
+    float RotationRadians,
+    bool FlipX,
+    bool FlipY);
+
 internal readonly record struct SkinPlayfieldSpriteDrawRequest(
     SkinAssetHandle Asset,
     SkinPlayfieldSpriteGeometrySnapshot Geometry,
@@ -959,7 +1313,16 @@ internal readonly record struct SkinPlayfieldSpriteDrawRequest(
     bool FlipX,
     bool FlipY,
     float ScaleX,
-    float ScaleY);
+    float ScaleY,
+    bool IsSpanInstance = false,
+    float SpanPosition = 0.5f,
+    float InstanceWidth = 0f,
+    float InstanceHeight = 0f,
+    float InstanceRotationDegrees = 0f,
+    float MinimumInstanceWidth = 0f,
+    float MinimumInstanceHeight = 0f,
+    bool AlignToLocalSurfaceAcross = false,
+    bool IsNativeComponent = false);
 
 internal readonly record struct SkinPlayfieldSurfaceGeometrySnapshot(
     VertexPositionColorTexture[] Vertices,
@@ -1055,7 +1418,7 @@ public sealed class SkinNoteView
     public float scale { get; }
     /// <summary>Default hit-effect billboard width already adjusted for the current projection.</summary>
     public float hit_width { get; }
-    /// <summary>Lane-following billboard rotation when the active hit style requests it.</summary>
+    /// <summary>Projected across-lane angle at the hit position, in radians; skins choose how to use it.</summary>
     public float hit_rotation { get; }
     public double progress { get; }
     public bool hit { get; }
@@ -3224,20 +3587,26 @@ public sealed class SkinRuntime : IDisposable
     private BlendState? _skinQuad3DRunCurrentBlendState;
     private readonly List<SkinDrawCommand> _drawCommands = new();
     private bool _insideHitEffectRenderer;
+    private long _hitEffectFrameId;
+    private readonly List<SkinHitEffectAnchorSnapshot> _hitEffectAnchorSnapshots = new(16);
+    private readonly List<SkinLaneQuadDrawRequest> _hitEffectLaneQuadDrawRequests = new(16);
     private readonly List<SkinDrawCommand> _drawCommandPool = new();
     private readonly List<SkinPlayfieldGeometryDrawRequest> _playfieldGeometryDrawRequests = new();
     private readonly List<SkinPlayfieldSpriteDrawRequest> _playfieldSpriteDrawRequests = new();
     private readonly List<SkinPlayfieldSurfaceDrawRequest> _playfieldSurfaceDrawRequests = new();
     private readonly List<SkinPlayfieldSpriteDrawRequest> _judgementLineSpriteDrawRequests = new();
+    private readonly List<SkinLaneQuadDrawRequest> _laneQuadDrawRequests = new();
+    private readonly List<SkinLaneLineDrawRequest> _laneLineDrawRequests = new();
     private readonly Dictionary<(int Track, int Tick, int EventIndex), int> _playfieldNoteIndices = new();
     private readonly List<Table> _playfieldNoteTables = new();
     private readonly List<Table> _playfieldNoteGeometryTables = new();
-    private readonly List<Table?> _playfieldNoteGeometryRoleTables = new();
+    private readonly List<Table> _playfieldNoteSpanTables = new();
+    private readonly List<Table> _playfieldNoteGeometryRoleTables = new();
     private readonly Dictionary<string, DynValue> _playfieldGeometryRoleValues = new(StringComparer.Ordinal);
     private readonly List<DynValue> _playfieldNoteTableValues = new();
     private readonly List<DynValue> _playfieldNoteGeometryTableValues = new();
+    private readonly List<DynValue> _playfieldNoteSpanTableValues = new();
     private readonly List<DynValue> _playfieldNoteGeometryRoleTableValues = new();
-    private bool _playfieldNoteUsesNumericGeometryHandles;
     private List<SkinPlayfieldGeometrySnapshot>? _activePlayfieldNoteGeometry;
     private List<SkinPlayfieldSpriteGeometrySnapshot>? _activePlayfieldNoteSpriteGeometry;
     private const int PlayfieldGeometryTokenIndexBits = 13;
@@ -3246,12 +3615,159 @@ public sealed class SkinRuntime : IDisposable
     private readonly List<int> _playfieldNoteGeometryCounts = new();
     private readonly List<int> _playfieldNotePreviousGeometryCounts = new();
     private readonly List<PlayfieldNoteTableCache> _playfieldNoteTableCaches = new();
+    private readonly Dictionary<string, List<NativeNoteComponent>> _nativeNoteComponents = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Dictionary<string, List<NativeNoteComponent>>> _nativeNoteRoleComponents = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<NativeNoteComponent>> _nativeNotePoseComponents = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _nativeOnlyNoteTypes = new(StringComparer.Ordinal);
+    private readonly List<VertexPositionColorTexture[]> _nativeNoteSuppressedGeometry = new();
+    private readonly List<(int Tick, int Track, int EventIndex)> _nativeNoteSuppressedFlickAttachments = new();
+    private readonly HashSet<VertexPositionColorTexture[]> _nativeNoteVisibleSourceGeometry = new();
+    private readonly HashSet<VertexPositionColorTexture[]> _nativeNoteHiddenSourceGeometry = new();
+    private readonly HashSet<(string NoteType, string ComponentId, int Track, int Tick, int EventIndex)> _nativePoseComponentKeys = new();
+    private Script? _nativeNotePlanOwner;
+    private bool _nativeNotePlanHasComponents;
+    private Table? _nativeNoteComponentSource;
+    private Table? _nativeNoteTransformSource;
     private Table? _playfieldNoteFrameTable;
     private Table? _playfieldNotesTable;
     private DynValue _playfieldNoteFrameValue = DynValue.Nil;
     private DynValue _playfieldNotesValue = DynValue.Nil;
     private DynValue _playfieldNoteVersionValue = DynValue.Nil;
     private Script? _playfieldTableOwner;
+
+    private readonly record struct NativeNoteSelectionKey(
+        string NoteType,
+        int Track,
+        int GeometryTrack,
+        int Attr,
+        string Side,
+        string Bank,
+        string Gear,
+        string SideGear,
+        string Family,
+        bool Hit,
+        bool Missed,
+        bool Simultaneous);
+
+    private readonly record struct NativeNoteSelectionContext(
+        string NoteType,
+        int Track,
+        int GeometryTrack,
+        int Attr,
+        string Side,
+        string Bank,
+        string Gear,
+        string SideGear,
+        string Family,
+        bool Hit,
+        bool Missed,
+        bool Simultaneous)
+    {
+        public NativeNoteSelectionKey CacheKey => new(
+            NoteType, Track, GeometryTrack, Attr, Side, Bank, Gear, SideGear, Family,
+            Hit, Missed, Simultaneous);
+    }
+
+    private readonly record struct NativeNoteVariantFilter(
+        string? NoteType,
+        string? Side,
+        string? Bank,
+        string? Gear,
+        string? SideGear,
+        string? Family,
+        int? Track,
+        int? GeometryTrack,
+        int? Attr,
+        bool? Hit,
+        bool? Missed,
+        bool? Simultaneous)
+    {
+        public int Specificity =>
+            (NoteType is null ? 0 : 1) + (Side is null ? 0 : 1) +
+            (Bank is null ? 0 : 1) + (Gear is null ? 0 : 1) +
+            (SideGear is null ? 0 : 1) + (Family is null ? 0 : 1) +
+            (Track.HasValue ? 1 : 0) + (GeometryTrack.HasValue ? 1 : 0) +
+            (Attr.HasValue ? 1 : 0) + (Hit.HasValue ? 1 : 0) +
+            (Missed.HasValue ? 1 : 0) + (Simultaneous.HasValue ? 1 : 0);
+
+        public bool Matches(in NativeNoteSelectionContext context) =>
+            (NoteType is null || string.Equals(NoteType, context.NoteType, StringComparison.OrdinalIgnoreCase)) &&
+            (Side is null || string.Equals(Side, context.Side, StringComparison.OrdinalIgnoreCase)) &&
+            (Bank is null || string.Equals(Bank, context.Bank, StringComparison.OrdinalIgnoreCase)) &&
+            (Gear is null || string.Equals(Gear, context.Gear, StringComparison.OrdinalIgnoreCase)) &&
+            (SideGear is null || string.Equals(SideGear, context.SideGear, StringComparison.OrdinalIgnoreCase)) &&
+            (Family is null || string.Equals(Family, context.Family, StringComparison.OrdinalIgnoreCase)) &&
+            (!Track.HasValue || Track.Value == context.Track) &&
+            (!GeometryTrack.HasValue || GeometryTrack.Value == context.GeometryTrack) &&
+            (!Attr.HasValue || Attr.Value == context.Attr) &&
+            (!Hit.HasValue || Hit.Value == context.Hit) &&
+            (!Missed.HasValue || Missed.Value == context.Missed) &&
+            (!Simultaneous.HasValue || Simultaneous.Value == context.Simultaneous);
+    }
+
+    private readonly record struct NativeNoteAssetChoice(
+        SkinAssetHandle? Asset,
+        SkinAssetHandle[]? Frames,
+        float FramesPerSecond,
+        bool Visible,
+        XnaColor? Tint = null);
+
+    private sealed class NativeNoteAssetVariant
+    {
+        public required NativeNoteVariantFilter Filter { get; init; }
+        public required NativeNoteAssetChoice Choice { get; init; }
+    }
+
+    private sealed class NativeNoteComponent
+    {
+        public required string Id { get; init; }
+        public required string[] SourceRoles { get; init; }
+        public string? AnchorRole { get; init; }
+        public required NativeNoteAssetChoice BaseChoice { get; init; }
+        public required NativeNoteAssetVariant[] Variants { get; init; }
+        public required XnaColor Tint { get; init; }
+        public required float Alpha { get; init; }
+        public required int? Layer { get; init; }
+        public required SkinPlayfieldGeometryTransform Transform { get; init; }
+        public required bool TransformOverridesScaleX { get; init; }
+        public required bool BeatPulse { get; init; }
+        public required bool FlipU { get; init; }
+        public required bool FlipV { get; init; }
+        public required float SizeX { get; init; }
+        public required float SizeY { get; init; }
+        public required SkinPlayfieldGeometrySpace Space { get; init; }
+        public required bool RebuildGeometryPlane { get; init; }
+        public Dictionary<NativeNoteSelectionKey, NativeNoteAssetChoice> SelectionCache { get; } = new();
+
+        public NativeNoteAssetChoice ResolveChoice(in NativeNoteSelectionContext context)
+        {
+            if (Variants.Length == 0)
+                return BaseChoice;
+
+            var key = context.CacheKey;
+            if (SelectionCache.TryGetValue(key, out var cached))
+                return cached;
+
+            // Metadata combinations are normally tiny (a few tracks, gear states
+            // and note flags). Keep a hard bound so unusual charts/skins cannot
+            // grow this per-component lookup cache without limit.
+            if (SelectionCache.Count >= 4096)
+                SelectionCache.Clear();
+
+            var selected = BaseChoice;
+            for (var i = 0; i < Variants.Length; i++)
+            {
+                if (Variants[i].Filter.Matches(context))
+                {
+                    selected = Variants[i].Choice;
+                    break;
+                }
+            }
+
+            SelectionCache.Add(key, selected);
+            return selected;
+        }
+    }
 
     private struct PlayfieldNoteTableCache
     {
@@ -3265,6 +3781,8 @@ public sealed class SkinRuntime : IDisposable
         public string? NoteType;
         public string? Side;
         public string? Bank;
+        public string? Gear;
+        public string? SideGear;
         public string? Family;
         public bool Hit;
         public bool Missed;
@@ -3272,10 +3790,13 @@ public sealed class SkinRuntime : IDisposable
         public DynValue? NoteTypeValue;
         public DynValue? TrackValue;
         public DynValue? TickValue;
+        public DynValue? EventIndexValue;
         public DynValue? AttrValue;
         public DynValue? DurationTicksValue;
         public DynValue? SideValue;
         public DynValue? BankValue;
+        public DynValue? GearValue;
+        public DynValue? SideGearValue;
         public DynValue? FamilyValue;
         public DynValue? HitValue;
         public DynValue? MissedValue;
@@ -3286,22 +3807,46 @@ public sealed class SkinRuntime : IDisposable
     private bool _insidePlayfieldNoteRenderer;
     private Table? _playfieldSurfaceFrameTable;
     private Table? _hitEffectFrameTable;
+    private Table? _hitEffectAnchorTable;
     private Script? _hitEffectFrameTableOwner;
     private Table? _playfieldSurfaceGeometryTable;
+    private Table? _playfieldSurfaceJudgeTable;
+    private Table? _playfieldSurfaceLaneTable;
+    private Table? _playfieldSurfaceLineBankTable;
+    private Table? _playfieldSurfaceLineLaneTable;
+    private readonly List<Table> _playfieldSurfaceLaneTables = new();
     private Script? _playfieldSurfaceTableOwner;
     private long _playfieldSurfaceGeometryFrameId;
     private int _playfieldSurfacePreviousGeometryCount;
+    private int _playfieldSurfacePreviousJudgeCount;
+    private int _playfieldSurfacePreviousLaneCount;
+    private int _playfieldSurfacePreviousLineBankCount;
+    private int _playfieldSurfacePreviousLineLaneCount;
     private bool _insidePlayfieldSurfaceRenderer;
+    private bool _insidePlayfieldBaseRenderer;
     private Table? _playfieldLifecycleTable;
     private string _playfieldLifecyclePhase = "idle";
     private string _playfieldLifecycleReason = string.Empty;
     private double _playfieldLifecycleElapsed;
     private Table? _judgementLineFrameTable;
     private Table? _judgementLineGeometryTable;
+    private Table? _judgementLineJudgeTable;
+    private Table? _judgementLineLaneTable;
+    private readonly List<Table> _judgementLineLaneTables = new();
     private Script? _judgementLineTableOwner;
     private long _judgementLineGeometryFrameId;
     private int _judgementLinePreviousGeometryCount;
+    private int _judgementLinePreviousJudgeCount;
+    private int _judgementLinePreviousLaneCount;
     private bool _insideJudgementLineRenderer;
+    private Table? _laneLineFrameTable;
+    private Table? _laneLineBankTable;
+    private Table? _laneLineLaneTable;
+    private Script? _laneLineTableOwner;
+    private long _laneLineFrameId;
+    private int _laneLinePreviousBankCount;
+    private int _laneLinePreviousLaneCount;
+    private bool _insideLaneLineRenderer;
     private int _drawCommandPoolIndex;
     private const int TextLayoutCacheCapacity = 1024;
     private readonly Dictionary<SkinTextLayoutCacheKey, LinkedListNode<SkinTextLayoutCacheEntry>> _textLayoutCache = new();
@@ -3633,6 +4178,25 @@ public sealed class SkinRuntime : IDisposable
     public double DebugLastRenderSortMilliseconds { get; private set; }
     public long DebugLastResolveLayoutAllocatedBytes { get; private set; }
     public double DebugLastResolveLayoutMilliseconds { get; private set; }
+    public long DebugLastPlayfieldNoteDataAllocatedBytes { get; private set; }
+    public double DebugLastPlayfieldNoteDataMilliseconds { get; private set; }
+    public int DebugLastNativeNoteGeometryCount { get; private set; }
+    public long DebugLastNativeNoteAllocatedBytes { get; private set; }
+    public double DebugLastNativeNoteMilliseconds { get; private set; }
+    public long DebugLastPlayfieldCallbackAllocatedBytes { get; private set; }
+    public double DebugLastPlayfieldCallbackMilliseconds { get; private set; }
+    public long DebugLastPlayfieldCallbackQuadApiAllocatedBytes { get; private set; }
+    public double DebugLastPlayfieldCallbackQuadApiMilliseconds { get; private set; }
+    public int DebugLastPlayfieldCallbackQuadApiCalls { get; private set; }
+    public long DebugLastPlayfieldCallbackSpriteApiAllocatedBytes { get; private set; }
+    public double DebugLastPlayfieldCallbackSpriteApiMilliseconds { get; private set; }
+    public int DebugLastPlayfieldCallbackSpriteApiCalls { get; private set; }
+    public long DebugLastPlayfieldCallbackSpriteInstancesAllocatedBytes { get; private set; }
+    public double DebugLastPlayfieldCallbackSpriteInstancesMilliseconds { get; private set; }
+    public int DebugLastPlayfieldCallbackSpriteInstancesCalls { get; private set; }
+    public long DebugLastSpriteInstancesApiAllocatedBytes { get; private set; }
+    public double DebugLastSpriteInstancesApiMilliseconds { get; private set; }
+    public int DebugLastSpriteInstancesApiCalls { get; private set; }
 #if TSC_ANDROID && DEBUG
     public double DebugLastLuaRenderMilliseconds { get; private set; }
     public double DebugLastLayoutResolveMilliseconds { get; private set; }
@@ -3709,7 +4273,8 @@ public sealed class SkinRuntime : IDisposable
         {
             if (_script is null || LastError is not null)
                 return false;
-            return _script.Globals.Get("render_notes").Type == DataType.Function;
+            return _script.Globals.Get("render_notes").Type == DataType.Function ||
+                   _script.Globals.Get("TSC_PLAYFIELD_NOTE_COMPONENTS").Type == DataType.Table;
         }
     }
     /// <summary>
@@ -3755,6 +4320,15 @@ public sealed class SkinRuntime : IDisposable
             return _script.Globals.Get("render_transition_flashes").Type == DataType.Function;
         }
     }
+    public bool SupportsLaneLineRenderer
+    {
+        get
+        {
+            if (_script is null || LastError is not null)
+                return false;
+            return _script.Globals.Get("render_lane_lines").Type == DataType.Function;
+        }
+    }
     public bool SupportsJudgementLineRenderer
     {
         get
@@ -3768,15 +4342,44 @@ public sealed class SkinRuntime : IDisposable
         => _playfieldGeometryDrawRequests;
     internal IReadOnlyList<SkinPlayfieldSpriteDrawRequest> PlayfieldSpriteDrawRequests
         => _playfieldSpriteDrawRequests;
+    internal IReadOnlyList<VertexPositionColorTexture[]> NativeNoteSuppressedGeometry
+        => _nativeNoteSuppressedGeometry;
+    internal IReadOnlyList<(int Tick, int Track, int EventIndex)> NativeNoteSuppressedFlickAttachments
+        => _nativeNoteSuppressedFlickAttachments;
     internal IReadOnlyList<SkinPlayfieldSurfaceDrawRequest> PlayfieldSurfaceDrawRequests
         => _playfieldSurfaceDrawRequests;
     internal IReadOnlyList<SkinPlayfieldSpriteDrawRequest> JudgementLineSpriteDrawRequests
         => _judgementLineSpriteDrawRequests;
+    internal IReadOnlyList<SkinLaneQuadDrawRequest> LaneQuadDrawRequests
+        => _laneQuadDrawRequests;
+    internal IReadOnlyList<SkinLaneQuadDrawRequest> HitEffectLaneQuadDrawRequests
+        => _hitEffectLaneQuadDrawRequests;
+    internal IReadOnlyList<SkinLaneLineDrawRequest> LaneLineDrawRequests
+        => _laneLineDrawRequests;
+    internal void ClearLaneLineDrawRequests() => _laneLineDrawRequests.Clear();
     internal Texture2D PlayfieldGeometryWhiteTexture => _skin3DWhiteTexture;
-    internal void ClearPlayfieldGeometryDrawRequests() => _playfieldGeometryDrawRequests.Clear();
-    internal void ClearPlayfieldSpriteDrawRequests() => _playfieldSpriteDrawRequests.Clear();
+    internal void ClearPlayfieldGeometryDrawRequests()
+    {
+        _playfieldGeometryDrawRequests.Clear();
+        _nativeNoteSuppressedGeometry.Clear();
+    }
+    internal void ClearPlayfieldSpriteDrawRequests()
+    {
+        _playfieldSpriteDrawRequests.Clear();
+        _nativeNoteSuppressedFlickAttachments.Clear();
+    }
     internal void ClearPlayfieldSurfaceDrawRequests() => _playfieldSurfaceDrawRequests.Clear();
     internal void ClearJudgementLineSpriteDrawRequests() => _judgementLineSpriteDrawRequests.Clear();
+    internal void ClearLaneQuadDrawRequests() => _laneQuadDrawRequests.Clear();
+    internal void ClearHitEffectLaneQuadDrawRequests() => _hitEffectLaneQuadDrawRequests.Clear();
+    internal void SetHitEffectAnchors(IReadOnlyList<SkinHitEffectAnchorSnapshot>? anchors)
+    {
+        _hitEffectAnchorSnapshots.Clear();
+        if (anchors is null || anchors.Count == 0)
+            return;
+        for (var i = 0; i < anchors.Count; i++)
+            _hitEffectAnchorSnapshots.Add(anchors[i]);
+    }
     internal bool IsInitialLoadDeferred => _initialLoadDeferred;
     public string ScriptPath => _scriptPath;
     internal string? ActiveScriptPath => _script is not null ? _activeScriptPath : null;
@@ -3815,9 +4418,11 @@ public sealed class SkinRuntime : IDisposable
         UserData.RegisterType<SkinUiLayoutView>();
         UserData.RegisterType<SkinVector2View>();
         UserData.RegisterType<SkinNoteView>();
-        UserData.RegisterType<SkinPlayfieldGeometryHandle>();
         UserData.RegisterType<SkinPlayfieldSpriteGeometryHandle>();
         UserData.RegisterType<SkinPlayfieldSurfaceGeometryHandle>();
+        UserData.RegisterType<SkinJudgeAnchorHandle>();
+        UserData.RegisterType<SkinHitEffectAnchorHandle>();
+        UserData.RegisterType<SkinLaneLineAnchorHandle>();
         UserData.RegisterType<SkinAssetHandle>();
         UserData.RegisterType<SkinShaderHandle>();
     }
@@ -4166,6 +4771,12 @@ public sealed class SkinRuntime : IDisposable
                 script.Call(init);
             }
 
+            // Compile the skin's declarative note component layouts and texture
+            // variant rules once, after init has loaded its assets and populated
+            // the component tables. No Lua component-selection callback is needed
+            // in the visible-note render loop.
+            EnsureNativeNotePlan(script);
+
             // Chart/panel data can be supplied before a deferred runtime has a
             // Lua environment. Re-publish the retained C# data after every
             // successful initialization and reload.
@@ -4348,7 +4959,7 @@ public sealed class SkinRuntime : IDisposable
         _mainMenu.Set("skin_options", DynValue.NewTable(skins));
     }
 
-    /// <summary>Toggles a Default-skin visibility option and persists it in the active skin folder.</summary>
+    /// <summary>Toggles a skin display setting and persists it in the active skin folder.</summary>
     public bool ToggleSkinDisplaySetting(string name)
         => _game.skin_display.Toggle(name);
 
@@ -4359,6 +4970,10 @@ public sealed class SkinRuntime : IDisposable
     /// <summary>Sets a numeric setting declared by the active skin.</summary>
     public bool SetSkinDisplayNumber(string name, double value)
         => _game.skin_display.SetNumber(name, value);
+
+    /// <summary>Cycles a per-skin choice setting.</summary>
+    public bool CycleSkinDisplayChoice(string name)
+        => _game.skin_display.CycleChoice(name);
 
     /// <summary>Gets a per-skin numeric setting.</summary>
     public double GetSkinDisplayNumber(string name)
@@ -4964,6 +5579,19 @@ public sealed class SkinRuntime : IDisposable
         {
             DebugLastRenderCallAllocatedBytes = 0;
             DebugLastRenderCallMilliseconds = 0.0;
+            DebugLastPlayfieldNoteDataAllocatedBytes = 0;
+            DebugLastPlayfieldNoteDataMilliseconds = 0.0;
+            DebugLastPlayfieldCallbackAllocatedBytes = 0;
+            DebugLastPlayfieldCallbackMilliseconds = 0.0;
+            DebugLastPlayfieldCallbackQuadApiAllocatedBytes = 0;
+            DebugLastPlayfieldCallbackQuadApiMilliseconds = 0.0;
+            DebugLastPlayfieldCallbackQuadApiCalls = 0;
+            DebugLastPlayfieldCallbackSpriteApiAllocatedBytes = 0;
+            DebugLastPlayfieldCallbackSpriteApiMilliseconds = 0.0;
+            DebugLastPlayfieldCallbackSpriteApiCalls = 0;
+            DebugLastPlayfieldCallbackSpriteInstancesAllocatedBytes = 0;
+            DebugLastPlayfieldCallbackSpriteInstancesMilliseconds = 0.0;
+            DebugLastPlayfieldCallbackSpriteInstancesCalls = 0;
             DebugLastRenderSortAllocatedBytes = 0;
             DebugLastRenderSortMilliseconds = 0.0;
             DebugLastResolveLayoutAllocatedBytes = 0;
@@ -4982,6 +5610,9 @@ public sealed class SkinRuntime : IDisposable
             DebugLastQuad3DDrawCallsSaved = 0;
             DebugLastSpriteApiAllocatedBytes = 0;
             DebugLastSpriteApiMilliseconds = 0.0;
+            DebugLastSpriteInstancesApiAllocatedBytes = 0;
+            DebugLastSpriteInstancesApiMilliseconds = 0.0;
+            DebugLastSpriteInstancesApiCalls = 0;
             DebugLastQuad3DApiAllocatedBytes = 0;
             DebugLastQuad3DApiMilliseconds = 0.0;
             DebugLastSparkleApiAllocatedBytes = 0;
@@ -10150,39 +10781,49 @@ public sealed class SkinRuntime : IDisposable
         return null;
     }
 
-    /// <summary>Whether the active skin provides the unified gameplay/editor playfield configuration API.</summary>
-    internal bool HasPlayfieldConfigProvider
-        => _script is not null && LastError is null &&
-           PathEquals(_activeScriptPath ?? string.Empty, _scriptPath) &&
-           _script.Globals.Get("get_playfield_config").Type == DataType.Function;
-
     /// <summary>
-    /// Evaluates get_playfield_config("gameplay"|"editor") on demand. This is called
-    /// only on load, explicit reload, or viewport changes; never from the frame loop.
-    /// Only a configuration callback from the selected skin's own entry script opts
-    /// into this API. A Default entry script loaded only as a legacy fallback must not
-    /// override an older skin's renderConfig.lua/editorRenderConfig.lua files.
-    /// A false return with no error means the legacy config path should be used.
+    /// Evaluates the selected skin's playfield configuration for the requested view.
+    /// An explicit get_playfield_config callback takes priority. Otherwise, the
+    /// selected skin's playfieldConfig module is imported; ImportModule naturally
+    /// falls back to the bundled Default skin when the selected skin has no override.
+    /// This runs only on load, explicit reload, or viewport changes, never per frame.
     /// </summary>
     internal bool TryGetPlayfieldConfig(string view, out RenderConfig config, out string? error)
     {
         config = new RenderConfig();
         error = null;
-        if (_script is null || LastError is not null ||
-            !PathEquals(_activeScriptPath ?? string.Empty, _scriptPath))
-            return false;
-
-        var function = _script.Globals.Get("get_playfield_config");
-        if (function.Type != DataType.Function)
+        if (_script is null || LastError is not null)
             return false;
 
         try
         {
             var normalizedView = string.Equals(view, "editor", StringComparison.OrdinalIgnoreCase)
                 ? "editor" : "gameplay";
-            var result = _script.Call(function, DynValue.NewString(normalizedView));
-            config = RenderConfigLuaLoader.DeserializeLuaConfigTable(
-                result, $"get_playfield_config(\"{normalizedView}\")");
+            var viewValue = DynValue.NewString(normalizedView);
+            var function = _script.Globals.Get("get_playfield_config");
+            DynValue result;
+            string configName;
+
+            if (function.Type == DataType.Function)
+            {
+                result = _script.Call(function, viewValue);
+                configName = $"get_playfield_config(\"{normalizedView}\")";
+            }
+            else
+            {
+                var module = ImportModule(_script, "playfieldConfig");
+                if (module.Type != DataType.Table || module.Table is null)
+                    throw new ScriptRuntimeException("playfieldConfig.lua must return a table with a get(view) function.");
+
+                var getFunction = module.Table.Get("get");
+                if (getFunction.Type != DataType.Function)
+                    throw new ScriptRuntimeException("playfieldConfig.lua must return a get(view) function.");
+
+                result = _script.Call(getFunction, viewValue);
+                configName = $"playfieldConfig.get(\"{normalizedView}\")";
+            }
+
+            config = PlayfieldConfigLoader.DeserializeLuaConfigTable(result, configName);
             return true;
         }
         catch (Exception ex)
@@ -10248,46 +10889,83 @@ public sealed class SkinRuntime : IDisposable
 
     internal bool InvokePlayfieldSurfaceRenderer(
         IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
+        IReadOnlyList<SkinJudgeAnchorSnapshot> judges,
+        IReadOnlyList<SkinJudgeLaneSnapshot> lanes,
+        IReadOnlyList<SkinLaneLineAnchorSnapshot> lineBanks,
+        IReadOnlyList<SkinLaneLineAnchorSnapshot> lineLanes,
         double time,
-        double tick)
-        => InvokePlayfieldSurfaceGeometryRenderer("render_playfield", geometry, time, tick);
+        double tick,
+        out SkinPlayfieldRendererControl control)
+        => InvokePlayfieldSurfaceGeometryRenderer(
+            "render_playfield", geometry, time, tick, judges, lanes,
+            realTime: null, lineBanks: lineBanks, lineLanes: lineLanes, control: out control);
 
     internal bool InvokeLaneHighlightRenderer(
         IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
         double time,
         double tick,
         double realTime)
-        => InvokePlayfieldSurfaceGeometryRenderer("render_lane_highlights", geometry, time, tick, realTime);
+        => InvokePlayfieldSurfaceGeometryRenderer("render_lane_highlights", geometry, time, tick,
+            judges: Array.Empty<SkinJudgeAnchorSnapshot>(), lanes: Array.Empty<SkinJudgeLaneSnapshot>(),
+            realTime: realTime, lineBanks: null, lineLanes: null, control: out _);
 
     internal bool InvokeTransitionFlashRenderer(
         IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
         double time,
         double tick)
-        => InvokePlayfieldSurfaceGeometryRenderer("render_transition_flashes", geometry, time, tick);
+        => InvokePlayfieldSurfaceGeometryRenderer("render_transition_flashes", geometry, time, tick,
+            judges: Array.Empty<SkinJudgeAnchorSnapshot>(), lanes: Array.Empty<SkinJudgeLaneSnapshot>(),
+            realTime: null, lineBanks: null, lineLanes: null, control: out _);
 
     private bool InvokePlayfieldSurfaceGeometryRenderer(
         string callbackName,
         IReadOnlyList<SkinPlayfieldSurfaceGeometrySnapshot> geometry,
         double time,
         double tick,
-        double? realTime = null)
+        IReadOnlyList<SkinJudgeAnchorSnapshot> judges,
+        IReadOnlyList<SkinJudgeLaneSnapshot> lanes,
+        double? realTime,
+        IReadOnlyList<SkinLaneLineAnchorSnapshot>? lineBanks,
+        IReadOnlyList<SkinLaneLineAnchorSnapshot>? lineLanes,
+        out SkinPlayfieldRendererControl control)
     {
+        control = default;
         _playfieldSurfaceDrawRequests.Clear();
+        _laneQuadDrawRequests.Clear();
+        _laneLineDrawRequests.Clear();
         if (_script is null || LastError is not null)
             return false;
 
         if (!ReferenceEquals(_playfieldSurfaceTableOwner, _script) ||
             _playfieldSurfaceFrameTable is null ||
-            _playfieldSurfaceGeometryTable is null)
+            _playfieldSurfaceGeometryTable is null ||
+            _playfieldSurfaceJudgeTable is null ||
+            _playfieldSurfaceLaneTable is null ||
+            _playfieldSurfaceLineBankTable is null ||
+            _playfieldSurfaceLineLaneTable is null)
         {
             _playfieldSurfaceTableOwner = _script;
             _playfieldSurfaceFrameTable = new Table(_script);
             _playfieldSurfaceGeometryTable = new Table(_script);
+            _playfieldSurfaceJudgeTable = new Table(_script);
+            _playfieldSurfaceLaneTable = new Table(_script);
+            _playfieldSurfaceLineBankTable = new Table(_script);
+            _playfieldSurfaceLineLaneTable = new Table(_script);
+            _playfieldSurfaceLaneTables.Clear();
+            _playfieldSurfacePreviousGeometryCount = 0;
+            _playfieldSurfacePreviousJudgeCount = 0;
+            _playfieldSurfacePreviousLaneCount = 0;
+            _playfieldSurfacePreviousLineBankCount = 0;
+            _playfieldSurfacePreviousLineLaneCount = 0;
         }
 
         _playfieldSurfaceGeometryFrameId++;
         var frame = _playfieldSurfaceFrameTable;
         var geometryTable = _playfieldSurfaceGeometryTable;
+        var judgeTable = _playfieldSurfaceJudgeTable;
+        var laneTable = _playfieldSurfaceLaneTable;
+        var lineBankTable = _playfieldSurfaceLineBankTable;
+        var lineLaneTable = _playfieldSurfaceLineLaneTable;
         for (var i = 0; i < geometry.Count; i++)
         {
             var handle = new SkinPlayfieldSurfaceGeometryHandle(
@@ -10298,14 +10976,84 @@ public sealed class SkinRuntime : IDisposable
             geometryTable.Remove(i);
         _playfieldSurfacePreviousGeometryCount = geometry.Count;
 
+        for (var i = 0; i < judges.Count; i++)
+        {
+            var handle = new SkinJudgeAnchorHandle(judges[i], _playfieldSurfaceGeometryFrameId);
+            judgeTable.Set(i + 1, UserData.Create(handle));
+        }
+        for (var i = judges.Count + 1; i <= _playfieldSurfacePreviousJudgeCount; i++)
+            judgeTable.Remove(i);
+        _playfieldSurfacePreviousJudgeCount = judges.Count;
+
+        for (var i = 0; i < lanes.Count; i++)
+        {
+            if (i >= _playfieldSurfaceLaneTables.Count)
+                _playfieldSurfaceLaneTables.Add(new Table(_script));
+            var lane = lanes[i];
+            var laneInfo = _playfieldSurfaceLaneTables[i];
+            laneInfo.Set("judge", judgeTable.Get(lane.JudgeIndex + 1));
+            laneInfo.Set("track", DynValue.NewNumber(lane.Track));
+            laneInfo.Set("column", DynValue.NewNumber(lane.Column));
+            laneInfo.Set("x", DynValue.NewNumber(lane.X));
+            laneInfo.Set("width", DynValue.NewNumber(lane.Width));
+            laneInfo.Set("active", DynValue.NewBoolean(lane.Active));
+            laneTable.Set(i + 1, DynValue.NewTable(laneInfo));
+        }
+        for (var i = lanes.Count + 1; i <= _playfieldSurfacePreviousLaneCount; i++)
+            laneTable.Remove(i);
+        _playfieldSurfacePreviousLaneCount = lanes.Count;
+
+        // The unified playfield callback receives the same LaneLine.fx anchors
+        // that the legacy render_lane_lines callback receives. Keep these handles
+        // separate from the judge anchors because the two drawing primitives use
+        // different local coordinate systems.
+        if (lineBanks is not null || lineLanes is not null)
+        {
+            _laneLineFrameId++;
+            var bankCount = lineBanks?.Count ?? 0;
+            var laneCount = lineLanes?.Count ?? 0;
+            for (var i = 0; i < bankCount; i++)
+                lineBankTable.Set(i + 1, UserData.Create(
+                    new SkinLaneLineAnchorHandle(lineBanks![i], _laneLineFrameId)));
+            for (var i = bankCount + 1; i <= _playfieldSurfacePreviousLineBankCount; i++)
+                lineBankTable.Remove(i);
+            _playfieldSurfacePreviousLineBankCount = bankCount;
+
+            for (var i = 0; i < laneCount; i++)
+                lineLaneTable.Set(i + 1, UserData.Create(
+                    new SkinLaneLineAnchorHandle(lineLanes![i], _laneLineFrameId)));
+            for (var i = laneCount + 1; i <= _playfieldSurfacePreviousLineLaneCount; i++)
+                lineLaneTable.Remove(i);
+            _playfieldSurfacePreviousLineLaneCount = laneCount;
+        }
+        else
+        {
+            for (var i = 1; i <= _playfieldSurfacePreviousLineBankCount; i++)
+                lineBankTable.Remove(i);
+            for (var i = 1; i <= _playfieldSurfacePreviousLineLaneCount; i++)
+                lineLaneTable.Remove(i);
+            _playfieldSurfacePreviousLineBankCount = 0;
+            _playfieldSurfacePreviousLineLaneCount = 0;
+        }
+
         frame.Set("version", DynValue.NewNumber(
             string.Equals(callbackName, "render_playfield", StringComparison.Ordinal) ? 1 : 2));
+        frame.Set("api_version", DynValue.NewNumber(
+            string.Equals(callbackName, "render_playfield", StringComparison.Ordinal) ? 5 : 1));
         frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
         frame.Set("real_time", DynValue.NewNumber(Math.Max(0.0, realTime ?? time)));
         frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
         frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
         frame.Set("geometry", DynValue.NewTable(geometryTable));
         frame.Set("geometry_count", DynValue.NewNumber(geometry.Count));
+        frame.Set("judges", DynValue.NewTable(judgeTable));
+        frame.Set("judge_count", DynValue.NewNumber(judges.Count));
+        frame.Set("lanes", DynValue.NewTable(laneTable));
+        frame.Set("lane_count", DynValue.NewNumber(lanes.Count));
+        frame.Set("line_banks", DynValue.NewTable(lineBankTable));
+        frame.Set("line_bank_count", DynValue.NewNumber(_playfieldSurfacePreviousLineBankCount));
+        frame.Set("line_lanes", DynValue.NewTable(lineLaneTable));
+        frame.Set("line_lane_count", DynValue.NewNumber(_playfieldSurfacePreviousLineLaneCount));
         if (_playfieldLifecycleTable is null)
             _playfieldLifecycleTable = new Table(_script);
         _playfieldLifecycleTable.Set("phase", DynValue.NewString(_playfieldLifecyclePhase));
@@ -10321,18 +11069,39 @@ public sealed class SkinRuntime : IDisposable
                 return false;
 
             _insidePlayfieldSurfaceRenderer = true;
+            _insidePlayfieldBaseRenderer = string.Equals(callbackName, "render_playfield", StringComparison.Ordinal);
             var result = _script.Call(function, DynValue.NewTable(frame));
-            return result.Type == DataType.Boolean && result.Boolean;
+            if (_insidePlayfieldBaseRenderer && result.Type == DataType.Table && result.Table is not null)
+            {
+                var settings = result.Table;
+                control = new SkinPlayfieldRendererControl(
+                    Unified: true,
+                    ReplaceSurfaces: GetBool(settings, "replace_surfaces", false),
+                    ReplaceLaneLines: GetBool(settings, "replace_lane_lines", false),
+                    ReplaceJudgementLine: GetBool(settings, "replace_judgement_line", false));
+                return control.ReplaceSurfaces;
+            }
+
+            // Boolean returns preserve the pre-unification contract: true means
+            // that submitted surface handles replace their matching native meshes.
+            var replaced = result.Type == DataType.Boolean && result.Boolean;
+            if (_insidePlayfieldBaseRenderer)
+                control = new SkinPlayfieldRendererControl(false, replaced, false, false);
+            _laneLineDrawRequests.Clear();
+            return replaced;
         }
         catch (Exception ex)
         {
             _playfieldSurfaceDrawRequests.Clear();
+            _laneQuadDrawRequests.Clear();
+            _laneLineDrawRequests.Clear();
             HandleScriptRuntimeFailure(ex, callbackName);
             return false;
         }
         finally
         {
             _insidePlayfieldSurfaceRenderer = false;
+            _insidePlayfieldBaseRenderer = false;
         }
     }
 
@@ -10343,23 +11112,51 @@ public sealed class SkinRuntime : IDisposable
         int height,
         string view)
     {
+        _hitEffectLaneQuadDrawRequests.Clear();
         if (!SupportsHitEffectRenderer || _script is null)
+        {
+            _hitEffectAnchorSnapshots.Clear();
             return;
+        }
 
-        if (!ReferenceEquals(_hitEffectFrameTableOwner, _script) || _hitEffectFrameTable is null)
+        if (!ReferenceEquals(_hitEffectFrameTableOwner, _script) ||
+            _hitEffectFrameTable is null ||
+            _hitEffectAnchorTable is null)
         {
             _hitEffectFrameTableOwner = _script;
             _hitEffectFrameTable = new Table(_script);
+            _hitEffectAnchorTable = new Table(_script);
         }
 
+        _hitEffectFrameId++;
         var frame = _hitEffectFrameTable;
+        var anchorTable = _hitEffectAnchorTable;
+        // Track IDs are zero-based in the chart API; expose each anchor at
+        // anchors[track + 1] to keep normal Lua array indexing convenient.
+        for (var track = 0; track < 16; track++)
+            anchorTable.Set(track + 1, DynValue.Nil);
+
+        var anchorCount = 0;
+        for (var i = 0; i < _hitEffectAnchorSnapshots.Count; i++)
+        {
+            var snapshot = _hitEffectAnchorSnapshots[i];
+            if (snapshot.Track < 0 || snapshot.Track >= 16)
+                continue;
+            var handle = new SkinHitEffectAnchorHandle(snapshot, _hitEffectFrameId);
+            anchorTable.Set(snapshot.Track + 1, UserData.Create(handle));
+            anchorCount++;
+        }
+
         frame.Set("version", DynValue.NewNumber(1));
+        frame.Set("api_version", DynValue.NewNumber(3));
         frame.Set("time", DynValue.NewNumber(Math.Max(0.0, realTime)));
         frame.Set("real_time", DynValue.NewNumber(Math.Max(0.0, realTime)));
         frame.Set("chart_time", DynValue.NewNumber(Math.Max(0.0, chartTime)));
         frame.Set("width", DynValue.NewNumber(Math.Max(1, width)));
         frame.Set("height", DynValue.NewNumber(Math.Max(1, height)));
         frame.Set("view", DynValue.NewString(string.Equals(view, "editor", StringComparison.OrdinalIgnoreCase) ? "editor" : "gameplay"));
+        frame.Set("anchors", DynValue.NewTable(anchorTable));
+        frame.Set("anchor_count", DynValue.NewNumber(anchorCount));
 
         try
         {
@@ -10374,35 +11171,129 @@ public sealed class SkinRuntime : IDisposable
         }
         catch (Exception ex)
         {
+            _hitEffectLaneQuadDrawRequests.Clear();
             HandleScriptRuntimeFailure(ex, "render_hit_effects");
         }
         finally
         {
             _insideHitEffectRenderer = false;
+            _hitEffectAnchorSnapshots.Clear();
+        }
+    }
+
+    internal bool InvokeLaneLineRenderer(
+        IReadOnlyList<SkinLaneLineAnchorSnapshot> banks,
+        IReadOnlyList<SkinLaneLineAnchorSnapshot> lanes,
+        double time,
+        double tick)
+    {
+        _laneLineDrawRequests.Clear();
+        if (!SupportsLaneLineRenderer || _script is null)
+            return false;
+
+        if (!ReferenceEquals(_laneLineTableOwner, _script) ||
+            _laneLineFrameTable is null ||
+            _laneLineBankTable is null ||
+            _laneLineLaneTable is null)
+        {
+            _laneLineTableOwner = _script;
+            _laneLineFrameTable = new Table(_script);
+            _laneLineBankTable = new Table(_script);
+            _laneLineLaneTable = new Table(_script);
+            _laneLinePreviousBankCount = 0;
+            _laneLinePreviousLaneCount = 0;
+        }
+
+        _laneLineFrameId++;
+        var frame = _laneLineFrameTable;
+        var bankTable = _laneLineBankTable;
+        var laneTable = _laneLineLaneTable;
+        for (var i = 0; i < banks.Count; i++)
+        {
+            var handle = new SkinLaneLineAnchorHandle(banks[i], _laneLineFrameId);
+            bankTable.Set(i + 1, UserData.Create(handle));
+        }
+        for (var i = banks.Count + 1; i <= _laneLinePreviousBankCount; i++)
+            bankTable.Remove(i);
+        _laneLinePreviousBankCount = banks.Count;
+
+        for (var i = 0; i < lanes.Count; i++)
+        {
+            var handle = new SkinLaneLineAnchorHandle(lanes[i], _laneLineFrameId);
+            laneTable.Set(i + 1, UserData.Create(handle));
+        }
+        for (var i = lanes.Count + 1; i <= _laneLinePreviousLaneCount; i++)
+            laneTable.Remove(i);
+        _laneLinePreviousLaneCount = lanes.Count;
+
+        frame.Set("api_version", DynValue.NewNumber(1));
+        frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
+        frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
+        frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
+        frame.Set("banks", DynValue.NewTable(bankTable));
+        frame.Set("bank_count", DynValue.NewNumber(banks.Count));
+        frame.Set("lanes", DynValue.NewTable(laneTable));
+        frame.Set("lane_count", DynValue.NewNumber(lanes.Count));
+
+        try
+        {
+            var function = _script.Globals.Get("render_lane_lines");
+            if (function.Type != DataType.Function)
+                return false;
+
+            _insideLaneLineRenderer = true;
+            var result = _script.Call(function, DynValue.NewTable(frame));
+            var replaced = result.Type == DataType.Boolean && result.Boolean;
+            if (!replaced)
+                _laneLineDrawRequests.Clear();
+            return replaced;
+        }
+        catch (Exception ex)
+        {
+            _laneLineDrawRequests.Clear();
+            HandleScriptRuntimeFailure(ex, "render_lane_lines");
+            return false;
+        }
+        finally
+        {
+            _insideLaneLineRenderer = false;
         }
     }
 
     internal bool InvokeJudgementLineRenderer(
         IReadOnlyList<SkinPlayfieldSpriteGeometrySnapshot> geometry,
+        IReadOnlyList<SkinJudgeAnchorSnapshot> judges,
+        IReadOnlyList<SkinJudgeLaneSnapshot> lanes,
         double time,
         double tick)
     {
         _judgementLineSpriteDrawRequests.Clear();
+        _laneQuadDrawRequests.Clear();
         if (!SupportsJudgementLineRenderer || _script is null)
             return false;
 
         if (!ReferenceEquals(_judgementLineTableOwner, _script) ||
             _judgementLineFrameTable is null ||
-            _judgementLineGeometryTable is null)
+            _judgementLineGeometryTable is null ||
+            _judgementLineJudgeTable is null ||
+            _judgementLineLaneTable is null)
         {
             _judgementLineTableOwner = _script;
             _judgementLineFrameTable = new Table(_script);
             _judgementLineGeometryTable = new Table(_script);
+            _judgementLineJudgeTable = new Table(_script);
+            _judgementLineLaneTable = new Table(_script);
+            _judgementLineLaneTables.Clear();
+            _judgementLinePreviousGeometryCount = 0;
+            _judgementLinePreviousJudgeCount = 0;
+            _judgementLinePreviousLaneCount = 0;
         }
 
         _judgementLineGeometryFrameId++;
         var frame = _judgementLineFrameTable;
         var geometryTable = _judgementLineGeometryTable;
+        var judgeTable = _judgementLineJudgeTable;
+        var laneTable = _judgementLineLaneTable;
         for (var i = 0; i < geometry.Count; i++)
         {
             var handle = new SkinPlayfieldSpriteGeometryHandle(
@@ -10413,12 +11304,51 @@ public sealed class SkinRuntime : IDisposable
             geometryTable.Remove(i);
         _judgementLinePreviousGeometryCount = geometry.Count;
 
+        for (var i = 0; i < judges.Count; i++)
+        {
+            var handle = new SkinJudgeAnchorHandle(judges[i], _judgementLineGeometryFrameId);
+            judgeTable.Set(i + 1, UserData.Create(handle));
+        }
+        for (var i = judges.Count + 1; i <= _judgementLinePreviousJudgeCount; i++)
+            judgeTable.Remove(i);
+        _judgementLinePreviousJudgeCount = judges.Count;
+
+        for (var i = 0; i < lanes.Count; i++)
+        {
+            if (i >= _judgementLineLaneTables.Count)
+                _judgementLineLaneTables.Add(new Table(_script));
+
+            var lane = lanes[i];
+            var laneInfo = _judgementLineLaneTables[i];
+            laneInfo.Set("judge", judgeTable.Get(lane.JudgeIndex + 1));
+            laneInfo.Set("track", DynValue.NewNumber(lane.Track));
+            laneInfo.Set("column", DynValue.NewNumber(lane.Column));
+            laneInfo.Set("x", DynValue.NewNumber(lane.X));
+            laneInfo.Set("width", DynValue.NewNumber(lane.Width));
+            laneInfo.Set("active", DynValue.NewBoolean(lane.Active));
+            laneTable.Set(i + 1, DynValue.NewTable(laneInfo));
+        }
+        for (var i = lanes.Count + 1; i <= _judgementLinePreviousLaneCount; i++)
+            laneTable.Remove(i);
+        _judgementLinePreviousLaneCount = lanes.Count;
+
+        // Keep the original frame version for skins that check it explicitly;
+        // the bank-anchor fields are additive.
         frame.Set("version", DynValue.NewNumber(1));
+        frame.Set("api_version", DynValue.NewNumber(5));
         frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
         frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
         frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
+        // Keep the original per-column screen geometry for existing skins.
         frame.Set("lines", DynValue.NewTable(geometryTable));
         frame.Set("line_count", DynValue.NewNumber(geometry.Count));
+        // New API: one lane-relative judge anchor per visible bank.
+        frame.Set("judges", DynValue.NewTable(judgeTable));
+        frame.Set("judge_count", DynValue.NewNumber(judges.Count));
+        // API v5: lane placements remain bank-relative and lane_quad now uses
+        // consistent screen-right / far-end coordinates in every geometry space.
+        frame.Set("lanes", DynValue.NewTable(laneTable));
+        frame.Set("lane_count", DynValue.NewNumber(lanes.Count));
 
         try
         {
@@ -10433,6 +11363,7 @@ public sealed class SkinRuntime : IDisposable
         catch (Exception ex)
         {
             _judgementLineSpriteDrawRequests.Clear();
+            _laneQuadDrawRequests.Clear();
             HandleScriptRuntimeFailure(ex, "render_judgement_line");
             return false;
         }
@@ -10451,9 +11382,64 @@ public sealed class SkinRuntime : IDisposable
     {
         _playfieldGeometryDrawRequests.Clear();
         _playfieldSpriteDrawRequests.Clear();
-        if (!SupportsPlayfieldNoteRenderer || _script is null)
+        _nativeNoteSuppressedGeometry.Clear();
+        _nativeNoteSuppressedFlickAttachments.Clear();
+        DebugLastNativeNoteGeometryCount = 0;
+        DebugLastNativeNoteAllocatedBytes = 0;
+        DebugLastNativeNoteMilliseconds = 0.0;
+        if (_script is null || LastError is not null)
             return false;
 
+        var measure = DebugMeasureApiAllocations;
+        var nativeStartTimestamp = measure ? Stopwatch.GetTimestamp() : 0L;
+        var nativeStartAllocatedBytes = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var hasNativePlan = false;
+        try
+        {
+            hasNativePlan = EnsureNativeNotePlan(_script);
+            if (hasNativePlan)
+                AppendNativeNoteGeometry(geometry, spriteGeometry, Math.Max(0.0, realTime));
+        }
+        catch (Exception ex)
+        {
+            _playfieldGeometryDrawRequests.Clear();
+            _playfieldSpriteDrawRequests.Clear();
+            _nativeNoteSuppressedGeometry.Clear();
+            _nativeNoteSuppressedFlickAttachments.Clear();
+            _nativeNoteComponents.Clear();
+            _nativeNoteRoleComponents.Clear();
+            _nativeNotePoseComponents.Clear();
+            _nativeOnlyNoteTypes.Clear();
+            _nativeNotePlanOwner = null;
+            _nativeNotePlanHasComponents = false;
+            SetNativeNoteRendererReady(_script, false);
+            WriteLog($"[skin] native note component plan rejected: {ex.Message}");
+            hasNativePlan = false;
+        }
+        if (measure)
+        {
+            DebugLastNativeNoteAllocatedBytes = Math.Max(
+                0L, GC.GetAllocatedBytesForCurrentThread() - nativeStartAllocatedBytes);
+            DebugLastNativeNoteMilliseconds =
+                (Stopwatch.GetTimestamp() - nativeStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+        }
+
+        var renderFunction = _script.Globals.Get("render_notes");
+        if (renderFunction.Type != DataType.Function)
+            return false;
+
+        // Fully-native note types never cross the Lua bridge. Mixed layouts still
+        // enter Lua, but only their non-native components are evaluated there.
+        var hasLuaNotes = false;
+        for (var i = 0; i < geometry.Count && !hasLuaNotes; i++)
+            hasLuaNotes = !_nativeOnlyNoteTypes.Contains(geometry[i].NoteType);
+        for (var i = 0; i < spriteGeometry.Count && !hasLuaNotes; i++)
+            hasLuaNotes = !_nativeOnlyNoteTypes.Contains(spriteGeometry[i].NoteType);
+        if (!hasLuaNotes)
+            return false;
+
+        var dataStartTimestamp = measure ? Stopwatch.GetTimestamp() : 0L;
+        var dataStartAllocatedBytes = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
         EnsurePlayfieldNoteFrameTables(_script);
         _playfieldGeometryFrameId++;
         _playfieldNoteIndices.Clear();
@@ -10463,10 +11449,14 @@ public sealed class SkinRuntime : IDisposable
         var frame = _playfieldNoteFrameTable!;
         var noteCount = 0;
         var geometryCount = 0;
+        var spriteGeometryCount = 0;
 
         for (var i = 0; i < geometry.Count; i++)
         {
             var item = geometry[i];
+            if (_nativeOnlyNoteTypes.Contains(item.NoteType))
+                continue;
+
             var key = (item.Track, item.Tick, item.EventIndex);
             if (!_playfieldNoteIndices.TryGetValue(key, out var noteIndex))
             {
@@ -10480,28 +11470,28 @@ public sealed class SkinRuntime : IDisposable
                 notes, noteIndex, _playfieldNoteTables[noteIndex], _playfieldNoteGeometryTables[noteIndex],
                 _playfieldGeometryFrameId,
                 item.Track, item.Tick, item.EventIndex, item.NoteType, item.Attr,
-                item.DurationTicks, item.Side, item.Bank, null,
+                item.DurationTicks, item.Side, item.Bank, item.Gear, item.SideGear, null,
                 item.Hit, item.Missed, item.Simultaneous);
 
             geometryCount++;
             var noteGeometryIndex = ++_playfieldNoteGeometryCounts[noteIndex];
-            if (_playfieldNoteUsesNumericGeometryHandles)
-            {
-                _playfieldNoteGeometryTables[noteIndex].Set(
-                    noteGeometryIndex,
-                    DynValue.NewNumber(CreatePlayfieldGeometryToken(_playfieldGeometryFrameId, i, sprite: false)));
-                _playfieldNoteGeometryRoleTables[noteIndex]!.Set(noteGeometryIndex, GetPlayfieldGeometryRoleValue(item.Component));
-            }
-            else
-            {
-                var handle = new SkinPlayfieldGeometryHandle(item, _playfieldGeometryFrameId);
-                _playfieldNoteGeometryTables[noteIndex].Set(noteGeometryIndex, UserData.Create(handle));
-            }
+            var geometryHandleValue = DynValue.NewNumber(
+                CreatePlayfieldGeometryToken(_playfieldGeometryFrameId, i, sprite: false));
+            _playfieldNoteGeometryTables[noteIndex].Set(noteGeometryIndex, geometryHandleValue);
+            _playfieldNoteGeometryRoleTables[noteIndex].Set(
+                noteGeometryIndex, GetPlayfieldGeometryRoleValue(item.Component));
+
+            var noteTable = _playfieldNoteTables[noteIndex];
+            if (noteTable.Get("pose").Type == DataType.Nil)
+                noteTable.Set("pose", geometryHandleValue);
         }
 
         for (var i = 0; i < spriteGeometry.Count; i++)
         {
             var item = spriteGeometry[i];
+            if (_nativeOnlyNoteTypes.Contains(item.NoteType))
+                continue;
+
             var key = (item.Track, item.Tick, item.EventIndex);
             if (!_playfieldNoteIndices.TryGetValue(key, out var noteIndex))
             {
@@ -10515,29 +11505,23 @@ public sealed class SkinRuntime : IDisposable
                 notes, noteIndex, _playfieldNoteTables[noteIndex], _playfieldNoteGeometryTables[noteIndex],
                 _playfieldGeometryFrameId,
                 item.Track, item.Tick, item.EventIndex, item.NoteType, item.Attr,
-                item.DurationTicks, item.Side, item.Bank, item.Family,
-                item.Hit, item.Missed, item.Simultaneous);
+                item.DurationTicks, item.Side, item.Bank, item.Gear, item.SideGear, item.Family,
+                item.Hit, item.Missed, item.Simultaneous, item.Span);
 
+            spriteGeometryCount++;
             var noteGeometryIndex = ++_playfieldNoteGeometryCounts[noteIndex];
-            if (_playfieldNoteUsesNumericGeometryHandles)
-            {
-                _playfieldNoteGeometryTables[noteIndex].Set(
-                    noteGeometryIndex,
-                    DynValue.NewNumber(CreatePlayfieldGeometryToken(_playfieldGeometryFrameId, i, sprite: true)));
-                _playfieldNoteGeometryRoleTables[noteIndex]!.Set(noteGeometryIndex, GetPlayfieldGeometryRoleValue(item.Component));
-            }
-            else
-            {
-                var handle = new SkinPlayfieldSpriteGeometryHandle(item, _playfieldGeometryFrameId);
-                _playfieldNoteGeometryTables[noteIndex].Set(noteGeometryIndex, UserData.Create(handle));
-            }
+            _playfieldNoteGeometryTables[noteIndex].Set(
+                noteGeometryIndex,
+                DynValue.NewNumber(CreatePlayfieldGeometryToken(_playfieldGeometryFrameId, i, sprite: true)));
+            _playfieldNoteGeometryRoleTables[noteIndex].Set(
+                noteGeometryIndex, GetPlayfieldGeometryRoleValue(item.Component));
         }
 
         for (var i = noteCount + 1; i <= _playfieldPreviousNoteCount; i++)
         {
             notes.Remove(i);
             _playfieldNoteGeometryTables[i - 1].Clear();
-            _playfieldNoteGeometryRoleTables[i - 1]?.Clear();
+            _playfieldNoteGeometryRoleTables[i - 1].Clear();
             _playfieldNotePreviousGeometryCounts[i - 1] = 0;
             _playfieldNoteTableCaches[i - 1] = default;
             _playfieldNoteTables[i - 1].Remove("family");
@@ -10553,14 +11537,11 @@ public sealed class SkinRuntime : IDisposable
             for (var key = currentCount + 1; key <= previousCount; key++)
             {
                 geometryTable.Remove(key);
-                geometryRoleTable?.Remove(key);
+                geometryRoleTable.Remove(key);
             }
             _playfieldNotePreviousGeometryCounts[i] = currentCount;
         }
 
-        // Re-publish these stable references each frame; this costs no table or
-        // DynValue allocations and protects the callback contract from Lua-side
-        // reassignment of frame.version/frame.notes.
         frame.Set("version", _playfieldNoteVersionValue);
         frame.Set("notes", _playfieldNotesValue);
         frame.Set("time", DynValue.NewNumber(Math.Max(0.0, time)));
@@ -10568,29 +11549,60 @@ public sealed class SkinRuntime : IDisposable
         frame.Set("tick", DynValue.NewNumber(Math.Max(0.0, tick)));
         frame.Set("beat", DynValue.NewNumber(Math.Max(0.0, _game.beat)));
         frame.Set("note_count", DynValue.NewNumber(noteCount));
-        frame.Set("geometry_count", DynValue.NewNumber(geometryCount + spriteGeometry.Count));
-        frame.Set("sprite_geometry_count", DynValue.NewNumber(spriteGeometry.Count));
+        frame.Set("geometry_count", DynValue.NewNumber(geometryCount + spriteGeometryCount));
+        frame.Set("sprite_geometry_count", DynValue.NewNumber(spriteGeometryCount));
+        frame.Set("native_renderer_ready", DynValue.NewBoolean(hasNativePlan));
+
+        if (measure)
+        {
+            DebugLastPlayfieldNoteDataAllocatedBytes += Math.Max(0L, GC.GetAllocatedBytesForCurrentThread() - dataStartAllocatedBytes);
+            DebugLastPlayfieldNoteDataMilliseconds += (Stopwatch.GetTimestamp() - dataStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+        }
+
+        var callbackStartTimestamp = measure ? Stopwatch.GetTimestamp() : 0L;
+        var callbackStartAllocatedBytes = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var quadApiBytesBefore = DebugLastQuad3DApiAllocatedBytes;
+        var quadApiMsBefore = DebugLastQuad3DApiMilliseconds;
+        var quadApiCallsBefore = DebugLastQuad3DApiCalls;
+        var spriteApiBytesBefore = DebugLastSpriteApiAllocatedBytes;
+        var spriteApiMsBefore = DebugLastSpriteApiMilliseconds;
+        var spriteApiCallsBefore = DebugLastSpriteApiCalls;
+        var spriteInstancesBytesBefore = DebugLastSpriteInstancesApiAllocatedBytes;
+        var spriteInstancesMsBefore = DebugLastSpriteInstancesApiMilliseconds;
+        var spriteInstancesCallsBefore = DebugLastSpriteInstancesApiCalls;
         try
         {
-            var function = _script.Globals.Get("render_notes");
-            if (function.Type != DataType.Function)
-                return false;
-
             _activePlayfieldNoteGeometry = geometry;
             _activePlayfieldNoteSpriteGeometry = spriteGeometry;
             _insidePlayfieldNoteRenderer = true;
-            var result = _script.Call(function, _playfieldNoteFrameValue);
+            var result = _script.Call(renderFunction, _playfieldNoteFrameValue);
             return result.Type == DataType.Boolean && result.Boolean;
         }
         catch (Exception ex)
         {
             _playfieldGeometryDrawRequests.Clear();
             _playfieldSpriteDrawRequests.Clear();
+            _nativeNoteSuppressedGeometry.Clear();
+            _nativeNoteSuppressedFlickAttachments.Clear();
             HandleScriptRuntimeFailure(ex, "render_notes");
             return false;
         }
         finally
         {
+            if (measure)
+            {
+                DebugLastPlayfieldCallbackAllocatedBytes += Math.Max(0L, GC.GetAllocatedBytesForCurrentThread() - callbackStartAllocatedBytes);
+                DebugLastPlayfieldCallbackMilliseconds += (Stopwatch.GetTimestamp() - callbackStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+                DebugLastPlayfieldCallbackQuadApiAllocatedBytes += Math.Max(0L, DebugLastQuad3DApiAllocatedBytes - quadApiBytesBefore);
+                DebugLastPlayfieldCallbackQuadApiMilliseconds += Math.Max(0.0, DebugLastQuad3DApiMilliseconds - quadApiMsBefore);
+                DebugLastPlayfieldCallbackQuadApiCalls += Math.Max(0, DebugLastQuad3DApiCalls - quadApiCallsBefore);
+                DebugLastPlayfieldCallbackSpriteApiAllocatedBytes += Math.Max(0L, DebugLastSpriteApiAllocatedBytes - spriteApiBytesBefore);
+                DebugLastPlayfieldCallbackSpriteApiMilliseconds += Math.Max(0.0, DebugLastSpriteApiMilliseconds - spriteApiMsBefore);
+                DebugLastPlayfieldCallbackSpriteApiCalls += Math.Max(0, DebugLastSpriteApiCalls - spriteApiCallsBefore);
+                DebugLastPlayfieldCallbackSpriteInstancesAllocatedBytes += Math.Max(0L, DebugLastSpriteInstancesApiAllocatedBytes - spriteInstancesBytesBefore);
+                DebugLastPlayfieldCallbackSpriteInstancesMilliseconds += Math.Max(0.0, DebugLastSpriteInstancesApiMilliseconds - spriteInstancesMsBefore);
+                DebugLastPlayfieldCallbackSpriteInstancesCalls += Math.Max(0, DebugLastSpriteInstancesApiCalls - spriteInstancesCallsBefore);
+            }
             _insidePlayfieldNoteRenderer = false;
             _activePlayfieldNoteGeometry = null;
             _activePlayfieldNoteSpriteGeometry = null;
@@ -10607,16 +11619,15 @@ public sealed class SkinRuntime : IDisposable
         return value;
     }
 
-    // A skin may opt into numeric-v1 by setting
-    // TSC_PLAYFIELD_GEOMETRY_HANDLE_FORMAT before its first render_notes call.
-    // The sign selects note-quad vs sprite geometry; high bits are the frame
-    // generation and low bits are the index into the active callback snapshot.
-    // Unlike a reusable mutable userdata object, an old numeric token can never
-    // silently become a handle for a later frame.
+    // Dynamic note geometry is always exposed as a numeric token. The sign
+    // selects note-quad vs sprite geometry; high bits are the frame generation
+    // and low bits are the index into the active callback snapshot. Unlike a
+    // reusable userdata object, an old token can never silently become a handle
+    // for a later frame.
     private static double CreatePlayfieldGeometryToken(long frameId, int index, bool sprite)
     {
         if ((uint)index > (uint)PlayfieldGeometryTokenIndexMask)
-            throw new ScriptRuntimeException("numeric-v1 supports at most 8192 note geometry components per callback");
+            throw new ScriptRuntimeException("note geometry tokens support at most 8192 components per callback");
 
         var frameTag = GetPlayfieldGeometryFrameTag(frameId);
         var token = (frameTag << PlayfieldGeometryTokenIndexBits) | (uint)index;
@@ -10638,8 +11649,7 @@ public sealed class SkinRuntime : IDisposable
     {
         geometry = default;
         spriteGeometry = default;
-        if (!_insidePlayfieldNoteRenderer || !_playfieldNoteUsesNumericGeometryHandles ||
-            tokenValue.Type != DataType.Number)
+        if (!_insidePlayfieldNoteRenderer || tokenValue.Type != DataType.Number)
             return false;
 
         var raw = tokenValue.Number;
@@ -10685,10 +11695,13 @@ public sealed class SkinRuntime : IDisposable
         int durationTicks,
         string side,
         string bank,
+        string gear,
+        string sideGear,
         string? family,
         bool hit,
         bool missed,
-        bool simultaneous)
+        bool simultaneous,
+        SkinPlayfieldSpriteSpanSnapshot? span = null)
     {
         ref var cache = ref CollectionsMarshal.AsSpan(_playfieldNoteTableCaches)[noteIndex];
         var identityChanged = !cache.Initialized ||
@@ -10708,16 +11721,21 @@ public sealed class SkinRuntime : IDisposable
                 DurationTicks = durationTicks,
                 Side = side,
                 Bank = bank,
+                Gear = gear,
+                SideGear = sideGear,
                 Hit = hit,
                 Missed = missed,
                 Simultaneous = simultaneous,
                 NoteTypeValue = DynValue.NewString(noteType),
                 TrackValue = DynValue.NewNumber(track),
                 TickValue = DynValue.NewNumber(tick),
+                EventIndexValue = DynValue.NewNumber(eventIndex),
                 AttrValue = DynValue.NewNumber(attr),
                 DurationTicksValue = DynValue.NewNumber(durationTicks),
                 SideValue = DynValue.NewString(side),
                 BankValue = DynValue.NewString(bank),
+                GearValue = DynValue.NewString(gear),
+                SideGearValue = DynValue.NewString(sideGear),
                 HitValue = DynValue.NewBoolean(hit),
                 MissedValue = DynValue.NewBoolean(missed),
                 SimultaneousValue = DynValue.NewBoolean(simultaneous),
@@ -10750,6 +11768,16 @@ public sealed class SkinRuntime : IDisposable
                 cache.Bank = bank;
                 cache.BankValue = DynValue.NewString(bank);
             }
+            if (!string.Equals(cache.Gear, gear, StringComparison.Ordinal))
+            {
+                cache.Gear = gear;
+                cache.GearValue = DynValue.NewString(gear);
+            }
+            if (!string.Equals(cache.SideGear, sideGear, StringComparison.Ordinal))
+            {
+                cache.SideGear = sideGear;
+                cache.SideGearValue = DynValue.NewString(sideGear);
+            }
         }
 
         // Preserve the mutable-table callback contract: each note's source
@@ -10758,18 +11786,20 @@ public sealed class SkinRuntime : IDisposable
         if (noteNeedsRefresh)
         {
             notes.Set(noteIndex + 1, _playfieldNoteTableValues[noteIndex]);
+            note.Set("pose", DynValue.Nil);
+            note.Set("span", DynValue.Nil);
             note.Set("geometry", _playfieldNoteGeometryTableValues[noteIndex]);
-            if (_playfieldNoteUsesNumericGeometryHandles)
-            {
-                note.Set("geometry_roles", _playfieldNoteGeometryRoleTableValues[noteIndex]);
-            }
+            note.Set("geometry_roles", _playfieldNoteGeometryRoleTableValues[noteIndex]);
             note.Set("type", cache.NoteTypeValue!);
             note.Set("track", cache.TrackValue!);
             note.Set("tick", cache.TickValue!);
+            note.Set("event_index", cache.EventIndexValue!);
             note.Set("attr", cache.AttrValue!);
             note.Set("duration_ticks", cache.DurationTicksValue!);
             note.Set("side", cache.SideValue!);
             note.Set("bank", cache.BankValue!);
+            note.Set("gear", cache.GearValue!);
+            note.Set("side_gear", cache.SideGearValue!);
         }
 
         // These can theoretically differ between component snapshots, so keep
@@ -10804,6 +11834,676 @@ public sealed class SkinRuntime : IDisposable
             }
             note.Set("family", cache.FamilyValue!);
         }
+
+        if (span is { } spanSnapshot)
+        {
+            var spanTable = _playfieldNoteSpanTables[noteIndex];
+            spanTable.Set("start_u", DynValue.NewNumber(spanSnapshot.StartNormalized));
+            spanTable.Set("end_u", DynValue.NewNumber(spanSnapshot.EndNormalized));
+            spanTable.Set("length_pixels", DynValue.NewNumber(spanSnapshot.AxisLengthPixels));
+            spanTable.Set("center_scale", DynValue.NewNumber(spanSnapshot.CenterPerspectiveScale));
+            spanTable.Set("strip_height_pixels", DynValue.NewNumber(spanSnapshot.StripHeightPixels));
+            spanTable.Set("highlight_height_pixels", DynValue.NewNumber(spanSnapshot.HighlightHeightPixels));
+            spanTable.Set("strip_reference_height_pixels", DynValue.NewNumber(spanSnapshot.StripReferenceHeightPixels));
+            spanTable.Set("highlight_reference_height_pixels", DynValue.NewNumber(spanSnapshot.HighlightReferenceHeightPixels));
+            spanTable.Set("scroll_speed", DynValue.NewNumber(spanSnapshot.ScrollSpeed));
+            spanTable.Set("scroll_gap", DynValue.NewNumber(spanSnapshot.ScrollGap));
+            spanTable.Set("highlight_speed", DynValue.NewNumber(spanSnapshot.HighlightSpeed));
+            spanTable.Set("highlight_opacity", DynValue.NewNumber(spanSnapshot.HighlightOpacity));
+            spanTable.Set("bank_opacity", DynValue.NewNumber(spanSnapshot.BankOpacity));
+            spanTable.Set("direction_sign", DynValue.NewNumber(spanSnapshot.DirectionSign));
+            spanTable.Set("elapsed_seconds", DynValue.NewNumber(spanSnapshot.ElapsedSeconds));
+            spanTable.Set("travel_pixels", DynValue.NewNumber(spanSnapshot.TravelPixels));
+            spanTable.Set("screen_start_x", DynValue.NewNumber(spanSnapshot.ScreenStart.X));
+            spanTable.Set("screen_start_y", DynValue.NewNumber(spanSnapshot.ScreenStart.Y));
+            spanTable.Set("screen_end_x", DynValue.NewNumber(spanSnapshot.ScreenEnd.X));
+            spanTable.Set("screen_end_y", DynValue.NewNumber(spanSnapshot.ScreenEnd.Y));
+            note.Set("span", _playfieldNoteSpanTableValues[noteIndex]);
+        }
+    }
+
+    private bool EnsureNativeNotePlan(Script script)
+    {
+        var componentValue = script.Globals.Get("TSC_PLAYFIELD_NOTE_COMPONENTS");
+        var transformValue = script.Globals.Get("TSC_NOTE_COMPONENT_TRANSFORMS");
+        var componentSource = componentValue.Type == DataType.Table ? componentValue.Table : null;
+        var transformSource = transformValue.Type == DataType.Table ? transformValue.Table : null;
+        if (ReferenceEquals(_nativeNotePlanOwner, script) &&
+            ReferenceEquals(_nativeNoteComponentSource, componentSource) &&
+            ReferenceEquals(_nativeNoteTransformSource, transformSource))
+        {
+            SetNativeNoteRendererReady(script, _nativeNotePlanHasComponents);
+            return _nativeNotePlanHasComponents;
+        }
+
+        _nativeNoteComponents.Clear();
+        _nativeNoteRoleComponents.Clear();
+        _nativeNotePoseComponents.Clear();
+        _nativeOnlyNoteTypes.Clear();
+        _nativePoseComponentKeys.Clear();
+        var hasNativeComponents = false;
+        if (componentSource is not null)
+        {
+            foreach (var noteTypePair in componentSource.Pairs)
+            {
+                if (noteTypePair.Key.Type != DataType.String ||
+                    noteTypePair.Value.Type != DataType.Table || noteTypePair.Value.Table is null)
+                    continue;
+
+                var noteType = noteTypePair.Key.String ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(noteType))
+                    continue;
+
+                var definitions = noteTypePair.Value.Table;
+                var compiled = new List<NativeNoteComponent>();
+                var componentIds = new HashSet<string>(StringComparer.Ordinal);
+                var componentCount = 0;
+                var allNative = true;
+                for (var index = 1; ; index++)
+                {
+                    var componentValueAtIndex = definitions.Get(index);
+                    if (componentValueAtIndex.Type == DataType.Nil)
+                        break;
+                    if (componentValueAtIndex.Type != DataType.Table || componentValueAtIndex.Table is null)
+                        continue;
+
+                    componentCount++;
+                    var component = componentValueAtIndex.Table;
+                    if (!GetBool(component, "native", false))
+                    {
+                        allNative = false;
+                        continue;
+                    }
+
+                    hasNativeComponents = true;
+                    if (component.Get("render").Type == DataType.Function)
+                        throw new ScriptRuntimeException($"native note component '{noteType}.{GetString(component, "id", index.ToString())}' cannot define a Lua render callback");
+
+                    var geometryValue = component.Get("geometry");
+                    if (geometryValue.Type != DataType.Table || geometryValue.Table is null)
+                        throw new ScriptRuntimeException($"native note component '{noteType}.{GetString(component, "id", index.ToString())}' needs a geometry descriptor");
+                    var geometryDescriptor = geometryValue.Table;
+                    var source = GetString(geometryDescriptor, "source", "role").Trim().ToLowerInvariant();
+                    if (source is not ("role" or "pose"))
+                        throw new ScriptRuntimeException($"native note component '{noteType}' geometry.source must be 'role' or 'pose'");
+
+                    var sourceRoles = new List<string>();
+                    if (source == "role")
+                    {
+                        var rolesValue = geometryDescriptor.Get("roles");
+                        if (rolesValue.Type == DataType.Table && rolesValue.Table is not null)
+                        {
+                            for (var roleIndex = 1; ; roleIndex++)
+                            {
+                                var roleValue = rolesValue.Table.Get(roleIndex);
+                                if (roleValue.Type == DataType.Nil)
+                                    break;
+                                if (roleValue.Type != DataType.String || string.IsNullOrWhiteSpace(roleValue.String))
+                                    throw new ScriptRuntimeException($"native note component '{noteType}' geometry.roles entries must be non-empty strings");
+                                sourceRoles.Add(roleValue.String);
+                            }
+                        }
+                        else
+                        {
+                            var role = GetString(geometryDescriptor, "role", GetString(component, "source_role", string.Empty));
+                            if (string.IsNullOrWhiteSpace(role))
+                                throw new ScriptRuntimeException($"native note component '{noteType}' role geometry needs geometry.role or geometry.roles");
+                            sourceRoles.Add(role);
+                        }
+                    }
+
+                    var anchorRoleValue = geometryDescriptor.Get("anchor_role");
+                    var anchorRole = anchorRoleValue.Type == DataType.Nil
+                        ? null
+                        : anchorRoleValue.Type == DataType.String && !string.IsNullOrWhiteSpace(anchorRoleValue.String)
+                            ? anchorRoleValue.String
+                            : throw new ScriptRuntimeException($"native note component '{noteType}' geometry.anchor_role must be a non-empty role string");
+                    var shape = GetString(geometryDescriptor, "shape", "quad").Trim().ToLowerInvariant();
+                    if (shape != "quad")
+                        throw new ScriptRuntimeException($"native note component '{noteType}' currently supports geometry.shape='quad'");
+                    var spaceName = GetString(geometryDescriptor, "space", GetString(component, "space", "note_surface"));
+                    var space = ParseNativeNoteGeometrySpace(spaceName);
+                    var rebuildGeometryPlane = GetBool(geometryDescriptor, "rebuild", false);
+                    var behavior = GetString(component, "behavior", string.Empty).Trim().ToLowerInvariant();
+                    if (behavior.Length > 0 && behavior is not ("beat_pulse" or "flick_attachment"))
+                        throw new ScriptRuntimeException($"native note component '{noteType}' has unsupported behavior '{behavior}'");
+
+                    var id = GetString(component, "id", sourceRoles.Count > 0 ? sourceRoles[0] : $"component_{index}");
+                    if (string.IsNullOrWhiteSpace(id) || !componentIds.Add(id))
+                        throw new ScriptRuntimeException($"native note component IDs must be non-empty and unique within '{noteType}' (duplicate '{id}')");
+                    if (source == "role" && sourceRoles.Count == 0)
+                        throw new ScriptRuntimeException($"native note component '{noteType}.{id}' needs at least one geometry role");
+                    var transformValueForComponent = ResolveNativeNoteComponentTransform(
+                        transformSource, noteType, id, sourceRoles.FirstOrDefault() ?? string.Empty, component);
+                    var scaleX = behavior == "beat_pulse"
+                        ? 1f
+                        : GetFiniteGeometryNumber(component, "scale_x", 1f, 0.001f, 100f);
+                    var scaleY = GetFiniteGeometryNumber(component, "scale_y", 1f, 0.001f, 100f);
+                    var transform = GetPlayfieldGeometryTransform(transformValueForComponent, scaleX, scaleY);
+                    var transformOverridesScaleX = false;
+                    if (transformValueForComponent.Type == DataType.Table && transformValueForComponent.Table is not null)
+                    {
+                        var scaleValue = transformValueForComponent.Table.Get("scale");
+                        if (scaleValue.Type == DataType.Table && scaleValue.Table is not null)
+                            transformOverridesScaleX = scaleValue.Table.Get("x").Type != DataType.Nil ||
+                                scaleValue.Table.Get(1).Type != DataType.Nil;
+                    }
+
+                    var sizeX = 1f;
+                    var sizeY = 1f;
+                    var sizeValue = geometryDescriptor.Get("size");
+                    if (sizeValue.Type == DataType.Table && sizeValue.Table is not null)
+                    {
+                        sizeX = GetFiniteGeometryNumber(sizeValue.Table, "x", 1f, 0.001f, 100f);
+                        sizeY = GetFiniteGeometryNumber(sizeValue.Table, "y", 1f, 0.001f, 100f);
+                    }
+                    else
+                    {
+                        sizeX = GetFiniteGeometryNumber(geometryDescriptor, "size_x", 1f, 0.001f, 100f);
+                        sizeY = GetFiniteGeometryNumber(geometryDescriptor, "size_y", 1f, 0.001f, 100f);
+                    }
+
+                    var baseChoice = ParseNativeNoteAssetChoice(component, default, allowFallback: false);
+                    var variants = new List<NativeNoteAssetVariant>();
+                    var variantsValue = component.Get("variants");
+                    if (variantsValue.Type != DataType.Nil &&
+                        (variantsValue.Type != DataType.Table || variantsValue.Table is null))
+                        throw new ScriptRuntimeException($"native note component '{noteType}.{id}' variants must be an array of tables");
+                    if (variantsValue.Type == DataType.Table && variantsValue.Table is not null)
+                    {
+                        for (var variantIndex = 1; ; variantIndex++)
+                        {
+                            var variantValue = variantsValue.Table.Get(variantIndex);
+                            if (variantValue.Type == DataType.Nil)
+                                break;
+                            if (variantValue.Type != DataType.Table || variantValue.Table is null)
+                                throw new ScriptRuntimeException($"native note component '{noteType}.{id}' variant {variantIndex} must be a table");
+                            var variant = variantValue.Table;
+                            var whenValue = variant.Get("when");
+                            if (whenValue.Type != DataType.Table || whenValue.Table is null)
+                                throw new ScriptRuntimeException($"native note component '{noteType}.{id}' variants require a 'when' condition table");
+                            ValidateNativeNoteVariantFilterFields(whenValue.Table, noteType, id);
+                            var filter = ParseNativeNoteVariantFilter(whenValue.Table);
+                            if (filter.Specificity == 0)
+                                throw new ScriptRuntimeException($"native note component '{noteType}.{id}' variant conditions cannot be empty");
+                            var choice = ParseNativeNoteAssetChoice(variant, baseChoice, allowFallback: true);
+                            variants.Add(new NativeNoteAssetVariant { Filter = filter, Choice = choice });
+                        }
+                    }
+
+                    // More-specific rules are evaluated first. LINQ's stable ordering
+                    // preserves definition order for equally-specific combinations.
+                    var orderedVariants = variants
+                        .OrderByDescending(variant => variant.Filter.Specificity)
+                        .ToArray();
+                    var tint = GetColor(component, "color", XnaColor.White);
+                    var alphaValue = GetNumber(component, "alpha", 1f);
+                    if (!float.IsFinite(alphaValue))
+                        throw new ScriptRuntimeException($"native note component '{noteType}.{id}' alpha must be finite");
+                    var alpha = Math.Clamp(alphaValue, 0f, 1f);
+                    var layerValue = component.Get("layer");
+                    if (layerValue.Type != DataType.Nil &&
+                        (layerValue.Type != DataType.Number || !double.IsFinite(layerValue.Number)))
+                        throw new ScriptRuntimeException($"native note component '{noteType}.{id}' layer must be a finite number");
+                    int? layer = layerValue.Type == DataType.Number
+                        ? (int)Math.Clamp(Math.Round(layerValue.Number), -32, 32)
+                        : null;
+                    compiled.Add(new NativeNoteComponent
+                    {
+                        Id = id,
+                        SourceRoles = sourceRoles.ToArray(),
+                        AnchorRole = anchorRole,
+                        BaseChoice = baseChoice,
+                        Variants = orderedVariants,
+                        Tint = tint,
+                        Alpha = alpha,
+                        Layer = layer,
+                        Transform = transform,
+                        TransformOverridesScaleX = transformOverridesScaleX,
+                        BeatPulse = behavior == "beat_pulse",
+                        FlipU = GetBool(component, "flip_u", false),
+                        FlipV = GetBool(component, "flip_v", false),
+                        SizeX = sizeX,
+                        SizeY = sizeY,
+                        Space = space,
+                        RebuildGeometryPlane = rebuildGeometryPlane,
+                    });
+                }
+
+                if (compiled.Count > 0)
+                {
+                    _nativeNoteComponents[noteType] = compiled;
+                    var byRole = new Dictionary<string, List<NativeNoteComponent>>(StringComparer.Ordinal);
+                    var poseComponents = new List<NativeNoteComponent>();
+                    for (var compiledIndex = 0; compiledIndex < compiled.Count; compiledIndex++)
+                    {
+                        var nativeComponent = compiled[compiledIndex];
+                        if (nativeComponent.SourceRoles.Length == 0)
+                        {
+                            poseComponents.Add(nativeComponent);
+                            continue;
+                        }
+                        for (var roleIndex = 0; roleIndex < nativeComponent.SourceRoles.Length; roleIndex++)
+                        {
+                            var role = nativeComponent.SourceRoles[roleIndex];
+                            if (!byRole.TryGetValue(role, out var roleComponents))
+                            {
+                                roleComponents = new List<NativeNoteComponent>();
+                                byRole.Add(role, roleComponents);
+                            }
+                            roleComponents.Add(nativeComponent);
+                        }
+                    }
+                    if (byRole.Count > 0)
+                        _nativeNoteRoleComponents[noteType] = byRole;
+                    if (poseComponents.Count > 0)
+                        _nativeNotePoseComponents[noteType] = poseComponents;
+                }
+                if (componentCount > 0 && allNative && compiled.Count == componentCount)
+                    _nativeOnlyNoteTypes.Add(noteType);
+            }
+        }
+
+        _nativeNotePlanOwner = script;
+        _nativeNotePlanHasComponents = hasNativeComponents;
+        _nativeNoteComponentSource = componentSource;
+        _nativeNoteTransformSource = transformSource;
+        SetNativeNoteRendererReady(script, hasNativeComponents);
+        return hasNativeComponents;
+    }
+
+    private static SkinPlayfieldGeometrySpace ParseNativeNoteGeometrySpace(string value)
+    {
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "note_surface" or "note-surface" => SkinPlayfieldGeometrySpace.NoteSurface,
+            "lane_surface" or "lane-surface" => SkinPlayfieldGeometrySpace.LaneSurface,
+            "billboard" or "sprite" => SkinPlayfieldGeometrySpace.Billboard,
+            _ => throw new ScriptRuntimeException($"unsupported native note geometry space '{value}'")
+        };
+    }
+
+    private static NativeNoteAssetChoice ParseNativeNoteAssetChoice(
+        Table table,
+        NativeNoteAssetChoice fallback,
+        bool allowFallback)
+    {
+        SkinAssetHandle? asset = fallback.Asset;
+        var assetValue = table.Get("asset");
+        if (assetValue.Type != DataType.Nil)
+        {
+            asset = assetValue.Type == DataType.UserData
+                ? assetValue.UserData?.Object as SkinAssetHandle
+                : null;
+            if (asset is null && !GetBool(table, "visible", true))
+                return new NativeNoteAssetChoice(null, null, fallback.FramesPerSecond, false, fallback.Tint);
+            if (asset is null)
+                throw new ScriptRuntimeException("native note component asset must be an assets.load() handle");
+        }
+
+        SkinAssetHandle[]? frames = assetValue.Type != DataType.Nil ? null : fallback.Frames;
+        var framesValue = table.Get("frames");
+        if (framesValue.Type != DataType.Nil)
+        {
+            if (framesValue.Type != DataType.Table || framesValue.Table is null)
+                throw new ScriptRuntimeException("native note component frames must be an array of assets.load() handles");
+            var parsedFrames = new List<SkinAssetHandle>();
+            for (var index = 1; ; index++)
+            {
+                var frameValue = framesValue.Table.Get(index);
+                if (frameValue.Type == DataType.Nil)
+                    break;
+                if (frameValue.Type != DataType.UserData || frameValue.UserData?.Object is not SkinAssetHandle frameAsset)
+                    throw new ScriptRuntimeException("native note component frames must contain only assets.load() handles");
+                parsedFrames.Add(frameAsset);
+            }
+            if (parsedFrames.Count == 0)
+                throw new ScriptRuntimeException("native note component frames cannot be empty");
+            frames = parsedFrames.ToArray();
+        }
+
+        var fps = GetNumber(table, "fps", fallback.FramesPerSecond > 0 ? fallback.FramesPerSecond : 30f);
+        if (!double.IsFinite(fps) || fps <= 0 || fps > 240)
+            throw new ScriptRuntimeException("native note component fps must be between 0 and 240");
+        var visible = GetBool(table, "visible", asset is not null || frames is not null);
+        if (allowFallback && assetValue.Type == DataType.Nil && framesValue.Type == DataType.Nil &&
+            table.Get("visible").Type == DataType.Nil)
+            visible = fallback.Visible;
+        var tint = table.Get("color").Type == DataType.Nil
+            ? fallback.Tint
+            : GetColor(table, "color", fallback.Tint ?? XnaColor.White);
+        return new NativeNoteAssetChoice(asset, frames, (float)fps, visible, tint);
+    }
+
+    private static void ValidateNativeNoteVariantFilterFields(Table when, string noteType, string componentId)
+    {
+        var hasType = false;
+        var hasNoteType = false;
+        foreach (var pair in when.Pairs)
+        {
+            if (pair.Key.Type != DataType.String)
+                throw new ScriptRuntimeException($"native note component '{noteType}.{componentId}' variant condition keys must be strings");
+            var key = pair.Key.String ?? string.Empty;
+            if (key is not ("type" or "note_type" or "side" or "bank" or "gear" or "side_gear" or
+                "family" or "track" or "geometry_track" or "attr" or "hit" or "missed" or "simultaneous"))
+                throw new ScriptRuntimeException($"native note component '{noteType}.{componentId}' has unsupported variant condition '{key}'");
+            hasType |= key == "type";
+            hasNoteType |= key == "note_type";
+        }
+        if (hasType && hasNoteType)
+            throw new ScriptRuntimeException($"native note component '{noteType}.{componentId}' must use either 'type' or 'note_type', not both");
+    }
+
+    private static NativeNoteVariantFilter ParseNativeNoteVariantFilter(Table? when)
+    {
+        if (when is null)
+            return new NativeNoteVariantFilter(null, null, null, null, null, null,
+                null, null, null, null, null, null);
+        static string? OptionalString(Table table, string name)
+        {
+            var value = table.Get(name);
+            if (value.Type == DataType.Nil) return null;
+            if (value.Type != DataType.String) throw new ScriptRuntimeException($"native note variant condition '{name}' must be a string");
+            return value.String;
+        }
+        static int? OptionalInt(Table table, string name)
+        {
+            var value = table.Get(name);
+            if (value.Type == DataType.Nil) return null;
+            if (value.Type != DataType.Number || !double.IsFinite(value.Number) ||
+                value.Number != Math.Truncate(value.Number) ||
+                value.Number < int.MinValue || value.Number > int.MaxValue)
+                throw new ScriptRuntimeException($"native note variant condition '{name}' must be a 32-bit integer");
+            return (int)value.Number;
+        }
+        static bool? OptionalBool(Table table, string name)
+        {
+            var value = table.Get(name);
+            if (value.Type == DataType.Nil) return null;
+            if (value.Type != DataType.Boolean) throw new ScriptRuntimeException($"native note variant condition '{name}' must be a boolean");
+            return value.Boolean;
+        }
+        return new NativeNoteVariantFilter(
+            OptionalString(when, "type") ?? OptionalString(when, "note_type"),
+            OptionalString(when, "side"),
+            OptionalString(when, "bank"),
+            OptionalString(when, "gear"),
+            OptionalString(when, "side_gear"),
+            OptionalString(when, "family"),
+            OptionalInt(when, "track"),
+            OptionalInt(when, "geometry_track"),
+            OptionalInt(when, "attr"),
+            OptionalBool(when, "hit"),
+            OptionalBool(when, "missed"),
+            OptionalBool(when, "simultaneous"));
+    }
+
+    private static void SetNativeNoteRendererReady(Script script, bool ready)
+    {
+        var current = script.Globals.Get("TSC_PLAYFIELD_NATIVE_READY");
+        if (current.Type != DataType.Boolean || current.Boolean != ready)
+            script.Globals.Set("TSC_PLAYFIELD_NATIVE_READY", DynValue.NewBoolean(ready));
+    }
+
+    private static DynValue ResolveNativeNoteComponentTransform(
+        Table? transformRoot,
+        string noteType,
+        string componentId,
+        string sourceRole,
+        Table component)
+    {
+        DynValue selected = DynValue.Nil;
+        if (transformRoot is not null)
+        {
+            var byType = transformRoot.Get(noteType);
+            if (byType.Type == DataType.Table && byType.Table is not null)
+            {
+                selected = byType.Table.Get(componentId);
+                if (selected.Type == DataType.Nil || selected.Type == DataType.Boolean && !selected.Boolean)
+                    selected = byType.Table.Get(sourceRole);
+            }
+            if (selected.Type == DataType.Nil || selected.Type == DataType.Boolean && !selected.Boolean)
+            {
+                var shared = transformRoot.Get("*");
+                if (shared.Type == DataType.Table && shared.Table is not null)
+                {
+                    selected = shared.Table.Get(componentId);
+                    if (selected.Type == DataType.Nil || selected.Type == DataType.Boolean && !selected.Boolean)
+                        selected = shared.Table.Get(sourceRole);
+                }
+            }
+        }
+        return selected.Type == DataType.Nil || selected.Type == DataType.Boolean && !selected.Boolean
+            ? component.Get("transform")
+            : selected;
+    }
+
+    private int AppendNativeNoteGeometry(
+        List<SkinPlayfieldGeometrySnapshot> geometry,
+        List<SkinPlayfieldSpriteGeometrySnapshot> spriteGeometry,
+        double realTime)
+    {
+        var nativeCount = 0;
+        _nativeNoteSuppressedGeometry.Clear();
+        _nativeNoteSuppressedFlickAttachments.Clear();
+        _nativePoseComponentKeys.Clear();
+
+        var visibleNativeSourceGeometry = _nativeNoteVisibleSourceGeometry;
+        var hiddenNativeSourceGeometry = _nativeNoteHiddenSourceGeometry;
+        visibleNativeSourceGeometry.Clear();
+        hiddenNativeSourceGeometry.Clear();
+
+        // 3D role components replace engine-provided geometry. Pose components
+        // use the first matching note geometry (or an explicit anchor_role) only
+        // as a transform anchor, then create their own native quad.
+        for (var geometryIndex = 0; geometryIndex < geometry.Count; geometryIndex++)
+        {
+            var snapshot = geometry[geometryIndex];
+            if (!_nativeNoteComponents.ContainsKey(snapshot.NoteType))
+                continue;
+
+            var context = new NativeNoteSelectionContext(
+                snapshot.NoteType, snapshot.Track, snapshot.GeometryTrack, snapshot.Attr,
+                snapshot.Side, snapshot.Bank, snapshot.Gear, snapshot.SideGear,
+                string.Empty, snapshot.Hit, snapshot.Missed, snapshot.Simultaneous);
+
+            if (_nativeNotePoseComponents.TryGetValue(snapshot.NoteType, out var poseComponents))
+            {
+                for (var componentIndex = 0; componentIndex < poseComponents.Count; componentIndex++)
+                {
+                    var component = poseComponents[componentIndex];
+                    if (component.AnchorRole is not null &&
+                        !string.Equals(component.AnchorRole, snapshot.Component, StringComparison.Ordinal))
+                        continue;
+
+                    var poseKey = (snapshot.NoteType, component.Id, snapshot.Track, snapshot.Tick, snapshot.EventIndex);
+                    if (!_nativePoseComponentKeys.Add(poseKey))
+                        continue;
+
+                    var poseChoice = component.ResolveChoice(context);
+                    if (!poseChoice.Visible)
+                        continue;
+                    var poseAsset = ResolveNativeNoteAsset(poseChoice, realTime);
+                    if (poseAsset is null)
+                        continue;
+
+                    var poseTransform = ResolveNativeNoteAnimationTransform(component, snapshot, out var poseAlpha);
+                    _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
+                        poseAsset, snapshot, poseChoice.Tint ?? component.Tint, poseAlpha,
+                        component.Layer ?? snapshot.Layer, poseTransform,
+                        IsIndependentGeometry: true,
+                        GeometryScaleX: component.SizeX,
+                        GeometryScaleY: component.SizeY,
+                        GeometrySpace: component.Space,
+                        FlipU: component.FlipU,
+                        FlipV: component.FlipV,
+                        IsNativeComponent: true,
+                        RebuildGeometryPlane: component.Space != SkinPlayfieldGeometrySpace.NoteSurface));
+                    nativeCount++;
+                }
+            }
+
+            if (!_nativeNoteRoleComponents.TryGetValue(snapshot.NoteType, out var byRole) ||
+                !byRole.TryGetValue(snapshot.Component, out var roleComponents))
+                continue;
+
+            for (var componentIndex = 0; componentIndex < roleComponents.Count; componentIndex++)
+            {
+                var component = roleComponents[componentIndex];
+                var choice = component.ResolveChoice(context);
+                if (!choice.Visible)
+                {
+                    hiddenNativeSourceGeometry.Add(snapshot.Vertices);
+                    continue;
+                }
+
+                var asset = ResolveNativeNoteAsset(choice, realTime);
+                if (asset is null)
+                {
+                    hiddenNativeSourceGeometry.Add(snapshot.Vertices);
+                    continue;
+                }
+
+                var transform = ResolveNativeNoteAnimationTransform(component, snapshot, out var alpha);
+                _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
+                    asset, snapshot, choice.Tint ?? component.Tint, alpha,
+                    component.Layer ?? snapshot.Layer, transform,
+                    IsIndependentGeometry: false,
+                    GeometryScaleX: component.SizeX,
+                    GeometryScaleY: component.SizeY,
+                    GeometrySpace: component.Space,
+                    FlipU: component.FlipU,
+                    FlipV: component.FlipV,
+                    IsNativeComponent: true,
+                    RebuildGeometryPlane: component.RebuildGeometryPlane));
+                visibleNativeSourceGeometry.Add(snapshot.Vertices);
+                nativeCount++;
+            }
+        }
+
+        // Native components own the source roles they match, even when their
+        // selected variant deliberately hides them. Fully-native note types also
+        // own all engine source roles omitted from the component layout.
+        for (var geometryIndex = 0; geometryIndex < geometry.Count; geometryIndex++)
+        {
+            var snapshot = geometry[geometryIndex];
+            var shouldSuppress = hiddenNativeSourceGeometry.Contains(snapshot.Vertices) ||
+                (_nativeOnlyNoteTypes.Contains(snapshot.NoteType) &&
+                 !visibleNativeSourceGeometry.Contains(snapshot.Vertices));
+            if (shouldSuppress && !visibleNativeSourceGeometry.Contains(snapshot.Vertices) &&
+                !_nativeNoteSuppressedGeometry.Contains(snapshot.Vertices))
+                _nativeNoteSuppressedGeometry.Add(snapshot.Vertices);
+        }
+
+        // Sprite roles have their own snapshot type and submission path. Keeping
+        // this lookup separate prevents screen-quad attachments from entering the
+        // 3D geometry path while still letting them use the same compiled rules.
+        for (var spriteIndex = 0; spriteIndex < spriteGeometry.Count; spriteIndex++)
+        {
+            var snapshot = spriteGeometry[spriteIndex];
+            if (!_nativeNoteRoleComponents.TryGetValue(snapshot.NoteType, out var byRole) ||
+                !byRole.TryGetValue(snapshot.Component, out var roleComponents))
+            {
+                if (_nativeOnlyNoteTypes.Contains(snapshot.NoteType) &&
+                    string.Equals(snapshot.Component, "flick_attachment", StringComparison.OrdinalIgnoreCase))
+                {
+                    var key = (snapshot.Tick, snapshot.Track, snapshot.EventIndex);
+                    if (!_nativeNoteSuppressedFlickAttachments.Contains(key))
+                        _nativeNoteSuppressedFlickAttachments.Add(key);
+                }
+                continue;
+            }
+
+            var context = new NativeNoteSelectionContext(
+                snapshot.NoteType, snapshot.Track, snapshot.Track, snapshot.Attr,
+                snapshot.Side, snapshot.Bank, snapshot.Gear, snapshot.SideGear,
+                snapshot.Family, snapshot.Hit, snapshot.Missed, snapshot.Simultaneous);
+            for (var componentIndex = 0; componentIndex < roleComponents.Count; componentIndex++)
+            {
+                var component = roleComponents[componentIndex];
+                if (string.Equals(snapshot.Component, "flick_attachment", StringComparison.OrdinalIgnoreCase))
+                {
+                    var key = (snapshot.Tick, snapshot.Track, snapshot.EventIndex);
+                    if (!_nativeNoteSuppressedFlickAttachments.Contains(key))
+                        _nativeNoteSuppressedFlickAttachments.Add(key);
+                }
+
+                var choice = component.ResolveChoice(context);
+                if (!choice.Visible || !snapshot.HasScreenQuad)
+                    continue;
+                var asset = ResolveNativeNoteAsset(choice, realTime);
+                if (asset is null)
+                    continue;
+
+                _playfieldSpriteDrawRequests.Add(new SkinPlayfieldSpriteDrawRequest(
+                    asset, snapshot, choice.Tint ?? component.Tint,
+                    component.Alpha * snapshot.Opacity,
+                    component.Layer ?? snapshot.Layer,
+                    component.FlipU, component.FlipV,
+                    component.Transform.ScaleX * component.SizeX,
+                    component.Transform.ScaleY * component.SizeY,
+                    IsNativeComponent: true));
+                nativeCount++;
+            }
+        }
+
+        DebugLastNativeNoteGeometryCount = nativeCount;
+        return nativeCount;
+    }
+
+    private static SkinAssetHandle? ResolveNativeNoteAsset(NativeNoteAssetChoice choice, double realTime)
+    {
+        if (choice.Frames is { Length: > 0 } frames)
+        {
+            var frameIndex = (int)Math.Floor(Math.Max(0.0, realTime) * choice.FramesPerSecond) % frames.Length;
+            return frames[frameIndex];
+        }
+        return choice.Asset;
+    }
+
+    private SkinPlayfieldGeometryTransform ResolveNativeNoteAnimationTransform(
+        NativeNoteComponent component,
+        SkinPlayfieldGeometrySnapshot snapshot,
+        out float alpha)
+    {
+        var transform = component.Transform;
+        alpha = component.Alpha;
+        if (component.BeatPulse)
+        {
+            if (snapshot.Missed)
+            {
+                // Beat-pulse affects only its own modulation; preserve the
+                // component's authored alpha in both judged and missed states.
+                if (!component.TransformOverridesScaleX)
+                    transform = transform with { ScaleX = 1f };
+            }
+            else
+            {
+                var pulse = CalculatePlayfieldBeatPulse(_game.beat);
+                alpha *= 0.65f + 0.35f * pulse;
+                if (!component.TransformOverridesScaleX)
+                    transform = transform with { ScaleX = 1f + 0.1f * pulse };
+            }
+        }
+        return transform;
+    }
+
+    private static float CalculatePlayfieldBeatPulse(double beat)
+    {
+        beat = Math.Max(0.0, beat);
+        var phase = beat - Math.Floor(beat);
+        const double attack = 0.14;
+        if (phase < attack)
+        {
+            var x = phase / attack;
+            var inverse = 1.0 - x;
+            var inverseSquared = inverse * inverse;
+            return (float)(1.0 - inverseSquared * inverseSquared);
+        }
+
+        var decay = Math.Clamp((phase - attack) / (1.0 - attack), 0.0, 1.0);
+        var smooth = decay * decay * (3.0 - 2.0 * decay);
+        return (float)(1.0 - smooth);
     }
 
     private void EnsurePlayfieldNoteFrameTables(Script script)
@@ -10814,22 +12514,21 @@ public sealed class SkinRuntime : IDisposable
             return;
 
         _playfieldTableOwner = script;
-        var geometryHandleFormat = script.Globals.Get("TSC_PLAYFIELD_GEOMETRY_HANDLE_FORMAT");
-        _playfieldNoteUsesNumericGeometryHandles = geometryHandleFormat.Type == DataType.String &&
-            string.Equals(geometryHandleFormat.String, "numeric-v1", StringComparison.Ordinal);
         _playfieldNoteFrameTable = new Table(script);
         _playfieldNotesTable = new Table(script);
         _playfieldNoteFrameValue = DynValue.NewTable(_playfieldNoteFrameTable);
         _playfieldNotesValue = DynValue.NewTable(_playfieldNotesTable);
-        _playfieldNoteVersionValue = DynValue.NewNumber(3);
+        _playfieldNoteVersionValue = DynValue.NewNumber(9);
         _playfieldNoteFrameTable.Set("version", _playfieldNoteVersionValue);
         _playfieldNoteFrameTable.Set("notes", _playfieldNotesValue);
         _playfieldNoteTables.Clear();
         _playfieldNoteGeometryTables.Clear();
+        _playfieldNoteSpanTables.Clear();
         _playfieldNoteGeometryRoleTables.Clear();
         _playfieldGeometryRoleValues.Clear();
         _playfieldNoteTableValues.Clear();
         _playfieldNoteGeometryTableValues.Clear();
+        _playfieldNoteSpanTableValues.Clear();
         _playfieldNoteGeometryRoleTableValues.Clear();
         _playfieldNoteGeometryCounts.Clear();
         _playfieldNotePreviousGeometryCounts.Clear();
@@ -10844,32 +12543,53 @@ public sealed class SkinRuntime : IDisposable
         {
             var noteTable = new Table(_playfieldTableOwner!);
             var geometryTable = new Table(_playfieldTableOwner!);
-            Table? geometryRoleTable = _playfieldNoteUsesNumericGeometryHandles ? new Table(_playfieldTableOwner!) : null;
+            var spanTable = new Table(_playfieldTableOwner!);
+            var geometryRoleTable = new Table(_playfieldTableOwner!);
             _playfieldNoteTables.Add(noteTable);
             _playfieldNoteGeometryTables.Add(geometryTable);
+            _playfieldNoteSpanTables.Add(spanTable);
             _playfieldNoteGeometryRoleTables.Add(geometryRoleTable);
             _playfieldNoteTableValues.Add(DynValue.NewTable(noteTable));
             _playfieldNoteGeometryTableValues.Add(DynValue.NewTable(geometryTable));
-            _playfieldNoteGeometryRoleTableValues.Add(geometryRoleTable is null ? DynValue.Nil : DynValue.NewTable(geometryRoleTable));
+            _playfieldNoteSpanTableValues.Add(DynValue.NewTable(spanTable));
+            _playfieldNoteGeometryRoleTableValues.Add(DynValue.NewTable(geometryRoleTable));
             _playfieldNotePreviousGeometryCounts.Add(0);
             _playfieldNoteTableCaches.Add(default);
         }
     }
 
 
+    private static SkinPlayfieldGeometrySpace ParsePlayfieldGeometrySpace(Table options)
+    {
+        var value = options.Get("geometry_space");
+        if (value.Type == DataType.Nil)
+            value = options.Get("space");
+        if (value.Type == DataType.Nil)
+            return SkinPlayfieldGeometrySpace.NoteSurface;
+        if (value.Type != DataType.String)
+            throw new ScriptRuntimeException("playfield geometry space must be 'note_surface', 'lane_surface', or 'billboard'");
+
+        return value.String.Trim().ToLowerInvariant() switch
+        {
+            "note_surface" or "note-surface" => SkinPlayfieldGeometrySpace.NoteSurface,
+            "lane_surface" or "lane-surface" => SkinPlayfieldGeometrySpace.LaneSurface,
+            "billboard" => SkinPlayfieldGeometrySpace.Billboard,
+            _ => throw new ScriptRuntimeException($"unsupported playfield geometry space '{value.String}'; expected note_surface, lane_surface, or billboard")
+        };
+    }
+
     private DynValue SubmitPlayfieldGeometryQuad(SkinAssetHandle? asset, Table options)
     {
         if (options.Get("shader").Type != DataType.Nil)
-            throw new ScriptRuntimeException("Shader overrides are not yet available for playfield geometry handles; use draw.sprite() or a regular draw.quad3d() command.");
+            throw new ScriptRuntimeException("Shader overrides are not yet available for playfield geometry tokens; use draw.sprite() or a regular draw.quad3d() command.");
         var geometryValue = options.Get("geometry");
         if (geometryValue.Type == DataType.Nil)
             return DynValue.Nil;
-        if (geometryValue.Type != DataType.UserData || geometryValue.UserData?.Object is null)
-            throw new ScriptRuntimeException("draw.quad3d option 'geometry' expects a geometry handle from the current playfield callback");
 
         var tint = GetColor(options, "color", XnaColor.White);
         var alpha = Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f);
-        if (geometryValue.UserData.Object is SkinPlayfieldSurfaceGeometryHandle surfaceGeometry)
+        if (geometryValue.Type == DataType.UserData &&
+            geometryValue.UserData?.Object is SkinPlayfieldSurfaceGeometryHandle surfaceGeometry)
         {
             if (!_insidePlayfieldSurfaceRenderer || surfaceGeometry.FrameId != _playfieldSurfaceGeometryFrameId)
                 throw new ScriptRuntimeException("draw.quad3d surface geometry handles are only valid inside the current playfield surface callback");
@@ -10887,25 +12607,54 @@ public sealed class SkinRuntime : IDisposable
             return DynValue.Nil;
         }
 
-        if (geometryValue.UserData.Object is SkinPlayfieldGeometryHandle geometry)
+        SkinPlayfieldGeometrySnapshot noteGeometry;
+        int noteDefaultLayer;
+        if (geometryValue.Type == DataType.Number)
         {
-            if (!_insidePlayfieldNoteRenderer || geometry.FrameId != _playfieldGeometryFrameId)
-                throw new ScriptRuntimeException("draw.quad3d note geometry handles are only valid inside the current render_notes(frame) call");
-            var layer = (int)Math.Round(GetNumber(options, "layer", geometry.layer));
-            var scaleX = (float)Math.Clamp(GetNumber(options, "scale_x", 1f), 0.001, 100.0);
-            var scaleY = (float)Math.Clamp(GetNumber(options, "scale_y", 1f), 0.001, 100.0);
-            _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
-                asset, geometry.Snapshot, tint, alpha, layer, scaleX, scaleY));
-            return DynValue.Nil;
+            if (!TryResolvePlayfieldGeometryToken(geometryValue, expectSprite: false, out noteGeometry, out _))
+                throw new ScriptRuntimeException("draw.quad3d option 'geometry' expects a current 3D note geometry token or note.pose from render_notes(frame)");
+            noteDefaultLayer = noteGeometry.Layer;
+        }
+        else
+        {
+            throw new ScriptRuntimeException("draw.quad3d option 'geometry' expects a current numeric note geometry token from render_notes(frame)");
         }
 
-        throw new ScriptRuntimeException("draw.quad3d option 'geometry' expects a note or lane geometry handle from the current playfield callback");
+        var sizeValue = options.Get("size");
+        var independentGeometry = sizeValue.Type != DataType.Nil;
+        var geometryScaleX = 1f;
+        var geometryScaleY = 1f;
+        if (independentGeometry)
+        {
+            if (sizeValue.Type != DataType.Table || sizeValue.Table is null)
+                throw new ScriptRuntimeException("draw.quad3d option 'size' must be a table with x/y scale factors");
+            geometryScaleX = GetVectorComponent(sizeValue.Table, "x", 1, 1f);
+            geometryScaleY = GetVectorComponent(sizeValue.Table, "y", 2, 1f);
+            if (!float.IsFinite(geometryScaleX) || !float.IsFinite(geometryScaleY) ||
+                geometryScaleX <= 0f || geometryScaleY <= 0f ||
+                geometryScaleX > 100f || geometryScaleY > 100f)
+                throw new ScriptRuntimeException("draw.quad3d option 'size' values must be finite, greater than 0, and no greater than 100");
+        }
+
+        var noteLayer = (int)Math.Round(GetNumber(options, "layer", noteDefaultLayer));
+        var noteTransform = GetPlayfieldGeometryTransform(options);
+        var geometrySpace = independentGeometry
+            ? ParsePlayfieldGeometrySpace(options)
+            : SkinPlayfieldGeometrySpace.NoteSurface;
+        _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
+            asset, noteGeometry, tint, alpha, noteLayer, noteTransform,
+            independentGeometry, geometryScaleX, geometryScaleY, geometrySpace,
+            GetBool(options, "flip_x", false), GetBool(options, "flip_y", false)));
+        return DynValue.Nil;
     }
 
     private Table CreateDrawApi(Script script)
     {
         var table = new Table(script);
         table.Set("sprite", DynValue.NewCallback(DrawSprite));
+        table.Set("sprite_instances", DynValue.NewCallback(DrawSpriteInstances));
+        table.Set("lane_quad", DynValue.NewCallback(DrawLaneQuad));
+        table.Set("lane_line", DynValue.NewCallback(DrawLaneLine));
         table.Set("quad3d", DynValue.NewCallback(DrawQuad3D));
         table.Set("quad3d_batch", DynValue.NewCallback(DrawQuad3DBatch));
         table.Set("quad3d_cached_batch", DynValue.NewCallback(DrawQuad3DCachedBatch));
@@ -10933,9 +12682,9 @@ public sealed class SkinRuntime : IDisposable
     private DynValue SubmitPlayfieldSpriteGeometryToken(SkinAssetHandle asset, Table options, DynValue tokenValue)
     {
         if (options.Get("shader").Type != DataType.Nil)
-            throw new ScriptRuntimeException("Shader overrides are not yet available for numeric playfield geometry tokens; use draw.sprite() without a geometry token.");
+            throw new ScriptRuntimeException("Shader overrides are not yet available for playfield geometry tokens; use draw.sprite() without a geometry token.");
         if (!TryResolvePlayfieldGeometryToken(tokenValue, expectSprite: true, out _, out var geometry))
-            throw new ScriptRuntimeException("draw.sprite numeric geometry_token is invalid or not from the current render_notes(frame) call");
+            throw new ScriptRuntimeException("draw.sprite geometry_token is invalid or not from the current render_notes(frame) call");
 
         var request = new SkinPlayfieldSpriteDrawRequest(
             asset,
@@ -10948,6 +12697,126 @@ public sealed class SkinRuntime : IDisposable
             (float)Math.Clamp(GetNumber(options, "scale_x", 1f), 0.001, 100.0),
             (float)Math.Clamp(GetNumber(options, "scale_y", 1f), 0.001, 100.0));
         _playfieldSpriteDrawRequests.Add(request);
+        return DynValue.Nil;
+    }
+
+    private DynValue DrawSpriteInstances(ScriptExecutionContext unusedContext, CallbackArguments args)
+    {
+        var measure = DebugMeasureApiAllocations;
+        var allocStart = measure ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        var timeStart = measure ? Stopwatch.GetTimestamp() : 0L;
+        try
+        {
+            return DrawSpriteInstancesCore(args);
+        }
+        finally
+        {
+            if (measure)
+            {
+                DebugLastSpriteInstancesApiAllocatedBytes += Math.Max(0L, GC.GetAllocatedBytesForCurrentThread() - allocStart);
+                DebugLastSpriteInstancesApiMilliseconds += (Stopwatch.GetTimestamp() - timeStart) * 1000.0 / Stopwatch.Frequency;
+                DebugLastSpriteInstancesApiCalls++;
+            }
+        }
+    }
+
+    private DynValue DrawSpriteInstancesCore(CallbackArguments args)
+    {
+        if (args.Count < 1 || args[0].Type != DataType.UserData ||
+            args[0].UserData?.Object is not SkinAssetHandle asset)
+        {
+            throw new ScriptRuntimeException("draw.sprite_instances(asset, options) expects an asset from assets.load()");
+        }
+        if (!_insidePlayfieldNoteRenderer)
+            throw new ScriptRuntimeException("draw.sprite_instances is only valid inside render_notes(frame)");
+
+        var options = GetOptions(args, 1);
+        if (options.Get("shader").Type != DataType.Nil)
+            throw new ScriptRuntimeException("draw.sprite_instances does not support shader overrides");
+
+        var geometryToken = options.Get("geometry_token");
+        if (geometryToken.Type != DataType.Number ||
+            !TryResolvePlayfieldGeometryToken(geometryToken, expectSprite: true, out _, out var geometrySnapshot))
+        {
+            throw new ScriptRuntimeException("draw.sprite_instances geometry_token must be a current sprite geometry token from render_notes(frame)");
+        }
+
+        if (geometrySnapshot.Span is null)
+            throw new ScriptRuntimeException("draw.sprite_instances requires a geometry token that exposes a surface span");
+
+        var instancesValue = options.Get("instances");
+        if (instancesValue.Type != DataType.Table || instancesValue.Table is null)
+            throw new ScriptRuntimeException("draw.sprite_instances option 'instances' must be an array of instance tables");
+        var instances = instancesValue.Table;
+        var count = (int)Math.Round(GetNumber(options, "count", instances.Length));
+        if (count < 0 || count > 4096)
+            throw new ScriptRuntimeException("draw.sprite_instances count must be between 0 and 4096");
+
+        var tint = GetColor(options, "color", XnaColor.White);
+        var baseAlpha = Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f);
+        var baseLayer = (int)Math.Round(GetNumber(options, "layer", geometrySnapshot.Layer));
+        var baseFlipX = GetBool(options, "flip_x", false);
+        var baseFlipY = GetBool(options, "flip_y", false);
+
+        // Always submit a zero-sized marker so the native fallback knows this
+        // component is intentionally owned by the skin even when Lua produces
+        // no visible instances for the current frame.
+        _playfieldSpriteDrawRequests.Add(new SkinPlayfieldSpriteDrawRequest(
+            asset, geometrySnapshot, tint, 0f, baseLayer, baseFlipX, baseFlipY,
+            1f, 1f, IsSpanInstance: true));
+
+        for (var i = 1; i <= count; i++)
+        {
+            var instanceValue = instances.Get(i);
+            if (instanceValue.Type != DataType.Table || instanceValue.Table is null)
+                throw new ScriptRuntimeException($"draw.sprite_instances item {i} must be a table");
+            var instance = instanceValue.Table;
+            var position = GetNumber(instance, "u", 0.5f);
+            var width = GetNumber(instance, "width", 0f);
+            var height = GetNumber(instance, "height", 0f);
+            var minimumWidth = GetNumber(instance, "min_width", 0f);
+            var minimumHeight = GetNumber(instance, "min_height", 0f);
+            var alpha = Math.Clamp(baseAlpha * GetNumber(instance, "alpha", 1f), 0f, 1f);
+            var rotation = GetNumber(instance, "rotation_degrees", 0f);
+            var axisValue = instance.Get("axis");
+            if (axisValue.Type != DataType.Nil && axisValue.Type != DataType.String)
+                throw new ScriptRuntimeException($"draw.sprite_instances item {i} axis must be a string");
+            var axisMode = GetString(instance, "axis", "span").Trim().ToLowerInvariant();
+            if (axisMode != "span" && axisMode != "surface_across")
+                throw new ScriptRuntimeException($"draw.sprite_instances item {i} axis must be 'span' or 'surface_across'");
+            if (!double.IsFinite(position) || position < -10.0 || position > 10.0 ||
+                !double.IsFinite(width) || !double.IsFinite(height) ||
+                !double.IsFinite(minimumWidth) || !double.IsFinite(minimumHeight) ||
+                width < 0.0 || height < 0.0 || minimumWidth < 0.0 || minimumHeight < 0.0 ||
+                width > 10000.0 || height > 10000.0 || minimumWidth > 10000.0 || minimumHeight > 10000.0 ||
+                !double.IsFinite(rotation) || Math.Abs(rotation) > 36000.0)
+            {
+                throw new ScriptRuntimeException($"draw.sprite_instances item {i} contains invalid position, size or rotation values");
+            }
+            if (width <= 0.001 || height <= 0.001 || alpha <= 0.001f)
+                continue;
+
+            var request = new SkinPlayfieldSpriteDrawRequest(
+                asset,
+                geometrySnapshot,
+                tint,
+                alpha,
+                (int)Math.Round(GetNumber(instance, "layer", baseLayer)),
+                GetBool(instance, "flip_x", baseFlipX),
+                GetBool(instance, "flip_y", baseFlipY),
+                1f,
+                1f,
+                IsSpanInstance: true,
+                SpanPosition: (float)position,
+                InstanceWidth: (float)width,
+                InstanceHeight: (float)height,
+                InstanceRotationDegrees: (float)rotation,
+                MinimumInstanceWidth: (float)minimumWidth,
+                MinimumInstanceHeight: (float)minimumHeight,
+                AlignToLocalSurfaceAcross: axisMode == "surface_across");
+            _playfieldSpriteDrawRequests.Add(request);
+        }
+
         return DynValue.Nil;
     }
 
@@ -11049,6 +12918,38 @@ public sealed class SkinRuntime : IDisposable
         var color = GetColor(options, "color", XnaColor.White);
         var alpha = Math.Clamp(GetNumber(options, "alpha", 1f), 0f, 1f);
         var rotation = GetNumber(options, "rotation", 0f);
+        var rotationModeValue = options.Get("rotation_mode");
+        if (rotationModeValue.Type != DataType.Nil)
+        {
+            if (rotationModeValue.Type != DataType.String)
+                throw new ScriptRuntimeException("draw.sprite option 'rotation_mode' must be 'fixed', 'snapshot', or 'follow_lane'");
+
+            switch (rotationModeValue.String?.Trim().ToLowerInvariant())
+            {
+                case "fixed":
+                    rotation = 0f;
+                    break;
+                case "snapshot":
+                    // Keep the explicit rotation supplied by Lua at effect creation.
+                    break;
+                case "follow_lane":
+                {
+                    if (!_insideHitEffectRenderer)
+                        throw new ScriptRuntimeException("draw.sprite rotation_mode='follow_lane' is only available inside render_hit_effects(frame)");
+                    var laneAnchorValue = options.Get("lane_anchor");
+                    if (laneAnchorValue.Type != DataType.UserData ||
+                        laneAnchorValue.UserData?.Object is not SkinHitEffectAnchorHandle laneAnchor ||
+                        laneAnchor.FrameId != _hitEffectFrameId)
+                        throw new ScriptRuntimeException("draw.sprite rotation_mode='follow_lane' expects lane_anchor from the current frame.anchors table");
+                    rotation = laneAnchor.Snapshot.Judge.LaneRotationRadians;
+                    break;
+                }
+                default:
+                    throw new ScriptRuntimeException("draw.sprite option 'rotation_mode' must be 'fixed', 'snapshot', or 'follow_lane'");
+            }
+        }
+        if (!double.IsFinite(rotation))
+            throw new ScriptRuntimeException("draw.sprite option 'rotation' must be finite radians");
         var layer = (int)Math.Round(GetNumber(options, "layer", 0f));
         var flipX = GetBool(options, "flip_x", false);
         var flipY = GetBool(options, "flip_y", false);
@@ -11162,6 +13063,222 @@ public sealed class SkinRuntime : IDisposable
     }
 
     /// <summary>
+    /// draw.lane_line(asset, options) submits a LaneLine.fx line relative to a
+    /// bank or physical-column anchor. Offset is measured in anchor-width units;
+    /// width.near/far are screen-space thicknesses using the configured values
+    /// when omitted. The line follows the canonical 3D lane projection.
+    /// </summary>
+    private DynValue DrawLaneLine(ScriptExecutionContext _, CallbackArguments args)
+    {
+        if (args.Count < 2)
+            throw new ScriptRuntimeException("draw.lane_line(asset, options) expects an asset or nil and an options table");
+        if (!_insideLaneLineRenderer && !_insidePlayfieldBaseRenderer)
+            throw new ScriptRuntimeException("draw.lane_line is only valid inside render_playfield(frame) or the legacy render_lane_lines(frame) callback");
+
+        SkinAssetHandle? asset = null;
+        var assetValue = args[0];
+        if (assetValue.Type != DataType.Nil)
+        {
+            if (assetValue.Type != DataType.UserData || assetValue.UserData?.Object is not SkinAssetHandle providedAsset)
+                throw new ScriptRuntimeException("draw.lane_line(asset, options) expects an asset from assets.load() or nil");
+            asset = providedAsset;
+        }
+
+        var options = GetOptions(args, 1);
+        var anchorValue = options.Get("anchor");
+        if (anchorValue.Type != DataType.UserData ||
+            anchorValue.UserData?.Object is not SkinLaneLineAnchorHandle anchor ||
+            anchor.FrameId != _laneLineFrameId)
+        {
+            throw new ScriptRuntimeException("draw.lane_line option 'anchor' expects a bank or lane anchor from the current playfield or legacy lane-line callback");
+        }
+
+        var snapshot = anchor.Snapshot;
+        var offset = GetNumber(options, "offset", 0f);
+        if (!float.IsFinite(offset) || Math.Abs(offset) > 10f)
+            throw new ScriptRuntimeException("draw.lane_line option 'offset' must be finite and within +/-10 anchor widths");
+
+        var widthValue = options.Get("width");
+        var nearWidth = snapshot.DefaultNearWidth;
+        var farWidth = snapshot.DefaultFarWidth;
+        if (widthValue.Type != DataType.Nil)
+        {
+            if (widthValue.Type != DataType.Table || widthValue.Table is null)
+                throw new ScriptRuntimeException("draw.lane_line option 'width' expects a table with near/far screen-space widths");
+            nearWidth = GetNumber(widthValue.Table, "near", nearWidth);
+            farWidth = GetNumber(widthValue.Table, "far", farWidth);
+        }
+        nearWidth = GetNumber(options, "near_width", nearWidth);
+        farWidth = GetNumber(options, "far_width", farWidth);
+        if (!float.IsFinite(nearWidth) || !float.IsFinite(farWidth) ||
+            nearWidth < 0f || farWidth < 0f || nearWidth > 2048f || farWidth > 2048f)
+        {
+            throw new ScriptRuntimeException("draw.lane_line near/far widths must be finite screen-space values between 0 and 2048");
+        }
+        if (nearWidth <= 0.0001f && farWidth <= 0.0001f)
+            return DynValue.Nil;
+
+        var outwardSign = string.Equals(snapshot.Side, "left", StringComparison.OrdinalIgnoreCase) ? -1f : 1f;
+        var centerNormalized = snapshot.CenterNormalized + outwardSign * offset * snapshot.NormalizedWidth;
+        if (!float.IsFinite(centerNormalized) ||
+            centerNormalized < snapshot.BankLeftNormalized - 0.0001f ||
+            centerNormalized > snapshot.BankRightNormalized + 0.0001f)
+        {
+            throw new ScriptRuntimeException("draw.lane_line offset places the line outside its bank");
+        }
+
+        var alphaValue = GetNumber(options, "alpha", snapshot.Opacity);
+        if (!float.IsFinite(alphaValue))
+            throw new ScriptRuntimeException("draw.lane_line option 'alpha' must be finite");
+        var alpha = Math.Clamp(alphaValue, 0f, 1f);
+        var layer = (int)Math.Clamp(Math.Round(GetNumber(options, "layer", 1f)), -32.0, 32.0);
+        _laneLineDrawRequests.Add(new SkinLaneLineDrawRequest(
+            asset,
+            snapshot.Side,
+            snapshot.Bank,
+            centerNormalized,
+            Math.Max(0.0001f, (snapshot.BankRightNormalized - snapshot.BankLeftNormalized) * 0.5f),
+            snapshot.NearDepth,
+            nearWidth,
+            farWidth,
+            GetColor(options, "color", XnaColor.White),
+            alpha,
+            layer));
+        return DynValue.Nil;
+    }
+
+    /// <summary>
+    /// draw.lane_quad(asset, options) submits a quad relative to a bank or
+    /// per-track hit-effect anchor. X/Y and width/height use the anchor's width
+    /// unit (1.0 spans the bank or physical track). Positive X follows the bank's
+    /// 3D across direction toward its right-hand edge; positive Y follows the
+    /// actual 3D lane tangent toward
+    /// the far end. lane_surface lies on the bank, note_surface uses the note
+    /// stand angle, and billboard faces camera. Billboard rotation_mode can be
+    /// fixed (default), snapshot (use rotation radians), or follow_lane (use the
+    /// anchor's current projected across-lane angle). These modes rotate only the
+    /// billboard shape; its center remains attached to the 3D anchor. lane_surface
+    /// and note_surface already inherit their respective 3D orientation.
+    /// normal_offset moves the quad along the bank normal to avoid z-fighting.
+    /// Valid in render_playfield(), the legacy render_judgement_line(), and
+    /// render_hit_effects() when using a current frame.anchors track anchor.
+    /// </summary>
+    private DynValue DrawLaneQuad(ScriptExecutionContext _, CallbackArguments args)
+    {
+        if (args.Count < 2)
+            throw new ScriptRuntimeException("draw.lane_quad(asset, options) expects an asset or nil and an options table");
+        if (!_insideHitEffectRenderer && !_insideJudgementLineRenderer && !_insidePlayfieldBaseRenderer)
+            throw new ScriptRuntimeException("draw.lane_quad is only valid inside render_playfield(frame), render_judgement_line(frame), or render_hit_effects(frame)");
+
+        SkinAssetHandle? asset = null;
+        var assetValue = args[0];
+        if (assetValue.Type != DataType.Nil)
+        {
+            if (assetValue.Type != DataType.UserData || assetValue.UserData?.Object is not SkinAssetHandle providedAsset)
+                throw new ScriptRuntimeException("draw.lane_quad(asset, options) expects an asset from assets.load() or nil");
+            asset = providedAsset;
+        }
+
+        var options = GetOptions(args, 1);
+        var anchorValue = options.Get("anchor");
+        if (anchorValue.Type == DataType.Nil)
+            anchorValue = options.Get("judge"); // Backward-compatible option name.
+
+        SkinJudgeAnchorSnapshot judgeSnapshot;
+        var validAnchor = false;
+        if (_insideHitEffectRenderer &&
+            anchorValue.Type == DataType.UserData &&
+            anchorValue.UserData?.Object is SkinHitEffectAnchorHandle hitAnchor)
+        {
+            validAnchor = hitAnchor.FrameId == _hitEffectFrameId;
+            judgeSnapshot = hitAnchor.Snapshot.Judge;
+        }
+        else if (!_insideHitEffectRenderer &&
+                 anchorValue.Type == DataType.UserData &&
+                 anchorValue.UserData?.Object is SkinJudgeAnchorHandle judge)
+        {
+            validAnchor = (_insidePlayfieldBaseRenderer &&
+                           judge.FrameId == _playfieldSurfaceGeometryFrameId) ||
+                          (_insideJudgementLineRenderer &&
+                           judge.FrameId == _judgementLineGeometryFrameId);
+            judgeSnapshot = judge.Snapshot;
+        }
+        else
+        {
+            throw new ScriptRuntimeException(_insideHitEffectRenderer
+                ? "draw.lane_quad option 'anchor' expects a track anchor from frame.anchors in the current render_hit_effects(frame) call"
+                : "draw.lane_quad option 'anchor' expects a bank anchor from the current render_playfield(frame) or render_judgement_line(frame) call");
+        }
+
+        if (!validAnchor)
+            throw new ScriptRuntimeException(_insideHitEffectRenderer
+                ? "draw.lane_quad hit-effect anchor must come from the current render_hit_effects(frame) call"
+                : "draw.lane_quad option 'anchor' must come from the current render_playfield(frame) or render_judgement_line(frame) call");
+
+        var x = GetNumber(options, "x", 0f);
+        var y = GetNumber(options, "y", 0f);
+        var normalOffset = GetNumber(options, "normal_offset", 0f);
+        var width = GetNumber(options, "width", 1f);
+        var height = GetNumber(options, "height", 0.02f);
+        if (!double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(normalOffset) ||
+            !double.IsFinite(width) || !double.IsFinite(height) ||
+            Math.Abs(x) > 10.0 || Math.Abs(y) > 10.0 || Math.Abs(normalOffset) > 1.0 ||
+            width <= 0.0001 || height <= 0.0001 || width > 10.0 || height > 10.0)
+        {
+            throw new ScriptRuntimeException("draw.lane_quad x/y must be within +/-10 anchor widths, normal_offset within +/-1 anchor width, and width/height greater than 0 and no greater than 10 anchor widths");
+        }
+
+        if (options.Get("geometry_space").Type == DataType.Nil &&
+            options.Get("space").Type == DataType.Nil)
+        {
+            options.Set("space", DynValue.NewString("lane_surface"));
+        }
+        var space = ParsePlayfieldGeometrySpace(options);
+        var rotationModeValue = options.Get("rotation_mode");
+        var rotationMode = SkinLaneQuadRotationMode.Fixed;
+        if (rotationModeValue.Type != DataType.Nil)
+        {
+            if (rotationModeValue.Type != DataType.String)
+                throw new ScriptRuntimeException("draw.lane_quad option 'rotation_mode' must be 'fixed', 'snapshot', or 'follow_lane'");
+            rotationMode = rotationModeValue.String?.Trim().ToLowerInvariant() switch
+            {
+                "fixed" => SkinLaneQuadRotationMode.Fixed,
+                "snapshot" => SkinLaneQuadRotationMode.Snapshot,
+                "follow_lane" => SkinLaneQuadRotationMode.FollowLane,
+                _ => throw new ScriptRuntimeException("draw.lane_quad option 'rotation_mode' must be 'fixed', 'snapshot', or 'follow_lane'")
+            };
+        }
+        if (space != SkinPlayfieldGeometrySpace.Billboard && rotationMode != SkinLaneQuadRotationMode.Fixed)
+            throw new ScriptRuntimeException("draw.lane_quad rotation_mode is only available with space='billboard'; lane_surface and note_surface already follow their 3D orientation");
+        var rotation = GetNumber(options, "rotation", 0f);
+        if (!double.IsFinite(rotation) || Math.Abs(rotation) > 1000.0)
+            throw new ScriptRuntimeException("draw.lane_quad option 'rotation' must be finite radians within +/-1000");
+        var alpha = Math.Clamp(GetNumber(options, "alpha", judgeSnapshot.Opacity), 0f, 1f);
+        var layer = (int)Math.Clamp(Math.Round(GetNumber(options, "layer", 0f)), -32.0, 32.0);
+        var request = new SkinLaneQuadDrawRequest(
+            asset,
+            judgeSnapshot,
+            (float)x,
+            (float)y,
+            (float)normalOffset,
+            (float)width,
+            (float)height,
+            GetColor(options, "color", XnaColor.White),
+            alpha,
+            layer,
+            space,
+            rotationMode,
+            (float)rotation,
+            GetBool(options, "flip_x", false),
+            GetBool(options, "flip_y", false));
+        if (_insideHitEffectRenderer)
+            _hitEffectLaneQuadDrawRequests.Add(request);
+        else
+            _laneQuadDrawRequests.Add(request);
+        return DynValue.Nil;
+    }
+
+    /// <summary>
     /// draw.quad3d(asset, options) submits one textured, perspective-projected
     /// quad directly through the GraphicsDevice. asset may be nil to render a
     /// solid white quad. x/y/width/height use screen-pixel units at z=0;
@@ -11242,10 +13359,9 @@ public sealed class SkinRuntime : IDisposable
                 }
 
                 // Flat note-geometry entries avoid allocating/looking up a nested
-                // options table for the common playfield case. This is an optional
-                // form of the shared batch API; existing { asset, options = {...} }
-                // entries continue through the fully general parser below.
-                var geometryValue = item.Get("geometry_handle");
+                // options table for the common playfield case. Entries without a
+                // geometry_token continue through the general options parser below.
+                var geometryValue = item.Get("geometry_token");
                 if (geometryValue.Type != DataType.Nil)
                 {
                     SkinPlayfieldGeometrySnapshot geometrySnapshot;
@@ -11253,31 +13369,34 @@ public sealed class SkinRuntime : IDisposable
                     if (geometryValue.Type == DataType.Number)
                     {
                         if (!TryResolvePlayfieldGeometryToken(geometryValue, expectSprite: false, out geometrySnapshot, out _))
-                            throw new ScriptRuntimeException("draw.quad3d_batch numeric geometry token is invalid or not from the current render_notes(frame) call");
+                            throw new ScriptRuntimeException("draw.quad3d_batch geometry token is invalid or not from the current render_notes(frame) call");
                         defaultLayer = geometrySnapshot.Layer;
-                    }
-                    else if (geometryValue.Type == DataType.UserData &&
-                             geometryValue.UserData?.Object is SkinPlayfieldGeometryHandle geometryHandle)
-                    {
-                        if (!_insidePlayfieldNoteRenderer || geometryHandle.FrameId != _playfieldGeometryFrameId)
-                            throw new ScriptRuntimeException("draw.quad3d_batch note geometry handles are only valid inside the current render_notes(frame) call");
-                        geometrySnapshot = geometryHandle.Snapshot;
-                        defaultLayer = geometryHandle.layer;
                     }
                     else
                     {
-                        throw new ScriptRuntimeException($"draw.quad3d_batch item {i} geometry must be a note geometry handle or numeric geometry token from the current render_notes callback");
+                        throw new ScriptRuntimeException($"draw.quad3d_batch item {i} geometry must be a current geometry token from render_notes(frame)");
                     }
                     if (item.Get("shader").Type != DataType.Nil)
-                        throw new ScriptRuntimeException("Shader overrides are not yet available for playfield geometry handles; use draw.sprite() or a regular draw.quad3d() command.");
+                        throw new ScriptRuntimeException("Shader overrides are not yet available for playfield geometry tokens; use draw.sprite() or a regular draw.quad3d() command.");
 
                     var tint = GetColor(item, "color", XnaColor.White);
                     var alpha = Math.Clamp(GetNumber(item, "alpha", 1f), 0f, 1f);
                     var layer = (int)Math.Round(GetNumber(item, "layer", defaultLayer));
-                    var scaleX = (float)Math.Clamp(GetNumber(item, "scale_x", 1f), 0.001, 100.0);
-                    var scaleY = (float)Math.Clamp(GetNumber(item, "scale_y", 1f), 0.001, 100.0);
+                    var transform = GetPlayfieldGeometryTransform(item);
+                    var independentGeometry = GetBool(item, "independent_geometry", false);
+                    var geometryScaleX = independentGeometry
+                        ? GetFiniteGeometryNumber(item, "geometry_size_x", 1f, 0.001f, 100f)
+                        : 1f;
+                    var geometryScaleY = independentGeometry
+                        ? GetFiniteGeometryNumber(item, "geometry_size_y", 1f, 0.001f, 100f)
+                        : 1f;
+                    var geometrySpace = independentGeometry
+                        ? ParsePlayfieldGeometrySpace(item)
+                        : SkinPlayfieldGeometrySpace.NoteSurface;
                     _playfieldGeometryDrawRequests.Add(new SkinPlayfieldGeometryDrawRequest(
-                        asset, geometrySnapshot, tint, alpha, layer, scaleX, scaleY));
+                        asset, geometrySnapshot, tint, alpha, layer, transform,
+                        independentGeometry, geometryScaleX, geometryScaleY, geometrySpace,
+                        GetBool(item, "flip_x", false), GetBool(item, "flip_y", false)));
                 }
                 else
                 {
@@ -13341,6 +15460,166 @@ public sealed class SkinRuntime : IDisposable
         var farX = (int)Math.Clamp(Math.Ceiling(right), int.MinValue, int.MaxValue);
         var farY = (int)Math.Clamp(Math.Ceiling(bottom), int.MinValue, int.MaxValue);
         return new XnaRectangle(x, y, Math.Max(0, farX - x), Math.Max(0, farY - y));
+    }
+
+    private static SkinPlayfieldGeometryTransform GetPlayfieldGeometryTransform(Table options)
+    {
+        // Keep the established flat scale fields working for existing skins.
+        var scaleX = GetFiniteGeometryNumber(options, "scale_x", 1f, 0.001f, 100f);
+        var scaleY = GetFiniteGeometryNumber(options, "scale_y", 1f, 0.001f, 100f);
+        return GetPlayfieldGeometryTransform(options.Get("transform"), scaleX, scaleY);
+    }
+
+    private static SkinPlayfieldGeometryTransform GetPlayfieldGeometryTransform(
+        DynValue transformValue, float scaleX, float scaleY)
+    {
+        if (transformValue.Type == DataType.Nil)
+        {
+            return new SkinPlayfieldGeometryTransform(
+                scaleX, scaleY, Vector3.Zero, Vector3.UnitZ, 0f, new Vector2(0.5f, 0.5f));
+        }
+
+        if (transformValue.Type != DataType.Table || transformValue.Table is null)
+            throw new ScriptRuntimeException("note geometry 'transform' must be a table");
+
+        var transform = transformValue.Table;
+        var scaleValue = transform.Get("scale");
+        if (scaleValue.Type != DataType.Nil)
+        {
+            if (scaleValue.Type != DataType.Table || scaleValue.Table is null)
+                throw new ScriptRuntimeException("note geometry transform.scale must be a table with x/y values");
+            scaleX = Math.Clamp(GetVectorComponent(scaleValue.Table, "x", 1, scaleX), 0.001f, 100f);
+            scaleY = Math.Clamp(GetVectorComponent(scaleValue.Table, "y", 2, scaleY), 0.001f, 100f);
+        }
+
+        var offset = Vector3.Zero;
+        var offsetValue = transform.Get("offset");
+        if (offsetValue.Type != DataType.Nil)
+        {
+            if (offsetValue.Type != DataType.Table || offsetValue.Table is null)
+                throw new ScriptRuntimeException("note geometry transform.offset must be a table with x/y/z values");
+            offset = ReadGeometryVector3(offsetValue.Table, "offset", Vector3.Zero);
+        }
+
+        var rotationAxis = Vector3.UnitZ;
+        var rotationDegrees = 0f;
+        var rotationPivot = new Vector2(0.5f, 0.5f);
+        var rotationValue = transform.Get("rotation");
+        if (rotationValue.Type != DataType.Nil)
+        {
+            if (rotationValue.Type != DataType.Table || rotationValue.Table is null)
+                throw new ScriptRuntimeException("note geometry transform.rotation must be a table");
+            var rotation = rotationValue.Table;
+            rotationDegrees = GetNumber(rotation, "angle_degrees", GetNumber(rotation, "angle", 0f));
+            rotationPivot = ReadGeometryRotationPivot(rotation.Get("pivot"));
+            if (!float.IsFinite(rotationDegrees))
+                throw new ScriptRuntimeException("note geometry rotation angle must be finite");
+            rotationDegrees = Math.Clamp(rotationDegrees, -3600f, 3600f);
+
+            var axisValue = rotation.Get("axis");
+            if (axisValue.Type == DataType.String)
+            {
+                var axisName = (axisValue.String ?? string.Empty).Trim().ToLowerInvariant();
+                rotationAxis = axisName switch
+                {
+                    "across" or "x" => Vector3.UnitX,
+                    "along" or "y" => Vector3.UnitY,
+                    "normal" or "z" => Vector3.UnitZ,
+                    _ => throw new ScriptRuntimeException("note geometry rotation.axis must be 'across', 'along', 'normal', or a vector table")
+                };
+            }
+            else if (axisValue.Type == DataType.Table && axisValue.Table is not null)
+            {
+                rotationAxis = ReadGeometryVector3(axisValue.Table, "rotation.axis", Vector3.Zero);
+            }
+            else if (axisValue.Type != DataType.Nil)
+            {
+                throw new ScriptRuntimeException("note geometry rotation.axis must be a string or vector table");
+            }
+
+            if (MathF.Abs(rotationDegrees) > 0.0001f)
+            {
+                if (rotationAxis.LengthSquared() < 0.000001f)
+                    throw new ScriptRuntimeException("note geometry rotation.axis cannot be a zero vector when angle_degrees is non-zero");
+                rotationAxis.Normalize();
+            }
+        }
+
+        return new SkinPlayfieldGeometryTransform(
+            scaleX, scaleY, offset, rotationAxis, rotationDegrees, rotationPivot);
+    }
+
+    private static Vector2 ReadGeometryRotationPivot(DynValue value)
+    {
+        if (value.Type == DataType.Nil)
+            return new Vector2(0.5f, 0.5f);
+
+        if (value.Type == DataType.String)
+        {
+            var name = (value.String ?? string.Empty).Trim().ToLowerInvariant().Replace('_', '-');
+            return name switch
+            {
+                "center" => new Vector2(0.5f, 0.5f),
+                "bottom" or "bottom-center" => new Vector2(0.5f, 0f),
+                "top" or "top-center" => new Vector2(0.5f, 1f),
+                "left" or "left-center" => new Vector2(0f, 0.5f),
+                "right" or "right-center" => new Vector2(1f, 0.5f),
+                "bottom-left" => new Vector2(0f, 0f),
+                "bottom-right" => new Vector2(1f, 0f),
+                "top-left" => new Vector2(0f, 1f),
+                "top-right" => new Vector2(1f, 1f),
+                _ => throw new ScriptRuntimeException(
+                    "note geometry rotation.pivot must be a normalized {x, y} table or a named anchor such as 'center' or 'bottom'")
+            };
+        }
+
+        if (value.Type != DataType.Table || value.Table is null)
+            throw new ScriptRuntimeException("note geometry rotation.pivot must be a normalized {x, y} table or a named anchor such as 'center' or 'bottom'");
+
+        // Coordinates are normalized from the component's bottom-left corner.
+        // Values outside 0..1 are allowed so the pivot can sit beyond the quad.
+        var x = GetVectorComponent(value.Table, "x", 1, 0.5f);
+        var y = GetVectorComponent(value.Table, "y", 2, 0.5f);
+        return new Vector2(Math.Clamp(x, -10f, 10f), Math.Clamp(y, -10f, 10f));
+    }
+
+    private static Vector3 ReadGeometryVector3(Table table, string name, Vector3 fallback)
+    {
+        var x = GetVectorComponent(table, "x", 1, fallback.X);
+        var y = GetVectorComponent(table, "y", 2, fallback.Y);
+        var z = GetVectorComponent(table, "z", 3, fallback.Z);
+        if (!float.IsFinite(x) || !float.IsFinite(y) || !float.IsFinite(z))
+            throw new ScriptRuntimeException($"note geometry {name} values must be finite numbers");
+        return new Vector3(
+            Math.Clamp(x, -100f, 100f),
+            Math.Clamp(y, -100f, 100f),
+            Math.Clamp(z, -100f, 100f));
+    }
+
+    private static float GetFiniteGeometryNumber(
+        Table table, string key, float fallback, float minimum, float maximum)
+    {
+        var value = table.Get(key);
+        if (value.Type == DataType.Nil)
+            return fallback;
+        if (value.Type != DataType.Number || !double.IsFinite(value.Number))
+            throw new ScriptRuntimeException($"note geometry transform.{key} must be a finite number");
+        return Math.Clamp((float)value.Number, minimum, maximum);
+    }
+
+    private static float GetVectorComponent(Table table, string name, int index, float fallback)
+    {
+        var value = table.Get(name);
+        if (value.Type == DataType.Nil)
+            value = table.Get(index);
+        if (value.Type == DataType.Nil)
+            return fallback;
+        if (value.Type != DataType.Number || !double.IsFinite(value.Number))
+            throw new ScriptRuntimeException($"note geometry vector component '{name}' must be a finite number");
+        var component = (float)value.Number;
+        if (!float.IsFinite(component))
+            throw new ScriptRuntimeException($"note geometry vector component '{name}' is outside the supported numeric range");
+        return component;
     }
 
     private static float GetNumber(Table options, string key, float fallback)

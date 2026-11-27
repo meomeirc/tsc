@@ -148,6 +148,20 @@ public sealed partial class Playfield
         SyncEditorConstantScrollMode();
         _projection.Compact = _compact;
 
+        // Build current-view anchors before the hit-effect callback runs. Lua keeps
+        // the originating chart track ID in each effect; frame.anchors supplies a
+        // fresh 3D projection of that same physical track every render, so effects
+        // follow camera/view changes without jumping to another bank after a gear
+        // transition.
+        var laneTick = _tempo?.SecondsToTick(_playSeconds) ?? 0.0;
+        GearState? laneState = _chart is not null && _tempo is not null && _gear is not null
+            ? RenderGearState(laneTick)
+            : null;
+        _skinHitEffectAnchorScratch.Clear();
+        if (_skinRuntime.SupportsHitEffectRenderer && laneState is { } hitEffectGearState)
+            BuildSkinHitEffectAnchorData(hitEffectGearState, _skinHitEffectAnchorScratch);
+        _skinRuntime.SetHitEffectAnchors(_skinHitEffectAnchorScratch);
+
         // Build the Lua skin once for this frame. Negative layers are rendered
         // between the default background and the 3D playfield; non-negative
         // layers are rendered after the normal HUD.
@@ -174,12 +188,8 @@ public sealed partial class Playfield
 
         var editorGroupInactiveBanks = _chartEditorMode && !_editorPreviewMode && !_compact &&
             _chart is not null && _tempo is not null && _gear is not null &&
-            Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f) > 0.001f &&
-            Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f) < 0.999f;
-        var laneTick = _tempo?.SecondsToTick(_playSeconds) ?? 0.0;
-        GearState? laneState = _chart is not null && _tempo is not null && _gear is not null
-            ? RenderGearState(laneTick)
-            : null;
+            Math.Clamp(_editorPlayfieldConfig.Editor.InactiveBankOpacity, 0f, 1f) > 0.001f &&
+            Math.Clamp(_editorPlayfieldConfig.Editor.InactiveBankOpacity, 0f, 1f) < 0.999f;
 #if DEBUG
         if (_showGameplayTouchHitAreasDebug)
         {
@@ -277,7 +287,7 @@ public sealed partial class Playfield
 #endif
         if (editorGroupInactiveBanks && laneState is not null)
         {
-            var inactiveBankOpacity = Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f);
+            var inactiveBankOpacity = Math.Clamp(_editorPlayfieldConfig.Editor.InactiveBankOpacity, 0f, 1f);
             CompositeEditorInactiveBankLayer(virtualWidth, virtualHeight, inactiveBankOpacity);
             // Draw inactive-bank connector textures only after the bank layer is
             // blended into the scene. This avoids applying inactiveBankOpacity to
@@ -897,7 +907,7 @@ public sealed partial class Playfield
         var (width, height) = GetVirtualResolution(_graphics.Viewport.Width, _graphics.Viewport.Height);
         EnsureGameplayRenderTarget(width, height);
 
-        var inactiveBankOpacity = Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f);
+        var inactiveBankOpacity = Math.Clamp(_editorPlayfieldConfig.Editor.InactiveBankOpacity, 0f, 1f);
         var needsInactiveBankTarget = !_editorPreviewMode && !_compact &&
             _gear is not null && inactiveBankOpacity > 0.001f && inactiveBankOpacity < 0.999f;
         if (needsInactiveBankTarget)
@@ -1178,6 +1188,8 @@ public sealed partial class Playfield
 
     private void DrawPlayfield()
     {
+        _skinPlayfieldUnifiedRendererThisPass = false;
+        _skinPlayfieldReplacesJudgementLineThisPass = false;
         var currentTick = _tempo?.SecondsToTick(_playSeconds) ?? 0;
         var state = RenderGearState(currentTick);
         var laneTexture = _textures.Get("lane");
@@ -1192,7 +1204,8 @@ public sealed partial class Playfield
             laneTexture ??= _skinRuntime.PlayfieldGeometryWhiteTexture;
             lineTexture ??= _skinRuntime.PlayfieldGeometryWhiteTexture;
         }
-        if (laneTexture is null && lineTexture is null)
+        var useSkinLaneLineRenderer = CanUseSkinPlayfieldEffects && _skinRuntime.SupportsLaneLineRenderer;
+        if (laneTexture is null && lineTexture is null && !useSkinLaneLineRenderer)
             return;
 
         var signature = ComputeLaneMeshCacheSignature(state);
@@ -1233,11 +1246,150 @@ public sealed partial class Playfield
         }
 
         if (useSkinRenderer)
-            ApplySkinPlayfieldSurfaceRenderer(laneCommands, lineCommands, currentTick);
+        {
+            var control = ApplySkinPlayfieldSurfaceRenderer(laneCommands, lineCommands, state, currentTick);
+            _skinPlayfieldUnifiedRendererThisPass = control.Unified;
+            _skinPlayfieldReplacesJudgementLineThisPass = control.Unified && control.ReplaceJudgementLine;
+            if (!control.Unified && useSkinLaneLineRenderer)
+                ApplySkinLaneLineRenderer(lineCommands, state, currentTick);
+        }
+        else if (useSkinLaneLineRenderer)
+        {
+            ApplySkinLaneLineRenderer(lineCommands, state, currentTick);
+        }
 
         _graphics.BlendState = BlendState.AlphaBlend;
         _graphics.RasterizerState = RasterizerState.CullNone;
         DrawLaneTextureMeshLayers(laneCommands, lineCommands, state);
+    }
+
+    private void BuildSkinLaneLineAnchors(GearState state)
+    {
+        var bankAnchors = _skinLaneLineBankAnchorScratch;
+        var laneAnchors = _skinLaneLineAnchorScratch;
+        bankAnchors.Clear();
+        laneAnchors.Clear();
+
+        foreach (var visibleBank in VisibleBanks(state))
+        {
+            if (!ShouldRenderBankInCurrentEditorPass(visibleBank.Side, visibleBank.Bank, state))
+                continue;
+
+            var bankEdges = _projection.LaneBankEdgesNormalized(visibleBank.Side, visibleBank.Bank);
+            var bankWidth = Math.Max(0.0001f, bankEdges.Right - bankEdges.Left);
+            var bankCenter = (bankEdges.Left + bankEdges.Right) * 0.5f;
+            var nearDepth = _projection.DepthForExtendedLaneNear(visibleBank.Side, visibleBank.Bank);
+            var sideGear = visibleBank.Bank == "Center"
+                ? "2K"
+                : visibleBank.Side == "left" ? state.LeftMode : state.RightMode;
+
+            bankAnchors.Add(new SkinLaneLineAnchorSnapshot(
+                visibleBank.Side,
+                visibleBank.Bank,
+                state.GlobalMode,
+                sideGear,
+                visibleBank.Active,
+                visibleBank.Active,
+                -1,
+                -1,
+                0f,
+                1f,
+                bankCenter,
+                bankWidth,
+                bankEdges.Left,
+                bankEdges.Right,
+                nearDepth,
+                _projection.LaneLineNearWidth,
+                _projection.LaneLineFarWidth,
+                1f));
+
+            var activeColumns = ActiveColumns(visibleBank.Side, visibleBank.Bank);
+            for (var column = 0; column < 3; column++)
+            {
+                var columnEdges = ColumnEdges(visibleBank.Side, visibleBank.Bank, column);
+                var columnWidth = Math.Max(0.0001f, columnEdges.Right - columnEdges.Left);
+                var columnCenter = (columnEdges.Left + columnEdges.Right) * 0.5f;
+                var active = activeColumns.Contains(column);
+                var track = TryGetTrackForBankColumn(visibleBank.Side, visibleBank.Bank, column, out var mappedTrack)
+                    ? mappedTrack
+                    : -1;
+                // Match BuildLaneBankMeshes exactly: mapped columns use the
+                // track's canonical normalized position; decorative columns use
+                // their physical column center.
+                var lineCenter = track >= 0 ? _projection.LaneNormalizedX(track) : columnCenter;
+                var outwardSign = visibleBank.Side == "left" ? -1f : 1f;
+                var x = (lineCenter - bankCenter) / bankWidth * outwardSign;
+                var width = columnWidth / bankWidth;
+                var opacity = active ? 1f : Math.Clamp(_projection.OuterTrackOpacity, 0f, 1f);
+
+                laneAnchors.Add(new SkinLaneLineAnchorSnapshot(
+                    visibleBank.Side,
+                    visibleBank.Bank,
+                    state.GlobalMode,
+                    sideGear,
+                    visibleBank.Active,
+                    active,
+                    track,
+                    column,
+                    x,
+                    width,
+                    lineCenter,
+                    columnWidth,
+                    bankEdges.Left,
+                    bankEdges.Right,
+                    nearDepth,
+                    _projection.LaneLineNearWidth,
+                    _projection.LaneLineFarWidth,
+                    opacity));
+            }
+        }
+    }
+
+    private void AppendSkinLaneLineDrawRequests(List<LaneTextureMeshCommand> lineCommands)
+    {
+        var requests = _skinRuntime.LaneLineDrawRequests;
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            var texture = request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture;
+            var command = BuildLaneLineTextureMesh(
+                texture,
+                request.Side,
+                request.CenterNormalized,
+                request.NearDepth,
+                request.HalfNormalizedWidth,
+                request.Bank,
+                request.NearWidth,
+                request.FarWidth) with
+            {
+                Opacity = request.Alpha,
+                Tint = request.Tint,
+                Layer = request.Layer
+            };
+            lineCommands.Add(command);
+        }
+        _skinRuntime.ClearLaneLineDrawRequests();
+    }
+
+    private void ApplySkinLaneLineRenderer(
+        List<LaneTextureMeshCommand> lineCommands,
+        GearState state,
+        double currentTick)
+    {
+
+        BuildSkinLaneLineAnchors(state);
+        var replaced = _skinRuntime.InvokeLaneLineRenderer(
+            _skinLaneLineBankAnchorScratch, _skinLaneLineAnchorScratch, _playSeconds, currentTick);
+        if (!replaced)
+        {
+            _skinRuntime.ClearLaneLineDrawRequests();
+            return;
+        }
+
+        // Returning true means the legacy skin owns the complete lane-line
+        // layer, including the ability to intentionally submit no lines.
+        lineCommands.Clear();
+        AppendSkinLaneLineDrawRequests(lineCommands);
     }
 
     private void DrawLaneTextureMeshLayers(
@@ -1245,7 +1397,8 @@ public sealed partial class Playfield
         List<LaneTextureMeshCommand> lineCommands,
         GearState state)
     {
-        if (laneCommands.Count == 0 && lineCommands.Count == 0)
+        var laneQuadRequests = _skinRuntime.LaneQuadDrawRequests;
+        if (laneCommands.Count == 0 && lineCommands.Count == 0 && laneQuadRequests.Count == 0)
             return;
 
         var minimumLayer = int.MaxValue;
@@ -1259,6 +1412,11 @@ public sealed partial class Playfield
         {
             minimumLayer = Math.Min(minimumLayer, lineCommands[i].Layer);
             maximumLayer = Math.Max(maximumLayer, lineCommands[i].Layer);
+        }
+        for (var i = 0; i < laneQuadRequests.Count; i++)
+        {
+            minimumLayer = Math.Min(minimumLayer, laneQuadRequests[i].Layer);
+            maximumLayer = Math.Max(maximumLayer, laneQuadRequests[i].Layer);
         }
 
         var lanesAtLayer = _laneLayerScratch;
@@ -1282,14 +1440,21 @@ public sealed partial class Playfield
             }
             if (linesAtLayer.Count > 0)
                 DrawLaneTextureMeshes(linesAtLayer, debugOrbitKind: 2, state: state);
+
+            // All skin-owned playfield primitives share this same Z-index loop.
+            // Lane quads are submitted after lane and line meshes at equal layer;
+            // a higher skin layer can place them above either primitive.
+            DrawSkinLaneQuadRequestsAtLayer(layer, "playfield", "skin_playfield_lane_quad");
         }
         lanesAtLayer.Clear();
         linesAtLayer.Clear();
+        _skinRuntime.ClearLaneQuadDrawRequests();
     }
 
-    private void ApplySkinPlayfieldSurfaceRenderer(
+    private SkinPlayfieldRendererControl ApplySkinPlayfieldSurfaceRenderer(
         List<LaneTextureMeshCommand> laneCommands,
         List<LaneTextureMeshCommand> lineCommands,
+        GearState state,
         double currentTick)
     {
         var geometry = _skinPlayfieldSurfaceScratch;
@@ -1318,8 +1483,18 @@ public sealed partial class Playfield
         customLanes.Clear();
         customLines.Clear();
 
+        var judges = _skinJudgementLineAnchorScratch;
+        var lanes = _skinJudgementLineLaneScratch;
+        BuildSkinJudgeAnchorData(
+            state, judges, lanes,
+            includeInactiveColumns: true,
+            useJudgeOpacity: false);
+        BuildSkinLaneLineAnchors(state);
+        var control = default(SkinPlayfieldRendererControl);
         var replaceRequested = _skinRuntime.InvokePlayfieldSurfaceRenderer(
-            geometry, _playSeconds, currentTick);
+            geometry, judges, lanes,
+            _skinLaneLineBankAnchorScratch, _skinLaneLineAnchorScratch,
+            _playSeconds, currentTick, out control);
         var requests = _skinRuntime.PlayfieldSurfaceDrawRequests;
         for (var i = 0; i < requests.Count; i++)
         {
@@ -1349,7 +1524,14 @@ public sealed partial class Playfield
                 replaced.Add(snapshot.Vertices);
         }
 
-        if (replaceRequested && replaced.Count > 0)
+        if (control.Unified)
+        {
+            if (control.ReplaceSurfaces)
+                laneCommands.Clear();
+            if (control.ReplaceLaneLines)
+                lineCommands.Clear();
+        }
+        else if (replaceRequested && replaced.Count > 0)
         {
             for (var i = laneCommands.Count - 1; i >= 0; i--)
             {
@@ -1376,7 +1558,13 @@ public sealed partial class Playfield
             customLines.Clear();
         }
 
+        if (control.Unified)
+            AppendSkinLaneLineDrawRequests(lineCommands);
+        else
+            _skinRuntime.ClearLaneLineDrawRequests();
+
         _skinRuntime.ClearPlayfieldSurfaceDrawRequests();
+        return control;
     }
 
     private static bool ContainsVertexArrayReference(

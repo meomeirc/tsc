@@ -78,7 +78,7 @@ public sealed partial class Playfield
         if (!_chartEditorMode)
             return 1f;
 
-        return Math.Clamp(_editorRenderConfig.Editor.InactiveBankOpacity, 0f, 1f);
+        return Math.Clamp(_editorPlayfieldConfig.Editor.InactiveBankOpacity, 0f, 1f);
     }
 
     private bool ShouldRenderBankInCurrentEditorPass(string side, string bank, GearState state)

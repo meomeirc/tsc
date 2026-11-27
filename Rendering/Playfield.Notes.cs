@@ -853,7 +853,7 @@ public sealed partial class Playfield
             {
                 var bridgeStartTimestamp = Stopwatch.GetTimestamp();
                 var bridgeAllocationStart = GC.GetAllocatedBytesForCurrentThread();
-                ApplySkinPlayfieldNoteRenderer(currentTick, superFlicks, headCommands);
+                ApplySkinPlayfieldNoteRenderer(currentTick, currentState, superFlicks, headCommands);
                 _debugSkinNoteBridgeMs += ElapsedMilliseconds(bridgeStartTimestamp);
                 _debugSkinNoteBridgeAllocatedBytes +=
                     GC.GetAllocatedBytesForCurrentThread() - bridgeAllocationStart;
@@ -861,7 +861,7 @@ public sealed partial class Playfield
             else
 #endif
             {
-                ApplySkinPlayfieldNoteRenderer(currentTick, superFlicks, headCommands);
+                ApplySkinPlayfieldNoteRenderer(currentTick, currentState, superFlicks, headCommands);
             }
         }
 
@@ -1034,9 +1034,85 @@ public sealed partial class Playfield
         }
     }
 
+    // Applies a component-local translation and axis-angle rotation after its
+    // in-plane scale. Local X follows the note's across axis, local Y points toward
+    // the top of the texture, and local Z follows the component surface normal.
+    // The rotation pivot is normalized in the component's local rectangle:
+    // (0,0) is bottom-left, (1,1) is top-right, and (0.5,0.5) is center.
+    // Values outside 0..1 intentionally allow pivots beyond the quad.
+    private static void TransformPlayfieldQuadInLocalSpace(
+        VertexPositionColorTexture[] vertices,
+        Vector3 localOffset,
+        Vector3 localRotationAxis,
+        float rotationDegrees,
+        Vector2 rotationPivot)
+    {
+        if (vertices.Length < 6 ||
+            (localOffset.LengthSquared() < 0.0000001f && MathF.Abs(rotationDegrees) < 0.0001f))
+            return;
+
+        // Standard quad order: TL, TR, BR, TL, BR, BL.
+        var topLeft = vertices[0].Position;
+        var topRight = vertices[1].Position;
+        var bottomRight = vertices[2].Position;
+        var bottomLeft = vertices[5].Position;
+        var center = (topLeft + topRight + bottomRight + bottomLeft) * 0.25f;
+
+        var across = (topRight - topLeft) + (bottomRight - bottomLeft);
+        var up = (topLeft - bottomLeft) + (topRight - bottomRight);
+        if (across.LengthSquared() < 0.000001f || up.LengthSquared() < 0.000001f)
+            return;
+
+        var axisX = Vector3.Normalize(across);
+        up -= axisX * Vector3.Dot(up, axisX);
+        if (up.LengthSquared() < 0.000001f)
+            return;
+        var axisY = Vector3.Normalize(up);
+        var axisZ = Vector3.Cross(axisX, axisY);
+        if (axisZ.LengthSquared() < 0.000001f)
+            return;
+        axisZ.Normalize();
+
+        var fullWidth = across.Length() * 0.5f;
+        var fullHeight = up.Length() * 0.5f;
+        var pivot = center +
+            axisX * ((Math.Clamp(rotationPivot.X, -10f, 10f) - 0.5f) * fullWidth) +
+            axisY * ((Math.Clamp(rotationPivot.Y, -10f, 10f) - 0.5f) * fullHeight);
+        var translation = axisX * localOffset.X + axisY * localOffset.Y + axisZ * localOffset.Z;
+        var applyRotation = MathF.Abs(rotationDegrees) > 0.0001f &&
+            localRotationAxis.LengthSquared() > 0.000001f;
+        var rotation = Quaternion.Identity;
+        if (applyRotation)
+        {
+            var normalizedLocalAxis = Vector3.Normalize(localRotationAxis);
+            var worldAxis = axisX * normalizedLocalAxis.X +
+                axisY * normalizedLocalAxis.Y +
+                axisZ * normalizedLocalAxis.Z;
+            if (worldAxis.LengthSquared() < 0.000001f)
+                applyRotation = false;
+            else
+            {
+                worldAxis.Normalize();
+                rotation = Quaternion.CreateFromAxisAngle(
+                    worldAxis, MathHelper.ToRadians(rotationDegrees));
+            }
+        }
+
+        for (var i = 0; i < vertices.Length; i++)
+        {
+            var vertex = vertices[i];
+            var position = vertex.Position - pivot;
+            if (applyRotation)
+                position = Vector3.Transform(position, rotation);
+            vertex.Position = pivot + position + translation;
+            vertices[i] = vertex;
+        }
+    }
+
     private void AddSkinPlayfieldGeometrySnapshot(
         List<SkinPlayfieldGeometrySnapshot> geometry,
-        Textured3DQuadCommand command)
+        Textured3DQuadCommand command,
+        GearState currentState)
     {
         if (command.Track < 0 || command.Tick < 0 || command.EventIndex < 0 ||
             command.Vertices is not { Length: > 0 } || string.IsNullOrEmpty(command.Component))
@@ -1061,23 +1137,120 @@ public sealed partial class Playfield
             _hitEvents.Contains(eventKey),
             command.SkinMissed || _missedEvents.Contains(eventKey),
             command.Simultaneous,
-            geometryTrack));
+            geometryTrack,
+            command.LaneBasis,
+            currentState.GlobalMode,
+            currentState.SideMode(position?.Side ?? string.Empty)));
+    }
+
+    private bool TryRebuildIndependentComponentPlane(
+        VertexPositionColorTexture[] destination,
+        VertexPositionColorTexture[] source,
+        SkinPlayfieldGeometrySpace geometrySpace,
+        StandingNoteBasis? laneBasis)
+    {
+        if (geometrySpace == SkinPlayfieldGeometrySpace.NoteSurface)
+            return true;
+        if (destination.Length != 6 || source.Length != 6)
+            return false;
+
+        var topLeft = source[0].Position;
+        var topRight = source[1].Position;
+        var bottomRight = source[2].Position;
+        var bottomLeft = source[5].Position;
+        var center = (topLeft + topRight + bottomRight + bottomLeft) * 0.25f;
+
+        // Measure the source quad after projection, then solve new world-space
+        // extents for the target axes. This keeps the component's apparent size
+        // stable when changing from a standing note plane to the lane or camera
+        // plane, even though those axes have different perspective magnification.
+        var screenTopLeft = _projection.ScreenPositionFromCameraSpace(topLeft);
+        var screenTopRight = _projection.ScreenPositionFromCameraSpace(topRight);
+        var screenBottomRight = _projection.ScreenPositionFromCameraSpace(bottomRight);
+        var screenBottomLeft = _projection.ScreenPositionFromCameraSpace(bottomLeft);
+        var projectedHalfWidth = (
+            Vector2.Distance(screenTopLeft, screenTopRight) +
+            Vector2.Distance(screenBottomLeft, screenBottomRight)) * 0.25f;
+        var projectedHalfHeight = (
+            Vector2.Distance(screenTopLeft, screenBottomLeft) +
+            Vector2.Distance(screenTopRight, screenBottomRight)) * 0.25f;
+        if (!float.IsFinite(projectedHalfWidth) || !float.IsFinite(projectedHalfHeight) ||
+            projectedHalfWidth < 0.0001f || projectedHalfHeight < 0.0001f)
+            return false;
+
+        Vector3 axisX;
+        Vector3 axisY;
+        if (geometrySpace == SkinPlayfieldGeometrySpace.Billboard)
+        {
+            // Playfield geometry is already expressed in camera coordinates
+            // (camera looks down -Z), so X/Y form a camera-facing plane.
+            axisX = Vector3.UnitX;
+            axisY = Vector3.UnitY;
+        }
+        else
+        {
+            if (laneBasis is not { } basis ||
+                basis.Across.LengthSquared() < 0.000001f ||
+                basis.Along.LengthSquared() < 0.000001f)
+                return false;
+
+            axisX = Vector3.Normalize(basis.Across);
+            axisY = basis.Along - axisX * Vector3.Dot(basis.Along, axisX);
+            if (axisY.LengthSquared() < 0.000001f)
+                return false;
+            axisY.Normalize();
+        }
+
+        var halfWidth = _projection.WorldHalfExtentForScreenPixels(
+            center, axisX, projectedHalfWidth);
+        var halfHeight = _projection.WorldHalfExtentForScreenPixels(
+            center, axisY, projectedHalfHeight);
+        if (!float.IsFinite(halfWidth) || !float.IsFinite(halfHeight) ||
+            halfWidth < 0.0001f || halfHeight < 0.0001f)
+            return false;
+
+        var newTopLeft = center - axisX * halfWidth + axisY * halfHeight;
+        var newTopRight = center + axisX * halfWidth + axisY * halfHeight;
+        var newBottomRight = center + axisX * halfWidth - axisY * halfHeight;
+        var newBottomLeft = center - axisX * halfWidth - axisY * halfHeight;
+        var vertex = destination[0]; vertex.Position = newTopLeft; destination[0] = vertex;
+        vertex = destination[1]; vertex.Position = newTopRight; destination[1] = vertex;
+        vertex = destination[2]; vertex.Position = newBottomRight; destination[2] = vertex;
+        vertex = destination[3]; vertex.Position = newTopLeft; destination[3] = vertex;
+        vertex = destination[4]; vertex.Position = newBottomRight; destination[4] = vertex;
+        vertex = destination[5]; vertex.Position = newBottomLeft; destination[5] = vertex;
+        if (geometrySpace == SkinPlayfieldGeometrySpace.Billboard)
+        {
+            vertex = destination[0]; vertex.TextureCoordinate = new Vector2(0f, 0f); destination[0] = vertex;
+            vertex = destination[1]; vertex.TextureCoordinate = new Vector2(1f, 0f); destination[1] = vertex;
+            vertex = destination[2]; vertex.TextureCoordinate = new Vector2(1f, 1f); destination[2] = vertex;
+            vertex = destination[3]; vertex.TextureCoordinate = new Vector2(0f, 0f); destination[3] = vertex;
+            vertex = destination[4]; vertex.TextureCoordinate = new Vector2(1f, 1f); destination[4] = vertex;
+            vertex = destination[5]; vertex.TextureCoordinate = new Vector2(0f, 1f); destination[5] = vertex;
+        }
+        return true;
     }
 
     private void ApplySkinPlayfieldNoteRenderer(
         double currentTick,
+        GearState currentState,
         List<(float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family)> superFlicks,
         List<TexturedQuadCommand> headCommands)
     {
+#if DEBUG
+        var measureBridgeStages = _performanceDebugInstrumentFrame;
+        var snapshotStartTimestamp = measureBridgeStages ? Stopwatch.GetTimestamp() : 0L;
+        var snapshotStartAllocatedBytes = measureBridgeStages ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+#endif
         var geometry = _skinPlayfieldGeometryScratch;
         var spriteGeometry = _skinPlayfieldSpriteGeometryScratch;
         geometry.Clear();
         spriteGeometry.Clear();
 
         for (var i = 0; i < _head3DCommands.Count; i++)
-            AddSkinPlayfieldGeometrySnapshot(geometry, _head3DCommands[i]);
+            AddSkinPlayfieldGeometrySnapshot(geometry, _head3DCommands[i], currentState);
         for (var i = 0; i < _body3DCommands.Count; i++)
-            AddSkinPlayfieldGeometrySnapshot(geometry, _body3DCommands[i]);
+            AddSkinPlayfieldGeometrySnapshot(geometry, _body3DCommands[i], currentState);
 
         for (var i = 0; i < superFlicks.Count; i++)
         {
@@ -1087,14 +1260,17 @@ public sealed partial class Playfield
             var family = item.Family == SuperFlickFamily.Inner ? "inner" : "outer";
             var missed = _gameplayMode && _missedEvents.Contains(key);
             var hit = _gameplayMode && _hitEvents.Contains(key);
+            var span = BuildSuperFlickSpriteSpanSnapshot(item, currentTick);
             spriteGeometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
                 ev.Track, ev.Tick, ev.EventIndex, ev.Attr, ev.Duration,
                 "super_flick", "strip", item.Side, item.Bank, family,
-                hit, missed, false, item.Depth));
+                hit, missed, false, item.Depth, Span: span,
+                Gear: currentState.GlobalMode, SideGear: currentState.SideMode(item.Side)));
             spriteGeometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
                 ev.Track, ev.Tick, ev.EventIndex, ev.Attr, ev.Duration,
                 "super_flick", "highlight", item.Side, item.Bank, family,
-                hit, missed, false, item.Depth));
+                hit, missed, false, item.Depth, Span: span,
+                Gear: currentState.GlobalMode, SideGear: currentState.SideMode(item.Side)));
         }
 
         for (var i = 0; i < headCommands.Count; i++)
@@ -1127,11 +1303,24 @@ public sealed partial class Playfield
                 true,
                 command.FlipU,
                 command.FlipV,
-                command.Layer));
+                command.Layer,
+                Gear: currentState.GlobalMode,
+                SideGear: currentState.SideMode(position?.Side ?? string.Empty)));
         }
 
+#if DEBUG
+        if (measureBridgeStages)
+        {
+            _debugSkinNoteSnapshotMs += ElapsedMilliseconds(snapshotStartTimestamp);
+            _debugSkinNoteSnapshotAllocatedBytes += Math.Max(0L, GC.GetAllocatedBytesForCurrentThread() - snapshotStartAllocatedBytes);
+        }
+#endif
         var replaceRequested = _skinRuntime.InvokePlayfieldNoteRenderer(
             geometry, spriteGeometry, _playSeconds, currentTick, _uiTimeSeconds);
+#if DEBUG
+        var applyStartTimestamp = measureBridgeStages ? Stopwatch.GetTimestamp() : 0L;
+        var applyStartAllocatedBytes = measureBridgeStages ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+#endif
         var requests = _skinRuntime.PlayfieldGeometryDrawRequests;
         var customHeads = _skinPlayfieldHeadScratch;
         var customBodies = _skinPlayfieldBodyScratch;
@@ -1139,6 +1328,13 @@ public sealed partial class Playfield
         customHeads.Clear();
         customBodies.Clear();
         replacedVertices.Clear();
+        var nativeSuppressedGeometry = _skinRuntime.NativeNoteSuppressedGeometry;
+        for (var i = 0; i < nativeSuppressedGeometry.Count; i++)
+        {
+            var vertices = nativeSuppressedGeometry[i];
+            if (!replacedVertices.Contains(vertices))
+                replacedVertices.Add(vertices);
+        }
 
         // Requests that keep the source geometry unchanged can replace their
         // source command in place. This is part of the shared skin renderer: it
@@ -1149,10 +1345,23 @@ public sealed partial class Playfield
         // once retains the old duplicate-command behavior.
         var inPlaceRequests = _skinPlayfieldInPlaceGeometryRequests;
         inPlaceRequests.Clear();
-        if (replaceRequested)
+        var hasNativeRequests = false;
+        for (var i = 0; i < requests.Count; i++)
+        {
+            if (requests[i].IsNativeComponent)
+            {
+                hasNativeRequests = true;
+                break;
+            }
+        }
+        if (replaceRequested || hasNativeRequests)
         {
             for (var i = 0; i < requests.Count; i++)
             {
+                // Independently-sized note components use the source snapshot only
+                // as a pose anchor. They must never replace or mutate that source.
+                if (requests[i].IsIndependentGeometry || requests[i].RebuildGeometryPlane)
+                    continue;
                 var source = requests[i].Geometry.Vertices;
                 if (source.Length == 0 || replacedVertices.Contains(source))
                     continue;
@@ -1171,15 +1380,18 @@ public sealed partial class Playfield
             if (source.Length == 0)
                 continue;
 
-            var isIdentity = request.Tint == Color.White &&
+            var isIdentity = !request.IsIndependentGeometry && !request.RebuildGeometryPlane &&
+                MathF.Abs(request.GeometryScaleX - 1f) < 0.0001f &&
+                MathF.Abs(request.GeometryScaleY - 1f) < 0.0001f &&
+                !request.FlipU && !request.FlipV &&
+                request.Tint == Color.White &&
                 request.Alpha >= 0.9999f &&
-                MathF.Abs(request.ScaleX - 1f) < 0.0001f &&
-                MathF.Abs(request.ScaleY - 1f) < 0.0001f;
-            if (replaceRequested && isIdentity &&
+                request.Transform.IsIdentity;
+            if ((replaceRequested || request.IsNativeComponent) && isIdentity &&
                 !replacedVertices.Contains(source) && inPlaceRequests.ContainsKey(source))
                 continue;
 
-            if (replaceRequested)
+            if ((replaceRequested || request.IsNativeComponent) && !request.IsIndependentGeometry)
             {
                 inPlaceRequests.Remove(source);
                 replacedVertices.Add(source);
@@ -1199,9 +1411,39 @@ public sealed partial class Playfield
                     (byte)Math.Clamp((int)MathF.Round(sourceColor.A * (tint.A / 255f) * alpha), 0, 255));
                 vertices[vertexIndex] = vertex;
             }
+            if ((request.IsIndependentGeometry || request.RebuildGeometryPlane) &&
+                request.GeometrySpace != SkinPlayfieldGeometrySpace.NoteSurface)
+            {
+                if (!TryRebuildIndependentComponentPlane(
+                    vertices, source, request.GeometrySpace, request.Geometry.LaneBasis))
+                {
+                    ReturnBody3DVertexArray(vertices);
+                    continue;
+                }
+            }
+            if (request.FlipU || request.FlipV)
+            {
+                for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+                {
+                    var vertex = vertices[vertexIndex];
+                    var uv = vertex.TextureCoordinate;
+                    if (request.FlipU) uv.X = 1f - uv.X;
+                    if (request.FlipV) uv.Y = 1f - uv.Y;
+                    vertex.TextureCoordinate = uv;
+                    vertices[vertexIndex] = vertex;
+                }
+            }
             TransformPlayfieldQuadInPlane(
-                vertices, request.ScaleX, request.ScaleY,
+                vertices,
+                request.Transform.ScaleX * request.GeometryScaleX,
+                request.Transform.ScaleY * request.GeometryScaleY,
                 0f, 0f, 0.5f, 0.5f);
+            TransformPlayfieldQuadInLocalSpace(
+                vertices,
+                request.Transform.Offset,
+                request.Transform.RotationAxis,
+                request.Transform.RotationDegrees,
+                request.Transform.RotationPivot);
 
             var geometrySnapshot = request.Geometry;
             var command = new Textured3DQuadCommand(
@@ -1218,12 +1460,14 @@ public sealed partial class Playfield
                 geometrySnapshot.Attr,
                 geometrySnapshot.DurationTicks,
                 geometrySnapshot.NoteType,
-                geometrySnapshot.Component,
-                geometrySnapshot.Simultaneous);
+                request.IsIndependentGeometry ? "skin_component" : geometrySnapshot.Component,
+                geometrySnapshot.Simultaneous,
+                geometrySnapshot.GeometryTrack);
 
-            if (string.Equals(geometrySnapshot.Component, "body", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(geometrySnapshot.Component, "connector", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(geometrySnapshot.Component, "endpoint", StringComparison.OrdinalIgnoreCase))
+            if (!request.IsIndependentGeometry &&
+                (string.Equals(geometrySnapshot.Component, "body", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(geometrySnapshot.Component, "connector", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(geometrySnapshot.Component, "endpoint", StringComparison.OrdinalIgnoreCase)))
                 customBodies.Add(command);
             else
                 customHeads.Add(command);
@@ -1236,7 +1480,7 @@ public sealed partial class Playfield
             inPlaceRequests.Clear();
         }
 
-        if (replaceRequested && replacedVertices.Count > 0)
+        if (replacedVertices.Count > 0)
         {
             for (var i = _body3DCommands.Count - 1; i >= 0; i--)
             {
@@ -1271,13 +1515,29 @@ public sealed partial class Playfield
         var attachmentCommands = _skinPlayfieldAttachmentScratch;
         attachmentCommands.Clear();
         _skinReplacedFlickAttachments.Clear();
+        var nativeSuppressedAttachments = _skinRuntime.NativeNoteSuppressedFlickAttachments;
+        for (var i = 0; i < nativeSuppressedAttachments.Count; i++)
+        {
+            var key = nativeSuppressedAttachments[i];
+            _skinReplacedFlickAttachments.Add(new ChartEventKey(key.Tick, key.Track, key.EventIndex));
+        }
         var spriteRequests = _skinRuntime.PlayfieldSpriteDrawRequests;
         for (var requestIndex = 0; requestIndex < spriteRequests.Count; requestIndex++)
         {
             var request = spriteRequests[requestIndex];
             var spriteSnapshot = request.Geometry;
-            if (string.Equals(spriteSnapshot.Component, "flick_attachment", StringComparison.OrdinalIgnoreCase) &&
-                spriteSnapshot.HasScreenQuad)
+            if (request.IsSpanInstance)
+            {
+                AddSkinPlayfieldSpanSpriteCommand(request, _headCommands);
+                if (replaceRequested && string.Equals(spriteSnapshot.NoteType, "super_flick", StringComparison.OrdinalIgnoreCase))
+                {
+                    _skinReplacedSuperFlickComponents.Add(new SkinSuperFlickComponentKey(
+                        spriteSnapshot.Track, spriteSnapshot.Tick, spriteSnapshot.EventIndex, spriteSnapshot.Component));
+                }
+                continue;
+            }
+
+            if (spriteSnapshot.HasScreenQuad)
             {
                 var tint = request.Tint;
                 tint.A = (byte)Math.Clamp((int)MathF.Round(tint.A * request.Alpha), 0, 255);
@@ -1307,7 +1567,8 @@ public sealed partial class Playfield
                     spriteSnapshot.Component,
                     spriteSnapshot.Simultaneous,
                     spriteSnapshot.Missed));
-                if (replaceRequested)
+                if ((replaceRequested || request.IsNativeComponent) &&
+                    string.Equals(spriteSnapshot.Component, "flick_attachment", StringComparison.OrdinalIgnoreCase))
                     _skinReplacedFlickAttachments.Add(new ChartEventKey(
                         spriteSnapshot.Tick, spriteSnapshot.Track, spriteSnapshot.EventIndex));
                 continue;
@@ -1328,7 +1589,7 @@ public sealed partial class Playfield
             }
         }
 
-        if (replaceRequested && _skinReplacedFlickAttachments.Count > 0)
+        if (_skinReplacedFlickAttachments.Count > 0)
         {
             for (var i = headCommands.Count - 1; i >= 0; i--)
             {
@@ -1346,6 +1607,13 @@ public sealed partial class Playfield
             attachmentCommands.Clear();
         }
 
+#if DEBUG
+        if (measureBridgeStages)
+        {
+            _debugSkinNoteApplyMs += ElapsedMilliseconds(applyStartTimestamp);
+            _debugSkinNoteApplyAllocatedBytes += Math.Max(0L, GC.GetAllocatedBytesForCurrentThread() - applyStartAllocatedBytes);
+        }
+#endif
         replacedVertices.Clear();
         _skinRuntime.ClearPlayfieldGeometryDrawRequests();
         _skinRuntime.ClearPlayfieldSpriteDrawRequests();
@@ -2316,9 +2584,11 @@ public sealed partial class Playfield
             {
                 _editorConnectorPreviewBody3DCommands.Add(BuildConnectorCommand(
                     bodyTexture,
+                    source.Track,
                     _projection.LaneNormalizedX(source.Track),
                     sourcePosition.Value.Side,
                     sourcePosition.Value.Bank,
+                    targetTrack,
                     _projection.LaneNormalizedX(targetTrack),
                     targetPosition.Value.Side,
                     targetPosition.Value.Bank,
@@ -2896,7 +3166,7 @@ public sealed partial class Playfield
         }
 
         // Size the billboard from the note's actual projected width at this depth.
-        // This preserves the existing renderConfig relationship without making the
+        // This preserves the existing playfield configuration relationship without making the
         // attach inherit the lane-plane foreshortening itself.
         var projectedNoteWidth = 0.5f * (
             Vector2.Distance(topLeft, topRight) +

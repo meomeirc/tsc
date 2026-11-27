@@ -4055,12 +4055,12 @@ public sealed partial class Playfield
         }
 
         // Keep a separate projection loaded with get_playfield_config("editor")
-        // (or the legacy editorRenderConfig.lua fallback). Never derive indicator
+        // (or the inherited Default playfieldConfig module). Never derive indicator
         // positions from the live gameplay projection, which may be compact/collapsed.
-        if (!ReferenceEquals(_editorIndicatorProjectionConfig, _editorRenderConfig))
+        if (!ReferenceEquals(_editorIndicatorProjectionPlayfieldConfig, _editorPlayfieldConfig))
         {
-            _editorIndicatorProjection.LoadRenderConfig(_editorRenderConfig);
-            _editorIndicatorProjectionConfig = _editorRenderConfig;
+            _editorIndicatorProjection.LoadRenderConfig(_editorPlayfieldConfig);
+            _editorIndicatorProjectionPlayfieldConfig = _editorPlayfieldConfig;
         }
 
         if (_tempo is not null && !ReferenceEquals(_editorIndicatorProjectionTempo, _tempo))

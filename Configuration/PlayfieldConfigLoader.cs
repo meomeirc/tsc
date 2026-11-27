@@ -5,14 +5,11 @@ using TSC.Rendering;
 namespace TSC;
 
 /// <summary>
-/// Loads renderConfig.lua as a declarative configuration file.
-///
-/// The script only receives input values in the <c>screen</c> table
-/// and the normal Lua standard library supplied by MoonSharp's hard sandbox. The
-/// returned value must be a plain Lua table containing configuration data. No game,
-/// renderer, asset, draw API, or callback API is exposed here.
+/// Converts playfield configuration tables returned by the skin API into the
+/// validated engine configuration model and supplies an in-memory emergency
+/// configuration when a skin's own and inherited playfield modules cannot load.
 /// </summary>
-public static class RenderConfigLuaLoader
+public static class PlayfieldConfigLoader
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -21,29 +18,21 @@ public static class RenderConfigLuaLoader
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.Never
     };
 
-    public static RenderConfig LoadOrCreate(
-        string path,
-        int outputWidth,
-        int outputHeight)
-    {
-        return TryLoadOrCreate(path, outputWidth, outputHeight, out var config, out _)
-            ? config
-            : new RenderConfig();
-    }
-
     /// <summary>
-    /// Builds the built-in render configuration in memory for the current viewport.
-    /// Unlike LoadOrCreate, this does not read or write skins/Default/scripts/renderConfig.lua.
+    /// Builds the engine's in-memory emergency configuration for the current viewport.
+    /// Normal skin selection uses get_playfield_config() or the playfieldConfig module,
+    /// which inherits from the bundled Default skin through the skin import resolver.
     /// </summary>
     public static RenderConfig LoadBuiltInDefault(int outputWidth, int outputHeight)
     {
         var (virtualWidth, virtualHeight) = GetVirtualResolution(outputWidth, outputHeight);
         var script = CreateScript(virtualWidth, virtualHeight, outputWidth, outputHeight);
-        var result = script.DoString(DefaultSource, script.Globals, "[built-in renderConfig]");
+        var result = script.DoString(
+            BuiltInDefaultSource, script.Globals, "[built-in playfield configuration]");
         if (result.Type != DataType.Table || result.Table is null)
-            throw new ScriptRuntimeException("The built-in render config must return a configuration table.");
+            throw new ScriptRuntimeException("The built-in playfield configuration must return a table.");
 
-        var plainValue = LuaValueToPlainObject(result, "renderConfig");
+        var plainValue = LuaValueToPlainObject(result, "playfield configuration");
         var json = JsonSerializer.Serialize(plainValue, JsonOptions);
         return JsonSerializer.Deserialize<RenderConfig>(json, JsonOptions)
             ?? new RenderConfig();
@@ -51,7 +40,8 @@ public static class RenderConfigLuaLoader
 
     /// <summary>
     /// Clones the current skin config while replacing perspective-related values
-    /// with the built-in defaults. Visual sizing and other skin customizations stay intact.
+    /// with the engine's built-in top-down defaults. Visual sizing and other skin
+    /// customizations stay intact.
     /// </summary>
     public static RenderConfig CreateTopDownViewVariant(
         RenderConfig source,
@@ -73,59 +63,7 @@ public static class RenderConfigLuaLoader
         return config;
     }
 
-    /// <summary>
-    /// Loads a skin-specific render config first, then the matching Default skin
-    /// config. The in-code configuration is used only when both scripts fail.
-    /// If neither file exists, preserve the normal first-run behavior and create
-    /// the primary file from the built-in source.
-    /// </summary>
-    public static bool TryLoadWithFallback(
-        string primaryPath,
-        string fallbackPath,
-        int outputWidth,
-        int outputHeight,
-        out RenderConfig config,
-        out string? error)
-    {
-        var failures = new List<string>();
-        var candidates = new List<string>();
-        AddUniquePath(candidates, primaryPath);
-        AddUniquePath(candidates, fallbackPath);
-
-        var anyFileExists = candidates.Any(File.Exists);
-        if (!anyFileExists)
-            return TryLoadOrCreate(primaryPath, outputWidth, outputHeight, out config, out error);
-
-        foreach (var candidate in candidates)
-        {
-            if (!File.Exists(candidate))
-                continue;
-
-            if (TryLoadOrCreate(candidate, outputWidth, outputHeight, out config, out var candidateError))
-            {
-                error = null;
-                return true;
-            }
-
-            failures.Add($"{candidate}: {candidateError ?? "unknown render config error"}");
-        }
-
-        config = LoadBuiltInDefault(outputWidth, outputHeight);
-        error = string.Join(Environment.NewLine + Environment.NewLine, failures);
-        return false;
-    }
-
-    private static void AddUniquePath(List<string> paths, string path)
-    {
-        var fullPath = Path.GetFullPath(path);
-        if (!paths.Any(existing => string.Equals(existing, fullPath, StringComparison.OrdinalIgnoreCase)))
-            paths.Add(fullPath);
-    }
-
-    /// <summary>
-    /// Converts the plain table returned by skin.lua's get_playfield_config(view)
-    /// into the same validated configuration model used by legacy renderConfig.lua.
-    /// </summary>
+    /// <summary>Deserializes a table returned by get_playfield_config(view).</summary>
     internal static RenderConfig DeserializeLuaConfigTable(DynValue result, string configName)
     {
         if (result.Type != DataType.Table || result.Table is null)
@@ -137,56 +75,12 @@ public static class RenderConfigLuaLoader
             ?? new RenderConfig();
     }
 
-    public static bool TryLoadOrCreate(
-        string path,
-        int outputWidth,
-        int outputHeight,
-        out RenderConfig config,
-        out string? error)
-    {
-        EnsureParentDirectory(path);
-        config = new RenderConfig();
-        error = null;
-
-        var (virtualWidth, virtualHeight) = GetVirtualResolution(outputWidth, outputHeight);
-
-        if (!File.Exists(path))
-        {
-            File.WriteAllText(path, DefaultSource);
-            return true;
-        }
-
-        try
-        {
-            var source = File.ReadAllText(path);
-            var script = CreateScript(virtualWidth, virtualHeight, outputWidth, outputHeight);
-            var result = script.DoString(source, script.Globals, path);
-
-            if (result.Type != DataType.Table || result.Table is null)
-                throw new ScriptRuntimeException("renderConfig.lua must return a configuration table.");
-
-            var plainValue = LuaValueToPlainObject(result, "renderConfig");
-            var json = JsonSerializer.Serialize(plainValue, JsonOptions);
-            config = JsonSerializer.Deserialize<RenderConfig>(json, JsonOptions)
-                ?? new RenderConfig();
-            return true;
-        }
-        catch (Exception ex)
-        {
-            error = ex.Message;
-            config = new RenderConfig();
-            return false;
-        }
-    }
-
-
     private static Script CreateScript(
         int virtualWidth,
         int virtualHeight,
         int outputWidth,
         int outputHeight)
     {
-        // pcall/xpcall support the skin's isolated fallback handling; retain the hard sandbox for all other APIs.
         var script = new Script(CoreModules.Preset_HardSandbox | CoreModules.ErrorHandling);
 
         var screen = new Table(script);
@@ -206,8 +100,6 @@ public static class RenderConfigLuaLoader
                 : Math.Max(1, outputHeight) / ChartProjection.ReferenceResolutionHeight));
 
         script.Globals["screen"] = screen;
-        // Draw-sprite-style blend tokens. This lets skins write blend = add / normal
-        // instead of quoting the strings, while keeping ordinary Lua values available.
         script.Globals["normal"] = DynValue.NewString("normal");
         script.Globals["add"] = DynValue.NewString("add");
         return script;
@@ -222,7 +114,7 @@ public static class RenderConfigLuaLoader
             DataType.Number => value.Number,
             DataType.String => value.String,
             DataType.Table when value.Table is not null => LuaTableToPlainObject(value.Table, path),
-            _ => throw new ScriptRuntimeException($"{path}: only numbers, booleans, strings, and tables are allowed in renderConfig.lua.")
+            _ => throw new ScriptRuntimeException($"{path}: only numbers, booleans, strings, and tables are allowed in playfield configuration.")
         };
     }
 
@@ -257,11 +149,10 @@ public static class RenderConfigLuaLoader
                     throw new ScriptRuntimeException($"{path}: array entries must use contiguous numeric keys starting at 1.");
             }
 
-            var indexed = entries
+            return entries
                 .OrderBy(pair => (int)pair.Key.Number)
                 .Select((pair, index) => LuaValueToPlainObject(pair.Value, $"{path}[{index + 1}]"))
                 .ToList();
-            return indexed;
         }
 
         var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
@@ -285,15 +176,8 @@ public static class RenderConfigLuaLoader
         return (width, height);
     }
 
-    private static void EnsureParentDirectory(string path)
-    {
-        var directory = Path.GetDirectoryName(path);
-        if (!string.IsNullOrWhiteSpace(directory))
-            Directory.CreateDirectory(directory);
-    }
-
-    private const string DefaultSource = """
--- renderConfig.lua
+    private const string BuiltInDefaultSource = """
+-- Built-in playfield configuration defaults.
 --
 -- Declarative playfield/camera configuration. Lua calculations are allowed,
 -- but game state, drawing, assets, and callbacks are not exposed here.

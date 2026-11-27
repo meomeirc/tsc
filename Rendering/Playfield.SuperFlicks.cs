@@ -23,6 +23,142 @@ public sealed partial class Playfield
         return BankEdges(side, bank);
     }
 
+    private SkinPlayfieldSpriteSpanSnapshot? BuildSuperFlickSpriteSpanSnapshot(
+        (float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family) flick,
+        double currentTick)
+    {
+        if (_tempo is null)
+            return null;
+
+        var ev = flick.Event;
+        var (bankLeft, bankRight) = SuperFlickSpanEdges(flick.Side, flick.Bank);
+        var travel = (float)_projection.ScrollPixelsAtTicks(ev.Tick, currentTick);
+        var surface = _projection.BuildBankSurface(flick.Side, flick.Bank);
+        var leftContext = _projection.BuildStandingNoteTravelContext(
+            surface, bankLeft, flick.Side, flick.Bank);
+        var rightContext = _projection.BuildStandingNoteTravelContext(
+            surface, bankRight, flick.Side, flick.Bank);
+        var leftBasis = _projection.BuildStandingNoteBasis(leftContext, travel);
+        var rightBasis = _projection.BuildStandingNoteBasis(rightContext, travel);
+        var screenStart = _projection.ScreenPositionFromCameraSpace(leftBasis.Center);
+        var screenEnd = _projection.ScreenPositionFromCameraSpace(rightBasis.Center);
+        var axisLength = Vector2.Distance(screenStart, screenEnd);
+        if (!float.IsFinite(axisLength) || axisLength < 1f)
+            return null;
+
+        var centerNormalized = (bankLeft + bankRight) * 0.5f;
+        var centerContext = _projection.BuildStandingNoteTravelContext(
+            surface, centerNormalized, flick.Side, flick.Bank);
+        var centerJudgeBasis = _projection.BuildStandingNoteBasis(centerContext, 0f);
+        var centerTravelBasis = _projection.BuildStandingNoteBasis(centerContext, travel);
+        var currentAcrossAtMid = _projection.ScreenPixelsPerWorldUnit(
+            centerTravelBasis.Center, centerJudgeBasis.Across);
+        var referenceAcrossAtMid = Math.Max(0.0001f,
+            _projection.ScreenPixelsPerWorldUnit(centerJudgeBasis.Center, centerJudgeBasis.Across));
+        var centerPerspectiveScale = Math.Max(0.05f, currentAcrossAtMid / referenceAcrossAtMid);
+        var bankOpacity = _chartEditorMode
+            ? GetEditorBankOpacity(flick.Side, flick.Bank, RenderGearState(currentTick))
+            : 1f;
+        var directionSign = flick.Family == SuperFlickFamily.Outer
+            ? (flick.Side == "right" ? 1f : -1f)
+            : (flick.Side == "right" ? -1f : 1f);
+
+        return new SkinPlayfieldSpriteSpanSnapshot(
+            bankLeft,
+            bankRight,
+            travel,
+            axisLength,
+            centerPerspectiveScale,
+            Math.Max(3f, _projection.SuperFlickTextureWidth * centerPerspectiveScale),
+            Math.Max(3f, _projection.SuperFlickHighlightWidth * centerPerspectiveScale),
+            _projection.SuperFlickTextureWidth,
+            _projection.SuperFlickHighlightWidth,
+            _projection.SuperFlickScrollRate,
+            _projection.SuperFlickScrollGap,
+            _projection.SuperFlickHighlightSpeed,
+            _projection.SuperFlickHighlightOpacity,
+            bankOpacity,
+            directionSign,
+            (float)(_playSeconds - _tempo.TickToSeconds(ev.Tick)),
+            screenStart,
+            screenEnd);
+    }
+
+    /// <summary>
+    /// Converts a skin-authored instance position on a projected lane span into a
+    /// billboard draw command. Lua chooses count, normalized position, dimensions,
+    /// alpha, rotation and flips; the renderer only resolves the surface projection
+    /// and local perspective scale shared by any component using a lane span.
+    /// </summary>
+    private void AddSkinPlayfieldSpanSpriteCommand(
+        SkinPlayfieldSpriteDrawRequest request,
+        List<TexturedQuadCommand> commands)
+    {
+        if (request.Asset is null || request.Geometry.Span is not { } span)
+            return;
+
+        var side = request.Geometry.Side;
+        var bank = request.Geometry.Bank;
+        if (string.IsNullOrWhiteSpace(side) || string.IsNullOrWhiteSpace(bank))
+            return;
+
+        var normalizedX = MathHelper.Lerp(span.StartNormalized, span.EndNormalized, request.SpanPosition);
+        var surface = _projection.BuildBankSurface(side, bank);
+        var context = _projection.BuildStandingNoteTravelContext(surface, normalizedX, side, bank);
+        var basis = _projection.BuildStandingNoteBasis(context, span.TravelPixels);
+        var reference = _projection.BuildStandingNoteBasis(context, 0f);
+        var currentPixelsPerWorld = Math.Max(0.0001f,
+            _projection.ScreenPixelsPerWorldUnit(basis.Center, basis.Across));
+        var referencePixelsPerWorld = Math.Max(0.0001f,
+            _projection.ScreenPixelsPerWorldUnit(reference.Center, reference.Across));
+        var localScale = currentPixelsPerWorld / referencePixelsPerWorld;
+        var width = Math.Max(request.MinimumInstanceWidth, request.InstanceWidth * localScale);
+        var height = Math.Max(request.MinimumInstanceHeight, request.InstanceHeight * localScale);
+        if (!float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f)
+            return;
+
+        Vector2 axis;
+        if (request.AlignToLocalSurfaceAcross)
+        {
+            var halfBankWidth = (surface.NearOuter - surface.NearInner).Length() * 0.5f;
+            var left = _projection.ScreenPositionFromCameraSpace(basis.Center - basis.Across * halfBankWidth);
+            var right = _projection.ScreenPositionFromCameraSpace(basis.Center + basis.Across * halfBankWidth);
+            axis = right - left;
+        }
+        else
+        {
+            axis = span.ScreenEnd - span.ScreenStart;
+        }
+        if (axis.LengthSquared() < 0.0001f)
+            axis = Vector2.UnitX;
+        else
+            axis.Normalize();
+        if (MathF.Abs(request.InstanceRotationDegrees) > 0.0001f)
+        {
+            var radians = MathHelper.ToRadians(request.InstanceRotationDegrees);
+            var cosine = MathF.Cos(radians);
+            var sine = MathF.Sin(radians);
+            axis = new Vector2(
+                axis.X * cosine - axis.Y * sine,
+                axis.X * sine + axis.Y * cosine);
+        }
+
+        var center = _projection.ScreenPositionFromCameraSpace(basis.Center);
+        var alpha = request.Alpha * Math.Clamp(span.BankOpacity, 0f, 1f);
+        AddSkinSpriteQuad(
+            request,
+            commands,
+            request.Asset.Texture,
+            center,
+            axis,
+            width,
+            height,
+            request.Geometry.Depth,
+            alpha,
+            false,
+            false);
+    }
+
     private void DrawSuperFlickHighlights(List<(float Depth, ChartEvent Event, ProjectedPoint Point, string Side, string Bank, SuperFlickFamily Family)> superFlicks, double currentTick)
     {
         if (_tempo is null || superFlicks.Count == 0)
@@ -631,19 +767,35 @@ public sealed partial class Playfield
     private void DrawJudgementLine(double currentTick)
     {
         var state = RenderGearState(currentTick);
+        if (_skinPlayfieldUnifiedRendererThisPass)
+        {
+            // A unified render_playfield callback already submitted all of its
+            // playfield geometry (including any custom judgement quads) in the
+            // shared skin-layer sort. Do not invoke the legacy judgement callback.
+            if (!_skinPlayfieldReplacesJudgementLineThisPass)
+                DrawNativeJudgementLine(state);
+            return;
+        }
+
         if (TryDrawSkinJudgementLine(currentTick, state))
             return;
 
         DrawNativeJudgementLine(state);
     }
 
-    private bool TryDrawSkinJudgementLine(double currentTick, GearState state)
-    {
-        if (!_skinRuntime.SupportsJudgementLineRenderer)
-            return false;
 
-        var geometry = _skinJudgementLineGeometryScratch;
-        geometry.Clear();
+    private void BuildSkinJudgeAnchorData(
+        GearState state,
+        List<SkinJudgeAnchorSnapshot> judges,
+        List<SkinJudgeLaneSnapshot> lanes,
+        List<SkinPlayfieldSpriteGeometrySnapshot>? legacyGeometry = null,
+        bool includeInactiveColumns = false,
+        bool useJudgeOpacity = true)
+    {
+        judges.Clear();
+        lanes.Clear();
+        legacyGeometry?.Clear();
+
         var judgeTexture = _textures.Get("judge");
         var baseWidth = Math.Max(0f, _projection.JudgeWidth);
         var autoHeight = judgeTexture is null
@@ -658,29 +810,105 @@ public sealed partial class Playfield
             var bankOpacity = _chartEditorMode
                 ? GetEditorBankOpacity(bank.Side, bank.Bank, state)
                 : 1f;
-            var opacity = MathHelper.Clamp(_projection.JudgeAlpha * bankOpacity, 0f, 1f);
-            if (opacity <= 0.001f)
+            var judgeOpacity = MathHelper.Clamp(_projection.JudgeAlpha, 0f, 1f);
+            var opacity = MathHelper.Clamp((useJudgeOpacity ? judgeOpacity : 1f) * bankOpacity, 0f, 1f);
+            if (useJudgeOpacity && opacity <= 0.001f)
                 continue;
+
+            var judgeSurface = _projection.BuildBankSurface(bank.Side, bank.Bank);
+            var (bankLeft, bankRight) = BankEdges(bank.Side, bank.Bank);
+            var bankCenter = (bankLeft + bankRight) * 0.5f;
+            var judgeBasis = _projection.BuildStandingNoteBasis(
+                judgeSurface, bankCenter, 0f, bank.Side, bank.Bank);
+            var edgeLeftBasis = _projection.BuildStandingNoteBasis(
+                judgeSurface, bankLeft, 0f, bank.Side, bank.Bank);
+            var edgeRightBasis = _projection.BuildStandingNoteBasis(
+                judgeSurface, bankRight, 0f, bank.Side, bank.Bank);
+            var screenLeft = _projection.ScreenPositionFromCameraSpace(edgeLeftBasis.Center);
+            var screenRight = _projection.ScreenPositionFromCameraSpace(edgeRightBasis.Center);
+            var screenCenter = _projection.ScreenPositionFromCameraSpace(judgeBasis.Center);
+            var laneRotation = _projection.SpriteRotationRadians(
+                bank.Side, bank.Bank, judgeBasis.CameraDistance, bankCenter);
+            var worldBankWidth = Math.Max(0.0001f,
+                Vector3.Distance(edgeLeftBasis.Center, edgeRightBasis.Center));
+            var projectedBankWidth = Math.Max(0.001f, MathF.Abs(screenRight.X - screenLeft.X));
+            var laneDefaultHeightWorld = 2f * _projection.WorldHalfExtentForScreenPixels(
+                judgeBasis.Center, judgeBasis.Along, baseHeight * 0.5f);
+            var defaultHeight = Math.Max(0f, laneDefaultHeightWorld / worldBankWidth);
+            var defaultBillboardWidth = Math.Max(0f, baseWidth / projectedBankWidth);
+            var defaultBillboardHeight = Math.Max(0f, baseHeight / projectedBankWidth);
+            var sideGear = bank.Bank == "Center"
+                ? "2K"
+                : bank.Side == "left" ? state.LeftMode : state.RightMode;
+            var judgeIndex = judges.Count;
+            judges.Add(new SkinJudgeAnchorSnapshot(
+                bank.Side,
+                bank.Bank,
+                state.GlobalMode,
+                sideGear,
+                bank.Active,
+                opacity,
+                judgeOpacity,
+                defaultHeight,
+                defaultBillboardWidth,
+                defaultBillboardHeight,
+                judgeBasis,
+                worldBankWidth,
+                projectedBankWidth,
+                screenCenter,
+                laneRotation));
+
+            // The across vector points toward the outer edge on both banks. Flip
+            // it where necessary so lane_quad's positive X is always screen-right.
+            var projectedAcrossPositive = _projection.ScreenPositionFromCameraSpace(
+                judgeBasis.Center + judgeBasis.Across);
+            var projectedAcrossNegative = _projection.ScreenPositionFromCameraSpace(
+                judgeBasis.Center - judgeBasis.Across);
+            var screenRightAcross = projectedAcrossPositive.X >= projectedAcrossNegative.X
+                ? judgeBasis.Across
+                : -judgeBasis.Across;
 
             var activeColumns = ActiveColumns(bank.Side, bank.Bank);
             for (var column = 0; column < 3; column++)
             {
-                if (bank.Bank != "Backward" && !activeColumns.Contains(column))
+                var columnActive = bank.Bank == "Backward" || activeColumns.Contains(column);
+                if (!includeInactiveColumns && bank.Bank != "Backward" && !columnActive)
                     continue;
 
                 var (columnLeft, columnRight) = ColumnEdges(bank.Side, bank.Bank, column);
                 var columnCenter = (columnLeft + columnRight) * 0.5f;
-                var judgeSurface = _projection.BuildBankSurface(bank.Side, bank.Bank);
-                var judgeBasis = _projection.BuildStandingNoteBasis(
+                var columnBasis = _projection.BuildStandingNoteBasis(
                     judgeSurface, columnCenter, 0f, bank.Side, bank.Bank);
-                var point = _projection.ScreenPositionFromCameraSpace(judgeBasis.Center);
-                var edgeLeftBasis = _projection.BuildStandingNoteBasis(
+                var columnLeftBasis = _projection.BuildStandingNoteBasis(
                     judgeSurface, columnLeft, 0f, bank.Side, bank.Bank);
-                var edgeRightBasis = _projection.BuildStandingNoteBasis(
+                var columnRightBasis = _projection.BuildStandingNoteBasis(
                     judgeSurface, columnRight, 0f, bank.Side, bank.Bank);
-                var projectedAcross =
-                    _projection.ScreenPositionFromCameraSpace(edgeRightBasis.Center) -
-                    _projection.ScreenPositionFromCameraSpace(edgeLeftBasis.Center);
+
+                var hasTrack = TryGetTrackForBankColumn(bank.Side, bank.Bank, column, out var track);
+                if (hasTrack || includeInactiveColumns)
+                {
+                    // Lane positions share lane_quad's bank-right-positive X axis.
+                    var laneOffset = Vector3.Dot(
+                        columnBasis.Center - judgeBasis.Center, screenRightAcross) / worldBankWidth;
+                    var laneWidth = Vector3.Distance(
+                        columnLeftBasis.Center, columnRightBasis.Center) / worldBankWidth;
+                    if (float.IsFinite(laneOffset) && float.IsFinite(laneWidth) && laneWidth > 0.0001f)
+                    {
+                        lanes.Add(new SkinJudgeLaneSnapshot(
+                            judgeIndex, hasTrack ? track : -1, column, laneOffset, laneWidth,
+                            columnActive && hasTrack));
+                    }
+                }
+
+                if (legacyGeometry is null)
+                    continue;
+
+                // Preserve the original per-column screen geometry for skins that
+                // still use frame.lines + draw.sprite().
+                var point = _projection.ScreenPositionFromCameraSpace(columnBasis.Center);
+                var columnEdgeLeft = _projection.ScreenPositionFromCameraSpace(columnLeftBasis.Center);
+                var columnEdgeRight = _projection.ScreenPositionFromCameraSpace(columnRightBasis.Center);
+                var projectedAcross = columnEdgeRight - columnEdgeLeft;
                 if (projectedAcross.LengthSquared() < 0.0001f)
                     projectedAcross = Vector2.UnitX;
                 else
@@ -690,10 +918,10 @@ public sealed partial class Playfield
                 var along = new Vector2(-across.Y, across.X);
                 var halfWidth = baseWidth * 0.5f;
                 var halfHeight = baseHeight * 0.5f;
-                geometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
+                legacyGeometry.Add(new SkinPlayfieldSpriteGeometrySnapshot(
                     -1, -1, -1, 0, 0,
                     "judge_line", "judge_line", bank.Side, bank.Bank, string.Empty,
-                    false, false, false, Math.Max(0f, -judgeBasis.Center.Z),
+                    false, false, false, Math.Max(0f, -columnBasis.Center.Z),
                     point - across * halfWidth - along * halfHeight,
                     point + across * halfWidth - along * halfHeight,
                     point + across * halfWidth + along * halfHeight,
@@ -701,8 +929,115 @@ public sealed partial class Playfield
                     true, false, false, 0, opacity));
             }
         }
+    }
 
-        var replaced = _skinRuntime.InvokeJudgementLineRenderer(geometry, _playSeconds, currentTick);
+    private void BuildSkinHitEffectAnchorData(
+        GearState state,
+        List<SkinHitEffectAnchorSnapshot> anchors)
+    {
+        anchors.Clear();
+
+        var judgeTexture = _textures.Get("judge");
+        var baseWidth = Math.Max(0f, _projection.JudgeWidth);
+        var baseHeight = Math.Max(0f, _projection.JudgeHeight ??
+            (judgeTexture is null
+                ? 4f
+                : baseWidth * judgeTexture.Height / (float)Math.Max(1, judgeTexture.Width)));
+
+        // Build anchors for every chart track, not only the currently active bank.
+        // Effects keep their originating chart track for their full lifetime; in
+        // compact mode all bank surfaces share the same collapsed projection, while
+        // in expanded mode an effect remains attached to its original bank if gear
+        // changes before the animation finishes.
+        foreach (var side in Sides)
+        foreach (var bankName in Banks)
+        {
+            var bank = (Side: side, Bank: bankName,
+                Active: string.Equals(GearTimeline.ActiveBankForSide(state, side), bankName, StringComparison.OrdinalIgnoreCase));
+            var bankOpacity = _chartEditorMode
+                ? GetEditorBankOpacity(bank.Side, bank.Bank, state)
+                : 1f;
+
+            var judgeSurface = _projection.BuildBankSurface(bank.Side, bank.Bank);
+            var activeColumns = ActiveColumns(bank.Side, bank.Bank);
+            var sideGear = state.SideMode(bank.Side);
+
+            for (var column = 0; column < 3; column++)
+            {
+                if (!TryGetTrackForBankColumn(bank.Side, bank.Bank, column, out var track))
+                    continue;
+
+                var (columnLeft, columnRight) = ColumnEdges(bank.Side, bank.Bank, column);
+                var columnCenter = (columnLeft + columnRight) * 0.5f;
+                var basis = _projection.BuildStandingNoteBasis(
+                    judgeSurface, columnCenter, 0f, bank.Side, bank.Bank);
+                var leftBasis = _projection.BuildStandingNoteBasis(
+                    judgeSurface, columnLeft, 0f, bank.Side, bank.Bank);
+                var rightBasis = _projection.BuildStandingNoteBasis(
+                    judgeSurface, columnRight, 0f, bank.Side, bank.Bank);
+
+                var worldTrackWidth = Math.Max(0.0001f,
+                    Vector3.Distance(leftBasis.Center, rightBasis.Center));
+                var screenCenter = _projection.ScreenPositionFromCameraSpace(basis.Center);
+                var laneRotation = _projection.SpriteRotationRadians(
+                    bank.Side, bank.Bank, basis.CameraDistance, columnCenter);
+                var screenLeft = _projection.ScreenPositionFromCameraSpace(leftBasis.Center);
+                var screenRight = _projection.ScreenPositionFromCameraSpace(rightBasis.Center);
+                // The lane-surface quad follows the projected across vector, which
+                // may be diagonal in non-top-down views. Use its full projected
+                // length when converting the legacy pixel hit width to lane units.
+                var projectedTrackWidth = Math.Max(0.001f,
+                    Vector2.Distance(screenLeft, screenRight));
+
+                var projectedAlongEnd = _projection.ScreenPositionFromCameraSpace(
+                    basis.Center + basis.Along * worldTrackWidth);
+                var projectedAlongWidth = Math.Max(0.001f,
+                    Vector2.Distance(screenCenter, projectedAlongEnd));
+                var defaultHeightWorld = 2f * _projection.WorldHalfExtentForScreenPixels(
+                    basis.Center, basis.Along, baseHeight * 0.5f);
+                var defaultHeight = defaultHeightWorld / worldTrackWidth;
+                var opacity = Math.Clamp(bankOpacity, 0f, 1f);
+
+                var judge = new SkinJudgeAnchorSnapshot(
+                    bank.Side,
+                    bank.Bank,
+                    state.GlobalMode,
+                    sideGear,
+                    bank.Active,
+                    opacity,
+                    1f,
+                    defaultHeight,
+                    baseWidth / projectedTrackWidth,
+                    baseHeight / projectedTrackWidth,
+                    basis,
+                    worldTrackWidth,
+                    projectedTrackWidth,
+                    screenCenter,
+                    laneRotation);
+                anchors.Add(new SkinHitEffectAnchorSnapshot(
+                    track,
+                    column,
+                    bank.Active && activeColumns.Contains(column),
+                    projectedAlongWidth,
+                    judge));
+            }
+        }
+    }
+
+    private bool TryDrawSkinJudgementLine(double currentTick, GearState state)
+    {
+        var geometry = _skinJudgementLineGeometryScratch;
+        var judges = _skinJudgementLineAnchorScratch;
+        var lanes = _skinJudgementLineLaneScratch;
+        BuildSkinJudgeAnchorData(state, judges, lanes, geometry);
+
+        var replaced = _skinRuntime.InvokeJudgementLineRenderer(
+            geometry, judges, lanes, _playSeconds, currentTick);
+
+        // Lane-relative 3D quads share this path between playfield and judge-line callbacks.
+        DrawSkinLaneQuadRequests("judge_line", "skin_judge_line");
+
+        // Retain legacy screen-space sprite submissions for older custom skins.
         var requests = _skinRuntime.JudgementLineSpriteDrawRequests;
         var commands = _skinJudgementLineCommandScratch;
         commands.Clear();
@@ -747,6 +1082,228 @@ public sealed partial class Playfield
         commands.Clear();
         _skinRuntime.ClearJudgementLineSpriteDrawRequests();
         return replaced;
+    }
+
+    private void DrawSkinLaneQuadRequestsAtLayer(
+        int layer,
+        string noteType,
+        string component,
+        IReadOnlyList<SkinLaneQuadDrawRequest>? requestSource = null)
+    {
+        var requests = requestSource ?? _skinRuntime.LaneQuadDrawRequests;
+        var commands = _skinLaneQuad3DCommandScratch;
+        commands.Clear();
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            if (request.Layer != layer ||
+                !TryBuildSkinLaneQuad(request, out var vertices, out var depth))
+                continue;
+
+            var tint = request.Tint;
+            tint.A = (byte)Math.Clamp((int)MathF.Round(tint.A * request.Alpha), 0, 255);
+            for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+            {
+                var vertex = vertices[vertexIndex];
+                vertex.Color = tint;
+                vertices[vertexIndex] = vertex;
+            }
+            commands.Add(new Textured3DQuadCommand(
+                request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture,
+                vertices,
+                depth,
+                false,
+                null,
+                request.Layer,
+                false,
+                -1,
+                -1,
+                -1,
+                0,
+                0,
+                noteType,
+                component));
+        }
+
+        if (commands.Count > 0)
+        {
+            DrawTextured3DCommands(commands);
+            ReturnQuad3DVertices(commands);
+            commands.Clear();
+        }
+    }
+
+    private void DrawSkinLaneQuadRequests(string noteType, string component)
+    {
+        var requests = _skinRuntime.LaneQuadDrawRequests;
+        var commands = _skinLaneQuad3DCommandScratch;
+        commands.Clear();
+        for (var i = 0; i < requests.Count; i++)
+        {
+            var request = requests[i];
+            if (!TryBuildSkinLaneQuad(request, out var vertices, out var depth))
+                continue;
+
+            var tint = request.Tint;
+            tint.A = (byte)Math.Clamp((int)MathF.Round(tint.A * request.Alpha), 0, 255);
+            for (var vertexIndex = 0; vertexIndex < vertices.Length; vertexIndex++)
+            {
+                var vertex = vertices[vertexIndex];
+                vertex.Color = tint;
+                vertices[vertexIndex] = vertex;
+            }
+            commands.Add(new Textured3DQuadCommand(
+                request.Asset?.Texture ?? _skinRuntime.PlayfieldGeometryWhiteTexture,
+                vertices,
+                depth,
+                false,
+                null,
+                request.Layer,
+                false,
+                -1,
+                -1,
+                -1,
+                0,
+                0,
+                noteType,
+                component));
+        }
+        if (commands.Count > 0)
+        {
+            DrawTextured3DCommands(commands);
+            ReturnQuad3DVertices(commands);
+            commands.Clear();
+        }
+        _skinRuntime.ClearLaneQuadDrawRequests();
+    }
+
+    private Vector3 ScreenRightAcrossAxis(StandingNoteBasis basis)
+    {
+        var positive = _projection.ScreenPositionFromCameraSpace(basis.Center + basis.Across);
+        var negative = _projection.ScreenPositionFromCameraSpace(basis.Center - basis.Across);
+        return positive.X >= negative.X ? basis.Across : -basis.Across;
+    }
+
+    private bool TryBuildSkinLaneQuad(
+        SkinLaneQuadDrawRequest request,
+        out VertexPositionColorTexture[] vertices,
+        out float depth)
+    {
+        vertices = Array.Empty<VertexPositionColorTexture>();
+        depth = 0f;
+        var basis = request.Judge.Basis;
+        var center = basis.Center;
+        // Placement coordinates always follow the bank's real 3D frame. Keep
+        // billboard sizing separate: its width/height are still screen-facing.
+        var positionUnit = Math.Max(0.0001f, request.Judge.WorldBankWidth);
+        var sizeUnit = positionUnit;
+
+        Vector3 offsetAxisX;
+        Vector3 offsetAxisY;
+        Vector3 quadAxisX;
+        Vector3 quadAxisY;
+        // Position coordinates and the quad's orientation are separate for
+        // billboards. Placement follows the bank's 3D across/along directions;
+        // the billboard itself keeps an orthogonal camera-facing basis so square
+        // dimensions cannot shear on angled banks.
+        switch (request.Space)
+        {
+            case SkinPlayfieldGeometrySpace.LaneSurface:
+                offsetAxisX = quadAxisX = ScreenRightAcrossAxis(basis);
+                offsetAxisY = quadAxisY = basis.Along;
+                break;
+            case SkinPlayfieldGeometrySpace.NoteSurface:
+            {
+                offsetAxisX = quadAxisX = ScreenRightAcrossAxis(basis);
+                var angle = MathHelper.ToRadians(MathHelper.Clamp(_projection.NoteStandAngleDegrees, 0f, 90f));
+                offsetAxisY = quadAxisY = basis.Along * MathF.Cos(angle) + basis.Normal * MathF.Sin(angle);
+                break;
+            }
+            case SkinPlayfieldGeometrySpace.Billboard:
+            {
+                // Placement always remains attached to the real 3D bank frame.
+                // Billboard shape is camera-facing, but its in-plane rotation is
+                // independently fixed, captured once by Lua, or recomputed from
+                // the current projected lane angle.
+                offsetAxisX = ScreenRightAcrossAxis(basis);
+                offsetAxisY = basis.Along;
+                var billboardRotation = request.RotationMode switch
+                {
+                    SkinLaneQuadRotationMode.Snapshot => request.RotationRadians,
+                    SkinLaneQuadRotationMode.FollowLane => request.Judge.LaneRotationRadians,
+                    _ => 0f
+                };
+                var cosine = MathF.Cos(billboardRotation);
+                var sine = MathF.Sin(billboardRotation);
+                // Camera-space +Y projects upward, while screen-space rotation
+                // uses +Y downward. This basis matches SpriteBatch rotation.
+                quadAxisX = new Vector3(cosine, -sine, 0f);
+                quadAxisY = new Vector3(sine, cosine, 0f);
+                break;
+            }
+            default:
+                return false;
+        }
+
+        if (offsetAxisX.LengthSquared() < 0.000001f || offsetAxisY.LengthSquared() < 0.000001f ||
+            quadAxisX.LengthSquared() < 0.000001f || quadAxisY.LengthSquared() < 0.000001f ||
+            !float.IsFinite(positionUnit) || positionUnit <= 0.0001f ||
+            !float.IsFinite(center.X) || !float.IsFinite(center.Y) || !float.IsFinite(center.Z) ||
+            !float.IsFinite(offsetAxisX.X) || !float.IsFinite(offsetAxisX.Y) || !float.IsFinite(offsetAxisX.Z) ||
+            !float.IsFinite(offsetAxisY.X) || !float.IsFinite(offsetAxisY.Y) || !float.IsFinite(offsetAxisY.Z) ||
+            !float.IsFinite(quadAxisX.X) || !float.IsFinite(quadAxisX.Y) || !float.IsFinite(quadAxisX.Z) ||
+            !float.IsFinite(quadAxisY.X) || !float.IsFinite(quadAxisY.Y) || !float.IsFinite(quadAxisY.Z))
+            return false;
+        offsetAxisX.Normalize();
+        offsetAxisY.Normalize();
+        quadAxisX.Normalize();
+        quadAxisY.Normalize();
+        center += offsetAxisX * (request.X * positionUnit) +
+                  offsetAxisY * (request.Y * positionUnit) +
+                  basis.Normal * (request.NormalOffset * positionUnit);
+
+        if (request.Space == SkinPlayfieldGeometrySpace.Billboard)
+        {
+            // Resolve the marker's pixel-sized shape at its final 3D position,
+            // not at the bank center. This keeps marker dimensions stable while
+            // allowing their centers to follow bank angle and perspective.
+            sizeUnit = 2f * _projection.WorldHalfExtentForScreenPixels(
+                center, quadAxisX, request.Judge.ProjectedBankWidth * 0.5f);
+        }
+
+        if (!float.IsFinite(sizeUnit) || sizeUnit <= 0.0001f)
+            return false;
+
+        var halfWidth = request.Width * sizeUnit * 0.5f;
+        var halfHeight = request.Height * sizeUnit * 0.5f;
+        if (!float.IsFinite(halfWidth) || !float.IsFinite(halfHeight) ||
+            halfWidth <= 0.0001f || halfHeight <= 0.0001f)
+            return false;
+        var topLeft = center - quadAxisX * halfWidth + quadAxisY * halfHeight;
+        var topRight = center + quadAxisX * halfWidth + quadAxisY * halfHeight;
+        var bottomRight = center + quadAxisX * halfWidth - quadAxisY * halfHeight;
+        var bottomLeft = center - quadAxisX * halfWidth - quadAxisY * halfHeight;
+
+        var uLeft = request.FlipX ? 1f : 0f;
+        var uRight = request.FlipX ? 0f : 1f;
+        var vTop = request.FlipY ? 1f : 0f;
+        var vBottom = request.FlipY ? 0f : 1f;
+        vertices = RentQuad3DVertices();
+        vertices[0] = new VertexPositionColorTexture(topLeft, Color.White, new Vector2(uLeft, vTop));
+        vertices[1] = new VertexPositionColorTexture(topRight, Color.White, new Vector2(uRight, vTop));
+        vertices[2] = new VertexPositionColorTexture(bottomRight, Color.White, new Vector2(uRight, vBottom));
+        vertices[3] = new VertexPositionColorTexture(topLeft, Color.White, new Vector2(uLeft, vTop));
+        vertices[4] = new VertexPositionColorTexture(bottomRight, Color.White, new Vector2(uRight, vBottom));
+        vertices[5] = new VertexPositionColorTexture(bottomLeft, Color.White, new Vector2(uLeft, vBottom));
+        depth = Math.Max(1f, Math.Max(
+            Math.Max(-topLeft.Z, -topRight.Z),
+            Math.Max(-bottomRight.Z, -bottomLeft.Z)));
+        if (float.IsFinite(depth))
+            return true;
+
+        _quad3DVertexPool.Push(vertices);
+        vertices = Array.Empty<VertexPositionColorTexture>();
+        return false;
     }
 
     private void DrawNativeJudgementLine(GearState state)
@@ -854,7 +1411,7 @@ public sealed partial class Playfield
         transition.FlashElapsedSeconds = 0f;
         transition.FlashActive = true;
         // Start the transition at the authored orbit angle. Previously this was
-        // hard-coded to 180 degrees, making the renderConfig value appear to have
+        // hard-coded to 180 degrees, making the playfield configuration value appear to have
         // no effect on the 3D transition's initial state.
         _projection.SetBankSwitchTransition(
             side,

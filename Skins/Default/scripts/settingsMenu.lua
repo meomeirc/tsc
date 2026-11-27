@@ -834,6 +834,32 @@ local function render_settings_menu()
             })
             return y + row_height + row_gap
         end
+        local function choice(x, y, width, setting)
+            local row_id = "skin_setting_" .. setting.id .. "_row"
+            local button_width = math.min(150, math.max(112, width * 0.30))
+            local button_height = math.min(44, row_height - 4)
+            UI.draw_panel({
+                id = row_id, parent = "settings_panel",
+                x = x, y = y, width = width, height = row_height,
+                color = UI.colors.panel, alpha = 0.92, clip = clip, layer = 10,
+            })
+            draw.text(setting.label, {
+                parent = row_id, x = skin_padding, y = row_height * 0.5,
+                size = UI.sizes.small, color = UI.colors.text, font = UI.fonts.medium,
+                anchor = "left", clip = clip, layer = 12,
+            })
+            UI.draw_button({
+                id = "skin_choice_" .. setting.id, parent = row_id,
+                x = width - skin_padding - button_width,
+                y = (row_height - button_height) * 0.5,
+                width = button_width, height = button_height,
+                label = string.upper(tostring(setting.value or "")),
+                text_size = UI.sizes.small, font = UI.fonts.bold,
+                action = "cycle_skin_choice", value = setting.id,
+                selected = false, variant = "secondary", clip = clip, layer = 13,
+            })
+            return y + row_height + row_gap
+        end
 
         for _, group in ipairs(skin_groups) do
             local column = tostring(group.column or "left"):lower()
@@ -846,6 +872,8 @@ local function render_settings_menu()
                     y = slider(x, y, width, setting)
                 elseif setting.type == "toggle" then
                     y = toggle(x, y, width, setting)
+                elseif setting.type == "choice" then
+                    y = choice(x, y, width, setting)
                 end
             end
             if column == "right" then right_y = y else left_y = y end

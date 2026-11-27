@@ -69,7 +69,12 @@ public sealed partial class Playfield
         if (showLinkHead)
         {
             var missedHead = interactive && (runtime!.StartMissed || runtime.Dropped);
-            var headPoint = _projection.Project(root.Track, rootStartSeconds, _playSeconds, currentState);
+            var rootTravel = (float)_projection.ScrollPixels(rootStartSeconds, _playSeconds);
+            var rootPosition = GearState.Position(root.Track);
+            var headPoint = rootPosition is { } rootLanePosition
+                ? GetTrackNotePoint(root.Track, rootLanePosition.Side, rootLanePosition.Bank,
+                    rootTravel, currentState)
+                : _projection.Project(root.Track, rootStartSeconds, _playSeconds, currentState);
             AddNoteOverlayCommands(
                 headCommands,
                 headPoint,
@@ -81,7 +86,7 @@ public sealed partial class Playfield
                     ? _textures.Get(NoteTextureAsset.IndicatorLongMiss)
                     : _textures.Get(simultaneous ? NoteTextureAsset.IndicatorLongMulti : NoteTextureAsset.IndicatorLong),
                 _projection.NoteWidth,
-                _projection.HoldIndicatorWidth, currentTick, (float)_projection.ScrollPixels(rootStartSeconds, _playSeconds));
+                _projection.HoldIndicatorWidth, currentTick, rootTravel);
         }
 
         // A short/standalone LinkHead is still handled by the normal note path.
@@ -204,9 +209,11 @@ public sealed partial class Playfield
                 var connectorTint = connectorOpacity < 0.999f ? Color.White * connectorOpacity : (Color?)null;
                 _body3DCommands.Add(BuildConnectorCommand(
                     body,
+                    head.Track,
                     _projection.LaneNormalizedX(head.Track),
                     headPosition.Value.Side,
                     headPosition.Value.Bank,
+                    tail.Track,
                     _projection.LaneNormalizedX(tail.Track),
                     tailPosition.Value.Side,
                     tailPosition.Value.Bank,
@@ -336,15 +343,19 @@ public sealed partial class Playfield
             if (!placementPreview && !_projection.WithinRenderDistance(connectedTailTravel))
                 continue;
 
-            // This is the same source-lane projected frame used by the connector
-            // below for this exact link segment. Reusing its travel coordinate avoids
-            // introducing a second, independently-calibrated screen position.
-            var connectedFrame = _projection.ProjectAtTravelFrame(
-                node.Track, connectedTailTravel, currentState);
+            // Match ordinary note cards: sample the already-baked per-track
+            // motion path instead of rebuilding a lane-plane frame for this tail.
+            // During an animated bank switch GetTrackNotePoint falls back to the
+            // live projection, preserving the transition's exact pose.
+            var connectedPosition = GearState.Position(node.Track);
+            var connectedTailPoint = connectedPosition is { } connectedLanePosition
+                ? GetTrackNotePoint(node.Track, connectedLanePosition.Side,
+                    connectedLanePosition.Bank, connectedTailTravel, currentState)
+                : _projection.ProjectAtTravel(node.Track, connectedTailTravel, currentState);
 
             AddLanePlaneTailCommand(
                 headCommands,
-                connectedFrame.Point,
+                connectedTailPoint,
                 node.Track,
                 connectedTailTravel,
                 tailTexture,
@@ -407,7 +418,12 @@ public sealed partial class Playfield
         }
 
         var terminalEndTick = GetLinkBodyEndTick(terminal, true);
-        var terminalEnd = _projection.ProjectAtTicks(terminal.Track, terminalEndTick, currentTick, currentState);
+        var terminalEndTravel = (float)_projection.ScrollPixelsAtTicks(terminalEndTick, currentTick);
+        var terminalPosition = GearState.Position(terminal.Track);
+        var terminalEnd = terminalPosition is { } terminalLanePosition
+            ? GetTrackNotePoint(terminal.Track, terminalLanePosition.Side, terminalLanePosition.Bank,
+                terminalEndTravel, currentState)
+            : _projection.ProjectAtTicks(terminal.Track, terminalEndTick, currentTick, currentState);
         var dim = _textures.Get(simultaneous ? NoteTextureAsset.DimMulti : NoteTextureAsset.Dim);
         var light = _textures.Get(simultaneous ? NoteTextureAsset.LightMulti : NoteTextureAsset.LightLong);
 
@@ -422,7 +438,7 @@ public sealed partial class Playfield
                 light,
                 _projection.DimTextureWidth,
                 _projection.LightIndicatorWidth, currentTick,
-                (float)_projection.ScrollPixels(_tempo.TickToSeconds(terminalEndTick), _playSeconds),
+                terminalEndTravel,
                 baseComponent: "end_cap",
                 overlayComponent: "end_indicator");
         }
@@ -539,9 +555,11 @@ public sealed partial class Playfield
 
     private Textured3DQuadCommand BuildConnectorCommand(
         Texture2D texture,
+        int trackA,
         float normalizedA,
         string sideA,
         string bankA,
+        int trackB,
         float normalizedB,
         string sideB,
         string bankB,
@@ -552,19 +570,17 @@ public sealed partial class Playfield
         int layer = 0,
         int geometryTrack = -1)
     {
-        var surfaceA = GetNoteSurface(sideA, bankA);
-        var surfaceB = GetNoteSurface(sideB, bankB);
-        // Build the fixed lane/travel context once per endpoint. The direct
-        // BuildStandingNoteBasis(surface, ...) overload recomputes the same bank
-        // edges and perspective setup for both the moving and judge samples.
-        var contextA = _projection.BuildStandingNoteTravelContext(
-            surfaceA, normalizedA, sideA, bankA);
-        var contextB = _projection.BuildStandingNoteTravelContext(
-            surfaceB, normalizedB, sideB, bankB);
-        var basisA = _projection.BuildStandingNoteBasis(contextA, travelPixels);
-        var basisB = _projection.BuildStandingNoteBasis(contextB, travelPixels);
-        var judgeA = _projection.BuildStandingNoteBasis(contextA, 0f);
-        var judgeB = _projection.BuildStandingNoteBasis(contextB, 0f);
+        var measureLinkConnector = _performanceDebugInstrumentFrame &&
+            _skinNoteGeometryContext?.NoteType == NoteType.LinkHead;
+        var linkConnectorStartTimestamp = measureLinkConnector ? Stopwatch.GetTimestamp() : 0L;
+        var linkConnectorStartAllocatedBytes = measureLinkConnector ? GC.GetAllocatedBytesForCurrentThread() : 0L;
+        // Ordinary note heads use the baked per-track motion samples. Link
+        // connectors must use those same samples instead of rebuilding both lane
+        // travel contexts and all four bases for every connector on every frame.
+        var basisA = GetTrackNoteBasis(
+            trackA, sideA, bankA, normalizedA, travelPixels, out var judgeA);
+        var basisB = GetTrackNoteBasis(
+            trackB, sideB, bankB, normalizedB, travelPixels, out var judgeB);
         // The connector is a lane-plane strip. U spans between the two link
         // endpoints, while V is only the short strip thickness along the lane.
         // Do not use the hold-body texture's height/width aspect here: that
@@ -603,7 +619,7 @@ public sealed partial class Playfield
         }
         var depth = Math.Max(Math.Max(-aNear.Z, -aFar.Z), Math.Max(-bNear.Z, -bFar.Z));
         var noteContext = _skinNoteGeometryContext;
-        return new Textured3DQuadCommand(
+        var connectorCommand = new Textured3DQuadCommand(
             texture, vertices, depth, flipV, tint, layer, false,
             noteContext?.Track ?? -1,
             noteContext?.Tick ?? -1,
@@ -615,6 +631,13 @@ public sealed partial class Playfield
             _skinNoteSimultaneousContext,
             geometryTrack >= 0 ? geometryTrack : noteContext?.Track ?? -1,
             _skinNoteMissedContext);
+        if (measureLinkConnector)
+        {
+            _debugLinkConnectorBuildMs += (Stopwatch.GetTimestamp() - linkConnectorStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+            _debugLinkConnectorAllocatedBytes += Math.Max(0L,
+                GC.GetAllocatedBytesForCurrentThread() - linkConnectorStartAllocatedBytes);
+        }
+        return connectorCommand;
     }
 
     private void AddLinkBodyEndTailCommand(
@@ -625,8 +648,12 @@ public sealed partial class Playfield
         GearState currentState,
         Texture2D texture)
     {
-        var bodyEndPoint = _projection.ProjectAtTicks(node.Track, bodyEndTick, currentTick, currentState);
-        var bodyEndTravel = _projection.ScrollPixelsAtTicks(bodyEndTick, currentTick);
+        var bodyEndTravel = (float)_projection.ScrollPixelsAtTicks(bodyEndTick, currentTick);
+        var nodePosition = GearState.Position(node.Track);
+        var bodyEndPoint = nodePosition is { } nodeLanePosition
+            ? GetTrackNotePoint(node.Track, nodeLanePosition.Side, nodeLanePosition.Bank,
+                bodyEndTravel, currentState)
+            : _projection.ProjectAtTicks(node.Track, bodyEndTick, currentTick, currentState);
         if (!_editorNoteGroupPlacementPreviewRendering &&
             bodyEndTravel < -_projection.GetRenderDistanceBehind())
             return;
@@ -692,6 +719,10 @@ public sealed partial class Playfield
         Color? effectiveTint = tint;
         if (opacity < 0.999f)
             effectiveTint = (tint ?? Color.White) * opacity;
+        var measureLinkTail = _performanceDebugInstrumentFrame &&
+            _skinNoteGeometryContext?.NoteType == NoteType.LinkHead;
+        var linkTailStartTimestamp = measureLinkTail ? Stopwatch.GetTimestamp() : 0L;
+        var linkTailStartAllocatedBytes = measureLinkTail ? GC.GetAllocatedBytesForCurrentThread() : 0L;
         _body3DCommands.Add(BuildFlatCardCommand(
             texture,
             point,
@@ -700,5 +731,12 @@ public sealed partial class Playfield
             travelPixels,
             effectiveTint,
             layer));
+        if (measureLinkTail)
+        {
+            _debugLinkTailBuildMs += (Stopwatch.GetTimestamp() - linkTailStartTimestamp) * 1000.0 / Stopwatch.Frequency;
+            _debugLinkTailAllocatedBytes += Math.Max(0L,
+                GC.GetAllocatedBytesForCurrentThread() - linkTailStartAllocatedBytes);
+            _debugLinkTailPlaneCount++;
+        }
     }
 }

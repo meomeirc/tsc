@@ -134,7 +134,7 @@ public sealed partial class Playfield
 
         // The editor's 2D view has its own hit-animation settings. Keep the
         // judgement effect aligned with whichever render config drives the lanes.
-        var viewRenderConfig = GetActiveViewRenderConfig();
+        var viewRenderConfig = GetActiveViewPlayfieldConfig();
         HitAnimationConfig config;
         string variant;
 
@@ -401,7 +401,7 @@ public sealed partial class Playfield
             samplerState: SamplerState.LinearClamp,
             blendState: BlendState.NonPremultiplied);
 
-        var activeHitConfig = GetActiveViewRenderConfig().HitAnimation;
+        var activeHitConfig = GetActiveViewPlayfieldConfig().HitAnimation;
         foreach (var animation in _hitAnimations)
         {
             // Every native hit effect follows the active projection, not only
@@ -626,7 +626,7 @@ public sealed partial class Playfield
         var superFlickFamily = ev.IsSuperFlick
             ? ev.GetSuperFlickFamily(_gear?.AtTick(ev.Tick, includeTickChanges: false)).ToString().ToLowerInvariant()
             : string.Empty;
-        var hitAnimationConfig = GetActiveViewRenderConfig().HitAnimation;
+        var hitAnimationConfig = GetActiveViewPlayfieldConfig().HitAnimation;
         var selectedHitConfig = ev.IsSuperFlick
             ? string.Equals(superFlickFamily, "inner", StringComparison.OrdinalIgnoreCase)
                 ? hitAnimationConfig.SuperFlick.Inner
@@ -636,7 +636,9 @@ public sealed partial class Playfield
                 : isMulti ? hitAnimationConfig.Multi : hitAnimationConfig.Regular;
         var hitWidth = Math.Max(1f,
             selectedHitConfig.Width * point.Scale * point.LaneRotationDepthScale);
-        var hitRotation = selectedHitConfig.RotateWithLane ? rotation : 0f;
+        // Expose the actual projected lane angle. The skin decides whether an
+        // effect uses it, captures it once, or ignores it entirely.
+        var hitRotation = rotation;
         return new SkinNoteView(
             type,
             noteSeconds,

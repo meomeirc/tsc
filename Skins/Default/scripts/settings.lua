@@ -3,10 +3,19 @@
 -- Values are stored in this skin folder's skinSettings.json.
 -- Read toggles in skin.lua with game.skin_display:Get("setting_id").
 -- Read numeric values with game.skin_display:GetNumber("setting_id").
--- Groups use column = "left" or "right"; controls support toggle and slider.
+-- Read choices with game.skin_display:GetChoice("setting_id").
+-- Groups use column = "left" or "right"; controls support toggle, slider, and choice.
 -- Slider entries use min, max, step (0 = continuous), and an optional Lua
 -- string.format pattern such as "%.0f%%".
 return {
+    {
+        id = "playfield",
+        label = "PLAYFIELD",
+        column = "left",
+        settings = {
+            { id = "playfield_style", label = "NOTE STYLE", type = "choice", default = "regular", options = { "regular", "minimal" } },
+        }
+    },
     {
         id = "background",
         label = "BACKGROUND",

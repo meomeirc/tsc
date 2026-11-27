@@ -172,7 +172,8 @@ public sealed partial class Playfield
         string Component = "",
         bool Simultaneous = false,
         int GeometryTrack = -1,
-        bool SkinMissed = false);
+        bool SkinMissed = false,
+        StandingNoteBasis? LaneBasis = null);
 
     private readonly record struct LaneTextureMeshCommand(
         Texture2D Texture,
@@ -227,7 +228,9 @@ public sealed partial class Playfield
         string Bank,
         float CenterNormalized,
         float HalfNormalizedWidth,
-        float NearDepth);
+        float NearDepth,
+        float NearLineWidth = 0f,
+        float FarLineWidth = 0f);
 
     private sealed class LaneMeshTemplate
     {
@@ -355,7 +358,7 @@ public sealed partial class Playfield
     // Bank-indicator positions are always derived from the expanded top-down
     // editor layout, regardless of the active gameplay view or compact mode.
     private readonly ChartProjection _editorIndicatorProjection = new();
-    private RenderConfig? _editorIndicatorProjectionConfig;
+    private RenderConfig? _editorIndicatorProjectionPlayfieldConfig;
     private TempoMap? _editorIndicatorProjectionTempo;
     private int _editorIndicatorProjectionWidth = -1;
     private int _editorIndicatorProjectionHeight = -1;
@@ -444,6 +447,13 @@ public sealed partial class Playfield
     private double _debugDrawNotesMs;
     private double _debugAutoLinkBuildMs;
     private double _debugGameplayLinkBuildMs;
+    private double _debugLinkBodyBuildMs;
+    private double _debugLinkConnectorBuildMs;
+    private double _debugLinkTailBuildMs;
+    private long _debugLinkBodyAllocatedBytes;
+    private long _debugLinkConnectorAllocatedBytes;
+    private long _debugLinkTailAllocatedBytes;
+    private int _debugLinkTailPlaneCount;
     private double _debugTexturedDrawMs;
     private double _debugTexturedSortMs;
     private long _debugAllocSkinBuildBytes;
@@ -462,6 +472,10 @@ public sealed partial class Playfield
     private int _debugTimingOffsetCount;
     private double _debugSkinNoteBridgeMs;
     private long _debugSkinNoteBridgeAllocatedBytes;
+    private double _debugSkinNoteSnapshotMs;
+    private long _debugSkinNoteSnapshotAllocatedBytes;
+    private double _debugSkinNoteApplyMs;
+    private long _debugSkinNoteApplyAllocatedBytes;
 #endif
     private int _debugVisibleGameplayChains;
     private int _debugGameplayLinkSegments;
@@ -620,14 +634,14 @@ public sealed partial class Playfield
     // get_playfield_config(view) in skin.lua can use screen.width/height/aspect.
     // Re-evaluate it automatically when the virtual gameplay resolution changes so
     // resizing the window does not require a manual F10 refresh.
-    private int _lastRenderConfigVirtualWidth = -1;
-    private int _lastRenderConfigVirtualHeight = -1;
+    private int _lastPlayfieldConfigVirtualWidth = -1;
+    private int _lastPlayfieldConfigVirtualHeight = -1;
     // Lua scripts capture screen dimensions during execution. Track those separately
-    // from renderConfig so startup can skip a redundant second script execution.
+    // from the playfield config dimensions so startup can skip a redundant reload.
     private int _lastSkinScriptVirtualWidth = -1;
     private int _lastSkinScriptVirtualHeight = -1;
     private bool _topDownViewEnabled;
-    private RenderConfig _editorRenderConfig = new();
+    private RenderConfig _editorPlayfieldConfig = new();
     private KeyboardState _previousKeyboard;
     private ChartEventKey? _selectedEventKey;
     private int? _selectedBeatTick;
@@ -884,7 +898,15 @@ public sealed partial class Playfield
     private readonly List<SkinPlayfieldGeometrySnapshot> _skinPlayfieldGeometryScratch = new(512);
     private readonly List<SkinPlayfieldSpriteGeometrySnapshot> _skinPlayfieldSpriteGeometryScratch = new(64);
     private readonly List<SkinPlayfieldSpriteGeometrySnapshot> _skinJudgementLineGeometryScratch = new(16);
+    private readonly List<SkinJudgeAnchorSnapshot> _skinJudgementLineAnchorScratch = new(8);
+    private readonly List<SkinJudgeLaneSnapshot> _skinJudgementLineLaneScratch = new(32);
+    private readonly List<SkinHitEffectAnchorSnapshot> _skinHitEffectAnchorScratch = new(16);
+    private readonly List<SkinLaneLineAnchorSnapshot> _skinLaneLineBankAnchorScratch = new(8);
+    private readonly List<SkinLaneLineAnchorSnapshot> _skinLaneLineAnchorScratch = new(32);
+    private bool _skinPlayfieldUnifiedRendererThisPass;
+    private bool _skinPlayfieldReplacesJudgementLineThisPass;
     private readonly List<TexturedQuadCommand> _skinJudgementLineCommandScratch = new(16);
+    private readonly List<Textured3DQuadCommand> _skinLaneQuad3DCommandScratch = new(8);
     private readonly HashSet<SkinSuperFlickComponentKey> _skinReplacedSuperFlickComponents = new();
     private readonly List<Textured3DQuadCommand> _skinPlayfieldHeadScratch = new(256);
     private readonly List<Textured3DQuadCommand> _skinPlayfieldBodyScratch = new(128);
@@ -1621,7 +1643,7 @@ public sealed partial class Playfield
             _editorPreferredCompact = _compact;
             _topDownViewEnabled = true;
             _compact = _editorPreferredCompact;
-            ApplyActiveViewRenderConfig(rebuildChartMotionPaths: !deferChartDependentWork);
+            ApplyActiveViewPlayfieldConfig(rebuildChartMotionPaths: !deferChartDependentWork);
         }
         var gameplaySkinEditorMode = enabled && !_editorPreviewMode;
         _skinRuntime.SetEditorMode(gameplaySkinEditorMode);
@@ -2601,25 +2623,24 @@ public sealed partial class Playfield
         {
             if (_skinRuntime.TryGetPlayfieldConfig("gameplay", out var gameplayConfig, out var gameplayConfigError))
                 _skin.RenderConfig = gameplayConfig;
-            else if (_skinRuntime.HasPlayfieldConfigProvider && !string.IsNullOrWhiteSpace(gameplayConfigError))
-                _statusMessage = $"skin.lua gameplay playfield config failed: {gameplayConfigError}";
+            else
+                _statusMessage = $"Gameplay playfield config failed: {gameplayConfigError}";
 
-            if (!ReloadEditorRenderConfig(out var editorConfigError))
+            if (!ReloadEditorPlayfieldConfig(out var editorConfigError))
                 _statusMessage = $"Editor playfield config failed: {editorConfigError}";
 
             QueueLegacyHitAnimationPreload(skin.RenderConfig);
             _projection.LoadRenderConfig(skin.RenderConfig);
         }
-        // The editor view uses the same skin API with the "editor" view key;
-        // legacy editorRenderConfig.lua remains a compatibility fallback.
+        // The editor view uses the same playfield configuration API with the "editor" view key.
+        // If the selected skin has no provider/module, SkinRuntime inherits the bundled Default module.
         _activeGaugeType = GameConfig.NormalizeGaugeType(skin.GameConfig.Gauge);
         _projection.ScrollSpeedScale = skin.GameConfig.ScrollSpeedScale;
         SyncEditorConstantScrollMode();
         var (virtualWidth, virtualHeight) = GetVirtualResolution(graphics.Viewport.Width, graphics.Viewport.Height);
         _projection.Resize(virtualWidth, virtualHeight);
-        // SkinContext.RenderConfig may have been parsed before the current
-        // viewport was established. Let the first viewport refresh reload and
-        // apply the skin API's gameplay/editor config before rendering begins.
+        // SkinContext.RenderConfig starts with an in-memory emergency configuration.
+        // Apply the selected skin's gameplay/editor configuration before rendering begins.
     }
     public void CreateEmptyEditorChart(string difficulty = "Expert", ChartBundleTemplate template = ChartBundleTemplate.Tsc)
     {
@@ -12602,14 +12623,14 @@ public sealed partial class Playfield
         }
     }
 
-    private RenderConfig GetActiveViewRenderConfig()
+    private RenderConfig GetActiveViewPlayfieldConfig()
     {
-        return _topDownViewEnabled ? _editorRenderConfig : _skin.RenderConfig;
+        return _topDownViewEnabled ? _editorPlayfieldConfig : _skin.RenderConfig;
     }
 
-    private void ApplyActiveViewRenderConfig(bool rebuildChartMotionPaths = true)
+    private void ApplyActiveViewPlayfieldConfig(bool rebuildChartMotionPaths = true)
     {
-        var activeConfig = GetActiveViewRenderConfig();
+        var activeConfig = GetActiveViewPlayfieldConfig();
         _projection.LoadRenderConfig(activeConfig);
         _projection.Compact = _compact;
         if (rebuildChartMotionPaths)
@@ -12645,7 +12666,7 @@ public sealed partial class Playfield
             _topDownViewEnabled = !_topDownViewEnabled;
         }
 
-        ApplyActiveViewRenderConfig();
+        ApplyActiveViewPlayfieldConfig();
         _projection.InvalidateGeometryCaches();
         InvalidateLaneMeshCache();
         _editorHoverCacheValid = false;
@@ -12670,46 +12691,20 @@ public sealed partial class Playfield
         _chartEditorInterfaceLayoutScriptPath = activeScriptPath;
     }
 
-    private bool ReloadEditorRenderConfig(out string? error)
+    private bool ReloadEditorPlayfieldConfig(out string? error)
     {
         if (_skinRuntime.TryGetPlayfieldConfig("editor", out var skinConfig, out error))
         {
-            _editorRenderConfig = skinConfig;
+            _editorPlayfieldConfig = skinConfig;
             return true;
         }
 
-        if (_skinRuntime.HasPlayfieldConfigProvider)
-        {
-            _editorRenderConfig = RenderConfigLuaLoader.LoadBuiltInDefault(
-                _graphics.Viewport.Width, _graphics.Viewport.Height);
-            return false;
-        }
-
-        // Older skins can continue to supply the editor view independently.
-        var path = SkinScriptPathResolver.Preferred(_skin.SkinDirectory, "editorRenderConfig.lua");
-        var defaultSkinDirectory = SkinScriptPathResolver.DefaultSkinDirectory(_skin.RootDirectory);
-        var defaultPath = SkinScriptPathResolver.Preferred(defaultSkinDirectory, "editorRenderConfig.lua");
-        if (!File.Exists(path) && !File.Exists(defaultPath))
-        {
-            _editorRenderConfig = RenderConfigLuaLoader.LoadBuiltInDefault(
-                _graphics.Viewport.Width, _graphics.Viewport.Height);
-            error = null;
-            return true;
-        }
-
-        if (!RenderConfigLuaLoader.TryLoadWithFallback(
-                path, defaultPath, _graphics.Viewport.Width, _graphics.Viewport.Height,
-                out var config, out error))
-        {
-            _editorRenderConfig = config;
-            return false;
-        }
-
-        _editorRenderConfig = config;
-        return true;
+        _editorPlayfieldConfig = PlayfieldConfigLoader.LoadBuiltInDefault(
+            _graphics.Viewport.Width, _graphics.Viewport.Height);
+        return false;
     }
 
-    private bool ReloadGameplayRenderConfig(out string? error)
+    private bool ReloadGameplayPlayfieldConfig(out string? error)
     {
         if (_skinRuntime.TryGetPlayfieldConfig("gameplay", out var skinConfig, out error))
         {
@@ -12717,40 +12712,34 @@ public sealed partial class Playfield
             return true;
         }
 
-        if (_skinRuntime.HasPlayfieldConfigProvider)
-        {
-            _skin.RenderConfig = RenderConfigLuaLoader.LoadBuiltInDefault(
-                _graphics.Viewport.Width, _graphics.Viewport.Height);
-            return false;
-        }
-
-        return SkinConfigStore.ReloadRenderConfig(
-            _skin, _graphics.Viewport.Width, _graphics.Viewport.Height, out error);
+        _skin.RenderConfig = PlayfieldConfigLoader.LoadBuiltInDefault(
+            _graphics.Viewport.Width, _graphics.Viewport.Height);
+        return false;
     }
 
-    private bool RefreshRenderConfigForViewportIfNeeded(int virtualWidth, int virtualHeight)
+    private bool RefreshPlayfieldConfigForViewportIfNeeded(int virtualWidth, int virtualHeight)
     {
-        if (virtualWidth == _lastRenderConfigVirtualWidth &&
-            virtualHeight == _lastRenderConfigVirtualHeight)
+        if (virtualWidth == _lastPlayfieldConfigVirtualWidth &&
+            virtualHeight == _lastPlayfieldConfigVirtualHeight)
             return true;
 
-        // Evaluate the new skin API against the current virtual screen dimensions.
-        // Old skins still use their separate config files through the fallback.
+        // Evaluate the selected skin's playfield API against the current virtual screen dimensions.
+        // The playfieldConfig module inherits from the bundled Default skin when not overridden.
         _skinRuntime.UpdateScreen(virtualWidth, virtualHeight);
-        var gameplayConfigOk = ReloadGameplayRenderConfig(out var gameplayConfigError);
-        var editorConfigOk = ReloadEditorRenderConfig(out var editorConfigError);
+        var gameplayConfigOk = ReloadGameplayPlayfieldConfig(out var gameplayConfigError);
+        var editorConfigOk = ReloadEditorPlayfieldConfig(out var editorConfigError);
         if (!gameplayConfigOk)
             _statusMessage = $"Gameplay playfield config refresh failed: {gameplayConfigError}";
         else if (!editorConfigOk)
             _statusMessage = $"Editor playfield config refresh failed: {editorConfigError}";
 
-        ApplyActiveViewRenderConfig();
-        _lastRenderConfigVirtualWidth = virtualWidth;
-        _lastRenderConfigVirtualHeight = virtualHeight;
+        ApplyActiveViewPlayfieldConfig();
+        _lastPlayfieldConfigVirtualWidth = virtualWidth;
+        _lastPlayfieldConfigVirtualHeight = virtualHeight;
         return gameplayConfigOk && editorConfigOk;
     }
 
-    private void RefreshSkinUiConfig(bool reloadRenderConfig = true)
+    private void RefreshSkinUiConfig(bool reloadPlayfieldConfig = true)
     {
         var (scriptVirtualWidth, scriptVirtualHeight) = GetVirtualResolution(
             _graphics.Viewport.Width,
@@ -12768,21 +12757,21 @@ public sealed partial class Playfield
         var editorInterfaceScriptOk = _chartEditorInterfaceRuntime.IsInitialLoadDeferred || _chartEditorInterfaceRuntime.Reload();
         var editorInterfaceScriptError = _chartEditorInterfaceRuntime.LastError;
 
-        var renderOk = true;
-        var editorRenderOk = true;
-        string? renderError = null;
-        string? editorRenderError = null;
-        if (reloadRenderConfig)
+        var playfieldOk = true;
+        var editorPlayfieldOk = true;
+        string? playfieldError = null;
+        string? editorPlayfieldError = null;
+        if (reloadPlayfieldConfig)
         {
             // Reload the skin script first so the configuration callback is evaluated
             // from the same freshly loaded script and screen dimensions.
-            renderOk = ReloadGameplayRenderConfig(out renderError);
-            editorRenderOk = ReloadEditorRenderConfig(out editorRenderError);
-            if (renderOk && editorRenderOk)
+            playfieldOk = ReloadGameplayPlayfieldConfig(out playfieldError);
+            editorPlayfieldOk = ReloadEditorPlayfieldConfig(out editorPlayfieldError);
+            if (playfieldOk && editorPlayfieldOk)
             {
-                ApplyActiveViewRenderConfig();
-                _lastRenderConfigVirtualWidth = scriptVirtualWidth;
-                _lastRenderConfigVirtualHeight = scriptVirtualHeight;
+                ApplyActiveViewPlayfieldConfig();
+                _lastPlayfieldConfigVirtualWidth = scriptVirtualWidth;
+                _lastPlayfieldConfigVirtualHeight = scriptVirtualHeight;
             }
         }
 
@@ -12796,7 +12785,7 @@ public sealed partial class Playfield
             _judgementPulseTimer = 0;
         }
 
-        if (renderOk && editorRenderOk && scriptOk && pauseScriptOk && resultScriptOk && editorInterfaceScriptOk)
+        if (playfieldOk && editorPlayfieldOk && scriptOk && pauseScriptOk && resultScriptOk && editorInterfaceScriptOk)
         {
             _statusMessage = _skinRuntime.IsLoaded
                 ? $"Render + skin.lua loaded (F10) | ahead={_projection.RenderDistanceAhead:0} behind={_projection.RenderDistanceBehind:0} laneEnd={_projection.LaneEndLength:0}"
@@ -12805,8 +12794,8 @@ public sealed partial class Playfield
         else
         {
             var errors = new List<string>();
-            if (!renderOk) errors.Add($"render={renderError}");
-            if (!editorRenderOk) errors.Add($"editorRender={editorRenderError}");
+            if (!playfieldOk) errors.Add($"gameplayPlayfield={playfieldError}");
+            if (!editorPlayfieldOk) errors.Add($"editorPlayfield={editorPlayfieldError}");
             if (!scriptOk) errors.Add($"script={scriptError}");
             if (!pauseScriptOk) errors.Add($"pause={pauseScriptError}");
             if (!resultScriptOk) errors.Add($"result={resultScriptError}");
@@ -12816,7 +12805,7 @@ public sealed partial class Playfield
     }
 
     /// <summary>
-    /// Ensures render configuration matches the current viewport. Gameplay skin
+    /// Ensures playfield configuration matches the current viewport. Gameplay skin
     /// scripts are only re-executed when their captured screen dimensions differ
     /// or a runtime previously failed to load. F10 remains the full manual reload.
     /// </summary>
@@ -12834,10 +12823,9 @@ public sealed partial class Playfield
                 _pauseSkinRuntime.LastError is null &&
                 _resultSkinRuntime.LastError is null &&
                 _chartEditorInterfaceRuntime.LastError is null;
-            // Refresh the playfield's camera/lane configuration from the active
-            // skin API (or legacy config fallback). The SkinContext may have been
-            // loaded before the current viewport was established.
-            var renderConfigOk = RefreshRenderConfigForViewportIfNeeded(virtualWidth, virtualHeight);
+            // Refresh the playfield's camera/lane configuration from the selected skin
+            // API and its inherited Default module after viewport dimensions are established.
+            var playfieldConfigOk = RefreshPlayfieldConfigForViewportIfNeeded(virtualWidth, virtualHeight);
             if (scriptsAlreadyMatchViewport)
             {
                 // This is also the initial editor-entry path when the skin was
@@ -12845,16 +12833,16 @@ public sealed partial class Playfield
                 // sure preview-only animation fonts are ready before preview is
                 // entered, even though no Lua reload was needed.
                 PrewarmGameplayAnimationFontsIfActive();
-                return renderConfigOk;
+                return playfieldConfigOk;
             }
 
             Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_BEGIN viewport={virtualWidth}x{virtualHeight}");
             // Re-execute Lua when dimensions changed or a runtime failed, then
             // re-evaluate the unified config callback from that new Lua environment.
-            var renderConfigStatus = _statusMessage;
-            RefreshSkinUiConfig(reloadRenderConfig: true);
-            if (!renderConfigOk)
-                _statusMessage = renderConfigStatus;
+            var playfieldConfigStatus = _statusMessage;
+            RefreshSkinUiConfig(reloadPlayfieldConfig: true);
+            if (!playfieldConfigOk)
+                _statusMessage = playfieldConfigStatus;
             _lastSkinScriptVirtualWidth = virtualWidth;
             _lastSkinScriptVirtualHeight = virtualHeight;
             _editorGameplayPreviewSkinWarmupAttempted = false;
@@ -12869,8 +12857,8 @@ public sealed partial class Playfield
                 if (_chartEditorMode && _chart is not null && _tempo is not null)
                     PrewarmEditorGameplayPreviewSkin();
             }
-            var ok = renderConfigOk && scriptsOk;
-            Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_DONE ok={ok} scripts={scriptsOk} renderConfig={renderConfigOk}");
+            var ok = playfieldConfigOk && scriptsOk;
+            Program.LogRuntime($"PLAYFIELD_STARTUP_SKIN_RELOAD_DONE ok={ok} scripts={scriptsOk} playfieldConfig={playfieldConfigOk}");
             return ok;
         }
         catch (Exception ex)
@@ -12898,13 +12886,13 @@ public sealed partial class Playfield
             var editorInterfaceOk = _chartEditorInterfaceRuntime.IsInitialLoadDeferred || _chartEditorInterfaceRuntime.Reload();
             string? gameplayConfigError = null;
             string? editorConfigError = null;
-            var gameplayConfigOk = scriptOk && ReloadGameplayRenderConfig(out gameplayConfigError);
-            var editorConfigOk = scriptOk && ReloadEditorRenderConfig(out editorConfigError);
+            var gameplayConfigOk = scriptOk && ReloadGameplayPlayfieldConfig(out gameplayConfigError);
+            var editorConfigOk = scriptOk && ReloadEditorPlayfieldConfig(out editorConfigError);
             if (gameplayConfigOk && editorConfigOk)
             {
-                ApplyActiveViewRenderConfig();
-                _lastRenderConfigVirtualWidth = virtualWidth;
-                _lastRenderConfigVirtualHeight = virtualHeight;
+                ApplyActiveViewPlayfieldConfig();
+                _lastPlayfieldConfigVirtualWidth = virtualWidth;
+                _lastPlayfieldConfigVirtualHeight = virtualHeight;
             }
             else if (scriptOk)
                 _statusMessage = !gameplayConfigOk
@@ -13052,18 +13040,17 @@ public sealed partial class Playfield
         _activeGaugeType = GameConfig.NormalizeGaugeType(skin.GameConfig.Gauge);
         _projection.ScrollSpeedScale = skin.GameConfig.ScrollSpeedScale;
         if (_statusMessage?.StartsWith("Missing note textures:", StringComparison.OrdinalIgnoreCase) == true ||
-            _statusMessage?.StartsWith("editorRenderConfig.lua load failed:", StringComparison.OrdinalIgnoreCase) == true ||
             _statusMessage?.StartsWith("Editor playfield config failed:", StringComparison.OrdinalIgnoreCase) == true ||
             _statusMessage?.StartsWith("Gameplay playfield config failed:", StringComparison.OrdinalIgnoreCase) == true)
             _statusMessage = null;
-        if (!ReloadGameplayRenderConfig(out var gameplayRenderError))
+        if (!ReloadGameplayPlayfieldConfig(out var gameplayRenderError))
             _statusMessage = $"Gameplay playfield config failed: {gameplayRenderError}";
-        if (!ReloadEditorRenderConfig(out var editorRenderError))
-            _statusMessage = $"Editor playfield config failed: {editorRenderError}";
+        if (!ReloadEditorPlayfieldConfig(out var editorPlayfieldError))
+            _statusMessage = $"Editor playfield config failed: {editorPlayfieldError}";
 
         if (_tempo is not null)
             _projection.SetTempo(_tempo);
-        ApplyActiveViewRenderConfig();
+        ApplyActiveViewPlayfieldConfig();
         _projection.InvalidateGeometryCaches();
         InvalidateLaneMeshCache();
         _editorHoverCacheValid = false;
@@ -13105,8 +13092,8 @@ public sealed partial class Playfield
         var (currentVirtualWidth, currentVirtualHeight) = GetVirtualResolution(
             _graphics.Viewport.Width,
             _graphics.Viewport.Height);
-        _lastRenderConfigVirtualWidth = currentVirtualWidth;
-        _lastRenderConfigVirtualHeight = currentVirtualHeight;
+        _lastPlayfieldConfigVirtualWidth = currentVirtualWidth;
+        _lastPlayfieldConfigVirtualHeight = currentVirtualHeight;
         _lastSkinScriptVirtualWidth = currentVirtualWidth;
         _lastSkinScriptVirtualHeight = currentVirtualHeight;
 
@@ -13530,7 +13517,7 @@ public sealed partial class Playfield
 
         var viewport = _graphics.Viewport;
         var (virtualWidth, virtualHeight) = GetVirtualResolution(viewport.Width, viewport.Height);
-        RefreshRenderConfigForViewportIfNeeded(virtualWidth, virtualHeight);
+        RefreshPlayfieldConfigForViewportIfNeeded(virtualWidth, virtualHeight);
         _projection.Resize(virtualWidth, virtualHeight);
         _projection.Compact = _compact;
         RefreshSkinGameState();
